@@ -12,7 +12,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
@@ -23,13 +23,29 @@ from .chart_history import load_chart_history
 from . import auction_views
 from .dispersion import load as load_dispersion
 from .engine import TradingEngine
+from .events import Frame, dumps, frame_text, json_value
 from .replay import ReplaySession
 from .universe import desk_underlying
 from .settings_store import RuntimeSettingsStore
 
 
+# Paths, the process layout and secrets come from the environment and
+# credentials.json, never from settings.json: a stored tick_database_path used
+# to override the one Compose set, so moving a database silently did nothing.
+ENVIRONMENT_ONLY = {
+    "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
+    "research_report_path", "contract_snapshot_path", "mp_database_path",
+    "blast_database_path", "tick_database_path", "api_token", "allowed_origins_csv",
+    "engine_role", "nats_url", "strategy_url", "desk_url",
+}
+PERSIST_EXCLUDED = ENVIRONMENT_ONLY | {
+    # Broker secrets live in credentials.json only — never mirrored into
+    # settings.json, where a stale plaintext token would otherwise linger.
+    "fyers_secret", "fyers_access_token", "telegram_bot_token",
+}
+
 settings_store = RuntimeSettingsStore(settings.runtime_settings_path)
-persisted_settings = settings_store.load()
+persisted_settings = {key: value for key, value in settings_store.load().items() if key not in ENVIRONMENT_ONLY}
 credentials_store = RuntimeSettingsStore(settings.credentials_path)
 saved_credentials = credentials_store.load()
 active_settings = Settings(**{**settings.model_dump(), **persisted_settings, **saved_credentials, "execution_mode": "paper", "allow_live_orders": False})
@@ -41,14 +57,6 @@ engine = TradingEngine(active_settings)
 engine.mp.vix_symbol = active_settings.vix_symbol
 alert_manager = AlertManager(engine)
 
-PERSIST_EXCLUDED = {
-    "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
-    "research_report_path", "contract_snapshot_path", "mp_database_path",
-    "blast_database_path", "api_token", "allowed_origins_csv",
-    # Broker secrets live in credentials.json only — never mirrored into
-    # settings.json, where a stale plaintext token would otherwise linger.
-    "fyers_secret", "fyers_access_token", "telegram_bot_token",
-}
 
 
 @asynccontextmanager
@@ -162,19 +170,37 @@ class FyersCredentialsInput(BaseModel):
     redirect_uri: str = Field(min_length=8)
 
 
+def fast_json(content) -> Response:
+    """JSON without FastAPI's jsonable_encoder pass, which alone took ~55 ms
+    of the 1.7 MB snapshot's ~130 ms. Content must be orjson-serializable."""
+    return Response(content=_encode(content), media_type="application/json")
+
+
+def _encode(content) -> bytes:
+    try:
+        return dumps(content)
+    except TypeError:  # an unusual type: take the slow, general path
+        return dumps(json_value(content))
+
+
+async def fast_json_off_loop(content) -> Response:
+    """For large payloads already built as plain values: encode in a thread."""
+    return Response(content=await asyncio.to_thread(_encode, content), media_type="application/json")
+
+
 @app.get("/health")
 async def health():
-    return {"ok": engine.status == "connected", "broker": engine.broker_status()}
+    return {"ok": engine.status == "connected", "broker": engine.broker_status(include_symbols=False)}
 
 
 @app.get("/api/snapshot", dependencies=[Depends(authorize)])
 async def snapshot():
-    return engine.snapshot()
+    return await fast_json_off_loop(engine.snapshot())
 
 
 @app.get("/api/watchlist", dependencies=[Depends(authorize)])
 async def watchlist():
-    return engine.snapshot()["watchlist"]
+    return fast_json(engine.snapshot()["watchlist"])
 
 
 @app.get("/api/chart/{symbol:path}", dependencies=[Depends(authorize)])
@@ -213,7 +239,7 @@ async def chart_history(symbol: str, timeframe_seconds: int = Query(default=1800
         "slow": engine.settings.slow_period,
         "signal": engine.settings.signal_period,
     }
-    return chart
+    return fast_json(chart)
 
 
 @app.get("/api/ratios/{spot_symbol:path}", dependencies=[Depends(authorize)])
@@ -671,7 +697,7 @@ def _as_json(order) -> dict:
 
 @app.get("/api/system/health", dependencies=[Depends(authorize)])
 async def system_health():
-    return {**engine.health(), "alerts": alert_manager.status()}
+    return fast_json({**engine.health(), "alerts": alert_manager.status()})
 
 
 @app.get("/api/equity-history", dependencies=[Depends(authorize)])
@@ -1101,13 +1127,17 @@ async def stream(websocket: WebSocket):
         data = engine.snapshot()
         while not queue.empty():
             queue.get_nowait()
-        queue.put_nowait({"seq": engine.events.current_sequence, "type": "snapshot", "data": data})
+        queue.put_nowait(Frame(engine.events.current_sequence, "snapshot", data))
 
     enqueue_snapshot()
 
     async def sender():
         while True:
-            await websocket.send_json(await queue.get())
+            frame = await queue.get()
+            # Every other socket shares a frame's cached text; the snapshot is
+            # built for this socket alone and is large, so encode it off-loop.
+            text = (await asyncio.to_thread(frame_text, frame)) if frame.get("type") == "snapshot" else frame_text(frame)
+            await websocket.send_text(text)
 
     async def receiver():
         while True:

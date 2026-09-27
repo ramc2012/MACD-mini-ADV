@@ -200,3 +200,60 @@ def store_historical_candles(
         return len(rows)
     finally:
         connection.close()
+
+
+# Deleting fewer rows than this leaves the free pages for SQLite to reuse;
+# VACUUM rewrites the whole file and is only worth it for a real reclaim.
+PRUNE_VACUUM_MIN_ROWS = 200_000
+
+
+def prune_history(
+    database_path: str, *, now: datetime, keep_days: int, expired_keep_days: int,
+) -> dict[str, int]:
+    """Bound the minute-bar cache, which otherwise grows ~190 MB a trading day.
+
+    Two rules, both measured in days:
+    - an option contract's bars go ``expired_keep_days`` after its expiry;
+    - any bar older than ``keep_days`` goes, contract or spot.
+    Cached indicators follow their bars. A value of 0 disables that rule.
+    Run outside market hours: the delete and any VACUUM hold the write lock.
+    """
+    if not Path(database_path).exists():
+        return {"candles": 0, "indicators": 0, "vacuumed": 0}
+    connection = sqlite3.connect(database_path, timeout=60)
+    deleted = {"candles": 0, "indicators": 0, "vacuumed": 0}
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "historical_candles" not in tables:
+            return deleted
+        has_indicators = "historical_indicators" in tables
+        with connection:
+            if expired_keep_days > 0:
+                expired_before = (now.date().toordinal() - expired_keep_days)
+                cutoff = datetime.fromordinal(expired_before).date().isoformat()
+                symbols = [row[0] for row in connection.execute(
+                    "SELECT DISTINCT symbol FROM historical_candles WHERE expiry IS NOT NULL AND expiry < ?",
+                    (cutoff,))]
+                for offset in range(0, len(symbols), 500):
+                    chunk = symbols[offset:offset + 500]
+                    marks = ",".join("?" * len(chunk))
+                    deleted["candles"] += connection.execute(
+                        f"DELETE FROM historical_candles WHERE symbol IN ({marks})", chunk).rowcount
+                    if has_indicators:
+                        deleted["indicators"] += connection.execute(
+                            f"DELETE FROM historical_indicators WHERE symbol IN ({marks})", chunk).rowcount
+            if keep_days > 0:
+                oldest = int(now.timestamp()) - keep_days * 86_400
+                deleted["candles"] += connection.execute(
+                    "DELETE FROM historical_candles WHERE timestamp < ?", (oldest,)).rowcount
+                if has_indicators:
+                    deleted["indicators"] += connection.execute(
+                        "DELETE FROM historical_indicators WHERE timestamp < ?", (oldest,)).rowcount
+        if deleted["candles"] + deleted["indicators"] >= PRUNE_VACUUM_MIN_ROWS:
+            connection.execute("VACUUM")
+            deleted["vacuumed"] = 1
+        return deleted
+    finally:
+        connection.close()

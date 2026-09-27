@@ -10,7 +10,9 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .brokers import Broker, create_broker
-from .candle_store import LiveCandleWriter, prior_session_candle_count, resolve_expiry, store_historical_candles
+from .candle_store import (
+    LiveCandleWriter, prior_session_candle_count, prune_history, resolve_expiry, store_historical_candles,
+)
 from .tick_store import TickStore
 from .universe import INDEX_SPOTS, desk_underlying
 from .regimes import regime_for
@@ -75,6 +77,9 @@ ANALYSIS_TICK_PUBLISH_SECONDS = 1.0
 QUOTES_BACKOFF_SECONDS = 300.0
 QUOTES_BACKOFF_MAX_SECONDS = 1800.0
 FEED_STALE_SECONDS = 120
+GREEKS_CACHE_SECONDS = 5.0
+# Once a day, outside the session and the pre-open, after this IST hour.
+HISTORY_PRUNE_AFTER_HOUR = 16
 # A print stamped this far past our own clock is treated as unusable: it would
 # otherwise become the "newest" quote and veto every real one behind it. A few
 # seconds of NTP error is normal; a Docker VM that slept can lag by minutes, and
@@ -180,6 +185,11 @@ class TradingEngine:
         self._stream_task: asyncio.Task | None = None
         self._startup_task: asyncio.Task | None = None
         self._tick_maintenance_task: asyncio.Task | None = None
+        self._history_prune_task: asyncio.Task | None = None
+        self.history_prune: dict = {"day": None, "result": None, "error": None}
+        # symbol -> (monotonic time, inputs, result): the snapshot recomputed
+        # every contract's implied vol (~25 us each, ~32 ms for the ladder).
+        self._greeks_cache: dict[str, tuple[float, tuple, dict]] = {}
         self._rollover_task: asyncio.Task | None = None
         self._session_close_task: asyncio.Task | None = None
         self._flushed_session: str | None = None
@@ -303,6 +313,7 @@ class TradingEngine:
         self._blast_task = asyncio.create_task(self._blast_maintenance_loop())
         if self.settings.tick_capture_enabled:
             self._tick_maintenance_task = asyncio.create_task(self._tick_maintenance_loop())
+        self._history_prune_task = asyncio.create_task(self._history_prune_loop())
 
     async def _lag_probe_loop(self) -> None:
         """Sample event-loop scheduling lag so single-process saturation is a
@@ -1031,6 +1042,33 @@ class TradingEngine:
         finally:
             self.events.publish("broker", self.broker_status())
 
+    async def _history_prune_loop(self) -> None:
+        """Bound historical.sqlite3 once a day, after the close.
+
+        The minute-bar cache had no retention and grew by up to ~190 MB a
+        trading day. The engine is the file's writer, so it prunes it; no
+        other process may, since the file is written without WAL.
+        """
+        while True:
+            await asyncio.sleep(600)
+            now = datetime.now(IST)
+            today = now.date().isoformat()
+            if (self.history_prune["day"] == today or regular_session_open() or preopen_window()
+                    or now.hour < HISTORY_PRUNE_AFTER_HOUR):
+                continue
+            self.history_prune["day"] = today
+            try:
+                self.history_prune["result"] = await asyncio.to_thread(
+                    prune_history,
+                    self.settings.research_database_path,
+                    now=now,
+                    keep_days=self.settings.history_retention_days,
+                    expired_keep_days=self.settings.expired_contract_retention_days,
+                )
+                self.history_prune["error"] = None
+            except Exception as exc:  # noqa: BLE001 - retry tomorrow; never stop the feed
+                self.history_prune["error"] = str(exc)[:300]
+
     async def _tick_maintenance_loop(self) -> None:
         """Condense raw ticks past the retention window, outside market hours.
 
@@ -1240,7 +1278,7 @@ class TradingEngine:
 
     async def stop(self) -> None:
         for name in ("_startup_task", "_expiry_flatten_task", "_tick_maintenance_task",
-                     "_blast_task"):
+                     "_blast_task", "_history_prune_task"):
             task = getattr(self, name, None)
             if task:
                 task.cancel()
@@ -1927,7 +1965,7 @@ class TradingEngine:
         seen_at, skew = last
         return skew if time.monotonic() - seen_at <= CLOCK_SKEW_REPORT_SECONDS else None
 
-    def broker_status(self) -> dict:
+    def broker_status(self, include_symbols: bool = True) -> dict:
         skew = self.clock_skew_seconds()
         skew_error = (f"Host clock is {skew:.0f}s behind exchange time; "
                       f"{getattr(self, 'future_ticks_ignored', 0)} ticks ignored. Sync the system clock."
@@ -1944,7 +1982,9 @@ class TradingEngine:
             "error": self.error or skew_error,
             "clock_skew_seconds": skew,
             "future_ticks_ignored": getattr(self, "future_ticks_ignored", 0),
-            "symbols": self.all_symbols,
+            # The full list is ~35 KB; /health, polled by Docker every 10 s,
+            # asks without it.
+            **({"symbols": self.all_symbols} if include_symbols else {"symbol_count": len(self.all_symbols)}),
             "spot_count": len(self.settings.symbols),
             "option_count": len(self.option_symbols),
             "analysis_option_count": len(getattr(self, "analysis_option_symbols", set())),
@@ -1969,16 +2009,25 @@ class TradingEngine:
             open_interest = contract.oi
         if not spot or open_interest is None:
             return {"iv": None, "gamma": None, "gex": None}
-        return contract_gex(
-            premium=float(premium or 0),
-            spot=float(spot),
+        inputs = (float(premium or 0), float(spot), int(open_interest), self.settings.risk_free_rate)
+        now = time.monotonic()
+        cached = self._greeks_cache.get(contract.symbol)
+        # Reuse while the marks are unchanged, and for a few seconds even when
+        # they move: a display snapshot does not need a fresh solve per tick.
+        if cached and (cached[1] == inputs or now - cached[0] < GREEKS_CACHE_SECONDS):
+            return cached[2]
+        result = contract_gex(
+            premium=inputs[0],
+            spot=inputs[1],
             strike=float(contract.strike),
             expiry=str(contract.expiry),
             option_type=str(contract.option_type),
-            open_interest=int(open_interest),
+            open_interest=inputs[2],
             lot_size=int(contract.lot_size or 0),
-            rate=self.settings.risk_free_rate,
+            rate=inputs[3],
         )
+        self._greeks_cache[contract.symbol] = (now, inputs, result)
+        return result
 
     def snapshot(self) -> dict:
         listed = set(self.settings.symbols) | set(self.contract_selector.contracts)
@@ -2132,6 +2181,7 @@ class TradingEngine:
             "day_baseline_equity": self.day_baseline_equity(),
             "loop_lag_ms": self.loop_lag_ms(),
             "candle_writer": self.candle_writer.status(),
+            "history_prune": self.history_prune,
             "tick_store": self.tick_store.status(include_database_counts=False)
             if self.settings.tick_capture_enabled else None,
             "mp": self.mp.health(),

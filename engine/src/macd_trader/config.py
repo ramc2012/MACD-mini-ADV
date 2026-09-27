@@ -214,6 +214,21 @@ class Settings(BaseSettings):
     # so it keeps a research year while the raw tier stays a replay window.
     flow_retention_days: int = 365
     tick_database_path: str = str(RUNTIME_DIR / "ticks.sqlite3")
+    # Minute-bar cache (historical.sqlite3) retention, pruned outside market
+    # hours: an option's bars go this many days after its expiry, and any bar
+    # older than history_retention_days goes. 0 disables a rule.
+    history_retention_days: int = Field(default=120, ge=0, le=3650)
+    expired_contract_retention_days: int = Field(default=30, ge=0, le=3650)
+    # Process layout. "all" runs every lane in one process (the original
+    # layout). "strategy" owns the Fyers feed, the MACD and blast lanes, and
+    # serves the desk; "desk" runs the Market Profile / order-flow lane from
+    # the tick bus. Environment-only, like the paths below.
+    engine_role: Literal["all", "strategy", "desk"] = "all"
+    # Tick bus (NATS). The strategy/all process publishes every accepted tick;
+    # the desk subscribes. Empty disables publishing.
+    nats_url: str = ""
+    strategy_url: str = "http://engine:8100"
+    desk_url: str = ""
 
     # Telegram alerting (bot token is a secret; empty disables alerts).
     telegram_bot_token: str = ""
