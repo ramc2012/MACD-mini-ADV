@@ -8,3 +8,7 @@ us-app/frontend/dist/
 us-app/frontend/*.tsbuildinfo
 us-app/runtime/
 analytics/target/
+engine/runtime/
+engine/.venv/
+**/__pycache__/
+.pytest_cache/

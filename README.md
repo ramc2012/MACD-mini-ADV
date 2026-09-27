@@ -1,6 +1,8 @@
 # MACD Mini Parallel
 
-A separate local Docker deployment of the [MACD Trader](../MACD-mini/README.md) terminal. The full React/TypeScript trading UI and established Python broker, strategy, and paper-book engine remain available. A Go gateway now fronts the engine, while a Rust analytics service computes an independent quantitative view of chart candles and records observations in QuestDB.
+The MACD Trader terminal as one self-contained local deployment: the Python trading engine ([engine/](engine/README.md)), a React/TypeScript terminal, a Go gateway that fans the engine's stream out to browsers and onto a NATS tick bus, and a Rust service that analyses ticks in parallel and records them in QuestDB.
+
+The engine was copied from the standalone `MACD-mini` repository at commit `30b5360` (27 Sep 2026) and is maintained here. That repository is kept as it was but is no longer deployed; its old `macd-trader` Docker images and network have been removed.
 
 ## Run
 
@@ -15,7 +17,7 @@ Open [the parallel terminal](http://localhost:3200). The Go gateway is at `http:
 
 The separate US Paper Desk is retired from the default deployment. Its source and `us_paper_data` volume are preserved. To run it again, opt in with `docker compose --profile us up -d --build us-backend us-frontend`; see [its module README](us-app/README.md).
 
-The feed is Fyers market data, with execution fixed to paper-only. The engine reports a broker configuration error until you connect your Fyers account in the terminal's **Settings → Broker connection** panel. The original deployment's ports and `runtime/` directory are untouched. This stack has its own `runtime/` and named QuestDB volume. The earlier simulation databases are preserved in `runtime/simulation-archive-2026-09-23/`, and their QuestDB observations remain in the old `macd-mini-parallel_questdb_data` volume.
+The feed is Fyers market data, with execution fixed to paper-only. The engine reports a broker configuration error until you connect your Fyers account in the terminal's **Settings → Broker connection** panel. This stack keeps all of its state in its own `runtime/` (bind-mounted into the engine) and named QuestDB volume. The earlier simulation databases are preserved in `runtime/simulation-archive-2026-09-23/`, and their QuestDB observations remain in the old `macd-mini-parallel_questdb_data` volume.
 
 To change the watchlist or supply Fyers credentials through Docker, copy `.env.example` to `.env` and edit it before restarting the stack. You can also enter credentials in the terminal's Settings panel. The Compose configuration fixes `MACD_EXECUTION_MODE=paper`, `MACD_ALLOW_LIVE_ORDERS=false`, and `MACD_AUTO_TRADE=false`.
 
@@ -25,7 +27,7 @@ To change the watchlist or supply Fyers credentials through Docker, copy `.env.e
 | --- | --- |
 | `frontend` | Full React/TypeScript terminal, served by Nginx on port 3200. |
 | `gateway` | Go API gateway on port 8201. Holds the one engine stream and fans it out to browsers, publishes every tick to the bus, and serves `/parallel/*`. |
-| `engine` | Original Python/FastAPI application, built unchanged from `../MACD-mini`. It remains the authority for market data, strategies, orders, and paper books. |
+| `engine` | Python/FastAPI engine built from [engine/](engine/README.md): Fyers market data, strategies, orders and paper books. The only process that talks to Fyers, and the authority for orders and risk. |
 | `nats` | Tick bus (core NATS, no persistence). The gateway publishes `md.tick.<symbol>`; consumers subscribe. |
 | `analytics` | Rust service. Live: worker shards consume the bus and build per-symbol 1-minute bars, MACD and volatility in parallel. On demand: `/analyze` of a chart's candles. |
 | `questdb` | Time-series store for raw ticks (5-day TTL), live 1-minute bars (90-day TTL) and on-demand observations; console on port 9002. |
@@ -35,7 +37,7 @@ The optional `us` profile contains the retired `us-backend` and `us-frontend` se
 ## Stream fan-out and tick bus
 
 ```
-Fyers ─► engine (Python, unchanged) ─► one websocket ─► Go gateway ─┬─► browsers (per-browser queues)
+Fyers ─► engine (Python, engine/) ─► one websocket ─► Go gateway ─┬─► browsers (per-browser queues)
                                                                    └─► NATS md.tick.<symbol> ─► Rust shards ─► QuestDB
 ```
 
@@ -83,7 +85,7 @@ The Go gateway adds a network hop to the existing Python API. In a local read-on
 | `/health` | 0.208 / 0.241 ms | 0.400 / 0.489 ms |
 | `/api/snapshot` | 0.961 / 1.053 ms | 1.150 / 1.237 ms |
 
-These results show about 0.19 ms of added median latency for the gateway and **no measured performance gain** for the original trading API's request/response calls. The stream fan-out above is where the gateway earns its hop. They do not measure Fyers response, concurrent load, tick-to-screen time, or order throughput. Broker performance can be measured after login under the same market session and symbol set.
+These results show about 0.19 ms of added median latency for the gateway and **no measured performance gain** for the engine's request/response calls. The stream fan-out above is where the gateway earns its hop. They do not measure Fyers response, concurrent load, tick-to-screen time, or order throughput. Broker performance can be measured after login under the same market session and symbol set.
 
 ## Check and stop
 

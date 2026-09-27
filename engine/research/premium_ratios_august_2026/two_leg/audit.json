@@ -1,0 +1,54 @@
+{
+  "pair_only": true,
+  "monthly_expiries": {
+    "NSE": "2026-08-25",
+    "BSE": "2026-08-27"
+  },
+  "catalogue_contracts": 1234,
+  "roots": 212,
+  "expiries": [
+    "2026-08-13",
+    "2026-08-18",
+    "2026-08-20",
+    "2026-08-25",
+    "2026-08-27"
+  ],
+  "catalogue_august_minute_rows": 3469178,
+  "metadata_missing_contracts": 185,
+  "metadata_conflicts": [],
+  "counts": {
+    "raw_rows_read": 4823291,
+    "invalid_or_offsession_rows": 75950,
+    "root_expiry_days": 3639,
+    "side_days_considered": 7268,
+    "side_days_no_causal_ladder": 6867,
+    "side_days_selected": 401,
+    "candidate_rows_5m": 25565,
+    "candidate_rows_15m": 8787,
+    "candidate_rows_30m": 4393,
+    "days_missing_selection_spot": 5
+  },
+  "observations_80pct": 11852,
+  "observations_complete": 11681,
+  "dates": [
+    "2026-08-03",
+    "2026-08-04",
+    "2026-08-05",
+    "2026-08-06",
+    "2026-08-07",
+    "2026-08-10",
+    "2026-08-11",
+    "2026-08-12",
+    "2026-08-13",
+    "2026-08-14",
+    "2026-08-17",
+    "2026-08-18",
+    "2026-08-19",
+    "2026-08-20",
+    "2026-08-24"
+  ],
+  "eligible_roots": 114,
+  "ladder_days": 401,
+  "snapshot": "/Users/ramachandran/CLAUDE PROJECTS/MACD mini/research/premium_ratios_august_2026/snapshot-20260831.sqlite3",
+  "created_at": "2026-08-31T07:50:41.302572+05:30"
+}

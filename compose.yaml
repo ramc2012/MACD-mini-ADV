@@ -2,9 +2,9 @@ name: macd-mini-parallel
 
 services:
   engine:
+    # This deployment's own copy of the engine (see engine/README.md).
     build:
-      context: ../MACD-mini
-      dockerfile: Dockerfile
+      context: ./engine
     environment:
       MACD_FEED_MODE: fyers
       MACD_EXECUTION_MODE: paper

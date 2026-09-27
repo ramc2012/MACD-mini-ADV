@@ -1,0 +1,9 @@
+# The image copies only pyproject.toml and src/.
+runtime
+tests
+docs
+.pytest_cache
+**/__pycache__
+.env
+research
+scripts

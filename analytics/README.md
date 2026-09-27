@@ -22,12 +22,12 @@ Every queue is bounded and never blocks the bus; drops are counted in
 
 ## On-demand analysis
 
-`POST /analyze` accepts the original MACD Trader chart response, including its
+`POST /analyze` accepts the engine's `/api/chart` response, including its
 extra `indicators` and candle OHLCV fields. The service sorts candles by Unix
 timestamp and keeps the last close for duplicate timestamps. It calculates
 fast/slow EMAs and the signal EMA with the periods in the chart's
 `macd_periods` (12/26/9 when absent) and the same first-value seeding as
-the original engine. `trend` is `bullish`, `bearish`, or `neutral` from the MACD
+the engine. `trend` is `bullish`, `bearish`, or `neutral` from the MACD
 sign; an empty history returns `no_data` and null numeric metrics.
 
 `realized_volatility_pct` is the sample standard deviation of log returns
