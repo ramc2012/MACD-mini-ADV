@@ -36,6 +36,29 @@ type gateway struct {
 	// token, when set, guards the gateway's own data endpoints the way the
 	// engine guards its API. Proxied engine routes are checked by the engine.
 	token string
+	// desk is the Market Profile / order-flow process. When set, /api/mp/*
+	// and /api/auction/* go there; otherwise the engine serves them.
+	desk      *url.URL
+	deskProxy *httputil.ReverseProxy
+}
+
+// setDesk routes the desk's API to its own process.
+func (g *gateway) setDesk(raw string) error {
+	desk, err := parseUpstream(raw)
+	if err != nil {
+		return fmt.Errorf("DESK_URL: %w", err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(desk)
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		log.Printf("desk proxy: %v", err)
+		writeError(w, http.StatusBadGateway, "desk_unavailable", "The Market Profile / order-flow desk is unavailable")
+	}
+	g.desk, g.deskProxy = desk, proxy
+	return nil
+}
+
+func isDeskPath(path string) bool {
+	return strings.HasPrefix(path, "/api/mp/") || strings.HasPrefix(path, "/api/auction/")
 }
 
 func (g *gateway) authorized(r *http.Request) bool {
@@ -55,12 +78,13 @@ type dependencyHealth struct {
 }
 
 type healthResponse struct {
-	Status    string           `json:"status"`
-	Gateway   string           `json:"gateway"`
-	Engine    dependencyHealth `json:"engine"`
-	Analytics dependencyHealth `json:"analytics"`
-	Stream    *streamHealth    `json:"stream,omitempty"`
-	CheckedAt string           `json:"checkedAt"`
+	Status    string            `json:"status"`
+	Gateway   string            `json:"gateway"`
+	Engine    dependencyHealth  `json:"engine"`
+	Analytics dependencyHealth  `json:"analytics"`
+	Desk      *dependencyHealth `json:"desk,omitempty"`
+	Stream    *streamHealth     `json:"stream,omitempty"`
+	CheckedAt string            `json:"checkedAt"`
 }
 
 type streamHealth struct {
@@ -78,6 +102,11 @@ func main() {
 		log.Fatal(err)
 	}
 	g.token = env("MACD_API_TOKEN", "")
+	if deskURL := env("DESK_URL", ""); deskURL != "" {
+		if err := g.setDesk(deskURL); err != nil {
+			log.Fatal(err)
+		}
+	}
 	if !strings.EqualFold(env("STREAM_FANOUT", "on"), "off") {
 		var bus publisher
 		if natsURL := env("NATS_URL", ""); natsURL != "" {
@@ -219,7 +248,17 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "Unknown parallel endpoint")
 			return
 		}
-		// The original Python engine remains the source of truth for every API,
+		// Process-to-process routes (desk context, broker proxy, settings
+		// saves) are for the Compose network only, never for a browser.
+		if strings.HasPrefix(r.URL.Path, "/api/internal/") {
+			writeError(w, http.StatusNotFound, "not_found", "Not found")
+			return
+		}
+		if g.deskProxy != nil && isDeskPath(r.URL.Path) {
+			g.deskProxy.ServeHTTP(w, r)
+			return
+		}
+		// The engine remains the source of truth for every other API,
 		// authentication, order and stream endpoint.
 		g.engineProxy.ServeHTTP(w, r)
 	}
@@ -230,24 +269,33 @@ func (g *gateway) health(w http.ResponseWriter, r *http.Request) {
 		name   string
 		health dependencyHealth
 	}
-	results := make(chan result, 2)
+	checks := 2
+	results := make(chan result, 3)
 	go func() { results <- result{"engine", g.check(r.Context(), g.engine)} }()
 	go func() { results <- result{"analytics", g.check(r.Context(), g.analytics)} }()
+	if g.desk != nil {
+		checks++
+		go func() { results <- result{"desk", g.check(r.Context(), g.desk)} }()
+	}
 
 	response := healthResponse{Status: "ok", Gateway: "ok", CheckedAt: time.Now().UTC().Format(time.RFC3339)}
-	for range 2 {
+	for range checks {
 		item := <-results
 		switch item.name {
 		case "engine":
 			response.Engine = item.health
 		case "analytics":
 			response.Analytics = item.health
+		case "desk":
+			desk := item.health
+			response.Desk = &desk
 		}
 	}
 	if g.stream != nil {
 		response.Stream = &streamHealth{Mode: "fanout", Connected: g.stream.connected()}
 	}
-	if !response.Engine.Reachable || !response.Analytics.Reachable || (response.Stream != nil && !response.Stream.Connected) {
+	if !response.Engine.Reachable || !response.Analytics.Reachable || (response.Stream != nil && !response.Stream.Connected) ||
+		(response.Desk != nil && !response.Desk.Reachable) {
 		response.Status = "degraded"
 	}
 	w.Header().Set("Content-Type", "application/json")

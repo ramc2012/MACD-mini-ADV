@@ -17,7 +17,7 @@ Open [the parallel terminal](http://localhost:3200). The Go gateway is at `http:
 
 The separate US Paper Desk is retired from the default deployment. Its source and `us_paper_data` volume are preserved. To run it again, opt in with `docker compose --profile us up -d --build us-backend us-frontend`; see [its module README](us-app/README.md).
 
-The feed is Fyers market data, with execution fixed to paper-only. The engine reports a broker configuration error until you connect your Fyers account in the terminal's **Settings → Broker connection** panel. This stack keeps all of its state in its own `runtime/` (bind-mounted into the engine) and named QuestDB volume. The earlier simulation databases are preserved in `runtime/simulation-archive-2026-09-23/`, and their QuestDB observations remain in the old `macd-mini-parallel_questdb_data` volume.
+The feed is Fyers market data, with execution fixed to paper-only. The engine reports a broker configuration error until you connect your Fyers account in the terminal's **Settings → Broker connection** panel. Settings, Fyers credentials and the contract snapshot live in `runtime/` (bind-mounted). The SQLite databases -- the three paper books, the minute-bar history cache and the tick capture -- live on the `engine_data` named volume, and QuestDB on its own volume; see [Storage](#storage). The earlier simulation databases are preserved in `runtime/simulation-archive-2026-09-23/`, and their QuestDB observations remain in the old `macd-mini-parallel_questdb_data` volume.
 
 To change the watchlist or supply Fyers credentials through Docker, copy `.env.example` to `.env` and edit it before restarting the stack. You can also enter credentials in the terminal's Settings panel. The Compose configuration fixes `MACD_EXECUTION_MODE=paper`, `MACD_ALLOW_LIVE_ORDERS=false`, and `MACD_AUTO_TRADE=false`.
 
@@ -27,12 +27,42 @@ To change the watchlist or supply Fyers credentials through Docker, copy `.env.e
 | --- | --- |
 | `frontend` | Full React/TypeScript terminal, served by Nginx on port 3200. |
 | `gateway` | Go API gateway on port 8201. Holds the one engine stream and fans it out to browsers, publishes every tick to the bus, and serves `/parallel/*`. |
-| `engine` | Python/FastAPI engine built from [engine/](engine/README.md): Fyers market data, strategies, orders and paper books. The only process that talks to Fyers, and the authority for orders and risk. |
-| `nats` | Tick bus (core NATS, no persistence). The gateway publishes `md.tick.<symbol>`; consumers subscribe. |
+| `engine` | The strategy process, built from [engine/](engine/README.md) with `MACD_ENGINE_ROLE=strategy`: the only Fyers client, the MACD and blast lanes and their books. Publishes every accepted tick to the bus. |
+| `desk` | Same image, `MACD_ENGINE_ROLE=desk`: the Market Profile / order-flow lane -- the auction desk and its book, tick capture, whale tracker, option-chain collector and nightly memory. Serves `/api/mp/*` and `/api/auction/*`. |
+| `nats` | Tick bus (core NATS, no persistence). The engine publishes `md.tick.<symbol>`; the desk and Rust analytics subscribe. |
 | `analytics` | Rust service. Live: worker shards consume the bus and build per-symbol 1-minute bars, MACD and volatility in parallel. On demand: `/analyze` of a chart's candles. |
 | `questdb` | Time-series store for raw ticks (5-day TTL), live 1-minute bars (90-day TTL) and on-demand observations; console on port 9002. |
 
 The optional `us` profile contains the retired `us-backend` and `us-frontend` services. They do not start with the default `docker compose up` command.
+
+## Strategy and desk processes
+
+```
+Fyers ─► engine (strategy) ──ticks──► NATS md.tick.* ──┬─► desk (MP / order flow) ──► mp_trader, ticks
+          │  MACD + blast lanes                         └─► Rust analytics ──► QuestDB
+          │  /api/internal/*: contracts, broker proxy, settings saves ◄── desk
+          └─► one websocket ─► Go gateway ─► browsers      (gateway: /api/mp, /api/auction ─► desk)
+```
+
+The engine used to run the Market Profile / order-flow desk in the same event loop as the MACD strategy: every tick fed both, and the desk's per-minute option-chain and whale work shared that loop with stop-loss handling. The two now run as separate processes from one image and one codebase:
+
+- **The desk runs the same code** -- a `DeskMixin` the single-process engine also uses -- so the layouts cannot drift. It rebuilds each tick exactly from the bus and configures itself from `/api/internal/desk-context` (today's contracts, futures roll, lot sizes, desk settings), which yields the same option map, scope and universe as the single process; the test suite checks both, and that the two build identical profiles and flow from the same ticks.
+- **The engine stays the only Fyers client and the only writer of `settings.json`.** The desk's option-chain and futures-quote calls, and its MP settings saves, go through the engine's internal API, which the gateway refuses from browsers.
+- **The desk reports its holdings** to the engine, which persists them (`runtime/desk_holdings.json`) so a restart still subscribes and restores those contracts.
+- **The desk's health, chain and nightly status and whale alerts** reach the engine's `/api/system/health` and Telegram alerts by the engine polling the desk.
+- **Rollback:** `MACD_ENGINE_ROLE=all` and `DESK_URL=` (empty) in `.env` put the whole engine back in one process. The desk process then idles by itself -- it only runs beside an engine that reports the `strategy` role -- so two desks can never trade one book.
+
+## Storage
+
+The SQLite files moved from the `runtime/` bind mount to the `engine_data` named volume when the engine split, because both processes use `historical.sqlite3` (the engine writes minute bars, the desk writes profiles and whale tables). Docker Desktop's bind mount does not give SQLite reliable cross-process locking -- the code records a book corrupted that way -- while a named volume is a local Linux filesystem shared by both containers. The pre-split files are kept in `runtime/pre-volume-backup-2026-09-27/`.
+
+To read a database from the host, copy it out:
+
+```bash
+docker compose cp engine:/app/data/historical.sqlite3 ./historical-copy.sqlite3
+```
+
+`docker compose down -v` deletes this volume with the books in it.
 
 ## Stream fan-out and tick bus
 
@@ -43,7 +73,7 @@ Fyers ─► engine (Python, engine/) ─► one websocket ─► Go gateway ─
 
 **Browsers.** The engine gives each subscriber a 512-event queue and drops the oldest event when it fills; a browser that falls behind then asks for a full 1.7 MB snapshot, which costs the engine's only event loop ~130 ms. The gateway is now the engine's single subscriber and serves every browser from a cached snapshot plus a 50,000-event replay ring. Each browser has its own queue in which the newest tick per symbol, the newest update per bar, and portfolio totals replace older ones, while orders, trades, signals and broker events are always delivered in order. Sequence numbers are rewritten per browser, so coalescing never looks like a gap. The parallel terminal acknowledges what it has processed; the gateway keeps at most 1,000 frames in flight per browser and holds the rest where they keep coalescing, because nginx and Docker's port forwarder buffer far too much for TCP backpressure to keep a slow tab current. A client that never acknowledges (such as the original terminal) is written to as fast as its socket accepts. `STREAM_FANOUT=off` restores the plain tunnel to the engine.
 
-**Bus.** Every engine tick is published as a versioned message carrying the engine's sequence number, exchange time and gateway receipt time (`busTick` in [backend/stream.go](backend/stream.go)). The Rust service routes each symbol to one of `LIVE_WORKERS` shards (default: CPU count, 2–8), so symbols are processed in parallel and each symbol's ticks stay in order. Each symbol loads its stored minute bars from the engine once, two symbols at a time, so its MACD is meaningful from the first live bar. Only fresh session trades build bars and are stored: prints received more than two minutes after their exchange time (Fyers republishes each contract's last trade on connect) move the displayed price only. Analysis-leg quotes reach the bus at the engine's rationed rate, not the raw feed rate.
+**Bus.** The engine publishes every tick it accepts as a versioned message carrying every tick field, a contiguous per-publisher sequence number, the exchange time and the engine's receipt time ([engine/src/macd_trader/bus.py](engine/src/macd_trader/bus.py)). The gateway can publish the same contract from the browser stream (`busTick` in [backend/stream.go](backend/stream.go)) but is not configured to, so each tick is on the bus once. The Rust service routes each symbol to one of `LIVE_WORKERS` shards (default: CPU count, 2–8), so symbols are processed in parallel and each symbol's ticks stay in order. Each symbol loads its stored minute bars from the engine once, two symbols at a time, so its MACD is meaningful from the first live bar. Only fresh session trades build bars and are stored: prints received more than two minutes after their exchange time (Fyers republishes each contract's last trade on connect) move the displayed price only. Analysis-leg quotes reach the bus at the engine's rationed rate, not the raw feed rate.
 
 **What it does not change.** The engine's strategy, orders, risk and books are untouched. Its history download is already store-first: a restart replays stored minute bars and asks Fyers only when a symbol's history is missing or stale, or once for a newly listed contract. Its order-flow analytics (footprint, Market Profile, whale flow, option chain) still run inside the engine; moving them out needs engine changes.
 

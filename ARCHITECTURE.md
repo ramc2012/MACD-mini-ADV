@@ -7,8 +7,9 @@
 | Browser | React/TypeScript, Lightweight Charts for candles/CVD, Canvas 2D footprint, SVG profile | Trading terminal and chart interactions |
 | API | Go gateway | Proxies REST to the engine; holds the engine's one stream and fans it out to browsers with per-browser coalescing and acknowledgement-based flow control; publishes ticks to the bus |
 | Bus | NATS (core) | `md.tick.<symbol>`, a versioned tick with engine sequence, exchange time and receipt time |
-| Live engine | Python/FastAPI and Fyers SDK, in `engine/` | Market data, inferred order flow, strategy, risk and **paper-only** execution; the only Fyers client |
-| Durable data | SQLite | Raw ticks, condensed flow, research history and paper books |
+| Strategy process | Python/FastAPI and Fyers SDK, `engine/` role `strategy` | Market data, the MACD and blast lanes, risk and **paper-only** execution; the only Fyers client; publishes accepted ticks |
+| Desk process | Same image, role `desk` | Market Profile / order-flow desk and its book, tick capture, whale tracker, option-chain collector, nightly memory; fed by the bus |
+| Durable data | SQLite on a named volume | Raw ticks, condensed flow, research history and paper books |
 | Analytics | Rust service and QuestDB | Live per-symbol 1-minute bars, MACD and volatility in parallel shards from the bus; raw ticks (5-day TTL) and bars (90-day TTL) in QuestDB; on-demand chart analysis |
 
 The Go hop has not improved request/response latency; it removes the

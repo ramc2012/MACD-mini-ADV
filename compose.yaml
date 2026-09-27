@@ -1,11 +1,28 @@
 name: macd-mini-parallel
 
 services:
+  # The strategy process: the only Fyers client, the MACD and blast lanes,
+  # and the publisher of every accepted tick to the bus. MACD_ENGINE_ROLE=all
+  # (with DESK_URL= for the gateway) puts the whole engine back in this one
+  # process; the desk process then idles on its own.
   engine:
     # This deployment's own copy of the engine (see engine/README.md).
     build:
       context: ./engine
+    image: macd-mini-parallel-engine
     environment:
+      MACD_ENGINE_ROLE: ${MACD_ENGINE_ROLE:-strategy}
+      MACD_NATS_URL: nats://nats:4222
+      MACD_DESK_URL: http://desk:8100
+      <<: &engine-databases
+        # SQLite files live on a named volume, not the macOS bind mount: the
+        # strategy and desk processes share historical.sqlite3, and only a
+        # local filesystem gives SQLite reliable cross-process locking.
+        MACD_DATABASE_PATH: /app/data/macd_trader.sqlite3
+        MACD_RESEARCH_DATABASE_PATH: /app/data/historical.sqlite3
+        MACD_MP_DATABASE_PATH: /app/data/mp_trader.sqlite3
+        MACD_BLAST_DATABASE_PATH: /app/data/blast_trader.sqlite3
+        MACD_TICK_DATABASE_PATH: /app/data/ticks.sqlite3
       MACD_FEED_MODE: fyers
       MACD_EXECUTION_MODE: paper
       MACD_ALLOW_LIVE_ORDERS: "false"
@@ -21,12 +38,48 @@ services:
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
     volumes:
       - ./runtime:/app/runtime
+      - engine_data:/app/data
+    depends_on:
+      - nats
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 20s
+    restart: unless-stopped
+
+  # The Market Profile / order-flow lane: the auction desk and its book, tick
+  # capture, the whale tracker and nightly memory. Same image, fed by the tick
+  # bus and by the engine's contract context; broker calls and settings saves
+  # go through the engine. Idle unless the engine runs as "strategy".
+  desk:
+    image: macd-mini-parallel-engine
+    environment:
+      MACD_ENGINE_ROLE: desk
+      MACD_NATS_URL: nats://nats:4222
+      MACD_STRATEGY_URL: http://engine:8100
+      <<: *engine-databases
+      MACD_RUNTIME_DIR: /app/runtime
+      MACD_LISTEN_HOST: 0.0.0.0
+      MACD_EXECUTION_MODE: paper
+      MACD_ALLOW_LIVE_ORDERS: "false"
+      MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+    volumes:
+      # Read-only: the engine owns settings.json and the credentials.
+      - ./runtime:/app/runtime:ro
+      - engine_data:/app/data
+    depends_on:
+      engine:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3))['ok']"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
 
   questdb:
@@ -76,7 +129,10 @@ services:
       ANALYTICS_URL: http://analytics:8081
       # "off" tunnels /ws/stream to the engine unchanged, as before.
       STREAM_FANOUT: ${STREAM_FANOUT:-on}
-      NATS_URL: nats://nats:4222
+      # The engine publishes ticks to the bus itself; the gateway only fans
+      # the stream out to browsers. Empty DESK_URL serves the desk's routes
+      # from the engine (MACD_ENGINE_ROLE=all).
+      DESK_URL: ${DESK_URL-http://desk:8100}
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       MACD_ALLOWED_ORIGINS_CSV: ${MACD_ALLOWED_ORIGINS_CSV:-}
     ports:
@@ -130,5 +186,6 @@ services:
     restart: unless-stopped
 
 volumes:
+  engine_data:
   questdb_fyers_data:
   us_paper_data:

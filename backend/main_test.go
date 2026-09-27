@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -221,5 +222,54 @@ func TestGatewayDataEndpointsRequireTheConfiguredToken(t *testing.T) {
 	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/parallel/health", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("health must stay open for container checks: %d", w.Code)
+	}
+}
+
+func TestDeskRoutesGoToTheDeskAndInternalRoutesStayInside(t *testing.T) {
+	hits := map[string]string{}
+	var mu sync.Mutex
+	serve := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			hits[r.URL.Path] = name
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{}`))
+		}))
+	}
+	engine, desk, analytics := serve("engine"), serve("desk"), serve("analytics")
+	defer engine.Close()
+	defer desk.Close()
+	defer analytics.Close()
+	g, _ := newGateway(engine.URL, analytics.URL)
+	if err := g.setDesk(desk.URL); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]string{
+		"/api/mp/footprint/NSE:NIFTY26OCTFUT": "desk",
+		"/api/auction/symbols":                "desk",
+		"/api/snapshot":                       "engine",
+		"/api/blast/snapshot":                 "engine",
+		"/api/mpx":                            "engine",
+	} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		mu.Lock()
+		got := hits[path]
+		mu.Unlock()
+		if w.Code != http.StatusOK || got != want {
+			t.Fatalf("%s went to %q (HTTP %d), want %s", path, got, w.Code, want)
+		}
+	}
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/internal/desk-context", nil))
+	if w.Code != http.StatusNotFound || hits["/api/internal/desk-context"] != "" {
+		t.Fatalf("internal route reached an upstream: HTTP %d", w.Code)
+	}
+	w = httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/parallel/health", nil))
+	var health healthResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &health)
+	if health.Desk == nil || !health.Desk.Reachable || health.Status != "ok" {
+		t.Fatalf("health does not report the desk: %s", w.Body.String())
 	}
 }
