@@ -1,0 +1,10 @@
+.env
+runtime/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+us-app/frontend/node_modules/
+us-app/frontend/dist/
+us-app/frontend/*.tsbuildinfo
+us-app/runtime/
+analytics/target/

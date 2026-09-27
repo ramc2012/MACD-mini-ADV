@@ -1,0 +1,106 @@
+name: macd-mini-parallel
+
+services:
+  engine:
+    build:
+      context: ../MACD-mini
+      dockerfile: Dockerfile
+    environment:
+      MACD_FEED_MODE: fyers
+      MACD_EXECUTION_MODE: paper
+      MACD_ALLOW_LIVE_ORDERS: "false"
+      MACD_AUTO_TRADE: "false"
+      # Empty means the complete maintained NSE F&O stock universe plus indices.
+      MACD_SYMBOLS_CSV: ${MACD_SYMBOLS_CSV:-}
+      MACD_TIMEFRAME_SECONDS: ${MACD_TIMEFRAME_SECONDS:-60}
+      MACD_RUNTIME_DIR: /app/runtime
+      MACD_FYERS_CLIENT_ID: ${MACD_FYERS_CLIENT_ID:-}
+      MACD_FYERS_SECRET: ${MACD_FYERS_SECRET:-}
+      MACD_FYERS_ACCESS_TOKEN: ${MACD_FYERS_ACCESS_TOKEN:-}
+      MACD_ALLOWED_ORIGINS_CSV: ${MACD_ALLOWED_ORIGINS_CSV:-}
+    volumes:
+      - ./runtime:/app/runtime
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  questdb:
+    image: questdb/questdb:10.0.1
+    ports:
+      - "127.0.0.1:9002:9000"
+    volumes:
+      - questdb_fyers_data:/var/lib/questdb
+    restart: unless-stopped
+
+  analytics:
+    build:
+      context: ./analytics
+    environment:
+      PORT: "8081"
+      QUESTDB_ADDR: questdb:9009
+    depends_on:
+      - questdb
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ./backend
+    environment:
+      PORT: "8100"
+      ENGINE_URL: http://engine:8100
+      ANALYTICS_URL: http://analytics:8081
+    ports:
+      - "127.0.0.1:8201:8100"
+    depends_on:
+      engine:
+        condition: service_healthy
+      analytics:
+        condition: service_started
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "127.0.0.1:3200:80"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  us-backend:
+    profiles: ["us"]
+    build:
+      context: ./us-app/backend
+    environment:
+      US_DATA_DIR: /data
+      US_FINNHUB_API_KEY: ${US_FINNHUB_API_KEY:-}
+      US_ALPHA_VANTAGE_API_KEY: ${US_ALPHA_VANTAGE_API_KEY:-}
+    volumes:
+      - us_paper_data:/data
+    ports:
+      - "127.0.0.1:8301:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  us-frontend:
+    profiles: ["us"]
+    build:
+      context: ./us-app/frontend
+    ports:
+      - "127.0.0.1:3300:80"
+    depends_on:
+      us-backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  questdb_fyers_data:
+  us_paper_data:
