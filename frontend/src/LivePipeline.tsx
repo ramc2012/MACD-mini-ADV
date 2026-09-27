@@ -29,6 +29,9 @@ type StreamStats = {
   clients?: { queued: number; sent: number; coalesced: number; resyncs: number }[];
   bus?: { enabled: boolean; published: number; errors: number };
 };
+// The engine publishes ticks to the bus itself (it did through the gateway
+// before the engine split); its counters come with the system health.
+type EngineBus = { layout?: { role?: string; bus?: { connected: boolean; published: number; dropped: number } | null } };
 type Sort = "abs_histogram" | "histogram" | "volatility" | "ticks";
 
 const count = new Intl.NumberFormat("en-IN");
@@ -52,6 +55,7 @@ export function LivePipeline({ symbol, onSelect }: { symbol: string; onSelect: (
   const [focus, setFocus] = useState<LiveView | undefined>();
   const [stats, setStats] = useState<LiveStats | undefined>();
   const [stream, setStream] = useState<StreamStats | undefined>();
+  const [engineBus, setEngineBus] = useState<EngineBus["layout"]>();
   const [unavailable, setUnavailable] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
@@ -62,11 +66,12 @@ export function LivePipeline({ symbol, onSelect }: { symbol: string; onSelect: (
     const poll = async () => {
       clearTimeout(timer);
       if (!document.hidden) {
-        const [scan, live, gateway, selected] = await Promise.all([
+        const [scan, live, gateway, selected, system] = await Promise.all([
           optional<{ rows: LiveView[] }>(`${API_URL}/parallel/live/scan?sort=${sort}&limit=25`, headers, controller.signal),
           optional<LiveStats>(`${API_URL}/parallel/live/stats`, headers, controller.signal),
           optional<StreamStats>(`${API_URL}/parallel/stream/stats`, headers, controller.signal),
           symbol ? optional<LiveView>(`${API_URL}/parallel/live?symbol=${encodeURIComponent(symbol)}`, headers, controller.signal) : Promise.resolve(undefined),
+          optional<EngineBus>(`${API_URL}/api/system/health`, headers, controller.signal),
         ]);
         if (controller.signal.aborted) return;
         setUnavailable(!live);
@@ -74,6 +79,7 @@ export function LivePipeline({ symbol, onSelect }: { symbol: string; onSelect: (
         setStats(live);
         setStream(gateway);
         setFocus(selected);
+        setEngineBus(system?.layout);
         setLoaded(true);
       }
       timer = window.setTimeout(poll, 2000);
@@ -88,6 +94,9 @@ export function LivePipeline({ symbol, onSelect }: { symbol: string; onSelect: (
   const shardTicks = stats?.shards.reduce((sum, shard) => sum + shard.ticks, 0) || 0;
   const coalesced = stream?.clients?.reduce((sum, client) => sum + client.coalesced, 0) || 0;
   const resyncs = stream?.clients?.reduce((sum, client) => sum + client.resyncs, 0) || 0;
+  // Whoever publishes: the engine (split layout) or the gateway (older layout).
+  const publisher = engineBus?.bus ? { name: "engine", published: engineBus.bus.published, dropped: engineBus.bus.dropped, ok: engineBus.bus.connected }
+    : { name: "gateway", published: stream?.bus?.published || 0, dropped: stream?.bus?.errors || 0, ok: (stream?.bus?.errors || 0) === 0 };
 
   return <section className="live-pipeline">
     <div className="live-heading">
@@ -107,9 +116,10 @@ export function LivePipeline({ symbol, onSelect }: { symbol: string; onSelect: (
             `${count.format(coalesced)} superseded ticks coalesced · ${count.format(resyncs)} resyncs`,
             `${count.format(stream.upstream?.gaps || 0)} engine gaps · snapshot ${fmt((stream.upstream?.snapshot_bytes || 0) / 1024 / 1024, price)} MB`,
           ] : ["tunnelled directly to the engine"]} />
-        <Stage title="Tick bus" loaded={loaded} ok={!!stats?.bus.connected && (stream?.bus?.errors || 0) === 0}
+        <Stage title="Tick bus" loaded={loaded} ok={!!stats?.bus.connected && publisher.ok}
           lines={[
-            `${count.format(stream?.bus?.published || 0)} published · ${count.format(stats?.bus.messages || 0)} received`,
+            `${count.format(publisher.published)} published by the ${publisher.name} · ${count.format(stats?.bus.messages || 0)} received`,
+            `${count.format(publisher.dropped)} not published`,
             `${count.format(stats?.bus.dropped || 0)} dropped at shards · ${count.format(stats?.bus.parse_errors || 0)} unreadable`,
           ]} />
         <Stage title={stats ? `${stats.workers} worker shards` : "Worker shards"} loaded={loaded} ok={!!stats}
