@@ -1,20 +1,23 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_LAYERS, DEFAULT_PANES, TradingChart } from "./Chart";
 import { useChartReferences } from "./useChartReferences";
 import { mergeLiveCandles, sessionCutoff } from "./chartMath";
 import { PositionChartModal } from "./PositionChartModal";
 import { SettingsPanel } from "./SettingsPanel";
 import { TradingLedger, type LedgerTab } from "./Ledger";
-import { EquityCurve } from "./EquityCurve";
-import { RRGPage } from "./RRG";
-import { MarketProfilePage } from "./MarketProfile";
-import { SignalRadar } from "./SignalRadar";
 import { DispersionPage, useDispersionSeries } from "./Dispersion";
-import { RatioPage } from "./RatioChart";
-import { AuctionPage } from "./Auction";
-import { BlastLanePage } from "./BlastLane";
-import { QuantAnalyticsPage } from "./QuantAnalytics";
 import { API_TOKEN, API_URL } from "./runtime";
+
+// Pages opened from the tab bar load on first visit, so the trading view
+// does not wait for the footprint, profile, research and analytics code.
+const EquityCurve = lazy(() => import("./EquityCurve").then((m) => ({ default: m.EquityCurve })));
+const RRGPage = lazy(() => import("./RRG").then((m) => ({ default: m.RRGPage })));
+const MarketProfilePage = lazy(() => import("./MarketProfile").then((m) => ({ default: m.MarketProfilePage })));
+const SignalRadar = lazy(() => import("./SignalRadar").then((m) => ({ default: m.SignalRadar })));
+const RatioPage = lazy(() => import("./RatioChart").then((m) => ({ default: m.RatioPage })));
+const AuctionPage = lazy(() => import("./Auction").then((m) => ({ default: m.AuctionPage })));
+const BlastLanePage = lazy(() => import("./BlastLane").then((m) => ({ default: m.BlastLanePage })));
+const QuantAnalyticsPage = lazy(() => import("./QuantAnalytics").then((m) => ({ default: m.QuantAnalyticsPage })));
 import { Readiness } from "./Readiness";
 import { PortfolioRisk } from "./PortfolioRisk";
 import { matchesWatchSearch, quoteStamp } from "./watchMath";
@@ -485,7 +488,7 @@ export default function App() {
           timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse}
           fitKey={`${selected}:${snapshot?.config.timeframe_seconds}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
-    </div> : page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : page === "RRG" ? <RRGPage /> : page === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : page === "RATIOS" ? <RatioPage options={snapshot?.option_watchlist || []} /> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "BLAST" ? <BlastLanePage snapshot={blast} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : <TradingLedger tab={page} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} />}
+    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : page === "RRG" ? <RRGPage /> : page === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : page === "RATIOS" ? <RatioPage options={snapshot?.option_watchlist || []} /> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "BLAST" ? <BlastLanePage snapshot={blast} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : <TradingLedger tab={page} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} />}</Suspense>}
     {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
     <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
   </main>;

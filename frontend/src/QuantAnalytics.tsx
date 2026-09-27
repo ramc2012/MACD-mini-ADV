@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
+import { LivePipeline } from "./LivePipeline";
 
 type Analysis = {
   symbol: string;
@@ -117,6 +118,8 @@ export function QuantAnalyticsPage({ symbols, selected, timeframe, onSelect }: {
               </div>
               <p className="quant-note">Read-only analysis of stored candles. These values do not place orders or change the trading engine’s strategy.</p>
             </>}
+
+    <LivePipeline symbol={symbol} onSelect={onSelect} />
   </section>;
 }
 

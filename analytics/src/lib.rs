@@ -1,8 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-const TRADING_SECONDS_PER_DAY: f64 = 22_500.0;
-const TRADING_DAYS_PER_YEAR: f64 = 252.0;
+pub mod live;
+pub mod minihttp;
+pub mod nats;
+pub mod pipeline;
+
+pub const TRADING_SECONDS_PER_DAY: f64 = 22_500.0;
+pub const TRADING_DAYS_PER_YEAR: f64 = 252.0;
+
+/// Escape a QuestDB line-protocol tag value.
+pub fn escape_tag(value: &str) -> String {
+    value.replace('\\', "\\\\").replace(',', "\\,").replace(' ', "\\ ").replace('=', "\\=")
+}
 
 /// The original engine's `/api/chart/{symbol}` response. Its additional
 /// `indicators` field and each candle's OHLCV fields are intentionally ignored.
@@ -17,7 +27,7 @@ pub struct ChartRequest {
     pub macd_periods: MacdPeriods,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MacdPeriods {
     pub fast: usize,
     pub slow: usize,

@@ -710,5 +710,35 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .quant-metric strong.quant-bearish { color: #f15b6c; }
 .quant-metric small { display: block; margin-top: 9px; line-height: 1.4; }
 .quant-note { margin: 14px 0 0; color: #738197; font-size: 11px; line-height: 1.5; }
-@media (max-width: 1050px) { .quant-heading { align-items: flex-start; flex-direction: column; }.quant-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.quant-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 600px) { .quant-controls { align-items: flex-start; flex-direction: column; width: 100%; }.quant-controls select { max-width: 100%; width: 100%; }.quant-summary, .quant-grid { grid-template-columns: 1fr; }.quant-summary > div { border-right: 0; border-bottom: 1px solid #202a38; } }
+.live-pipeline { margin-top: 22px; }
+.live-heading h2 { margin: 0; color: #dce5f1; font-size: 15px; }
+.live-heading p { margin: 6px 0 12px; color: #738197; font-size: 11px; line-height: 1.5; }
+.live-stages { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.live-stage { position: relative; min-width: 0; padding: 12px 14px 12px 28px; }
+.live-stage strong { display: block; margin-bottom: 6px; color: #dce5f1; font-size: 12px; }
+.live-stage small { display: block; overflow: hidden; color: #9fb0c5; font-size: 11px; line-height: 1.55; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.live-dot { position: absolute; top: 16px; left: 12px; width: 8px; height: 8px; border-radius: 50%; background: #4b5a70; }
+.live-dot.ok { background: #22c893; }
+.live-dot.bad { background: #f15b6c; }
+.live-focus { margin-top: 12px; padding: 14px 16px; }
+.live-focus-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.live-focus-head strong { overflow: hidden; color: #dce5f1; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.live-badge { padding: 2px 7px; border: 1px solid #34465f; border-radius: 10px; color: #9fb0c5; font-size: 10px; white-space: nowrap; }
+.live-badge.warm { border-color: #1d6b53; color: #22c893; }
+.live-focus-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 16px; }
+.live-focus-grid span { display: block; color: #738197; font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
+.live-focus-grid b { display: block; margin-top: 4px; overflow: hidden; color: #dce5f1; font-size: 13px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.live-scan { margin-top: 12px; padding: 14px 16px; }
+.live-scan-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.live-scan-head strong { margin-right: auto; color: #dce5f1; font-size: 13px; }
+.live-scan-head label { color: #738197; font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
+.live-scan-head select { padding: 6px 8px; border: 1px solid #34465f; border-radius: 4px; background: #0e1520; color: #dce5f1; font-size: 11px; }
+.live-table-wrap { overflow-x: auto; }
+.live-table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+.live-table th { padding: 6px 8px; border-bottom: 1px solid #202a38; color: #738197; font-size: 10px; font-weight: 700; letter-spacing: .05em; text-align: right; text-transform: uppercase; }
+.live-table td { padding: 6px 8px; border-bottom: 1px solid #161f2b; color: #c9d4e3; text-align: right; white-space: nowrap; }
+.live-table th:first-child, .live-table td:first-child { max-width: 240px; overflow: hidden; text-align: left; text-overflow: ellipsis; }
+.live-table tbody tr { cursor: pointer; }
+.live-table tbody tr:hover, .live-table tbody tr.selected { background: #152237; }
+@media (max-width: 1050px) { .live-stages, .live-focus-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.quant-heading { align-items: flex-start; flex-direction: column; }.quant-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.quant-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .live-stages, .live-focus-grid { grid-template-columns: 1fr; }.quant-controls { align-items: flex-start; flex-direction: column; width: 100%; }.quant-controls select { max-width: 100%; width: 100%; }.quant-summary, .quant-grid { grid-template-columns: 1fr; }.quant-summary > div { border-right: 0; border-bottom: 1px solid #202a38; } }

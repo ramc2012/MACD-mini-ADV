@@ -18,6 +18,7 @@ services:
       MACD_FYERS_SECRET: ${MACD_FYERS_SECRET:-}
       MACD_FYERS_ACCESS_TOKEN: ${MACD_FYERS_ACCESS_TOKEN:-}
       MACD_ALLOWED_ORIGINS_CSV: ${MACD_ALLOWED_ORIGINS_CSV:-}
+      MACD_API_TOKEN: ${MACD_API_TOKEN:-}
     volumes:
       - ./runtime:/app/runtime
     healthcheck:
@@ -36,14 +37,34 @@ services:
       - questdb_fyers_data:/var/lib/questdb
     restart: unless-stopped
 
+  # Tick bus. Core NATS, no persistence: the engine's SQLite capture and
+  # QuestDB are the durable records; the bus only fans ticks out.
+  nats:
+    image: nats:2.10-alpine
+    command: ["--http_port", "8222"]
+    restart: unless-stopped
+
   analytics:
     build:
       context: ./analytics
     environment:
       PORT: "8081"
       QUESTDB_ADDR: questdb:9009
+      QUESTDB_HTTP_URL: http://questdb:9000
+      # Raw ticks in QuestDB expire after 5 days; "off" keeps only 1-minute bars.
+      QUESTDB_STORE_TICKS: ${QUESTDB_STORE_TICKS:-on}
+      NATS_ADDR: nats:4222
+      ENGINE_URL: http://engine:8100
+      MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      # Worker shards for live analytics; defaults to the CPU count, 2 to 8.
+      LIVE_WORKERS: ${LIVE_WORKERS:-}
     depends_on:
-      - questdb
+      questdb:
+        condition: service_started
+      nats:
+        condition: service_started
+      engine:
+        condition: service_healthy
     restart: unless-stopped
 
   gateway:
@@ -53,12 +74,19 @@ services:
       PORT: "8100"
       ENGINE_URL: http://engine:8100
       ANALYTICS_URL: http://analytics:8081
+      # "off" tunnels /ws/stream to the engine unchanged, as before.
+      STREAM_FANOUT: ${STREAM_FANOUT:-on}
+      NATS_URL: nats://nats:4222
+      MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      MACD_ALLOWED_ORIGINS_CSV: ${MACD_ALLOWED_ORIGINS_CSV:-}
     ports:
       - "127.0.0.1:8201:8100"
     depends_on:
       engine:
         condition: service_healthy
       analytics:
+        condition: service_started
+      nats:
         condition: service_started
     restart: unless-stopped
 

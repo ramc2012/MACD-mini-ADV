@@ -189,3 +189,37 @@ func TestWebSocketUpgradeIsTunneled(t *testing.T) {
 		t.Fatalf("websocket tunnel failed: %q %v", buf, err)
 	}
 }
+
+func TestGatewayDataEndpointsRequireTheConfiguredToken(t *testing.T) {
+	analytics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			return
+		}
+		if r.URL.Path != "/live/stats" {
+			t.Errorf("live route not rewritten: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"workers":8}`))
+	}))
+	defer analytics.Close()
+	g, _ := newGateway(analytics.URL, analytics.URL)
+	g.token = "secret"
+	for _, path := range []string{"/parallel/live/stats", "/parallel/stream/stats"} {
+		w := httptest.NewRecorder()
+		g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s without a token: %d", path, w.Code)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/parallel/live/stats", nil)
+	req.Header.Set("X-Macd-Token", "secret")
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != `{"workers":8}` {
+		t.Fatalf("authorized request: %d %s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/parallel/health", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("health must stay open for container checks: %d", w.Code)
+	}
+}

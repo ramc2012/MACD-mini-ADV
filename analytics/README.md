@@ -1,14 +1,37 @@
 # Rust analytics service
 
+## Live pipeline
+
+With `NATS_ADDR` set, the service subscribes to `md.tick.>` and routes each
+symbol to one of `LIVE_WORKERS` shards ([src/pipeline.rs](src/pipeline.rs)).
+Each shard owns its symbols' state ([src/live.rs](src/live.rs)): 1-minute
+bars on exchange time within the NSE session, MACD with the engine's
+periods (read from `/api/settings` every minute; a change resets and
+re-seeds), and realized volatility over the last 120 adjacent-bar returns.
+A new symbol loads its stored minute bars from `ENGINE_URL`'s
+`/api/chart/{symbol}?timeframe_seconds=60`, two at a time, and the shard
+applies them in line with its ticks. Prints received more than two minutes
+after their exchange time move the price but build no bar and are not stored.
+
+With `QUESTDB_ADDR` and `QUESTDB_HTTP_URL`, the service creates `ticks`
+(5-day TTL) and `bars_1m` (90-day TTL, de-duplicated on time and symbol)
+before writing, then streams fresh ticks and closed bars over one batched
+line-protocol connection. `QUESTDB_STORE_TICKS=off` keeps bars only.
+Every queue is bounded and never blocks the bus; drops are counted in
+`GET /live/stats`. `GET /live?symbol=` and `GET /live/scan` serve the state.
+
+## On-demand analysis
+
 `POST /analyze` accepts the original MACD Trader chart response, including its
 extra `indicators` and candle OHLCV fields. The service sorts candles by Unix
 timestamp and keeps the last close for duplicate timestamps. It calculates
-12/26 EMAs and 9-period signal EMA with the same first-value seeding as the
-original engine. `trend` is `bullish`, `bearish`, or `neutral` from the MACD
+fast/slow EMAs and the signal EMA with the periods in the chart's
+`macd_periods` (12/26/9 when absent) and the same first-value seeding as
+the original engine. `trend` is `bullish`, `bearish`, or `neutral` from the MACD
 sign; an empty history returns `no_data` and null numeric metrics.
 
-`realized_volatility_pct` is the sample standard deviation of consecutive log
-returns, annualized with 252 Indian trading days and 22,500 regular-session
+`realized_volatility_pct` is the sample standard deviation of log returns
+between adjacent bars (overnight gaps and missing bars excluded intraday), annualized with 252 Indian trading days and 22,500 regular-session
 seconds per day (or 252 bars per year for daily candles), multiplied by 100.
 It is null until at least three candles are available.
 

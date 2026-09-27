@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // Matches the analytics service's request body limit, so a chart the gateway
@@ -21,11 +24,29 @@ import (
 const maxChartBytes = 32 << 20
 
 type gateway struct {
-	engine       *url.URL
-	analytics    *url.URL
-	engineProxy  *httputil.ReverseProxy
-	client       *http.Client
-	healthClient *http.Client
+	engine         *url.URL
+	analytics      *url.URL
+	engineProxy    *httputil.ReverseProxy
+	analyticsProxy *httputil.ReverseProxy
+	client         *http.Client
+	healthClient   *http.Client
+	// stream is nil when STREAM_FANOUT=off: /ws/stream is then tunnelled to
+	// the engine unchanged, as before.
+	stream *streamHub
+	// token, when set, guards the gateway's own data endpoints the way the
+	// engine guards its API. Proxied engine routes are checked by the engine.
+	token string
+}
+
+func (g *gateway) authorized(r *http.Request) bool {
+	if g.token == "" {
+		return true
+	}
+	supplied := r.Header.Get("X-Macd-Token")
+	if supplied == "" {
+		supplied = r.URL.Query().Get("token")
+	}
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(g.token)) == 1
 }
 
 type dependencyHealth struct {
@@ -38,7 +59,13 @@ type healthResponse struct {
 	Gateway   string           `json:"gateway"`
 	Engine    dependencyHealth `json:"engine"`
 	Analytics dependencyHealth `json:"analytics"`
+	Stream    *streamHealth    `json:"stream,omitempty"`
 	CheckedAt string           `json:"checkedAt"`
+}
+
+type streamHealth struct {
+	Mode      string `json:"mode"`
+	Connected bool   `json:"connected"`
 }
 
 func main() {
@@ -49,6 +76,30 @@ func main() {
 	g, err := newGateway(engineURL, analyticsURL)
 	if err != nil {
 		log.Fatal(err)
+	}
+	g.token = env("MACD_API_TOKEN", "")
+	if !strings.EqualFold(env("STREAM_FANOUT", "on"), "off") {
+		var bus publisher
+		if natsURL := env("NATS_URL", ""); natsURL != "" {
+			// Connect in the background and buffer while NATS is away: the
+			// bus feeds analytics only and must never hold up the terminal.
+			conn, err := nats.Connect(natsURL,
+				nats.Name("parallel-gateway"),
+				nats.RetryOnFailedConnect(true),
+				nats.MaxReconnects(-1),
+				nats.ReconnectWait(time.Second),
+				nats.ReconnectBufSize(16<<20),
+			)
+			if err != nil {
+				log.Printf("tick bus disabled: %v", err)
+			} else {
+				bus = conn
+			}
+		}
+		origins := strings.Split(env("MACD_ALLOWED_ORIGINS_CSV", ""), ",")
+		g.stream = newStreamHub(g.engine, g.token, origins, bus)
+		go g.stream.run(context.Background())
+		log.Printf("stream fan-out enabled (tick bus: %v)", bus != nil)
 	}
 
 	server := &http.Server{
@@ -96,10 +147,16 @@ func newGateway(engineRaw, analyticsRaw string) (*gateway, error) {
 		log.Printf("engine proxy: %v", err)
 		writeError(w, http.StatusBadGateway, "engine_unavailable", "The trading engine is unavailable")
 	}
+	analyticsProxy := httputil.NewSingleHostReverseProxy(analytics)
+	analyticsProxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		log.Printf("analytics proxy: %v", err)
+		writeError(w, http.StatusBadGateway, "analytics_unavailable", "The analytics service is unavailable")
+	}
 	return &gateway{
-		engine:      engine,
-		analytics:   analytics,
-		engineProxy: proxy,
+		engine:         engine,
+		analytics:      analytics,
+		engineProxy:    proxy,
+		analyticsProxy: analyticsProxy,
 		client: &http.Client{
 			Timeout: 90 * time.Second,
 		},
@@ -125,6 +182,38 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		g.analyze(w, r)
+	case "/parallel/live", "/parallel/live/scan", "/parallel/live/stats":
+		if !g.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "invalid_token", "Invalid API token")
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "GET is required")
+			return
+		}
+		// Rust owns the live analytics; it serves them as /live*.
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/parallel")
+		r.URL.RawPath = ""
+		g.analyticsProxy.ServeHTTP(w, r)
+	case "/parallel/stream/stats":
+		if !g.authorized(r) {
+			writeError(w, http.StatusUnauthorized, "invalid_token", "Invalid API token")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if g.stream == nil {
+			_ = json.NewEncoder(w).Encode(map[string]string{"mode": "tunnel"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(g.stream.stats())
+	case "/ws/stream":
+		if g.stream != nil {
+			g.stream.serveClient(w, r)
+			return
+		}
+		g.engineProxy.ServeHTTP(w, r)
 	default:
 		if strings.HasPrefix(r.URL.Path, "/parallel/") {
 			writeError(w, http.StatusNotFound, "not_found", "Unknown parallel endpoint")
@@ -155,7 +244,10 @@ func (g *gateway) health(w http.ResponseWriter, r *http.Request) {
 			response.Analytics = item.health
 		}
 	}
-	if !response.Engine.Reachable || !response.Analytics.Reachable {
+	if g.stream != nil {
+		response.Stream = &streamHealth{Mode: "fanout", Connected: g.stream.connected()}
+	}
+	if !response.Engine.Reachable || !response.Analytics.Reachable || (response.Stream != nil && !response.Stream.Connected) {
 		response.Status = "degraded"
 	}
 	w.Header().Set("Content-Type", "application/json")

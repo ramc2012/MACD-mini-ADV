@@ -5,13 +5,17 @@
 | Layer | Implementation | Role |
 | --- | --- | --- |
 | Browser | React/TypeScript, Lightweight Charts for candles/CVD, Canvas 2D footprint, SVG profile | Trading terminal and chart interactions |
-| API | Go reverse proxy | Routes browser API/WebSocket requests to the engine and exposes Rust analytics |
-| Live engine | Python/FastAPI and Fyers SDK | Market data, inferred order flow, strategy, risk and **paper-only** execution |
+| API | Go gateway | Proxies REST to the engine; holds the engine's one stream and fans it out to browsers with per-browser coalescing and acknowledgement-based flow control; publishes ticks to the bus |
+| Bus | NATS (core) | `md.tick.<symbol>`, a versioned tick with engine sequence, exchange time and receipt time |
+| Live engine | Python/FastAPI and Fyers SDK | Market data, inferred order flow, strategy, risk and **paper-only** execution (unchanged) |
 | Durable data | SQLite | Raw ticks, condensed flow, research history and paper books |
-| Analytics | Rust service and QuestDB | EMA/MACD/volatility observations from chart candles; QuestDB does **not** yet store raw ticks |
+| Analytics | Rust service and QuestDB | Live per-symbol 1-minute bars, MACD and volatility in parallel shards from the bus; raw ticks (5-day TTL) and bars (90-day TTL) in QuestDB; on-demand chart analysis |
 
-The Go hop has not improved the measured local API latency. The Rust service
-currently has no authority over orders or risk. Polars, Parquet, DuckDB and a
+The Go hop has not improved request/response latency; it removes the
+engine's per-browser fan-out and snapshot resyncs (see the README's load
+test). The Rust service has no authority over orders or risk. QuestDB's
+ticks are the engine's *published* stream: delayed prints are already
+filtered, analysis legs are rationed, and replayed last trades are dropped. Polars, Parquet, DuckDB and a
 WebGL footprint renderer are not part of this deployment.
 
 ## Target boundaries
@@ -32,8 +36,9 @@ WebGL footprint renderer are not part of this deployment.
    code, whether Python or Rust, submits an intent through that gate. A Rust
    implementation alone does not make skipped checks impossible; the broker
    adapter must have no other order path, and retries need idempotent IDs.
-4. **Storage and research.** Add QuestDB raw-tick ingestion with observed loss
-   and lag metrics, then export immutable session partitions to Parquet. Use
+4. **Storage and research.** QuestDB now ingests the published tick stream
+   with gateway lag per tick; add observed-loss metrics against the engine's
+   own capture, then export immutable session partitions to Parquet. Use
    DuckDB to query those files and Polars in Python research. Keep replay inputs
    immutable and record strategy/configuration versions with each run.
 5. **Rendering.** Keep Lightweight Charts for time series. The footprint and

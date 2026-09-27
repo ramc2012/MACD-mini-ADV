@@ -24,12 +24,49 @@ To change the watchlist or supply Fyers credentials through Docker, copy `.env.e
 | Service | Role |
 | --- | --- |
 | `frontend` | Full React/TypeScript terminal, served by Nginx on port 3200. |
-| `gateway` | Go API and WebSocket reverse proxy on port 8201; serves `/parallel/health` and `/parallel/analytics`. |
-| `engine` | Original Python/FastAPI application, isolated on the Compose network. It remains the authority for market data, strategies, orders, and paper books. |
-| `analytics` | Rust service calculating EMA, MACD, and realized volatility from the engine's chart candles. |
-| `questdb` | Time-series store for Rust analytics observations, with its console on port 9002. |
+| `gateway` | Go API gateway on port 8201. Holds the one engine stream and fans it out to browsers, publishes every tick to the bus, and serves `/parallel/*`. |
+| `engine` | Original Python/FastAPI application, built unchanged from `../MACD-mini`. It remains the authority for market data, strategies, orders, and paper books. |
+| `nats` | Tick bus (core NATS, no persistence). The gateway publishes `md.tick.<symbol>`; consumers subscribe. |
+| `analytics` | Rust service. Live: worker shards consume the bus and build per-symbol 1-minute bars, MACD and volatility in parallel. On demand: `/analyze` of a chart's candles. |
+| `questdb` | Time-series store for raw ticks (5-day TTL), live 1-minute bars (90-day TTL) and on-demand observations; console on port 9002. |
 
 The optional `us` profile contains the retired `us-backend` and `us-frontend` services. They do not start with the default `docker compose up` command.
+
+## Stream fan-out and tick bus
+
+```
+Fyers ─► engine (Python, unchanged) ─► one websocket ─► Go gateway ─┬─► browsers (per-browser queues)
+                                                                   └─► NATS md.tick.<symbol> ─► Rust shards ─► QuestDB
+```
+
+**Browsers.** The engine gives each subscriber a 512-event queue and drops the oldest event when it fills; a browser that falls behind then asks for a full 1.7 MB snapshot, which costs the engine's only event loop ~130 ms. The gateway is now the engine's single subscriber and serves every browser from a cached snapshot plus a 50,000-event replay ring. Each browser has its own queue in which the newest tick per symbol, the newest update per bar, and portfolio totals replace older ones, while orders, trades, signals and broker events are always delivered in order. Sequence numbers are rewritten per browser, so coalescing never looks like a gap. The parallel terminal acknowledges what it has processed; the gateway keeps at most 1,000 frames in flight per browser and holds the rest where they keep coalescing, because nginx and Docker's port forwarder buffer far too much for TCP backpressure to keep a slow tab current. A client that never acknowledges (such as the original terminal) is written to as fast as its socket accepts. `STREAM_FANOUT=off` restores the plain tunnel to the engine.
+
+**Bus.** Every engine tick is published as a versioned message carrying the engine's sequence number, exchange time and gateway receipt time (`busTick` in [backend/stream.go](backend/stream.go)). The Rust service routes each symbol to one of `LIVE_WORKERS` shards (default: CPU count, 2–8), so symbols are processed in parallel and each symbol's ticks stay in order. Each symbol loads its stored minute bars from the engine once, two symbols at a time, so its MACD is meaningful from the first live bar. Only fresh session trades build bars and are stored: prints received more than two minutes after their exchange time (Fyers republishes each contract's last trade on connect) move the displayed price only. Analysis-leg quotes reach the bus at the engine's rationed rate, not the raw feed rate.
+
+**What it does not change.** The engine's strategy, orders, risk and books are untouched. Its history download is already store-first: a restart replays stored minute bars and asks Fyers only when a symbol's history is missing or stale, or once for a newly listed contract. Its order-flow analytics (footprint, Market Profile, whale flow, option chain) still run inside the engine; moving them out needs engine changes.
+
+When `MACD_API_TOKEN` is set, `/parallel/live*` and `/parallel/stream/stats` require it (as `X-Macd-Token` or `?token=`), as the engine's API does; `/parallel/health` stays open for container checks. The terminal loads its secondary pages (Quant, Profile, Auction, Blast lane, Equity, RRG, Ratios, Signals) on first visit, which cut the initial script from 612 KB to 419 KB (133 KB gzipped).
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /parallel/stream/stats` | Gateway fan-out: engine connection, gaps, replay ring, per-browser queue, coalescing, flow control, bus publishes. |
+| `GET /parallel/live?symbol=…` | One symbol's live bar, MACD, signal, histogram, realized volatility, warm-up and seed state. |
+| `GET /parallel/live/scan?sort=abs_histogram\|histogram\|volatility\|ticks&limit=50&warm_only=false` | Symbols ranked, for the Quant page scanner. |
+| `GET /parallel/live/stats` | Bus, shards, seeding and QuestDB writer counters. |
+
+### Load test (27 Sep 2026, market closed)
+
+A stand-in engine speaking the real stream protocol sent 5,000 ticks/s across 1,500 symbols for 90 s (450,000 ticks) through the gateway, NATS and eight Rust shards, isolated from the live stack. Browsers were Python clients that apply real backpressure; the slow ones processed one frame per 2 ms.
+
+| Browser | Tick latency p50 / p99 | Orders delivered | Gaps / resyncs |
+| --- | ---: | ---: | --- |
+| Fast, via gateway | 36 ms / 58 ms | 1,800 / 1,800 | 0 / 0 |
+| Slow, via gateway | 2.4 s / 5.3 s | 1,800 / 1,800 | 0 / 0 |
+| Slow, direct to the engine protocol | 44 s / 89 s | 166 / 1,800 | 144,200 events dropped for it |
+
+The bus delivered every tick (450,000 published and received, none dropped); shards took 32k–40k ticks each. At that rate the gateway used ~12% of a core and 40 MB, analytics 4–10% and 6 MB, NATS ~3.5%. Latency includes the gateway's 50 ms coalescing window. This measures the new components with a synthetic engine; it does not measure the real engine or Fyers during a session.
+
+## On-demand analytics
 
 `GET /parallel/analytics?symbol=NSE:NIFTY50-INDEX` asks Go to fetch the selected chart from the Python engine, then sends those candles to Rust. The React Quant analytics page uses this endpoint. Rust writes the computed observation to QuestDB on a best-effort basis; temporary database unavailability does not stop the trading terminal.
 
@@ -46,12 +83,14 @@ The Go gateway adds a network hop to the existing Python API. In a local read-on
 | `/health` | 0.208 / 0.241 ms | 0.400 / 0.489 ms |
 | `/api/snapshot` | 0.961 / 1.053 ms | 1.150 / 1.237 ms |
 
-These results show about 0.19 ms of added median latency for the gateway and **no measured performance gain** for the original trading API. They do not measure Fyers response, concurrent load, tick-to-screen time, or order throughput. Broker performance can be measured after login under the same market session and symbol set.
+These results show about 0.19 ms of added median latency for the gateway and **no measured performance gain** for the original trading API's request/response calls. The stream fan-out above is where the gateway earns its hop. They do not measure Fyers response, concurrent load, tick-to-screen time, or order throughput. Broker performance can be measured after login under the same market session and symbol set.
 
 ## Check and stop
 
 ```bash
 curl -fsS http://localhost:8201/parallel/health
+curl -fsS http://localhost:8201/parallel/stream/stats
+curl -fsS http://localhost:8201/parallel/live/stats
 curl -fsS 'http://localhost:8201/parallel/analytics?symbol=NSE:NIFTY50-INDEX&timeframe_seconds=60'
 docker compose logs --tail=50
 docker compose down

@@ -51,6 +51,12 @@ export function useStream(onEvent: (event: StreamEvent) => void) {
     const connect = () => {
       clearPending();
       const gate = createSequenceGate();
+      // Acknowledge what this tab has taken in. The gateway then holds at most
+      // a small window in flight and coalesces the rest, so a busy tab gets
+      // current prices rather than a backlog. Driven by arrivals, not timers,
+      // which background tabs throttle.
+      let ackedAt = 0;
+      let unacked = 0;
       const url = new URL(WS_URL);
       if (API_TOKEN) url.searchParams.set("token", API_TOKEN);
       socket = new WebSocket(url);
@@ -60,6 +66,15 @@ export function useStream(onEvent: (event: StreamEvent) => void) {
       socket.onmessage = (message) => {
         try {
           const event = JSON.parse(message.data) as StreamEvent;
+          if (event.seq !== undefined) {
+            unacked += 1;
+            const now = Date.now();
+            if (unacked >= 32 || now - ackedAt >= 50) {
+              socket?.send(JSON.stringify({ command: "ack", seq: event.seq }));
+              unacked = 0;
+              ackedAt = now;
+            }
+          }
           const decision = gate(event);
           if (decision === "request") {
             clearPending();
