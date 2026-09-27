@@ -1905,6 +1905,30 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
       schedule();
     };
 
+    const onKey = (event: KeyboardEvent) => {
+      const len = dataRef.current?.bars?.length ?? 0;
+      if (!len) return;
+      const view = viewRef.current;
+      const drawn = priceDrawRef.current;
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        const step = event.shiftKey ? 5 : 1;
+        const direction = event.key === "ArrowLeft" ? -1 : 1;
+        viewRef.current = { ...view, start: clamp(view.start + direction * step, 0, Math.max(0, len - view.count)) };
+      } else if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        const direction = event.key === "ArrowUp" ? 1 : -1;
+        priceViewRef.current = { ...priceViewRef.current, center: drawn.center + direction * drawn.rowSize * (event.shiftKey ? 5 : 1), follow: false };
+      } else if (event.key === "+" || event.key === "=" || event.key === "-") {
+        const zoomOut = event.key === "-";
+        viewRef.current = { start: view.start, count: clamp(view.count + (zoomOut ? 2 : -2), Math.min(MIN_BARS, len), len) };
+        viewRef.current.start = clamp(view.start, 0, Math.max(0, len - viewRef.current.count));
+      } else if (event.key === "Home") {
+        priceViewRef.current = { center: null, rows: null, follow: true };
+        viewRef.current = { ...view, start: Math.max(0, len - view.count) };
+      } else return;
+      event.preventDefault();
+      schedule();
+    };
+
     const endDrag = (event: PointerEvent) => {
       if (dragRef.current && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
       dragRef.current = null;
@@ -1925,6 +1949,7 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     canvas.addEventListener("pointercancel", endDrag);
     canvas.addEventListener("pointerleave", onLeave);
     canvas.addEventListener("dblclick", onDoubleClick);
+    canvas.addEventListener("keydown", onKey);
     return () => {
       canvas.removeEventListener("wheel", onWheel);
       canvas.removeEventListener("pointerdown", onDown);
@@ -1933,6 +1958,7 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
       canvas.removeEventListener("pointercancel", endDrag);
       canvas.removeEventListener("pointerleave", onLeave);
       canvas.removeEventListener("dblclick", onDoubleClick);
+      canvas.removeEventListener("keydown", onKey);
     };
   }, [schedule]);
 
@@ -1952,8 +1978,9 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     >
       <canvas
         ref={canvasRef}
-        title="Bid and ask are inferred from quote and trade updates. Wheel over chart: time zoom; wheel over price axis or Alt+wheel: price zoom; Shift+wheel or drag price axis: price pan; double-click: follow last price."
-        aria-label="Footprint chart with estimated bid and ask volume. Wheel to zoom time, drag price axis to pan price, double-click to follow last price."
+        tabIndex={0}
+        title="Estimated bid and ask. Wheel: time zoom; price axis or Alt+wheel: price zoom; Shift+wheel: price pan. Keyboard: arrows pan, +/− zoom time, Home follows last price."
+        aria-label="Footprint chart with estimated bid and ask volume. Focus this chart and use arrow keys to pan, plus or minus to zoom time, and Home to follow last price."
         style={{ display: "block", width: "100%", height: "100%", cursor: "crosshair", touchAction: "none" }}
       />
     </div>

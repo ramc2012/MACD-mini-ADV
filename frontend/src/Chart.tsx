@@ -1,5 +1,5 @@
 import {
-  CandlestickSeries, ColorType, createChart, createSeriesMarkers, HistogramSeries, LineSeries, LineStyle, TickMarkType,
+  BarSeries, CandlestickSeries, ColorType, createChart, createSeriesMarkers, HistogramSeries, LineSeries, LineStyle, TickMarkType,
   type IChartApi, type IPanePrimitive, type IPanePrimitivePaneView, type IPriceLine, type IPrimitivePaneRenderer, type ISeriesApi,
   type ISeriesMarkersPluginApi, type MouseEventParams, type PaneAttachedParameter, type Time,
 } from "lightweight-charts";
@@ -9,10 +9,13 @@ import type { AuctionContext, Candle, ChartLayers, ChartMarker, Indicator, PaneC
 
 export const DEFAULT_LAYERS: ChartLayers = { volume: true, legend: true, priorDay: true, week: false, nakedPocs: false, ib: true, sessions: true };
 export const DEFAULT_PANES: PaneCollapse = { rsi: false, roc: false };
+export type PriceStyle = "candles" | "ohlc";
+export type ChartSource = { label: string; title: string; tone: "live" | "warn" | "muted" };
 
 type Props = {
   candles: Candle[]; current?: Candle; indicators: Indicator[]; markers?: ChartMarker[]; error?: string; fitKey: string; rsiGate?: number; rocGate?: number;
   timeframe?: number; layers?: ChartLayers; references?: AuctionContext; paneCollapse?: PaneCollapse;
+  priceStyle?: PriceStyle; source?: ChartSource;
 };
 const istDateTime = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
 const istDay = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short" });
@@ -83,13 +86,14 @@ const LEVEL_STYLE: Record<ReferenceKind, { color: string; lineWidth: 1 | 2; line
 };
 
 type ChartHandles = {
-  chart: IChartApi; candle: ISeriesApi<"Candlestick">; candleMarkers: ISeriesMarkersPluginApi<Time>; volume: ISeriesApi<"Histogram">;
+  chart: IChartApi; candle: ISeriesApi<"Candlestick">; bar: ISeriesApi<"Bar">;
+  candleMarkers: ISeriesMarkersPluginApi<Time>; barMarkers: ISeriesMarkersPluginApi<Time>; volume: ISeriesApi<"Histogram">;
   bbUpper: ISeriesApi<"Line">; bbMiddle: ISeriesApi<"Line">; bbLower: ISeriesApi<"Line">; kama: ISeriesApi<"Line">; vwap: ISeriesApi<"Line">;
   line: ISeriesApi<"Line">; signal: ISeriesApi<"Line">; hist: ISeriesApi<"Histogram">;
   kamaRsi: ISeriesApi<"Line">; kamaRoc: ISeriesApi<"Line">; separators: SessionSeparators[];
 };
 
-export function TradingChart({ candles, current, indicators, markers = [], error, fitKey, rsiGate = 65, rocGate = 0.5, timeframe, layers = DEFAULT_LAYERS, references, paneCollapse = DEFAULT_PANES }: Props) {
+export function TradingChart({ candles, current, indicators, markers = [], error, fitKey, rsiGate = 65, rocGate = 0.5, timeframe, layers = DEFAULT_LAYERS, references, paneCollapse = DEFAULT_PANES, priceStyle = "candles", source }: Props) {
   const element = useRef<HTMLDivElement>(null);
   const legend = useRef<HTMLDivElement>(null);
   const lastFit = useRef("");
@@ -100,7 +104,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
   // VWAP state after the last closed row, so the forming bar's VWAP can be
   // recomputed per tick without walking the session again.
   const vwapTail = useRef({ session: Number.NaN, tradedValue: 0, tradedVolume: 0 });
-  const priceLines = useRef(new Map<string, { price: number; kind: ReferenceKind; line: IPriceLine }>());
+  const priceLines = useRef(new Map<string, { price: number; kind: ReferenceKind; lines: IPriceLine[] }>());
   const charts = useRef<ChartHandles>();
   // The bar under the crosshair, or undefined when the pointer is off the
   // data.  Held in a ref rather than passed per call because the legend is
@@ -138,7 +142,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
       + cell("O", fmt(bar.open), tone) + cell("H", fmt(bar.high), tone) + cell("L", fmt(bar.low), tone) + cell("C", fmt(bar.close), tone)
       + cell("Δ", `${change >= 0 ? "+" : ""}${fmt(change)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`, changeTone)
       + cell("Vol", bar.volume ? compact.format(bar.volume) : "—")
-      + cell("VWAP", fmt(vwap))
+      + cell("VWAP≈", fmt(vwap))
       + cell("MACD", `${fmt(ind?.macd, 3)} / ${fmt(ind?.signal, 3)} / ${fmt(ind?.histogram, 3)}`, ind ? (ind.histogram >= 0 ? "up" : "down") : "")
       + cell("KAMA", fmt(ind?.kama)) + cell("RSI", fmt(ind?.kama_rsi, 1)) + cell("ROC", `${fmt(ind?.kama_roc)}%`);
     // Each series.update() re-fires crosshairMoved, so one tick asks for four
@@ -160,6 +164,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     if (last && last.timestamp === bar.timestamp) list[list.length - 1] = bar;
     else { list.push(bar); indexByTime.current.set(bar.timestamp, list.length - 1); }
     api.candle.update({ time: bar.timestamp as Time, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+    api.bar.update({ time: bar.timestamp as Time, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
     api.volume.update({ time: bar.timestamp as Time, value: Math.max(0, bar.volume || 0), color: volumeColor(bar) });
     const tail = vwapTail.current;
     const volume = Math.max(0, bar.volume || 0);
@@ -206,6 +211,8 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     });
     const candle = chart.addSeries(CandlestickSeries, { upColor: UP, downColor: DOWN, borderVisible: false, wickUpColor: UP, wickDownColor: DOWN }, 0);
     const candleMarkers = createSeriesMarkers(candle, []);
+    const bar = chart.addSeries(BarSeries, { upColor: UP, downColor: DOWN, openVisible: true, thinBars: false, visible: false }, 0);
+    const barMarkers = createSeriesMarkers(bar, []);
     // Volume sits on its own overlay scale so it never bends the price axis.
     const volume = chart.addSeries(HistogramSeries, { priceScaleId: "volume", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false }, 0);
     volume.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
@@ -213,7 +220,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     const bbMiddle = chart.addSeries(LineSeries, { color: "#7083a499", lineWidth: 1, title: "BB 20", lastValueVisible: false, priceLineVisible: false }, 0);
     const bbLower = chart.addSeries(LineSeries, { color: "#7083a455", lineWidth: 1, title: "BB Lower", lastValueVisible: false, priceLineVisible: false }, 0);
     const kama = chart.addSeries(LineSeries, { color: "#c084fc", lineWidth: 2, title: "KAMA", lastValueVisible: true, priceLineVisible: false }, 0);
-    const vwap = chart.addSeries(LineSeries, { color: "#f5b84b", lineWidth: 2, title: "VWAP", lastValueVisible: true, priceLineVisible: false }, 0);
+    const vwap = chart.addSeries(LineSeries, { color: "#f5b84b", lineWidth: 2, title: "VWAP≈", lastValueVisible: true, priceLineVisible: false }, 0);
     // All three MACD series must share one price scale.  An empty scale id
     // creates an overlay scale, which made histogram zero render at a
     // different height from MACD/signal zero even though the values agreed.
@@ -228,7 +235,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     kamaRoc.createPriceLine({ price: rocGate, color: "#7083a477", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "ROC gate" });
     kamaRsi.priceScale().applyOptions({ scaleMargins: { top: 0.12, bottom: 0.12 } });
     const separators = chart.panes().map((pane) => { const primitive = new SessionSeparators(); pane.attachPrimitive(primitive); return primitive; });
-    charts.current = { chart, candle, candleMarkers, volume, bbUpper, bbMiddle, bbLower, kama, vwap, line, signal, hist, kamaRsi, kamaRoc, separators };
+    charts.current = { chart, candle, bar, candleMarkers, barMarkers, volume, bbUpper, bbMiddle, bbLower, kama, vwap, line, signal, hist, kamaRsi, kamaRoc, separators };
     const onCrosshair = (param: MouseEventParams<Time>) => {
       hovered.current = typeof param.time === "number" ? param.time : undefined;
       paintLegend();
@@ -256,12 +263,15 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     const all = forming ? [...base, forming] : base;
     const indicatorsByTime = [...new Map(indicators.map((row) => [row.timestamp, row])).values()].sort((a, b) => a.timestamp - b.timestamp);
     api.candle.setData(base.map((c) => ({ time: c.timestamp as Time, open: c.open, high: c.high, low: c.low, close: c.close })));
+    api.bar.setData(base.map((c) => ({ time: c.timestamp as Time, open: c.open, high: c.high, low: c.low, close: c.close })));
     api.volume.setData(base.map((c) => ({ time: c.timestamp as Time, value: Math.max(0, c.volume || 0), color: volumeColor(c) })));
     const candleTimes = all.map((c) => c.timestamp);
-    api.candleMarkers.setMarkers(markers.flatMap((marker) => {
+    const displayMarkers = markers.flatMap((marker) => {
       const time = candleTimes.filter((candidate) => candidate <= marker.timestamp).pop();
       return time === undefined ? [] : [{ time: time as Time, position: marker.tone === "stop" ? "aboveBar" as const : "belowBar" as const, color: marker.tone === "stop" ? DOWN : marker.tone === "signal" ? "#f5b84b" : "#4da3ff", shape: marker.tone === "stop" ? "arrowDown" as const : "arrowUp" as const, text: `${marker.label} ₹${marker.price.toFixed(2)}` }];
-    }));
+    });
+    api.candleMarkers.setMarkers(displayMarkers);
+    api.barMarkers.setMarkers(displayMarkers);
     api.bbUpper.setData(indicatorsByTime.filter((p) => p.bb_upper != null).map((p) => ({ time: p.timestamp as Time, value: p.bb_upper as number })));
     api.bbMiddle.setData(indicatorsByTime.filter((p) => p.bb_middle != null).map((p) => ({ time: p.timestamp as Time, value: p.bb_middle as number })));
     api.bbLower.setData(indicatorsByTime.filter((p) => p.bb_lower != null).map((p) => ({ time: p.timestamp as Time, value: p.bb_lower as number })));
@@ -332,14 +342,16 @@ export function TradingChart({ candles, current, indicators, markers = [], error
       // The kind matters as much as the price: an IB whose extreme never moved
       // still changes from forming to complete at 10:15.
       if (!level || level.price !== entry.price || level.kind !== entry.kind) {
-        api.candle.removePriceLine(entry.line);
+        api.candle.removePriceLine(entry.lines[0]);
+        api.bar.removePriceLine(entry.lines[1]);
         priceLines.current.delete(key);
       }
     }
     for (const level of levels) {
       if (priceLines.current.has(level.key)) continue;
-      const line = api.candle.createPriceLine({ price: level.price, title: level.title, ...LEVEL_STYLE[level.kind] });
-      priceLines.current.set(level.key, { price: level.price, kind: level.kind, line });
+      const options = { price: level.price, title: level.title, ...LEVEL_STYLE[level.kind] };
+      priceLines.current.set(level.key, { price: level.price, kind: level.kind,
+        lines: [api.candle.createPriceLine(options), api.bar.createPriceLine(options)] });
     }
   }, [references, layers, timeframe, candles, current?.timestamp, current?.high, current?.low]);
 
@@ -353,9 +365,17 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     api.kamaRoc.applyOptions({ visible: !paneCollapse.roc });
   }, [paneCollapse.rsi, paneCollapse.roc]);
 
+  useEffect(() => {
+    const api = charts.current;
+    if (!api) return;
+    api.candle.applyOptions({ visible: priceStyle === "candles" });
+    api.bar.applyOptions({ visible: priceStyle === "ohlc" });
+  }, [priceStyle]);
+
   const empty = candles.length === 0 && !current;
   return <div className="chart-stack">
     <div ref={element} className="chart-panes" aria-label="Price, volume, MACD, KAMA RSI and KAMA ROC chart" />
+    {source && <div className={`chart-source ${source.tone}`} title={source.title} role="status">{source.label}</div>}
     <div ref={legend} className="chart-legend" hidden={!layers.legend} aria-live="off" />
     {empty && <div className={`chart-empty${error ? " error" : ""}`}>{error || "Loading broker candle history…"}</div>}
   </div>;

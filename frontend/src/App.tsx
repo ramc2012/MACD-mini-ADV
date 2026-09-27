@@ -1,5 +1,6 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { DEFAULT_LAYERS, DEFAULT_PANES, TradingChart } from "./Chart";
+import { DEFAULT_LAYERS, DEFAULT_PANES, TradingChart, type PriceStyle } from "./Chart";
+import { chartSourceStatus } from "./chartSource";
 import { useChartReferences } from "./useChartReferences";
 import { mergeLiveCandles, sessionCutoff } from "./chartMath";
 import { PositionChartModal } from "./PositionChartModal";
@@ -38,6 +39,7 @@ const CHART_PERIODS: { key: ChartPeriod; sessions: number }[] = [
 const CHART_PERIOD_STORE = "macd.chartPeriod";
 const CHART_LAYERS_STORE = "macd.chartLayers";
 const CHART_PANES_STORE = "macd.chartPanes";
+const CHART_STYLE_STORE = "macd.chartStyle";
 const SELECTED_SYMBOL_STORE = "macd.selectedSymbol";
 // Every localStorage touch goes through these.  Writes throw outright in
 // Safari private browsing and with site data blocked, and a throw inside a
@@ -115,6 +117,8 @@ export default function App() {
   const toggleLayer = useCallback((key: keyof ChartLayers) => setChartLayers((old) => { const next = { ...old, [key]: !old[key] }; writeKey(CHART_LAYERS_STORE, JSON.stringify(next)); return next; }), []);
   const [paneCollapse, setPaneCollapse] = useState<PaneCollapse>(() => readStore(CHART_PANES_STORE, DEFAULT_PANES));
   const togglePane = useCallback((key: keyof PaneCollapse) => setPaneCollapse((old) => { const next = { ...old, [key]: !old[key] }; writeKey(CHART_PANES_STORE, JSON.stringify(next)); return next; }), []);
+  const [priceStyle, setPriceStyle] = useState<PriceStyle>(() => readKey(CHART_STYLE_STORE) === "ohlc" ? "ohlc" : "candles");
+  const pickPriceStyle = (style: PriceStyle) => { setPriceStyle(style); writeKey(CHART_STYLE_STORE, style); };
   // Bumping this re-fits the chart without touching symbol or period (key "f").
   const [fitNonce, setFitNonce] = useState(0);
   // Bars that closed since /api/chart was fetched.  The engine publishes only
@@ -428,6 +432,18 @@ export default function App() {
   // out of the percentage rather than out of clipped glyphs.
   const brokerStatus = observedBrokerStatus(snapshot?.broker.status, health, healthUpdated);
   const brokerDown = !!snapshot && brokerStatus !== "connected";
+  const lastHistoryBar = visibleCandles[visibleCandles.length - 1];
+  const formingBar = chartReady ? current[selected] : undefined;
+  const latestChartBar = formingBar && (!lastHistoryBar || formingBar.timestamp >= lastHistoryBar.timestamp) ? formingBar : lastHistoryBar;
+  const chartSource = chartSourceStatus({
+    bar: chartReady ? latestChartBar : undefined,
+    quote: quoteStamp(ticks[selected]?.timestamp, quoteNow),
+    now: quoteNow,
+    marketOpen: health?.session_open,
+    streamConnected: connected && brokerStatus === "connected",
+    timeframeSeconds: snapshot?.config.timeframe_seconds,
+    loading: chartLoading,
+  });
   return <main>
     <header className={brokerDown ? "feed-alarm" : undefined}>
       <div className="brand"><span className="logo">M</span><strong>MACD Trader</strong><span className="parallel-badge" title="Parallel React terminal through the Go API gateway">PARALLEL</span></div>
@@ -469,6 +485,10 @@ export default function App() {
       <section className="chart panel">
         <div className="panel-title"><span>{selected || "Select instrument"}</span>
           <span className="chart-controls">
+            <span className="radar-filter chart-style" aria-label="Price chart style">
+              <button className={priceStyle === "candles" ? "active" : ""} aria-pressed={priceStyle === "candles"} onClick={() => pickPriceStyle("candles")}>Candles</button>
+              <button className={priceStyle === "ohlc" ? "active" : ""} aria-pressed={priceStyle === "ohlc"} onClick={() => pickPriceStyle("ohlc")}>OHLC</button>
+            </span>
             <span className="radar-filter chart-layers" aria-label="Chart layers">
               {([["volume", "Vol", "v"], ["legend", "Legend", "l"], ["priorDay", "PD", "p"], ["week", "WK", "w"], ["nakedPocs", "nPOC", "n"], ["ib", "IB", "i"], ["sessions", "Days", "s"]] as [keyof ChartLayers, string, string][]).map(([key, label, hotkey]) => {
                 const needsSpot = key === "priorDay" || key === "week" || key === "nakedPocs";
@@ -485,11 +505,11 @@ export default function App() {
           </span>
         </div>
         <TradingChart candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]}
-          timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse}
+          timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
           fitKey={`${selected}:${snapshot?.config.timeframe_seconds}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
     </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : page === "RRG" ? <RRGPage /> : page === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : page === "RATIOS" ? <RatioPage options={snapshot?.option_watchlist || []} /> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "BLAST" ? <BlastLanePage snapshot={blast} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : <TradingLedger tab={page} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} />}</Suspense>}
-    {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
+    {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
     <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
   </main>;
 }

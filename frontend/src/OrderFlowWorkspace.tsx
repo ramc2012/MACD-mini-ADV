@@ -37,13 +37,18 @@ const overlayKind = (name: string): ProfileOverlay["kind"] =>
   name.startsWith("pd_") ? "pd" : name.startsWith("week_") ? "week"
     : name.startsWith("month_") ? "month" : "composite";
 
-export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus }: {
-  symbols: string[]; traded?: string[]; focus: string; onFocus: (s: string) => void;
+export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpenAuction }: {
+  symbols: string[]; traded?: string[]; focus: string; onFocus: (s: string) => void; onOpenAuction: () => void;
 }) {
   // Any subscribed contract can be opened; a marker shows which have actually
   // printed today, since a chart on an untraded contract is legitimately empty.
   const tradedSet = useMemo(() => new Set(traded), [traded]);
-  const [loaded, setLoaded] = useState<{ key: string; value: FootprintData }>();
+  const [loaded, setLoaded] = useState<{ key: string; value: FootprintData; receivedAt: number }>();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 3000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [timeframe, setTimeframe] = useState(() => recallNumber(TIMEFRAME_STORE, TIMEFRAMES, 300));
   const [bars, setBars] = useState(() => recallNumber(BARS_STORE, BAR_COUNTS, 40));
   const [showTpo, setShowTpo] = useState(() => recall(TPO_STORE) === "1");
@@ -131,7 +136,7 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus }: {
       if (replay) replayFetch.current = controller;
       void fetch(requestUrl, { headers, signal: controller.signal })
         .then((r) => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-        .then((d) => { if (!stopped) { setLoaded({ key: requestUrl, value: d as FootprintData }); setFailure(undefined); } })
+        .then((d) => { if (!stopped) { setLoaded({ key: requestUrl, value: d as FootprintData, receivedAt: Date.now() }); setFailure(undefined); } })
         .catch((e) => { if (!stopped && !controller.signal.aborted) setFailure({
           key: requestUrl, message: e instanceof Error ? e.message : "footprint unavailable",
         }); })
@@ -152,6 +157,13 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus }: {
   const flow = data?.flow;
   const speedRead = data?.tape_speed ?? flow?.tape_speed ?? null;
   const session = data?.session ?? null;
+  const responseAge = data && loaded ? Math.max(0, Math.floor((now - loaded.receivedAt) / 1000)) : null;
+  const latestPrint = data?.tape?.length ? Math.max(...data.tape.map((row) => row.t).filter(Number.isFinite)) : null;
+  const printTime = latestPrint != null && Number.isFinite(latestPrint) ? clock.format(new Date(latestPrint * 1000)) : "—";
+  const responseLabel = !focus ? "No symbol" : replay ? `Replay · print ${printTime}`
+    : paused ? `Paused · print ${printTime}` : error ? `Update failed · last print ${printTime}`
+      : responseAge === null ? "Loading flow…" : `Response ${responseAge}s · print ${printTime}`;
+  const responseAged = !replay && !paused && (!!error || (responseAge !== null && responseAge > 10));
   const totals = useMemo(() => {
     const rows = data?.bars || [];
     const volume = rows.reduce((sum, b) => sum + b.v, 0);
@@ -197,6 +209,7 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus }: {
         onClick={() => pickBars(n)}>{n} bars</button>)}</div>
       <button className={showTpo ? "of-toggle active" : "of-toggle"} onClick={toggleTpo}>TPO</button>
       {!replay && <button className={paused ? "of-toggle active" : "of-toggle"} onClick={() => setPaused((v) => !v)}>{paused ? "Paused" : "Live"}</button>}
+      <span className={`of-source${responseAged ? " aged" : ""}`} role="status" title="Response age is time since the last API update; print time is the latest captured trade, which may be older.">{responseLabel}</span>
       <button className={replay ? "of-toggle active" : "of-toggle"}
         onClick={() => { setReplay((v) => !v); setPlaying(false); }}>Replay</button>
       {/* The composite is a trailing window merged per request, so it is asked
@@ -299,9 +312,10 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus }: {
 
       <section className="panel of-profile">
         <div className="panel-title"><span>Session profile</span>
-          <span>{data?.composite ? `${showTpo ? "TPO + volume" : "volume"} · ${data.composite.days}/${data.composite.requested_days}d composite`
+          <span className="of-profile-actions"><span className="of-profile-detail" title={data?.composite ? `${data.composite.days}/${data.composite.requested_days}d composite` : profileSampled ? "Sampled profile" : "Session profile"}>{data?.composite ? `${showTpo ? "TPO + volume" : "volume"} · ${data.composite.days}/${data.composite.requested_days}d composite`
             : profileSampled ? `volume · sampled ${profile!.levels_returned ?? profile!.levels.length}/${profile!.levels_total ?? "?"} levels`
-              : showTpo ? "TPO + volume" : "volume"}</span></div>
+              : showTpo ? "TPO + volume" : "volume"}</span>
+            <button type="button" onClick={onOpenAuction} title="Open the complete scrollable TPO and volume ladder">Full ladder</button></span></div>
         <div className="of-profile-body" ref={profilePane}>
           <VolumeProfilePane profile={profile} showTpo={showTpo} height={profileHeight}
             overlays={overlays}

@@ -239,7 +239,7 @@ export function MarketProfilePage() {
         symbols={snap?.subscribed_symbols?.length ? snap.subscribed_symbols : (snap?.tracked_symbols || [])}
         traded={snap?.tracked_symbols || []}
         focus={focus || snap?.focus || ""}
-        onFocus={pickFocus} />}
+        onFocus={pickFocus} onOpenAuction={() => pickTab("AUCTION")} />}
       {tab === "AUCTION" && <AuctionView snap={snap}
         fullProfile={currentFullProfile}
         fullProfileUnavailable={fullProfileErrorKey === `${snap?.profile?.symbol}|${snap?.profile?.day}`} />}
