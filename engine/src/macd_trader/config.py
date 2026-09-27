@@ -287,3 +287,14 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# Paths, the process layout and secrets come from the environment (and
+# credentials.json), never from settings.json: a stored tick_database_path used
+# to override the one Compose set, so moving a database silently did nothing.
+ENVIRONMENT_ONLY = frozenset({
+    "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
+    "research_report_path", "contract_snapshot_path", "mp_database_path",
+    "blast_database_path", "tick_database_path", "api_token", "allowed_origins_csv",
+    "engine_role", "nats_url", "strategy_url", "desk_url",
+})

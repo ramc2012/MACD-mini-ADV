@@ -12,6 +12,20 @@ deployed; changes made in one are not carried to the other.
 
 Operating notes for the strategy, desks and blast lane are in [docs/](docs/).
 
+## Process roles
+
+`MACD_ENGINE_ROLE` selects what one process runs:
+
+| Role | Runs | Entry |
+| --- | --- | --- |
+| `all` (default) | Everything in one process, as the engine always did | `macd_trader.app` |
+| `strategy` | Fyers feed, contract selection, MACD and blast lanes; publishes ticks to `MACD_NATS_URL`; serves the desk its context, broker proxy and settings saves | `macd_trader.app` |
+| `desk` | Market Profile / order-flow desk, tick capture, whale tracker, chain collector, nightly memory, from the bus | `macd_trader.desk_app` |
+
+The desk's logic lives in `desk.py` (`DeskMixin`), shared by `all` and `desk`, and its routes in `desk_routes.py`. `python -m macd_trader` starts the app for the role. A `desk` process stays idle unless the engine it polls reports the `strategy` role.
+
+Paths, secrets and the role are environment-only (`config.ENVIRONMENT_ONLY`); values for them in `settings.json` are ignored.
+
 ## Develop and test
 
 ```bash

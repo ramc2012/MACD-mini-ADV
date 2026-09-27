@@ -102,7 +102,8 @@ def test_nightly_retries_a_locked_database_instead_of_writing_the_day_off(monkey
             raise RuntimeError("database is locked")
         return {"day": "2026-09-02", "sessions": 1}
 
-    monkeypatch.setattr(engine_module.nightly, "run", flaky)
+    from macd_trader import nightly
+    monkeypatch.setattr(nightly, "run", flaky)
     fixed = datetime(2026, 9, 2, 16, 5, tzinfo=engine_module.IST)
 
     class Clock(datetime):
@@ -110,7 +111,9 @@ def test_nightly_retries_a_locked_database_instead_of_writing_the_day_off(monkey
         def now(cls, tz=None):
             return fixed if tz is None else fixed.astimezone(tz)
 
-    monkeypatch.setattr(engine_module, "datetime", Clock)
+    # The nightly loop is desk code (macd_trader.desk); patch its clock there.
+    from macd_trader import desk as desk_module
+    monkeypatch.setattr(desk_module, "datetime", Clock)
     sleeps = {"n": 0}
 
     async def fast_sleep(_seconds):

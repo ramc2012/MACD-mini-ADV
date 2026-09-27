@@ -2,8 +2,9 @@
 
 import asyncio
 from datetime import UTC, datetime
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
+from macd_trader.desk import DeskMixin
 from macd_trader.engine import IST, TradingEngine, regular_session_open
 
 
@@ -63,6 +64,9 @@ def test_expiry_exit_retries_each_failed_book_on_the_next_sweep():
         expiring_positions=lambda: list(positions),
         events=SimpleNamespace(publish=lambda topic, payload: published.append((topic, payload))),
     )
+    # The desk's share of the sweep lives on DeskMixin, which TradingEngine inherits.
+    engine.expiring_desk_positions = MethodType(DeskMixin.expiring_desk_positions, engine)
+    engine._flatten_expiring_desk = MethodType(DeskMixin._flatten_expiring_desk, engine)
     now = datetime(2026, 9, 28, 15, 10, tzinfo=IST)
 
     asyncio.run(TradingEngine._flatten_expiring_positions(engine, now))

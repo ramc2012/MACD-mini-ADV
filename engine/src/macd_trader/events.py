@@ -18,6 +18,9 @@ _ORJSON_OPTIONS = orjson.OPT_NON_STR_KEYS
 
 
 def _default(value: Any) -> Any:
+    # orjson encodes datetime natively but not subclasses of it.
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
     if isinstance(value, (set, frozenset)):
         return list(value)
     if isinstance(value, Path):
