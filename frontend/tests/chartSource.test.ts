@@ -28,3 +28,12 @@ test("after the session closes, the last bar is historical rather than alarming"
   assert.equal(closed.tone, "muted");
   assert.match(closed.label, /closed/);
 });
+
+test("a contract Fyers reports as never traded is not shown as a quote", () => {
+  // Fyers' placeholder time for an untraded contract: 1 Jan 1980 00:00 IST.
+  const stamp = quoteStamp("1979-12-31T18:30:00+00:00", Date.parse("2026-09-29T03:47:00Z"));
+  assert.equal(stamp.untraded, true);
+  assert.equal(stamp.aged, true);
+  assert.equal(stamp.label, "No trade yet");
+  assert.equal(quoteStamp("2026-09-29T03:46:59Z", Date.parse("2026-09-29T03:47:00Z")).untraded, false);
+});

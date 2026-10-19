@@ -36,8 +36,8 @@ type gateway struct {
 	// token, when set, guards the gateway's own data endpoints the way the
 	// engine guards its API. Proxied engine routes are checked by the engine.
 	token string
-	// desk is the Market Profile / order-flow process. When set, /api/mp/*
-	// and /api/auction/* go there; otherwise the engine serves them.
+	// desk is the Market Profile / order-flow process. When set, /api/mp/*,
+	// /api/auction/* and /api/agent/* go there; otherwise the engine serves them.
 	desk      *url.URL
 	deskProxy *httputil.ReverseProxy
 }
@@ -58,7 +58,8 @@ func (g *gateway) setDesk(raw string) error {
 }
 
 func isDeskPath(path string) bool {
-	return strings.HasPrefix(path, "/api/mp/") || strings.HasPrefix(path, "/api/auction/")
+	return strings.HasPrefix(path, "/api/mp/") || strings.HasPrefix(path, "/api/auction/") ||
+		strings.HasPrefix(path, "/api/agent/")
 }
 
 func (g *gateway) authorized(r *http.Request) bool {
@@ -75,6 +76,9 @@ func (g *gateway) authorized(r *http.Request) bool {
 type dependencyHealth struct {
 	Reachable  bool `json:"reachable"`
 	HTTPStatus int  `json:"httpStatus,omitempty"`
+	// Healthy is the dependency's own "ok" verdict when it reports one (analytics
+	// sets it false when bars stop reaching QuestDB); reachable alone is liveness.
+	Healthy *bool `json:"healthy,omitempty"`
 }
 
 type healthResponse struct {
@@ -294,7 +298,7 @@ func (g *gateway) health(w http.ResponseWriter, r *http.Request) {
 	if g.stream != nil {
 		response.Stream = &streamHealth{Mode: "fanout", Connected: g.stream.connected()}
 	}
-	if !response.Engine.Reachable || !response.Analytics.Reachable || (response.Stream != nil && !response.Stream.Connected) ||
+	if !response.Engine.Reachable || !response.Analytics.Reachable || response.Analytics.Healthy != nil && !*response.Analytics.Healthy || (response.Stream != nil && !response.Stream.Connected) ||
 		(response.Desk != nil && !response.Desk.Reachable) {
 		response.Status = "degraded"
 	}
@@ -315,8 +319,11 @@ func (g *gateway) check(ctx context.Context, upstream *url.URL) dependencyHealth
 		return dependencyHealth{}
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	return dependencyHealth{Reachable: resp.StatusCode < 500, HTTPStatus: resp.StatusCode}
+	var body struct {
+		OK *bool `json:"ok"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&body)
+	return dependencyHealth{Reachable: resp.StatusCode < 500, HTTPStatus: resp.StatusCode, Healthy: body.OK}
 }
 
 func (g *gateway) analyze(w http.ResponseWriter, r *http.Request) {

@@ -17,6 +17,7 @@ import sqlite3
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import sqlite_journal
 from .profile_history import (
     build_period, build_session, ensure_tables, period_key, save_periods, save_sessions,
     session_bounds, value_migration,
@@ -35,8 +36,7 @@ def _connect(path: str, read_only: bool = False) -> sqlite3.Connection:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
     else:
         connection = sqlite3.connect(path, timeout=60)
-        connection.execute("PRAGMA journal_mode=DELETE")
-        connection.execute("PRAGMA synchronous=FULL")
+        sqlite_journal.configure(connection, path)
     return connection
 
 

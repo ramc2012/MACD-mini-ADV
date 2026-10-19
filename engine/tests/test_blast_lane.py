@@ -7,10 +7,27 @@ the journal records the rejections as well as the fills (they are the control
 group the research needs), and that none of it can reach the MACD lane's book.
 """
 import asyncio
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def fixed_blast_session_clock(monkeypatch):
+    """The contract fixtures belong to September; expiry checks use that session."""
+    from macd_trader import blast_engine, engine, execution, models
+
+    class SessionClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            moment = datetime(2026, 9, 11, 5, 30, tzinfo=UTC)
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    for module in (blast_engine, engine, execution, models):
+        monkeypatch.setattr(module, "datetime", SessionClock)
+    monkeypatch.setattr(sys.modules[__name__], "datetime", SessionClock)
 
 from macd_trader.blast_engine import (
     ALREADY_HELD, AUTO_TRADE_OFF, BREADTH_TOO_THIN, MACD_SEED_BARS, NOT_OFF_HIGH, NO_HISTORY,
@@ -41,6 +58,7 @@ def build(tmp_path: Path, **overrides) -> BlastEngine:
         "blast_high_lookback_bars": 30,
         "blast_min_breadth_cohort": 1,
         "blast_target_notional": 100_000,
+        "blast_signal_bar_seconds": 60,          # these tests pin the one-minute screen as built
         **overrides,
     })
     lane = BlastEngine(str(tmp_path / "blast.sqlite3"), settings, BrokerThatMustNotReceiveOrders(), EventHub())
@@ -589,7 +607,7 @@ def build_on(tmp_path: Path, events, broker, **overrides) -> BlastEngine:
     settings = Settings(**{
         "execution_mode": "paper", "symbols_csv": SPOT, "slippage_bps": 0,
         "blast_auto_trade": True, "blast_min_lookback_bars": 10, "blast_high_lookback_bars": 30,
-        "blast_min_breadth_cohort": 1, "blast_target_notional": 100_000, **overrides,
+        "blast_min_breadth_cohort": 1, "blast_target_notional": 100_000, "blast_signal_bar_seconds": 60, **overrides,
     })
     lane = BlastEngine(str(tmp_path / "blast.sqlite3"), settings, broker, events)
     lane.set_tradable_contracts({SYMBOL: 100})
@@ -817,3 +835,70 @@ class TestOperatorSurface:
         assert [row["reason"] for row in lane.journal_rows(reason=PREMIUM_TOO_RICH)] == [PREMIUM_TOO_RICH]
         assert lane.journal_days() == [lane.journal_rows()[0]["day"]]
         asyncio.run(lane.stop())
+
+
+def test_a_holding_that_left_the_days_selection_can_still_hit_its_stop(tmp_path):
+    """30 Sep 2026: a blast holding from the day before was no longer selected; its stop raised
+    'not on the watchlist' inside the tick path and stopped the Fyers stream."""
+    lane = build(tmp_path)
+    prime(lane)
+    row = cross(lane, premium=5.0)
+    assert row["reason"] == TAKEN and SYMBOL in lane.portfolio.positions
+    # Next morning: the selection no longer carries this contract.
+    lane.set_tradable_contracts({"NSE:SBIN26OCT820CE": 100})
+    assert SYMBOL in lane.execution.tradable_symbols          # kept: the lane still holds it
+    asyncio.run(lane.on_tick(SYMBOL, 2.4, datetime.now(UTC), session_open=True))   # below the -50% stop
+    assert SYMBOL not in lane.portfolio.positions
+
+
+# --- the 30-minute screen ------------------------------------------------------------
+
+from zoneinfo import ZoneInfo as _Zone
+
+_OPEN = int(datetime(2026, 9, 21, 9, 15, tzinfo=_Zone("Asia/Kolkata")).timestamp())
+
+
+def minute(ts: int, close: float) -> Candle:
+    return Candle(SYMBOL, ts, close, close, close, close, volume=100, closed=True)
+
+
+def build30(tmp_path: Path) -> BlastEngine:
+    return build(tmp_path, blast_signal_bar_seconds=1800, blast_high_lookback_bars=300, blast_min_lookback_bars=10)
+
+
+def test_thirty_minute_bars_are_judged_only_when_they_close(tmp_path):
+    lane = build(tmp_path, blast_signal_bar_seconds=1800, blast_high_lookback_bars=2000, blast_min_lookback_bars=10)
+    # Three sessions of slow decline, 10 -> 6.5 (warm-up: folded into 30-minute bars, never judged).
+    n = 0
+    for day in (-3, -2, -1):
+        for m in range(375):
+            lane.observe_warmup(minute(_OPEN + day * 86_400 + m * 60, 10.0 - 3.5 * n / 1124))
+            n += 1
+    lane.execution.set_quote(SYMBOL, 6.8)
+    for i in range(60):                                              # 09:15-10:15 keeps easing
+        ts = _OPEN + i * 60
+        assert asyncio.run(lane.on_minute_bar(minute(ts, 6.5 - 0.1 * i / 59), datetime.fromtimestamp(ts + 61, UTC))) is None
+    verdicts = []
+    for i in range(60, 91):                                          # 10:15-10:45 rebounds; the 10:45 minute closes it
+        ts = _OPEN + i * 60
+        row = asyncio.run(lane.on_minute_bar(minute(ts, 6.8), datetime.fromtimestamp(ts + 61, UTC)))
+        if row is not None:
+            verdicts.append((i, row))
+    assert [i for i, _ in verdicts] == [90], "judged only when the 30-minute bar closed, and once"
+    row = verdicts[0][1]
+    assert row["reason"] == TAKEN and row["bar_timestamp"] == _OPEN + 60 * 60
+    assert row["off_high_pct"] < -25 and SYMBOL in lane.portfolio.positions
+
+
+def test_the_last_bar_of_a_session_is_not_judged_the_next_morning(tmp_path):
+    lane = build30(tmp_path)
+    for i in range(345):                                             # 09:15 -> 15:00, falling
+        lane.observe_warmup(minute(_OPEN + i * 60, 10.0 - 5.0 * i / 344))
+    lane.execution.set_quote(SYMBOL, 5.6)
+    for i in range(360, 375):                                        # 15:15 -> 15:29 rebounds: the day's last bar
+        ts = _OPEN + i * 60
+        asyncio.run(lane.on_minute_bar(minute(ts, 5.6), datetime.fromtimestamp(ts + 61, UTC)))
+    next_open = _OPEN + 86_400
+    row = asyncio.run(lane.on_minute_bar(minute(next_open, 5.6), datetime.fromtimestamp(next_open + 61, UTC)))
+    assert row is None and SYMBOL not in lane.portfolio.positions
+    assert lane.late_bars_skipped >= 1

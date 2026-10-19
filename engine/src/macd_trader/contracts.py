@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .brokers import Broker, OptionChainEntry
-from .rollover import first_tradable, is_tradable
+from .rollover import Expiry, first_tradable, is_tradable
 from .universe import DISPLAY_BY_SPOT, INDEX_SPOTS, STOCK_SPOTS
 
 IST = ZoneInfo("Asia/Kolkata")
+
+# Index spots also stream a ladder in the NEXT listed series. Near a weekly
+# expiry the front series expires inside a 1-3 session hold, and the option
+# agent (which never holds across expiry) then had no index contract to trade:
+# SENSEX had none on most September days. These rows are analysis-only and
+# carry "NEXT-" moneyness, so no strategy, desk map, ratio ladder or
+# dispersion cohort (all of which read ITM/ATM/OTM) can pick them up.
+NEXT_SERIES_SPOTS = frozenset(INDEX_SPOTS.values())
+NEXT_PREFIX = "NEXT-"
 
 
 @dataclass(slots=True)
@@ -60,15 +70,28 @@ def contract_is_live(expiry: str | None, today=None) -> bool:
     return is_tradable(expiry, min_days=0, today=today)
 
 
-def select_liquid_contract(entries: list[OptionChainEntry], spot: float, option_type: str) -> OptionChainEntry | None:
-    """Use the original app's side-rounded ATM plus 1.5x liquidity rule."""
+def liquidity_window(
+    entries: list[OptionChainEntry], spot: float, option_type: str,
+) -> tuple[OptionChainEntry | None, list[OptionChainEntry]]:
+    """(side-rounded anchor strike, the anchor and two strikes either side of it).
+
+    These are the only strikes whose liquidity the ATM rule reads, so a
+    selector without a chain needs quotes for just these.
+    """
     side = sorted((e for e in entries if e.option_type == option_type and e.symbol), key=lambda e: e.strike)
     if not side or spot <= 0:
-        return None
+        return None, []
     anchored = [e for e in side if e.strike >= spot] if option_type == "CE" else [e for e in side if e.strike <= spot]
     anchor = (anchored[0] if option_type == "CE" else anchored[-1]) if anchored else min(side, key=lambda e: abs(e.strike - spot))
     index = side.index(anchor)
-    nearby = side[max(0, index - 2): index + 3]
+    return anchor, side[max(0, index - 2): index + 3]
+
+
+def select_liquid_contract(entries: list[OptionChainEntry], spot: float, option_type: str) -> OptionChainEntry | None:
+    """Use the original app's side-rounded ATM plus 1.5x liquidity rule."""
+    anchor, nearby = liquidity_window(entries, spot, option_type)
+    if anchor is None:
+        return None
     liquidity = lambda e: max(e.volume, e.oi / 100)
     if liquidity(anchor) <= 0:
         return max(nearby, key=liquidity)
@@ -118,6 +141,10 @@ class ContractSelector:
         self.errors: dict[str, str] = {}
         self.new_symbols: set[str] = set()
         self.rolled: dict[str, str] = {}
+        self.next_series_errors: dict[str, str] = {}
+        # Which path settled each spot on the last build, and why any fell back.
+        self.master_errors: dict[str, str] = {}
+        self.selection_source: dict = {}
 
     def retained_contracts(self, symbols: set[str]) -> list[OptionContract]:
         """Restore open contracts even when their selection day has passed."""
@@ -213,7 +240,11 @@ class ContractSelector:
             for row in selected
         }
         required_roles = {(side, role) for side in ("CE", "PE") for role in ("ITM", "ATM", "OTM")}
-        covered = {spot for spot, roles in ladder_roles.items() if required_roles.issubset(roles)}
+        next_roles = {(side, NEXT_PREFIX + "ATM") for side in ("CE", "PE")}
+        covered = {
+            spot for spot, roles in ladder_roles.items()
+            if required_roles.issubset(roles) and (spot not in NEXT_SERIES_SPOTS or next_roles.issubset(roles))
+        }
         missing_spots = [symbol for symbol in spot_symbols if symbol not in covered]
         if selected and not missing_spots:
             selected.extend(row for symbol, row in retained_by_symbol.items() if symbol not in {item.symbol for item in selected})
@@ -263,13 +294,24 @@ class ContractSelector:
                         ))
                 roles = {(row.option_type, row.moneyness) for row in rows}
                 if required_roles.issubset(roles):
+                    if spot_symbol in NEXT_SERIES_SPOTS:
+                        rows.extend(await self._next_series(spot_symbol, chain, reference, semaphore))
                     return rows
                 raise RuntimeError("option chain did not provide a complete CE/PE ITM-ATM-OTM ladder")
             except Exception as exc:
                 self.errors[spot_symbol] = str(exc)
                 return []
 
-        groups = await asyncio.gather(*(one(symbol) for symbol in missing_spots))
+        started = time.monotonic()
+        local = await self._select_from_master(missing_spots, saved)
+        chain_spots = [symbol for symbol in missing_spots if symbol not in local]
+        groups = [*local.values(), *await asyncio.gather(*(one(symbol) for symbol in chain_spots))]
+        self.selection_source = {
+            "at": datetime.now(IST).isoformat(timespec="seconds"),
+            "master": len(local), "chain": len(chain_spots),
+            "seconds": round(time.monotonic() - started, 1),
+            "fallbacks": dict(self.master_errors),
+        }
         selected.extend(row for group in groups for row in group)
         selected.extend(row for symbol, row in retained_by_symbol.items() if symbol not in {item.symbol for item in selected})
         # Persist the expensive chain selection before the separate instrument
@@ -283,6 +325,154 @@ class ContractSelector:
         }
         self._save(selected)
         return selected
+
+    async def _select_from_master(self, spot_symbols: list[str], saved: dict) -> dict[str, list[OptionContract]]:
+        """The same ladders as the chain path, from the instrument master and two quote sweeps.
+
+        The chain path spent two to four REST calls per underlying -- a chain,
+        a roll chain near expiry, a pre-open history request and a NEXT-series
+        chain for indices -- about 430 paced calls, five minutes every morning.
+        Everything it read is available more cheaply: the strikes and expiries
+        from the day's master file, the reference from one batched spot quote,
+        and liquidity only for the five strikes per side the ATM rule reads
+        (batched quotes, previous-session volume before the open, as the chain
+        reported). The rules are unchanged: side-rounded ATM, the 1.5x
+        liquidity tie-break, adjacent ITM/OTM, the expiry roll and the NEXT
+        series. Any spot this cannot settle returns to the chain path.
+        """
+        self.master_errors = {}
+        loader = getattr(self.broker, "option_master", None)
+        if loader is None or not spot_symbols:
+            return {}
+        exchanges = sorted({symbol.split(":", 1)[0] for symbol in spot_symbols if ":" in symbol})
+        try:
+            listed = await loader(exchanges)
+        except Exception as exc:  # noqa: BLE001 - the chain path is the fallback
+            self.master_errors["*"] = f"instrument master: {exc}"[:200]
+            return {}
+        if not listed:
+            return {}
+        series: dict[tuple[str, str], dict[str, list[OptionChainEntry]]] = {}
+        lots: dict[str, int] = {}
+        for row in listed:
+            key = (row.symbol.split(":", 1)[0], row.underlying)
+            series.setdefault(key, {}).setdefault(row.expiry, []).append(
+                OptionChainEntry(row.strike, row.option_type, row.symbol))
+            lots[row.symbol] = row.lot_size
+        references = {symbol: float(saved.get(symbol, {}).get("selection_price") or 0) for symbol in spot_symbols}
+        unpriced = [symbol for symbol, price in references.items() if price <= 0]
+        if unpriced:
+            try:
+                marks = await self.broker.quotes(unpriced)
+            except Exception as exc:  # noqa: BLE001
+                self.master_errors["*"] = f"spot quotes: {exc}"[:200]
+                return {}
+            for symbol in unpriced:
+                tick = marks.get(symbol)
+                if tick is not None and tick.ltp > 0:
+                    references[symbol] = float(tick.ltp)
+        plans: dict[str, tuple] = {}
+        window: dict[str, OptionChainEntry] = {}
+        for spot_symbol in spot_symbols:
+            root = DISPLAY_BY_SPOT.get(spot_symbol)
+            listed_series = series.get((spot_symbol.split(":", 1)[0], root)) if root else None
+            reference = references.get(spot_symbol, 0.0)
+            if not listed_series:
+                self.master_errors[spot_symbol] = "not in the instrument master"
+                continue
+            if reference <= 0:
+                self.master_errors[spot_symbol] = "no reference price"
+                continue
+            expiries = sorted(listed_series)
+            chosen = first_tradable([Expiry(day) for day in expiries], self.min_days_to_expiry)
+            if chosen is None:
+                self.master_errors[spot_symbol] = f"no expiry at least {self.min_days_to_expiry} day(s) out"
+                continue
+            front = chosen.date
+            later = [day for day in expiries if day > front]
+            following = later[0] if spot_symbol in NEXT_SERIES_SPOTS and later else None
+            plans[spot_symbol] = (reference, expiries[0], front, following)
+            for day in filter(None, (front, following)):
+                for side in ("CE", "PE"):
+                    window.update((entry.symbol, entry) for entry in
+                                  liquidity_window(listed_series[day], reference, side)[1])
+        if not plans:
+            return {}
+        try:
+            marks = await self.broker.quotes(sorted(window))
+        except Exception as exc:  # noqa: BLE001
+            self.master_errors["*"] = f"strike quotes: {exc}"[:200]
+            return {}
+        # A sweep that came back mostly empty would silently turn the
+        # liquidity tie-break into "lowest strike in the window"; the chain is
+        # the better answer then.
+        if len(marks) < 0.5 * len(window):
+            self.master_errors["*"] = f"strike quotes covered {len(marks)} of {len(window)} strikes"
+            return {}
+        for symbol, entry in window.items():
+            tick = marks.get(symbol)
+            if tick is not None:
+                entry.ltp = float(tick.ltp or 0)
+                entry.volume = int(tick.volume or 0)
+                entry.oi = int(tick.open_interest or 0)
+        required = {(side, role) for side in ("CE", "PE") for role in ("ITM", "ATM", "OTM")}
+        result: dict[str, list[OptionContract]] = {}
+        for spot_symbol, (reference, nearest, front, following) in plans.items():
+            listed_series = series[(spot_symbol.split(":", 1)[0], DISPLAY_BY_SPOT[spot_symbol])]
+            name = DISPLAY_BY_SPOT.get(spot_symbol, spot_symbol)
+            rows: list[OptionContract] = []
+            for day, prefix in ((front, ""), (following, NEXT_PREFIX)):
+                if day is None:
+                    continue
+                for side in ("CE", "PE"):
+                    for moneyness, pick in select_contract_ladder(listed_series[day], reference, side):
+                        rows.append(OptionContract(
+                            name, spot_symbol, side, pick.symbol, pick.strike, day, reference,
+                            pick.volume, pick.oi, lot_size=lots.get(pick.symbol, 0),
+                            moneyness=prefix + moneyness, analysis_only=bool(prefix) or moneyness != "ATM",
+                        ))
+            if not required.issubset({(row.option_type, row.moneyness) for row in rows}):
+                self.master_errors[spot_symbol] = "master did not give a complete CE/PE ITM-ATM-OTM ladder"
+                continue
+            if front != nearest:
+                self.rolled[spot_symbol] = f"{nearest} -> {front}"
+            if spot_symbol in NEXT_SERIES_SPOTS:
+                if following:
+                    self.next_series_errors.pop(spot_symbol, None)
+                else:
+                    self.next_series_errors[spot_symbol] = f"no series listed after {front}"
+            self.errors.pop(spot_symbol, None)
+            result[spot_symbol] = rows
+        return result
+
+    async def _next_series(self, spot_symbol: str, chain, reference: float, semaphore) -> list[OptionContract]:
+        """The same ITM/ATM/OTM ladder one series further out, analysis-only.
+
+        A failure here is recorded, never raised: the front ladder is what
+        the strategies need, and it must not be lost to an optional extra.
+        """
+        later = sorted((row for row in (chain.expiries or []) if row.token and str(row.date) > str(chain.expiry)),
+                       key=lambda row: str(row.date))
+        if not later:
+            self.next_series_errors[spot_symbol] = f"no series listed after {chain.expiry}"
+            return []
+        try:
+            async with semaphore:
+                nxt = await self.broker.option_chain(spot_symbol, later[0].token)
+                await asyncio.sleep(0.35)
+        except Exception as exc:  # noqa: BLE001 - optional
+            self.next_series_errors[spot_symbol] = str(exc)[:200]
+            return []
+        rows = []
+        for side in ("CE", "PE"):
+            for moneyness, pick in select_contract_ladder(nxt.entries, reference, side):
+                rows.append(OptionContract(
+                    DISPLAY_BY_SPOT.get(spot_symbol, spot_symbol), spot_symbol, side,
+                    pick.symbol, pick.strike, nxt.expiry, reference, pick.volume, pick.oi,
+                    moneyness=NEXT_PREFIX + moneyness, analysis_only=True,
+                ))
+        self.next_series_errors.pop(spot_symbol, None)
+        return rows
 
     async def _resolve_lot_sizes(self, rows: list[OptionContract]) -> None:
         resolver = getattr(self.broker, "lot_sizes", None)
@@ -309,7 +499,15 @@ class ContractSelector:
         payload = {
             "date": datetime.now(IST).date().isoformat(),
             "selected_at": datetime.now(IST).isoformat(),
-            "spots": {row.spot_symbol: {"selection_price": row.selection_price} for row in rows},
+            # Today's ladder rows set each spot's reference. A held contract
+            # carried from an earlier day keeps ITS selection price, and
+            # letting it win here (it is appended last) made a same-day
+            # restart re-centre that spot's ladder on a stale price: 26 of
+            # 1 Oct's 428 ATM legs would have moved.
+            "spots": {
+                row.spot_symbol: {"selection_price": row.selection_price}
+                for row in sorted(rows, key=lambda row: not row.retained)
+            },
             "contracts": [asdict(row) for row in rows],
         }
         self.path.write_text(json.dumps(payload, indent=2))

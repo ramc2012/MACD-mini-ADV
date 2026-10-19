@@ -185,3 +185,28 @@ class TestCondensation:
             store.condense_day("2026-08-20")
             store.vacuum()
             assert store.status()["minute_rows"] == 2
+
+
+def test_stale_stamped_ticks_on_condensed_days_are_purged_not_stranded():
+    """An idle contract streams its last trade's time; 1980 is the feed's "never traded"."""
+    import sqlite3
+    with tempfile.TemporaryDirectory() as folder:
+        store = _store(folder, retention_days=2)
+        store.add(_tick("NSE:X", 100.0, _ist(20, 9, 20), volume=100))
+        store.flush_sync()
+        assert [r["day"] for r in store.condense_pending(now=_ist(22, 16, 0))] == ["2026-08-20"]
+        # After the day was condensed, the feed re-sends stale stamps for it,
+        # plus a zero-time snapshot and a live tick from today.
+        store.add(_tick("NSE:IDLE", 5.0, _ist(20, 15, 29), volume=7))
+        store.add(_tick("NSE:NEVER", 1.0, datetime(1980, 1, 1, 5, 30, tzinfo=IST)))
+        store.add(_tick("NSE:X", 101.0, _ist(22, 9, 20), volume=200))
+        store.flush_sync()
+
+        assert store.days_pending_condensation(now=_ist(24, 16, 0)) == ["2026-08-22"]
+        store.condense_pending(now=_ist(24, 16, 0))
+
+        days = [r[0] for r in sqlite3.connect(os.path.join(folder, "ticks.sqlite3")).execute(
+            "SELECT day FROM tick_condensed_days ORDER BY day")]
+        assert days == ["2026-08-20", "2026-08-22"]
+        assert store.status()["raw_ticks"] == 0
+        assert store.last_purge["raw_ticks"] == 2

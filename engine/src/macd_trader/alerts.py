@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from .sessions import market_close
 from . import whale
 from .market_calendar import is_trading_day
 
@@ -31,7 +32,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def market_hours(now: datetime | None = None) -> bool:
     moment = (now or datetime.now(IST)).astimezone(IST)
-    return is_trading_day(moment.date()) and dtime(9, 15) <= moment.time() <= dtime(15, 30)
+    return is_trading_day(moment.date()) and dtime(9, 15) <= moment.time() <= market_close(moment.date())
 
 
 class AlertManager:

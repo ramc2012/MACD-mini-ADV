@@ -179,6 +179,11 @@ def test_desk_process_configures_itself_exactly_like_the_single_process(tmp_path
         assert desk.mp.universe == single.mp.universe
         assert desk.mp.directional_scope == single.mp.directional_scope
         assert desk.analysis_option_symbols == single.analysis_option_symbols
+        # The index-only shadow desk reads the index future and trades only index contracts.
+        assert desk.mp_index.directional_scope == ["NSE:NIFTY26OCTFUT"]
+        assert desk.mp_index.universe and all(s.startswith("NSE:NIFTY") for s in desk.mp_index.universe)
+        assert not any("RELIANCE" in s for s in desk.mp_index.universe)
+        assert desk.mp_index.events is None and desk.mp_index_shadow_view()["scope"] == ["NSE:NIFTY26OCTFUT"]
     finally:
         single.repository.close()
         strategy.repository.close()

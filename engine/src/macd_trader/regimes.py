@@ -38,6 +38,11 @@ class Regime:
     nifty_weekly_expiry: str | None
     session_end: str
     notes: str = ""
+    # Cash equities: continuous trading ends here; a closing call auction may
+    # follow until ``closing_auction_end``. Its match is one uncrossing print
+    # with no aggressor, so it is not order flow.
+    cash_continuous_end: str = "15:30"
+    closing_auction_end: str | None = None
 
     @property
     def start_date(self) -> date:
@@ -141,6 +146,7 @@ REGIMES: tuple[Regime, ...] = (
         nifty_weekly_expiry="tuesday", session_end="15:40",
         notes="Closing Auction Session 15:15-15:35. The last bracket changes length, "
               "so closing-spike and bracket-M statistics do not cross this date.",
+        cash_continuous_end="15:15", closing_auction_end="15:35",
     ),
 )
 

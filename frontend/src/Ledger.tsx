@@ -2,6 +2,9 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ClosedBook, ClosedPosition, Excursion, Order, Portfolio, Position, Signal, Trade } from "./types";
 import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPositions, observedExcursion, visibleClosedRows, type RoundTrip } from "./ledgerMath";
 
+import { bookFillCounts } from "./ledgerMath";
+import { LedgerCounts } from "./LedgerCounts";
+
 const number = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
 const currency = (value: number) => `₹${number.format(value)}`;
 const clock = (value: string) => new Date(value).toLocaleTimeString("en-IN", {
@@ -42,8 +45,9 @@ const initialSorts: Record<LedgerTab, SortState> = {
   SIGNALS: { key: "time", direction: "desc" },
 };
 
-export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays }: {
+export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true }: {
   tab: LedgerTab;
+  ledgerReady?: boolean;
   /** Exchange holidays (YYYY-MM-DD) so the closed book rolls on trading days, not weekdays. */
   holidays?: string[];
   orders: Order[];
@@ -77,6 +81,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
   // weekend exactly as long as the backend keeps it in the frame.
   const closedToday = useMemo(() => visibleClosedRows(portfolio.closed_positions ?? [], now, holidaySet), [portfolio.closed_positions, now, holidaySet]);
   const closedPositionCount = useMemo(() => distinctPositions(closedToday), [closedToday]);
+  const bookFills = useMemo(() => bookFillCounts(trades, now, holidaySet), [trades, now, holidaySet]);
   const bookSince = bookStartLabel(closedBookStart(now, holidaySet), now);
 
   const orderColumns: Column<Order>[] = [
@@ -180,10 +185,11 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
   // Open rows carry opened_at/average_price; closed slices carry the backend's entry_time/entry_price.
   const toFocus = (row: { symbol: string; opened_at?: string; average_price?: number; entry_time?: string; entry_price?: number }): FocusRow =>
     ({ symbol: row.symbol, entryTime: row.entry_time ?? row.opened_at ?? "", entryPrice: row.entry_price ?? row.average_price ?? 0 });
-  const positionTabs = <div className="watch-tabs book-tabs position-tabs">{bookTabsAvailable.map((row) => <button key={row.key} className={`${activeBook === row.key ? "active" : ""}${row.key === "CLOSED" ? " closed" : ""}`} onClick={() => setPositionBook(row.key)}>{row.label}<span>{row.count}</span></button>)}</div>;
+  const positionTabs = <div className="watch-tabs book-tabs position-tabs">{bookTabsAvailable.map((row) => <button key={row.key} className={`${activeBook === row.key ? "active" : ""}${row.key === "CLOSED" ? " closed" : ""}`} onClick={() => setPositionBook(row.key)} title={row.key === "CLOSED" ? `Since ${bookSince}: buy/sell counts are filled trades; partial exits count separately from closed positions.` : undefined}>{row.label}<span>{row.count}</span>{row.key === "CLOSED" && <><span className="book-side-count buy">Buy {ledgerReady ? bookFills.buys : "…"}</span><span className="book-side-count sell">Sell {ledgerReady ? bookFills.sells : "…"}</span></>}</button>)}</div>;
 
   return <section className="ledger-page">
     <div className="page-heading"><div><h1>{tab === "STATISTICS" ? "Trade statistics" : titleCase(tab)}</h1><p>{pageDescription(tab)}</p></div><span>{tabCount(tab, orders, trades, portfolio, signals, rounds)} records</span></div>
+    {(tab === "ORDERS" || tab === "TRADES") && <LedgerCounts orders={orders} trades={trades} ready={ledgerReady} />}
     <div className="full-ledger panel">
       {tab === "ORDERS" && <SortableTable rows={orders} columns={orderColumns} sort={sort} onSort={updateSort} empty="No paper orders recorded yet" />}
       {tab === "TRADES" && <SortableTable rows={trades} columns={tradeColumns} sort={sort} onSort={updateSort} empty="No paper fills recorded yet" />}

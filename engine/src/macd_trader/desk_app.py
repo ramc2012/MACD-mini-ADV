@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import httpx
 from fastapi import Depends, FastAPI
 
+from .sessions import market_close
 from . import desk_routes, market_calendar, whale
 from .brokers import OptionChain, OptionChainEntry
 from .bus import TickBusSubscriber
@@ -32,6 +33,7 @@ from .contracts import contract_from_row
 from .desk import IST, DeskMixin, desk_settings
 from .events import EventHub, dumps, json_value
 from .models import Tick
+from pathlib import Path
 from .mp_engine import MPEngine
 from .rollover import Expiry
 from .settings_store import RuntimeSettingsStore
@@ -82,6 +84,14 @@ class StrategyClient:
             fp=raw.get("fp", 0.0), vix=raw.get("vix"),
         )
 
+    async def backfill_minutes(self, symbol: str, since: str) -> dict:
+        """Ask the strategy process to download and store 1-minute history."""
+        response = await self._client.post("/api/internal/backfill-minutes",
+                                           json={"symbol": symbol, "since": since}, timeout=60.0)
+        if response.status_code >= 400:
+            raise RuntimeError(response.json().get("detail", response.text)[:500])
+        return response.json()
+
     async def quotes(self, symbols: list[str]) -> dict[str, Tick]:
         raw = await self._broker("POST", "/api/internal/quotes", json={"symbols": symbols})
         return {symbol: Tick(**{**row, "timestamp": datetime.fromisoformat(row["timestamp"])})
@@ -103,6 +113,16 @@ class DeskEngine(DeskMixin):
             history_database_path=settings.research_database_path,
         )
         self.mp.vix_symbol = settings.vix_symbol
+        # Shadow book: the same desk, trading only index signals (read on the index futures). 15 Oct 2026:
+        # over 7 sessions index signals made +5.6% / +3.0% per signal before / after the 12 Oct tuning while stock
+        # signals lost (research/auction_orderflow_20261015). Own database, no UI events, same rules and caps.
+        self.mp_index = MPEngine(
+            str(Path(settings.mp_database_path).with_name("mp_index_shadow.sqlite3")),
+            settings=desk_settings(settings, enabled=settings.mp_enabled),
+            events=None,
+            history_database_path=settings.research_database_path,
+        )
+        self.mp_index.vix_symbol = settings.vix_symbol
         self.tick_store = TickStore(settings.tick_database_path, settings.tick_retention_days,
                                     settings.flow_retention_days)
         self.whale_live = whale.LiveFlow()
@@ -191,7 +211,7 @@ class DeskEngine(DeskMixin):
         self.active = active
         if active:
             loops = [self._holdings_loop(), self._expiry_flatten_loop(), self._session_close_loop(),
-                     self._nightly_loop(), self._chain_loop()]
+                     self._nightly_loop(), self._chain_loop(), self._agent_loop()]
             if self.settings.tick_capture_enabled:
                 loops.append(self._tick_maintenance_loop())
             self._lane_tasks = [asyncio.create_task(loop) for loop in loops]
@@ -243,10 +263,11 @@ class DeskEngine(DeskMixin):
             today = now.date().isoformat()
             if not market_calendar.is_trading_day(now.date()) or self._flushed_session == today:
                 continue
-            if (now.hour, now.minute) < (15, 30):
+            if now.time() < market_close(now.date()):   # F&O trades to 15:40
                 continue
             self._flushed_session = today
             await self.mp.close_positions()
+            await self.mp_index.close_positions()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -264,7 +285,10 @@ class DeskEngine(DeskMixin):
         await self.bus.stop()
         await self.tick_store.stop()
         await self.mp.stop()
+        await self.mp_index.stop()
         await self.strategy.close()
+        from .self_heal import mark_clean_shutdown
+        mark_clean_shutdown(self.settings.database_path, self.settings.engine_role)
 
     def status(self, *, drain_alerts: bool = False) -> dict:
         alerts = list(self.whale_alert_queue) if drain_alerts else []
@@ -275,6 +299,7 @@ class DeskEngine(DeskMixin):
             "active": self.active,
             "uptime_seconds": round((datetime.now(UTC) - self.started_at).total_seconds()),
             "mp": self.mp.health(),
+            "mp_index_shadow": self.mp_index_shadow_view(),
             "chain": self.chain_status,
             "nightly": self.nightly_report,
             "tick_store": self.tick_store.status(include_database_counts=False)
@@ -310,8 +335,18 @@ desk_routes.bind(engine, persist_mp_settings_remotely)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await engine.start()
+    _start_loop_watchdog()
     yield
     await engine.stop()
+
+
+def _start_loop_watchdog() -> None:
+    """Exit on a wedged event loop so Docker restarts the desk (self_heal.LoopWatchdog). Container-only."""
+    import os
+    if os.environ.get("MACD_LOOP_WATCHDOG") == "1":
+        from .self_heal import LoopWatchdog
+        engine.loop_watchdog = LoopWatchdog("desk", marker_dir=os.path.dirname(os.path.abspath(engine.settings.database_path)))
+        engine.loop_watchdog.start()
 
 
 app = FastAPI(title="MACD Trader desk", version="0.1.0", lifespan=lifespan)

@@ -1,6 +1,7 @@
 import { AreaSeries, ColorType, createChart, LineSeries, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { OrderFlowWorkspace, SessionBadges } from "./OrderFlowWorkspace";
+import { ProfileSeriesChart } from "./ProfileSeries";
 import { MarketProfileLadder, type LadderProfile } from "./MarketProfileLadder";
 import type { SessionInfo } from "./types";
 import { API_TOKEN, API_URL } from "./runtime";
@@ -198,15 +199,20 @@ export function MarketProfilePage() {
     && fullProfile.profile.day === snap?.profile?.day
     && Date.now() - fullProfile.receivedAt < 15_000 ? fullProfile.profile : undefined;
 
+  const pageDetail = `TPO auction structure and quote-rule order flow from the Fyers tick feed · independent paper book${snap
+    ? ` · ${snap.prints_seen.toLocaleString("en-IN")} prints · ${snap.tracked_symbols.length} of ${snap.subscribed_count ?? snap.tracked_symbols.length} contracts traded today · ${snap.trades_today} desk trades` : ""}`;
+  const fewTraded = snap && snap.tracked_symbols.length < (snap.subscribed_count ?? 0) / 2;
+  // One header row: title, the desk's tabs, status and symbol. The old stack
+  // (title, description, hint, a tab bar) took ~110px from the chart.
   return <section className="ledger-page mp-page">
-    <div className="page-heading">
-      <div><h1>Market Profile &amp; Order Flow</h1>
-        <p>TPO auction structure and quote-rule order flow from the Fyers tick feed · independent paper book
-          {snap ? ` · ${snap.prints_seen.toLocaleString("en-IN")} prints · ${snap.tracked_symbols.length} of ${snap.subscribed_count ?? snap.tracked_symbols.length} contracts traded today · ${snap.trades_today} desk trades` : ""}</p>
-        {snap && snap.tracked_symbols.length < (snap.subscribed_count ?? 0) / 2 && <p className="mp-hint">
-          Only instruments that have traded today build a profile — the rest are subscribed and waiting.
-          Before 09:15 that is normally just the indices.</p>}</div>
-      <div className="rrg-controls">
+    <div className="mp-head">
+      <h1 title={pageDetail}>Profile &amp; Flow</h1>
+      <nav className="main-tabs mp-main-tabs">
+        {TABS.map(k =>
+          <button key={k} className={tab === k ? "active" : ""} onClick={() => pickTab(k)}>
+            {k === "FLOW" ? "Order flow" : k === "STATS" ? "Statistics" : k.charAt(0) + k.slice(1).toLowerCase()}{counts[k] !== "" && <span>{counts[k]}</span>}</button>)}
+      </nav>
+      <div className="rrg-controls" title={fewTraded ? "Only instruments that have traded today build a profile — the rest are subscribed and waiting. Before 09:15 that is normally just the indices." : undefined}>
         <span className={snap?.health?.ready_for_auto_paper ? "feed-badge" : "mode"} title={snap?.health?.blockers.join(" · ")}>
           {snap?.settings.auto_trade ? "AUTO PAPER" : "PAPER OBSERVE"} · {snap?.health?.session_open ? (snap?.health?.ready_for_auto_paper ? "READY" : "DEGRADED") : "SESSION CLOSED"} · {snap?.settings.allow_overnight_carry ? "SELECTIVE CARRY" : "INTRADAY"}
         </span>
@@ -221,13 +227,6 @@ export function MarketProfilePage() {
         </select>
       </div>
     </div>
-    {/* `main-tabs` (not the small `watch-tabs`) so the desk's tabs render at the
-        same weight as the MACD lane's — this lane is a peer, not a sub-view. */}
-    <nav className="main-tabs mp-main-tabs">
-      {TABS.map(k =>
-        <button key={k} className={tab === k ? "active" : ""} onClick={() => pickTab(k)}>
-          {k === "FLOW" ? "Order flow" : k === "STATS" ? "Trade statistics" : k.charAt(0) + k.slice(1).toLowerCase()}{counts[k] !== "" && <span>{counts[k]}</span>}</button>)}
-    </nav>
     {error && <div className="settings-error">{error}</div>}
     {snap && !snap.enabled && <div className="settings-error">The Market-Profile desk is disabled (MACD_MP_ENABLED=false).</div>}
     {snap?.health?.session_open && snap.health.blockers.length > 0 && <div className="settings-error">
@@ -260,18 +259,35 @@ function AuctionView({ snap, fullProfile, fullProfileUnavailable }: { snap?: Sna
   const flow = snap?.flow;
   const partialCapture = profile?.partial_capture === true || (profile?.first_bracket ?? 0) > 0;
   const maxFoot = useMemo(() => Math.max(1, ...(flow?.footprint || []).map(f => f.buy + f.sell)), [flow]);
+  // Continuous (month, weeks, recent sessions, today) or today's full TPO ladder.
+  const [view, setView] = useState<"SERIES" | "LADDER">(() => {
+    try { return window.localStorage.getItem("macd.mp.profileView") === "LADDER" ? "LADDER" : "SERIES"; } catch { return "SERIES"; }
+  });
+  const pickView = (next: "SERIES" | "LADDER") => {
+    setView(next);
+    try { window.localStorage.setItem("macd.mp.profileView", next); } catch { /* convenience only */ }
+  };
+  const symbol = profile?.symbol || snap?.focus || "";
 
   return <div className="mp-layout">
     <div className="panel mp-profile-panel">
-      <div className="panel-title"><span>{profile ? short(profile.symbol) : "Waiting for prints"}</span>
-        <span>{profile ? `${profile.brackets} observed ${profile.brackets === 1 ? "bracket" : "brackets"} · ${profile.day}` : ""}</span></div>
-      {!profile ? <div className="chart-empty">No profile yet — profiles build from live ticks during market hours.</div>
+      {/* One header line (symbol, brackets, view switch) and one context strip
+          -- badges and the six stats -- where there were four stacked rows. */}
+      <div className="panel-title mp-profile-head"><span>{symbol ? short(symbol) : "Waiting for prints"}
+        {profile && <small> · {profile.brackets} {profile.brackets === 1 ? "bracket" : "brackets"} · {profile.day}</small>}</span>
+        <span className="radar-filter mp-view-switch">
+          <button className={view === "SERIES" ? "active" : ""} aria-pressed={view === "SERIES"} onClick={() => pickView("SERIES")}
+            title="Previous month, earlier weeks, this week, the last five sessions and today on one price grid">Continuous</button>
+          <button className={view === "LADDER" ? "active" : ""} aria-pressed={view === "LADDER"} onClick={() => pickView("LADDER")}
+            title="Today's complete TPO ladder with letters and volume">Today ladder</button>
+        </span></div>
+      {!profile && !symbol ? <div className="chart-empty">No profile yet — profiles build from live ticks during market hours.</div>
         : <div className="mp-profile-body">
           {/* The same strip the FLOW tab carries, from the same builder: a
               reader moving between the two tabs must not have to re-establish
               what kind of day it is. */}
           {snap?.session && <div className="mp-session-badges"><SessionBadges session={snap.session} /></div>}
-          <div className="mp-stats">
+          {profile && <div className="mp-stats inline">
             <Stat label="Open type" value={words(profile.open_type)}
               hint={profile.open_observed === false ? "The 09:15-09:30 window was not observed this session" : undefined} />
             <Stat label="Day type" value={words(profile.day_type) + (profile.ib_complete === false && !partialCapture ? " *" : "")}
@@ -281,11 +297,14 @@ function AuctionView({ snap, fullProfile, fullProfileUnavailable }: { snap?: Sna
             <Stat label={partialCapture ? "Captured POC" : "TPO POC"} value={profile.poc != null ? `₹${money.format(profile.poc)}` : "—"} />
             <Stat label={partialCapture ? "Captured VA" : "Value area"} value={profile.vah != null && profile.val != null ? `₹${money.format(profile.val)} – ₹${money.format(profile.vah)}` : "—"} />
             <Stat label="Initial balance" value={profile.ib_high != null && profile.ib_low != null ? `₹${money.format(profile.ib_low)} – ₹${money.format(profile.ib_high)}` : "—"} />
-          </div>
-          {fullProfileUnavailable && <div className="mp-ladder-warning">
-            Full ladder update unavailable; showing {profile.levels_sampled ? "a sampled" : "the current"} desk snapshot.
           </div>}
-          <MarketProfileLadder profile={profile} />
+          {view === "SERIES" ? <ProfileSeriesChart symbol={symbol} />
+            : profile ? <>
+              {fullProfileUnavailable && <div className="mp-ladder-warning">
+                Full ladder update unavailable; showing {profile.levels_sampled ? "a sampled" : "the current"} desk snapshot.
+              </div>}
+              <MarketProfileLadder profile={profile} />
+            </> : <div className="chart-empty">No prints for this contract today yet.</div>}
         </div>}
     </div>
 

@@ -1,5 +1,5 @@
 """Regression tests for the six session-integrity fixes."""
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from macd_trader.candles import IST, CandleAggregator, session_bucket
 from macd_trader.chart_history import aggregate_session_candles
@@ -8,7 +8,7 @@ from macd_trader.repository import TradeRepository
 
 
 def _tick(symbol, ltp, hh, mm, ss=0, volume=100, day=None):
-    base = day or datetime.now(IST).date()
+    base = day or date(2026, 9, 28)  # A known session; independent of the test runner's day.
     moment = datetime(base.year, base.month, base.day, hh, mm, ss, tzinfo=IST)
     return Tick(symbol, ltp, volume, timestamp=moment.astimezone(timezone.utc))
 
@@ -18,7 +18,7 @@ def test_live_buckets_match_the_stored_history_buckets():
     bucketed on epoch % timeframe (09:00/09:30) while history anchored to the
     09:15 open (09:15/09:45)."""
     aggregator = CandleAggregator(1800)
-    day = datetime.now(IST).date()
+    day = date(2026, 9, 28)
     live_buckets = []
     for hh, mm in [(9, 20), (9, 50), (10, 20)]:
         current, _ = aggregator.on_tick(_tick("X", 10.0, hh, mm))

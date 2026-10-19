@@ -86,7 +86,11 @@ def test_expiry_exit_retries_each_failed_book_on_the_next_sweep():
     assert len(published) == 2
 
 
-def test_regular_session_ends_at_1530_not_at_the_end_of_that_minute():
+def test_the_market_closes_with_its_last_segment_not_at_the_end_of_that_minute():
+    # Regime 2026-08: F&O trades to 15:40, so the market-wide gate runs to it.
     assert regular_session_open(datetime(2026, 9, 28, 9, 15, tzinfo=IST))
-    assert regular_session_open(datetime(2026, 9, 28, 15, 29, 59, tzinfo=IST))
-    assert not regular_session_open(datetime(2026, 9, 28, 15, 30, tzinfo=IST))
+    assert regular_session_open(datetime(2026, 9, 28, 15, 39, 59, tzinfo=IST))
+    assert not regular_session_open(datetime(2026, 9, 28, 15, 40, tzinfo=IST))
+    # Before it, one 15:30 close for everything.
+    assert regular_session_open(datetime(2026, 7, 28, 15, 29, 59, tzinfo=IST))
+    assert not regular_session_open(datetime(2026, 7, 28, 15, 30, tzinfo=IST))

@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from "react";
+import { profileRowStep, rowContains, rowOverlaps } from "./profileLadderMath";
 
 /* ------------------------------------------------------------------ *
  * Session volume / market profile drawn against the price axis, the
@@ -19,6 +20,7 @@ export type VolumeProfileSession = {
   last: number | null;
   levels: VolumeProfileLevel[];
   tick_size?: number | null;
+  row_size?: number | null;
   levels_total?: number;
   levels_sampled?: boolean;
   first_bracket?: number | null;
@@ -274,7 +276,12 @@ export function VolumeProfilePane({
     if (!profile || profile.levels.length === 0 || width < 60) return null;
 
     const src = profile.levels.slice().sort((a, b) => b.price - a.price);
-    const prices = src.map((l) => l.price);
+    // An aggregated row's price is its lower edge; it is drawn at its centre so
+    // tick-precise lines (POC, VAH, IB) fall inside the row that holds them.
+    const baseTick = profile.tick_size && profile.tick_size > 0 ? profile.tick_size : 0;
+    const rowStep = profileRowStep(profile);
+    const centreOffset = rowStep && rowStep > baseTick ? (rowStep - baseTick) / 2 : 0;
+    const prices = src.map((l) => l.price + centreOffset);
 
     // A compact API payload may skip exchange ticks. Use the published tick
     // for price precision and value-area matching; observed row spacing is
@@ -285,8 +292,9 @@ export function VolumeProfilePane({
       if (d > 0) gaps.push(d);
     }
     gaps.sort((a, b) => a - b);
-    const tick = profile.tick_size && profile.tick_size > 0
-      ? profile.tick_size : gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0.05;
+    // The ATR row the server aggregated to (the auction ladder's row); the
+    // tick, then observed spacing, for older payloads.
+    const tick = profileRowStep(profile) ?? (gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0.05);
     const dp = tick >= 5 ? 0 : tick >= 0.5 ? 1 : 2;
 
     const svgH = Math.max(72, height - HEADER_H);
@@ -347,7 +355,6 @@ export function VolumeProfilePane({
     const vah = profile.vah;
     const val = profile.val;
     const poc = profile.poc;
-    const eps = tick / 2;
     const hasVa = vah !== null && val !== null && Number.isFinite(vah) && Number.isFinite(val);
 
     const rows: PlotRow[] = picked.map((i) => {
@@ -358,11 +365,11 @@ export function VolumeProfilePane({
         frac: valueOf(l) / maxValue,
         volume: Number.isFinite(l.volume) ? l.volume : 0,
         tpo: Number.isFinite(l.tpo) ? l.tpo : 0,
-        y: yFor(l.price),
-        inVa: hasVa ? l.price <= (vah as number) + eps && l.price >= (val as number) - eps : false,
+        y: yFor(l.price + centreOffset),
+        inVa: hasVa ? rowOverlaps(l.price, tick, val as number, vah as number) : false,
         // A sampled source can omit the POC row. Never put a POC badge on the
         // nearest different price simply because the sampling gap is wide.
-        isPoc: poc !== null && Number.isFinite(poc) ? Math.abs(l.price - poc) < 1e-6 : false,
+        isPoc: rowContains(l.price, tick, poc),
       };
     });
 
@@ -821,7 +828,7 @@ function ProfileHeader({ profile, dp, visibleRows }: { profile: VolumeProfileSes
   const totalRows = profile?.levels_total ?? sourceRows;
   const sourceSampled = profile?.levels_sampled === true || totalRows > sourceRows;
   const partialCapture = profile?.partial_capture === true || (profile?.first_bracket ?? 0) > 0;
-  const detail = `Overview: ${visibleRows}/${sourceRows} source price rows visible; ${sourceSampled ? `${sourceRows}/${totalRows} source rows sampled` : "full captured source"}${partialCapture ? "; partial session capture" : ""}. Open Auction for the scrollable tick ladder.`;
+  const detail = `Overview: ${visibleRows}/${sourceRows} source price rows visible; ${sourceSampled ? `${sourceRows}/${totalRows} source rows sampled` : "full captured source"}${partialCapture ? "; partial session capture" : ""}. Open Auction for the scrollable ladder on the same rows.`;
   return (
     <div
       style={{
@@ -865,7 +872,7 @@ function ProfileHeader({ profile, dp, visibleRows }: { profile: VolumeProfileSes
       </div>
       <div title={detail} style={{ color: sourceSampled || partialCapture ? AMBER : DIM, fontSize: 9,
         lineHeight: "12px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-        {`OVERVIEW · ${visibleRows}/${sourceRows} drawn · ${sourceSampled ? `source sampled ${sourceRows}/${totalRows}` : "full captured source"}${partialCapture ? " · partial session" : ""} · Auction has tick ladder`}
+        {`OVERVIEW · ${visibleRows}/${sourceRows} drawn · ${sourceSampled ? `source sampled ${sourceRows}/${totalRows}` : "full captured source"}${partialCapture ? " · partial session" : ""}${profile?.row_size ? ` · rows ₹${profile.row_size}` : ""} · Auction has full ladder`}
       </div>
     </div>
   );

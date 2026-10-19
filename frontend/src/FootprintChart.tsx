@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CompositeProfile, MarketContext, ReplayMeta, SessionInfo } from "./types";
 import { footprintColumns, priceRangesOverlap, priceViewport } from "./footprintViewport";
 
@@ -165,6 +165,7 @@ export type FootprintProfile = {
   levels_total?: number; levels_returned?: number; levels_sampled?: boolean;
   single_prints_total?: number; single_prints_sampled?: boolean;
   tick_size?: number | null;
+  row_size?: number | null;        // ATR-scaled profile row (server); tick when absent
   /* ladder extras — optional so an older API renders the plain profile */
   vpoc?: number | null;           // volume point of control, apart from the TPO one
   single_prints?: number[];
@@ -450,6 +451,10 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     { mode: "price"; y: number; center: number; rowHeight: number; rowSize: number } | null
   >(null);
   const frameRef = useRef(0);
+  // The time window mirrored into React so the scrollbar under the canvas can
+  // show and move it; the canvas itself still draws from viewRef.
+  const [nav, setNav] = useState({ start: 0, count: 0, len: 0 });
+  const panAccumRef = useRef(0);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -527,6 +532,8 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     const count = clamp(view.count || Math.min(all.length, DEFAULT_BARS), Math.min(MIN_BARS, all.length), all.length);
     const start = clamp(view.start, 0, Math.max(0, all.length - count));
     viewRef.current = { start, count };
+    setNav((old) => old.start === start && old.count === count && old.len === all.length
+      ? old : { start, count, len: all.length });
     const bars = all.slice(start, start + count);
     // A newly traded contract may have only one bar. The latest cluster stays
     // beside the price scale, at the same readable width it has with history.
@@ -1818,12 +1825,29 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
       const rect = canvas.getBoundingClientRect();
       const priceDraw = priceDrawRef.current;
       if (event.shiftKey) {
-        const rows = Math.max(1, Math.min(20, Math.round(Math.abs(event.deltaY) / 45)));
+        // macOS turns Shift+wheel into a horizontal delta; read whichever moved.
+        const delta = event.deltaY || event.deltaX;
+        const rows = Math.max(1, Math.min(20, Math.round(Math.abs(delta) / 45)));
         priceViewRef.current = {
-          ...priceViewRef.current, center: priceDraw.center - Math.sign(event.deltaY) * rows * priceDraw.rowSize,
+          ...priceViewRef.current, center: priceDraw.center - Math.sign(delta) * rows * priceDraw.rowSize,
           follow: false,
         };
         schedule();
+        return;
+      }
+      // A sideways trackpad swipe (or a horizontal wheel) scrolls through the
+      // bars. It used to reach the zoom branch with deltaY = 0, which zoomed IN
+      // -- a swipe left the chart showing a few bars and no way across.
+      if (!event.ctrlKey && Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
+        const colW = footprintColumns(plotWidth(), viewRef.current.count).width;
+        panAccumRef.current += event.deltaX;
+        const shift = Math.trunc(panAccumRef.current / Math.max(8, colW * 0.5));
+        if (shift !== 0) {
+          panAccumRef.current = 0;
+          const view = viewRef.current;
+          viewRef.current = { ...view, start: clamp(view.start + shift, 0, Math.max(0, len - view.count)) };
+          schedule();
+        }
         return;
       }
       if (event.altKey || event.clientX - rect.left >= plotWidth()) {
@@ -1966,12 +1990,20 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     if (frameRef.current) window.cancelAnimationFrame(frameRef.current);
   }, []);
 
+  const moveTo = (start: number, count = viewRef.current.count) => {
+    const len = dataRef.current?.bars?.length ?? 0;
+    const size = clamp(count, Math.min(MIN_BARS, len), Math.max(1, len));
+    viewRef.current = { start: clamp(start, 0, Math.max(0, len - size)), count: size };
+    schedule();
+  };
+  const last = Math.max(0, nav.len - nav.count);
   return (
+    <div className="footprint-frame" style={{ display: "flex", flexDirection: "column", width: "100%", height, minHeight: 180 }}>
     <div
       ref={wrapRef}
       className="footprint-wrap"
       style={{
-        position: "relative", width: "100%", height, minHeight: 160,
+        position: "relative", width: "100%", flex: 1, minHeight: 150,
         background: C.chart, border: `1px solid ${C.border}`, borderRadius: 4,
         overflow: "hidden", fontVariantNumeric: "tabular-nums",
       }}
@@ -1979,10 +2011,27 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
       <canvas
         ref={canvasRef}
         tabIndex={0}
-        title="Estimated bid and ask. Wheel: time zoom; price axis or Alt+wheel: price zoom; Shift+wheel: price pan. Keyboard: arrows pan, +/− zoom time, Home follows last price."
+        title="Estimated bid and ask. Swipe sideways or drag: scroll bars; wheel or pinch: time zoom; price axis or Alt+wheel: price zoom; Shift+wheel: price pan. Keyboard: arrows pan, +/− zoom time, Home follows last price."
         aria-label="Footprint chart with estimated bid and ask volume. Focus this chart and use arrow keys to pan, plus or minus to zoom time, and Home to follow last price."
         style={{ display: "block", width: "100%", height: "100%", cursor: "crosshair", touchAction: "none" }}
       />
+    </div>
+    {nav.len > 0 && <div className="footprint-nav" aria-label="Footprint time navigation">
+      <button type="button" title="Oldest bars" disabled={nav.start <= 0} onClick={() => moveTo(0)}>⏮</button>
+      <button type="button" title="Back one screen" disabled={nav.start <= 0}
+        onClick={() => moveTo(nav.start - Math.max(1, nav.count - 1))}>◀</button>
+      <input type="range" min={0} max={last} step={1} value={Math.min(nav.start, last)} disabled={last === 0}
+        aria-label="Scroll through the session's bars"
+        onChange={(event) => moveTo(Number(event.target.value))} />
+      <button type="button" title="Forward one screen" disabled={nav.start >= last}
+        onClick={() => moveTo(nav.start + Math.max(1, nav.count - 1))}>▶</button>
+      <button type="button" title="Latest bars" disabled={nav.start >= last} onClick={() => moveTo(last)}>⏭</button>
+      <button type="button" title="Fewer bars (zoom in)" disabled={nav.count <= Math.min(MIN_BARS, nav.len)}
+        onClick={() => moveTo(nav.start + 1, nav.count - 2)}>＋</button>
+      <button type="button" title="More bars (zoom out)" disabled={nav.count >= nav.len}
+        onClick={() => moveTo(nav.start - 1, nav.count + 2)}>－</button>
+      <span>bars {nav.start + 1}–{Math.min(nav.len, nav.start + nav.count)} of {nav.len}</span>
+    </div>}
     </div>
   );
 }

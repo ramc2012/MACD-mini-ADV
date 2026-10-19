@@ -314,6 +314,39 @@ func TestUpstreamGapResynchronisesEveryBrowser(t *testing.T) {
 	}
 }
 
+func TestSnapshotRequiredRefreshesTheCutInsteadOfLooping(t *testing.T) {
+	engine := newFakeEngine(t)
+	hub, server := startFanout(t, engine, "", nil)
+	engine.emit("order", `{"order_id":"before"}`, 0)
+	engine.emit("snapshot_required", `{"reason":"startup_complete"}`, 0)
+	waitFor(t, func() bool {
+		hub.mu.Lock()
+		defer hub.mu.Unlock()
+		return hub.snap != nil && hub.snap.seq == 2
+	})
+	if hub.upstreamGaps.Load() != 0 {
+		t.Fatalf("a requested cut is not a gap")
+	}
+	engine.emit("order", `{"order_id":"after"}`, 0)
+
+	// A browser that attaches later, or asks to resync, gets the fresh cut and
+	// never sees the marker: replaying it is what made every browser loop.
+	browser := dialBrowser(t, server, "/ws/stream", nil)
+	var last int64
+	for round := 0; round < 3; round++ {
+		frames := readUntil(t, browser, &last, "order")
+		if frames[0].Type != "snapshot" || string(frames[0].Data) != `{"cut":2}` {
+			t.Fatalf("expected the refreshed cut, got %s %s", frames[0].Type, frames[0].Data)
+		}
+		for _, frame := range frames {
+			if frame.Type == "snapshot_required" {
+				t.Fatalf("snapshot_required was replayed to the browser")
+			}
+		}
+		_ = browser.Write(context.Background(), websocket.MessageText, []byte(`{"command":"snapshot"}`))
+	}
+}
+
 func TestBrowserResyncCommandAndPingAreAnswered(t *testing.T) {
 	engine := newFakeEngine(t)
 	_, server := startFanout(t, engine, "", nil)

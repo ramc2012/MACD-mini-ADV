@@ -225,7 +225,7 @@ def test_ib_range_extension_fires_once_on_the_break_not_continuously():
         engine = _mp_engine(folder)
         symbol = "NSE:SBIN26AUG800CE"
         profile = Profile(symbol, datetime.now(IST).date().isoformat(), tick_size=0.05)
-        for minute, price in [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5)]:
+        for minute, price in [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5), (616, 100.5)]:
             profile.add(price, 500, minute)
         engine.profiles.profiles[symbol] = profile
         engine.tapes.on_price(symbol, profile.day, profile.last_price or 100.0, 0, 610)
@@ -254,7 +254,7 @@ def test_read_paths_do_not_consume_edge_triggers():
         engine = _mp_engine(folder)
         symbol = "NSE:SBIN26AUG800CE"
         profile = Profile(symbol, datetime.now(IST).date().isoformat(), tick_size=0.05)
-        for minute, price in [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5)]:
+        for minute, price in [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5), (616, 100.5)]:
             profile.add(price, 500, minute)
         engine.profiles.profiles[symbol] = profile
         engine.tapes.on_price(symbol, profile.day, profile.last_price or 100.0, 0, 610)

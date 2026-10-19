@@ -12,6 +12,8 @@ services:
     image: macd-mini-parallel-engine
     environment:
       MACD_ENGINE_ROLE: ${MACD_ENGINE_ROLE:-strategy}
+      # Self-healing: exit on a wedged event loop so the restart policy brings the process back.
+      MACD_LOOP_WATCHDOG: "1"
       MACD_NATS_URL: nats://nats:4222
       MACD_DESK_URL: http://desk:8100
       <<: &engine-databases
@@ -57,6 +59,7 @@ services:
     image: macd-mini-parallel-engine
     environment:
       MACD_ENGINE_ROLE: desk
+      MACD_LOOP_WATCHDOG: "1"
       MACD_NATS_URL: nats://nats:4222
       MACD_STRATEGY_URL: http://engine:8100
       <<: *engine-databases

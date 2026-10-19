@@ -1,9 +1,12 @@
+import { useEffect, useRef } from "react";
 import type { HealthInfo } from "./types";
 
-export function Readiness({ health, error, updated }: { health?: HealthInfo; error: string; updated?: string }) {
+export function Readiness({ health, error, updated, open = false }: { health?: HealthInfo; error: string; updated?: string; open?: boolean }) {
   const stamp = updated ? new Date(updated).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }) : "not yet received";
   const warm = health?.warmup;
-  return <details className="readiness">
+  const details = useRef<HTMLDetailsElement>(null);
+  useEffect(() => { if (details.current && open) details.current.open = true; }, [open]);
+  return <details className="readiness" ref={details}>
     <summary>Readiness · {error ? "health unavailable" : health?.session_open ? health.feed_alive ? "receiving ticks" : "waiting for feed" : health ? "session closed" : "loading"}
       {warm && ` · ${warm.with_indicators}/${warm.required} indicators available`}
       {!!health?.history_errors && ` · ${health.history_errors} history errors`}

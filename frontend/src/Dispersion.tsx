@@ -20,10 +20,14 @@ const SCALE_STORE = "macd.dispersionScale";
 // preference must not take the page down with it.
 const recall = (key: string) => { try { return window.localStorage.getItem(key) || ""; } catch { return ""; } };
 const remember = (key: string, value: string) => { try { window.localStorage.setItem(key, value); } catch { return; } };
-// Opening on the whole stored series squeezes today into a few pixels: the
-// desk reads intraday rotation, so the viewport starts on the last three IST
-// sessions and the rest stays loaded to pan back into.
-const ZOOM_SESSIONS = 3;
+// The whole stored series stays loaded (live bars plus reconstructed history);
+// the period picks how many IST sessions the viewport opens on, and the rest
+// is there to pan back into.
+type Period = "1D" | "1W" | "1M" | "ALL";
+const PERIODS: { key: Period; sessions: number; title: string }[] = [
+  { key: "1D", sessions: 1, title: "Latest session" }, { key: "1W", sessions: 5, title: "Last 5 sessions" },
+  { key: "1M", sessions: 21, title: "Last 21 sessions" }, { key: "ALL", sessions: Number.POSITIVE_INFINITY, title: "Every stored session" }];
+const PERIOD_STORE = "macd.dispersionPeriod";
 
 /** Where the newest `sessions` IST sessions start, and how many were found. */
 function recentSessions(rows: { time: number }[], sessions: number) {
@@ -69,7 +73,7 @@ export function useDispersionSeries(
   useEffect(() => {
     const controller = new AbortController();
     const headers = API_TOKEN ? { "x-macd-token": API_TOKEN } : undefined;
-    const load = () => void fetch(`${API_URL}/api/dispersion?timeframe_seconds=${timeframe}&limit=2000`,
+    const load = () => void fetch(`${API_URL}/api/dispersion?timeframe_seconds=${timeframe}&limit=5000`,
       { headers, signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error((await response.json()).detail || "Dispersion history request failed");
@@ -97,10 +101,15 @@ function samePoint(a: DispersionPoint | undefined, b: DispersionPoint) {
     && a.ceEligible === b.ceEligible && a.peEligible === b.peEligible && a.total === b.total;
 }
 
-export function DispersionPage({ current, history, error, timeframe }: {
+export function DispersionPage({ current: live, history, error, timeframe }: {
   current?: DispersionPoint; history: DispersionPoint[]; error?: string; timeframe: number;
 }) {
+  // Off-hours there is no live cohort; the cards read the newest stored bar instead
+  // (labelled "at last close" by the freshness check below) rather than zeros.
+  const current = live ?? history[history.length - 1];
   const [scale, setScale] = useState<Scale>(() => recall(SCALE_STORE) === "COUNT" ? "COUNT" : "SHARE");
+  const [period, setPeriod] = useState<Period>(() => PERIODS.find((p) => p.key === recall(PERIOD_STORE))?.key || "1W");
+  const pickPeriod = (value: Period) => { setPeriod(value); remember(PERIOD_STORE, value); };
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
@@ -119,6 +128,7 @@ export function DispersionPage({ current, history, error, timeframe }: {
       <div><h1>CE / PE MACD Dispersion</h1>
         <p>Option contracts whose completed-candle MACD is above zero · {Math.round(timeframe / 60)}m basis · stored server-side</p></div>
       <div className="dispersion-controls">
+        <span className="radar-filter">{PERIODS.map((p) => <button key={p.key} title={p.title} aria-pressed={period === p.key} className={period === p.key ? "active" : ""} onClick={() => pickPeriod(p.key)}>{p.key === "ALL" ? "All" : p.key}</button>)}</span>
         <span className="radar-filter">{(["SHARE", "COUNT"] as const).map((value) => <button key={value} aria-pressed={scale === value} className={scale === value ? "active" : ""} onClick={() => pickScale(value)}>{value === "SHARE" ? "% of side" : "Contracts"}</button>)}</span>
         <span className={isCurrent && coverage >= 90 ? "feed-badge" : "mode"}>{current ? `${coverage.toFixed(1)}% ${isCurrent ? "fresh coverage" : "coverage at last close"}` : "Waiting for breadth"}</span>
       </div>
@@ -127,7 +137,7 @@ export function DispersionPage({ current, history, error, timeframe }: {
       <section className="panel dispersion-chart-panel">
         <div className="panel-title"><span>Positive MACD breadth</span>
           <span>{current ? `AS OF ${CLOCK.format(current.time * 1000)} IST` : "WAITING FOR INDICATORS"}</span></div>
-        <DispersionChart rows={history} scale={scale} error={error} />
+        <DispersionChart rows={history} scale={scale} error={error} sessions={PERIODS.find((p) => p.key === period)!.sessions} />
       </section>
       <aside className="dispersion-side">
         <BreadthCard kind="CE" value={current?.ceAbove || 0} eligible={current?.ceEligible || 0} tone="ce" />
@@ -161,7 +171,7 @@ function BreadthCard({ kind, value, eligible, tone }: { kind: string; value: num
 
 const share = (above: number, eligible: number) => eligible ? above / eligible * 100 : 0;
 
-function DispersionChart({ rows, scale, error }: { rows: DispersionPoint[]; scale: Scale; error?: string }) {
+function DispersionChart({ rows, scale, error, sessions }: { rows: DispersionPoint[]; scale: Scale; error?: string; sessions: number }) {
   const element = useRef<HTMLDivElement>(null);
   const api = useRef<{ chart: IChartApi; ce: ISeriesApi<"Line">; pe: ISeriesApi<"Line"> }>();
   const zoomed = useRef("");
@@ -202,16 +212,16 @@ function DispersionChart({ rows, scale, error }: { rows: DispersionPoint[]; scal
       // session count is part of the key because the live point renders before
       // the stored history answers — zooming only on that first lone bar would
       // leave the page stuck at one candle's width once the series landed.
-      const { from, found } = recentSessions(rows, ZOOM_SESSIONS);
-      const key = `${scale}:${found}`;
+      const { from, found } = recentSessions(rows, Number.isFinite(sessions) ? sessions : Number.MAX_SAFE_INTEGER);
+      const key = `${scale}:${sessions}:${found}`;
       const to = rows[rows.length - 1].time;
       if (zoomed.current !== key) {
-        if (from < to) api.current.chart.timeScale().setVisibleRange({ from: from as Time, to: to as Time });
+        if (Number.isFinite(sessions) && from < to) api.current.chart.timeScale().setVisibleRange({ from: from as Time, to: to as Time });
         else api.current.chart.timeScale().fitContent();
         zoomed.current = key;
       }
     }
-  }, [rows, scale]);
+  }, [rows, scale, sessions]);
   return <div className="dispersion-chart" ref={element}>
     {!rows.length && <div className={`chart-empty${error ? " error" : ""}`}>
       {error || "No stored breadth yet — the series begins with the next completed cohort."}</div>}

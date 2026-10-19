@@ -70,6 +70,7 @@ books, never from a request made on this lane's behalf.
 from __future__ import annotations
 
 import asyncio
+import math
 import sqlite3
 from collections import deque
 from contextlib import suppress
@@ -84,6 +85,7 @@ from .events import EventHub, json_value
 from .execution import ExecutionManager
 from .indicators import IncrementalMACD
 from .models import Candle, IndicatorPoint, Signal, Trade
+from .option_greeks import greeks, years_to_expiry
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
 
@@ -104,6 +106,11 @@ BREADTH_FRESH_SECONDS = 300
 # A minute bar closes when the contract's next tick arrives. When that tick
 # comes long after the minute ended, the cross is history, not an entry.
 LATE_BAR_GRACE_SECONDS = 120
+# A signal bar longer than a minute closes on the first minute bar of the next
+# bucket; judged only if that minute arrived within this grace of its own end.
+SIGNAL_BAR_GRACE_SECONDS = 300
+# Stored minutes read to warm a longer signal bar's MACD (about eight sessions).
+SIGNAL_WARM_MINUTES = 3_000
 # Verdicts. Everything except TAKEN is a rejection, and the rejections are
 # ordered from "could not evaluate" to "evaluated and declined" so a journal
 # scan can separate missing data from a real veto.
@@ -117,6 +124,43 @@ TOO_ILLIQUID = "TOO_ILLIQUID"
 ALREADY_HELD = "ALREADY_HELD"
 AUTO_TRADE_OFF = "AUTO_TRADE_OFF"
 TAKEN = "TAKEN"
+
+
+def vix_entry_policy(settings: Settings, quote=None, now: datetime | None = None) -> dict:
+    """Bounded user-defined entry policy; no broker access or model fitting."""
+    now = now or datetime.now(UTC)
+    value = getattr(quote, "ltp", None)
+    stamp = getattr(quote, "timestamp", None)
+    if stamp is not None and stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    age = (now - stamp).total_seconds() if stamp is not None else None
+    status = "fresh"
+    if not settings.blast_vix_adaptive_enabled:
+        status = "disabled"
+    elif quote is None:
+        status = "missing"
+    elif value is None or not math.isfinite(value) or not 0 < value <= 200:
+        status = "invalid"
+    elif age is None or age < -5 or age > settings.blast_vix_max_age_seconds:
+        status = "stale"
+    active = status == "fresh"
+    scale = min(2.0, max(0.5, value / settings.blast_vix_reference)) if active else 1.0
+    normal = min(100.0, settings.blast_max_premium_pct * scale)
+    hard = min(100.0, normal * settings.blast_rich_premium_max_multiple) if active else normal
+    breadth = min(1.0, max(0.0, settings.blast_min_breadth +
+                          (settings.blast_vix_breadth_adjustment * (scale - 1.0) if active else 0.0)))
+    return {"version": "vix-rich-v1", "active": active, "vix_status": status,
+            "vix": value if value is not None and math.isfinite(value) else None,
+            "vix_age_seconds": round(age, 1) if age is not None else None,
+            "reference_vix": settings.blast_vix_reference, "vix_scale": scale,
+            "normal_premium_limit_pct": normal, "hard_premium_limit_pct": hard,
+            "min_side_breadth": breadth, "rich_size_power": 2.0}
+
+
+def premium_size_multiplier(premium_pct: float, policy: dict) -> float:
+    if premium_pct <= policy["normal_premium_limit_pct"]:
+        return 1.0
+    return (policy["normal_premium_limit_pct"] / premium_pct) ** policy["rich_size_power"]
 
 
 class BrokerAccessDenied(PermissionError):
@@ -285,6 +329,11 @@ class BlastEngine:
         # The lane's own one-minute MACD per symbol, and its newest value.
         self._macd: dict[str, IncrementalMACD] = {}
         self._points: dict[str, IndicatorPoint] = {}
+        # Longer signal bars: the forming bar per symbol, and the minute each
+        # high in the recent-high window belongs to (so the bar being judged
+        # can be left out of its own "recent high").
+        self._forming: dict[str, Candle] = {}
+        self._high_times: dict[str, deque[int]] = {}
         self.late_bars_skipped = 0
         self.warmed_symbols = 0
         self.last_warm_at: str | None = None
@@ -298,6 +347,7 @@ class BlastEngine:
         self._highs: dict[str, deque[float]] = {}
         self._spot_symbols: dict[str, str] = {}
         self._spot_price = lambda _symbol: None
+        self._vix_quote = lambda: None
         self._breadth = self.side_breadth
         self._contracts: dict[str, dict] = {}
         # journal_id -> live excursion watcher for a candidate already written,
@@ -309,6 +359,8 @@ class BlastEngine:
         self.taken = 0
         self.rejections: dict[str, int] = {}
         self.error: str | None = None
+        # Called with each journal row whose candidate passed the screen (smart lanes).
+        self.candidate_listeners: list = []
         self._restore()
         self._restore_contract_context()
         self._rehydrate_watchers()
@@ -316,7 +368,15 @@ class BlastEngine:
     # ---------------------------------------------------------------- wiring
 
     def set_tradable_contracts(self, lot_sizes: dict[str, int]) -> None:
-        self.execution.set_tradable_contracts(lot_sizes)
+        """Today's selection plus every contract this lane still holds.
+
+        Merged for the same reason as set_contract_context: a holding that has
+        rolled out of the day's selection must stay exitable by its stop, trail
+        and expiry flatten.
+        """
+        held = {symbol: position.lot_size for symbol, position in self.portfolio.positions.items()
+                if position.quantity > 0 and position.lot_size > 1}
+        self.execution.set_tradable_contracts({**held, **lot_sizes})
 
     def set_contract_context(self, contracts: dict[str, dict]) -> None:
         """symbol -> {spot_symbol, option_type, strike, expiry}.
@@ -329,6 +389,7 @@ class BlastEngine:
         merged = {symbol: row for symbol, row in self._contracts.items() if symbol in held}
         merged.update(contracts)
         self._contracts = merged
+        self.execution.set_contract_expiries({symbol: row.get("expiry") for symbol, row in merged.items()})
         self._spot_symbols = {
             symbol: row["spot_symbol"] for symbol, row in merged.items() if row.get("spot_symbol")
         }
@@ -336,10 +397,15 @@ class BlastEngine:
     def rebind_broker(self, broker) -> None:
         self.broker.rebind(broker)
 
-    def set_resolvers(self, *, spot_price, breadth=None) -> None:
+    def set_resolvers(self, *, spot_price, breadth=None, vix_quote=None) -> None:
         """``spot_price(spot_symbol) -> float|None``; ``breadth('CE'|'PE')`` overrides the lane's own."""
         self._spot_price = spot_price
         self._breadth = breadth or self.side_breadth
+        if vix_quote is not None:
+            self._vix_quote = vix_quote
+
+    def entry_policy(self, now: datetime | None = None) -> dict:
+        return vix_entry_policy(self.settings, self._vix_quote(), now)
 
     def side_breadth(self, option_type: str) -> float | None:
         """Share of this side's contracts whose one-minute premium MACD is above zero.
@@ -356,7 +422,10 @@ class BlastEngine:
         if not points:
             return None
         newest = max(point.timestamp for point in points)
-        fresh = [point for point in points if point.timestamp >= newest - BREADTH_FRESH_SECONDS]
+        # A longer bar's point carries its bucket start: a contract whose current
+        # bucket has not yet closed still counts on the previous one.
+        horizon = BREADTH_FRESH_SECONDS + (self.signal_seconds if self.signal_seconds > BAR_SECONDS else 0)
+        fresh = [point for point in points if point.timestamp >= newest - horizon]
         if len(fresh) < self.settings.blast_min_breadth_cohort:
             return None
         return sum(1 for point in fresh if point.macd > 0) / len(fresh)
@@ -414,6 +483,7 @@ class BlastEngine:
         self._spot_symbols = {
             symbol: row["spot_symbol"] for symbol, row in self._contracts.items() if row.get("spot_symbol")
         }
+        self.execution.set_contract_expiries({symbol: row.get("expiry") for symbol, row in self._contracts.items()})
 
     def _record_context(self, symbol: str) -> None:
         context = self._contracts.get(symbol)
@@ -441,11 +511,18 @@ class BlastEngine:
 
     # --------------------------------------------------------- bar ingestion
 
+    @property
+    def signal_seconds(self) -> int:
+        return max(BAR_SECONDS, int(getattr(self.settings, "blast_signal_bar_seconds", BAR_SECONDS)))
+
     def observe_warmup(self, candle: Candle, point: IndicatorPoint | None = None) -> None:
         """Fold a stored one-minute bar into the window and the lane's MACD.
 
         Safe to call repeatedly with the same bars: see _remember.
         """
+        if self.signal_seconds > BAR_SECONDS:
+            self._fold_minute(candle)
+            return
         self._remember(candle, point)
 
     async def warm_from_store(self, database_path: str, symbols) -> int:
@@ -458,11 +535,15 @@ class BlastEngine:
         """
         wanted = list(dict.fromkeys(symbols))
         since = {symbol: self._last_bar.get(symbol, -1) for symbol in wanted}
-        limit = self.lookback_bars + MACD_SEED_BARS
+        longer = self.signal_seconds > BAR_SECONDS
+        limit = self.lookback_bars + (SIGNAL_WARM_MINUTES if longer else MACD_SEED_BARS)
         stored = await asyncio.to_thread(read_stored_minute_bars, database_path, since, limit)
         for symbol in wanted:
             for candle in stored.get(symbol, ()):
-                self._remember(candle)
+                if longer:
+                    self._fold_minute(candle)
+                else:
+                    self._remember(candle)
         self.warmed_symbols = sum(1 for symbol in wanted if self._highs.get(symbol))
         self.last_warm_at = datetime.now(UTC).isoformat()
         return self.warmed_symbols
@@ -475,6 +556,8 @@ class BlastEngine:
         self._previous_bar.clear()
         self._macd.clear()
         self._points.clear()
+        self._forming.clear()
+        self._high_times.clear()
 
     def _indicator(self, candle: Candle) -> IndicatorPoint:
         macd = self._macd.get(candle.symbol)
@@ -517,12 +600,83 @@ class BlastEngine:
         """
         if candle.symbol not in self._contracts:
             return None
+        if self.signal_seconds > BAR_SECONDS:
+            lateness = closed_at.timestamp() - (candle.timestamp + BAR_SECONDS)
+            closed, previous, point, recent_high, bars = self._fold_minute(candle)
+            if closed is None or point is None or previous is None:
+                return None
+            if lateness > SIGNAL_BAR_GRACE_SECONDS or self._session_day(closed.timestamp) != self._session_day(candle.timestamp):
+                # Closed late, or overnight by the next morning's first minute: history, not an entry.
+                self.late_bars_skipped += 1
+                return None
+            if not self.settings.blast_enabled or not (previous[0] <= previous[1] and point.macd > point.signal):
+                return None
+            try:
+                return await self._evaluate(closed, point, recent_high, bars)
+            except Exception as exc:  # noqa: BLE001 -- a lane fault must not kill the feed
+                self.error = f"{type(exc).__name__}: {exc}"
+                return None
         lateness = closed_at.timestamp() - (candle.timestamp + BAR_SECONDS)
         if lateness > LATE_BAR_GRACE_SECONDS:
             if self._remember(candle)[0]:
                 self.late_bars_skipped += 1
             return None
         return await self.on_closed_bar(candle)
+
+    @staticmethod
+    def _session_day(timestamp: int):
+        return datetime.fromtimestamp(timestamp, IST).date()
+
+    def _bucket(self, timestamp: int) -> int:
+        moment = datetime.fromtimestamp(timestamp, IST)
+        opened = datetime.combine(moment.date(), datetime.min.time().replace(hour=9, minute=15), IST)
+        elapsed = int((moment - opened).total_seconds())
+        if elapsed < 0:
+            return timestamp - timestamp % self.signal_seconds
+        return int(opened.timestamp()) + (elapsed // self.signal_seconds) * self.signal_seconds
+
+    def _fold_minute(self, candle: Candle):
+        """Fold one minute into the recent-high window and the forming signal bar, exactly once.
+
+        Returns (closed signal bar or None, its previous (macd, signal), its MACD point,
+        the recent high before it, minutes of history before it).
+        """
+        symbol = candle.symbol
+        if candle.timestamp <= self._last_bar.get(symbol, -1):
+            return None, None, None, None, 0
+        window = self._highs.get(symbol)
+        times = self._high_times.get(symbol)
+        if window is None or window.maxlen != self.lookback_bars or times is None:
+            window = self._highs[symbol] = deque(window or (), maxlen=self.lookback_bars)
+            times = self._high_times[symbol] = deque(times or (), maxlen=self.lookback_bars)
+            while len(times) < len(window):
+                times.appendleft(-1)
+        closed = previous = point = recent_high = None
+        bars = 0
+        bucket = self._bucket(candle.timestamp)
+        forming = self._forming.get(symbol)
+        if forming is not None and forming.timestamp != bucket:
+            closed = forming
+            before = [high for when, high in zip(times, window) if when < closed.timestamp]
+            recent_high = max(before) if before else None
+            bars = len(before)
+            previous = self._previous.get(symbol)
+            point = self._indicator(closed)
+            self._previous[symbol] = (point.macd, point.signal)
+            self._previous_bar[symbol] = closed.timestamp
+            forming = None
+        if forming is None:
+            self._forming[symbol] = Candle(symbol, bucket, candle.open, candle.high, candle.low, candle.close,
+                                           candle.volume, True)
+        else:
+            forming.high = max(forming.high, candle.high)
+            forming.low = min(forming.low, candle.low)
+            forming.close = candle.close
+            forming.volume += candle.volume
+        window.append(candle.high)
+        times.append(candle.timestamp)
+        self._last_bar[symbol] = candle.timestamp
+        return closed, previous, point, recent_high, bars
 
     async def on_closed_bar(self, candle: Candle, point: IndicatorPoint | None = None) -> dict | None:
         """Evaluate one closed bar. Returns the journal row when one was written."""
@@ -563,6 +717,7 @@ class BlastEngine:
         breadth = self._breadth(option_type)
         premium_pct = (premium / spot * 100.0) if spot else None
         off_high_pct = ((premium / recent_high - 1.0) * 100.0) if recent_high else None
+        policy = self.entry_policy()
 
         reason = None
         # A contract already in the book is not a screen decision at all: the
@@ -571,22 +726,34 @@ class BlastEngine:
         # whichever leg they happened to fail, which buried 76% of the
         # BREADTH_TOO_THIN comparison group in rows the lane already owned and
         # made the control groups unreadable.
+        # The screen's own verdict, independent of this lane's book and switch,
+        # so a candidate that passes can also be offered to the smart lanes.
+        def screen_reason(premium_limit, breadth_floor):
+            if not spot:
+                return NO_SPOT
+            if breadth is None:
+                return NO_BREADTH
+            if bars < min(self.lookback_bars, self.settings.blast_min_lookback_bars):
+                return NO_HISTORY
+            if premium_pct > premium_limit:
+                return PREMIUM_TOO_RICH
+            if breadth < breadth_floor:
+                return BREADTH_TOO_THIN
+            if off_high_pct > -self.settings.blast_min_off_high_pct:
+                return NOT_OFF_HIGH
+            if self._liquidity_lots(symbol) == 0:
+                return TOO_ILLIQUID
+            return None
+
+        screen = screen_reason(policy["hard_premium_limit_pct"], policy["min_side_breadth"])
+        # Smart books consume the original fixed-screen research population.
+        # A Blast-only risk policy must not silently widen their entries.
+        legacy_screen = screen_reason(self.settings.blast_max_premium_pct, self.settings.blast_min_breadth)
+        size_multiplier = premium_size_multiplier(premium_pct, policy) if premium_pct is not None else None
         if symbol in self.portfolio.positions:
             reason = ALREADY_HELD
-        elif not spot:
-            reason = NO_SPOT
-        elif breadth is None:
-            reason = NO_BREADTH
-        elif bars < min(self.lookback_bars, self.settings.blast_min_lookback_bars):
-            reason = NO_HISTORY
-        elif premium_pct > self.settings.blast_max_premium_pct:
-            reason = PREMIUM_TOO_RICH
-        elif breadth < self.settings.blast_min_breadth:
-            reason = BREADTH_TOO_THIN
-        elif off_high_pct > -self.settings.blast_min_off_high_pct:
-            reason = NOT_OFF_HIGH
-        elif self._liquidity_lots(symbol) == 0:
-            reason = TOO_ILLIQUID
+        elif screen is not None:
+            reason = screen
         elif not self.settings.blast_auto_trade:
             reason = AUTO_TRADE_OFF
 
@@ -613,7 +780,13 @@ class BlastEngine:
             "order_id": None,
             "strike": contract.get("strike"),
             "expiry": contract.get("expiry"),
+            "entry_policy": policy,
+            "premium_size_multiplier": size_multiplier,
+            "planned_target_notional": self.settings.blast_target_notional * size_multiplier if size_multiplier is not None else None,
+            "smart_screen_passed": legacy_screen is None,
         }
+        if reason not in {NO_SPOT, NO_BREADTH, NO_HISTORY, PREMIUM_TOO_RICH, ALREADY_HELD}:
+            row["shadow"] = self.shadow_features(symbol, option_type, premium, spot, contract, spot_symbol)
 
         signal = Signal(
             symbol, "BUY", SIGNAL_KIND, premium, point.macd, point.signal, point.histogram,
@@ -621,7 +794,9 @@ class BlastEngine:
         )
         if reason is None:
             self.repository.save_signal(signal)
-            order = await self._enter(signal)
+            detail = {}
+            order = await self._enter(signal, policy=policy, detail=detail)
+            row.update(detail)
             if order is None:
                 row["reason"] = "ENTRY_REJECTED"
             else:
@@ -634,7 +809,74 @@ class BlastEngine:
         self.last_candidate_at = row["at"]
         self._journal(row)
         self.events.publish("candidate", row)
+        if legacy_screen is None:
+            for listener in self.candidate_listeners:
+                try:
+                    listener({**row, "journal_id": row["id"]})
+                except Exception as exc:  # noqa: BLE001 -- a listener must not cost this lane its journal
+                    self.error = f"candidate listener: {type(exc).__name__}: {exc}"[:300]
         return row
+
+    # Set by the engine: the latest tick per symbol (bid/ask) and the stored minute-bar store (RV20).
+    quote_source = None
+    history_path: str | None = None
+    RV_SESSIONS = 20
+
+    def shadow_features(self, symbol: str, option_type: str, premium: float, spot: float | None,
+                        contract: dict, spot_symbol: str | None) -> dict:
+        """Measured at the candidate and journalled; NO rule reads them.
+
+        The 15 Oct 2026 review proposed gating on delta band, IV vs realized vol and the bid-ask spread; on
+        408 live journal rows none was proven either way (research/option_recs_20261015). Recording them on
+        every premium-cleared candidate builds the sample that can decide. The underlying's order flow is not
+        logged here: the tick store's per-minute delta joins onto these rows by time afterwards.
+        """
+        out: dict = {}
+        try:
+            expiry, strike = contract.get("expiry"), float(contract.get("strike") or 0)
+            now = datetime.now(IST)
+            if expiry and strike > 0 and spot:
+                out["dte"] = (date.fromisoformat(str(expiry)[:10]) - now.date()).days
+                g = greeks(premium, spot, strike, years_to_expiry(str(expiry), now), option_type == "CE")
+                if g:
+                    out.update({key: round(value, 6) for key, value in g.items()})
+            rv = self._rv20(spot_symbol, now.date()) if spot_symbol else None
+            out["rv20"] = rv
+            if rv and out.get("iv"):
+                out["iv_rv"] = round(out["iv"] / rv, 4)
+            tick = self.quote_source(symbol) if self.quote_source is not None else None
+            bid, ask = getattr(tick, "bid", None), getattr(tick, "ask", None)
+            if bid and ask and 0 < bid <= ask:
+                out.update({"bid": bid, "ask": ask, "spread_pct": round((ask - bid) / ((ask + bid) / 2) * 100, 4)})
+        except Exception as exc:  # noqa: BLE001 -- a measurement must never cost the lane its verdict
+            out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
+
+    def _rv20(self, spot_symbol: str, today: date) -> float | None:
+        """Annualised close-to-close volatility of the 20 completed sessions before today, cached per day."""
+        cache = self.__dict__.setdefault("_rv_cache", {})
+        key = (spot_symbol, today.isoformat())
+        if key in cache:
+            return cache[key]
+        value = None
+        if self.history_path:
+            start = int(datetime.combine(today, datetime.min.time(), IST).timestamp())
+            with sqlite3.connect(f"file:{self.history_path}?mode=ro", uri=True, timeout=5) as db:
+                rows = db.execute(
+                    """SELECT timestamp, close FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60
+                       AND timestamp < ? AND timestamp >= ? ORDER BY timestamp""",
+                    (spot_symbol, start, start - 45 * 86400)).fetchall()
+            closes: dict[str, float] = {}
+            for stamp, close in rows:
+                closes[datetime.fromtimestamp(stamp, IST).date().isoformat()] = close
+            series = [closes[day] for day in sorted(closes)][-(self.RV_SESSIONS + 1):]
+            if len(series) >= self.RV_SESSIONS * 3 // 4 + 1:
+                returns = [math.log(b / a) for a, b in zip(series, series[1:]) if a > 0 and b > 0]
+                if len(returns) > 1:
+                    mean = sum(returns) / len(returns)
+                    value = round(math.sqrt(sum((r - mean) ** 2 for r in returns) / (len(returns) - 1) * 252), 6)
+        cache[key] = value
+        return value
 
     def _liquidity_lots(self, symbol: str) -> int | None:
         """Lots this contract's own turnover will carry, or None when unknown.
@@ -652,19 +894,40 @@ class BlastEngine:
             return None
         return int(liquidity * (self.settings.blast_max_volume_share_pct / 100.0) // lot_size)
 
-    async def _enter(self, signal: Signal):
-        price = self.execution.last_prices.get(signal.symbol, signal.price)
+    async def _enter(self, signal: Signal, *, policy: dict | None = None, detail: dict | None = None):
+        detail = detail if detail is not None else {}
         try:
+            price = self.execution._fresh_price(signal.symbol)
             lots = self.execution.entry_lots(signal.symbol, price)
+            if policy is not None:
+                spot = self._spot_price(self._spot_symbols.get(signal.symbol))
+                if spot is None or not math.isfinite(spot) or spot <= 0:
+                    raise RuntimeError("No valid spot price for entry repricing")
+                premium_pct = price / spot * 100.0
+                if premium_pct > policy["hard_premium_limit_pct"]:
+                    raise RuntimeError("Current premium exceeds the VIX-adjusted hard limit")
+                multiplier = min(premium_size_multiplier(premium_pct, policy),
+                                 premium_size_multiplier(signal.price / spot * 100.0, policy))
+                budget = self.settings.blast_target_notional * multiplier
+                detail.update({"entry_reference_price": price, "entry_premium_pct": premium_pct,
+                               "entry_size_multiplier": multiplier, "entry_target_notional": budget})
+                if multiplier < 1.0:
+                    # Round down; never force one lot above the reduced ticket.
+                    unit = round(price * (1 + self.settings.slippage_bps / 10_000), 4)
+                    per_lot = unit * self.execution.lot_sizes.get(signal.symbol, 0)
+                    lots = min(lots, int((budget + 1e-8) // per_lot)) if per_lot > 0 else 0
             cap = self._liquidity_lots(signal.symbol)
             if cap is not None:
                 lots = min(lots, cap)
             if lots < 1:
+                detail["entry_rejection"] = "No whole lot fits the ticket, cash or liquidity cap"
                 return None
             order = await self.execution.submit(signal.symbol, "BUY", lots=lots, signal=signal)
         except (ValueError, RuntimeError, PermissionError) as exc:
             self.error = f"entry rejected: {exc}"
+            detail["entry_rejection"] = str(exc)
             return None
+        detail["entry_lots"] = order.lots
         self._record_context(signal.symbol)
         return order
 
@@ -866,6 +1129,11 @@ class BlastEngine:
             "target_notional": current.blast_target_notional,
             "max_premium_pct": current.blast_max_premium_pct,
             "min_breadth": current.blast_min_breadth,
+            "vix_adaptive_enabled": current.blast_vix_adaptive_enabled,
+            "vix_reference": current.blast_vix_reference,
+            "vix_breadth_adjustment": current.blast_vix_breadth_adjustment,
+            "vix_max_age_seconds": current.blast_vix_max_age_seconds,
+            "rich_premium_max_multiple": current.blast_rich_premium_max_multiple,
             "min_off_high_pct": current.blast_min_off_high_pct,
             "hard_stop_pct": current.blast_hard_stop_pct,
             "trail_activation_pct": current.blast_trail_activation_pct,
@@ -881,12 +1149,13 @@ class BlastEngine:
             "watching": len(self._watchers),
             "open_positions": len(self.portfolio.positions),
             "symbols_with_history": len(self._highs),
-            "bar_seconds": BAR_SECONDS,
+            "bar_seconds": BAR_SECONDS, "signal_bar_seconds": self.signal_seconds,
             "warmed_symbols": self.warmed_symbols,
             "last_warm_at": self.last_warm_at,
             "late_bars_skipped": self.late_bars_skipped,
             "last_candidate_at": self.last_candidate_at,
             "broker_access": "orders only",
+            "entry_policy": self.entry_policy(),
             "error": self.error,
         }
 
@@ -898,8 +1167,9 @@ class BlastEngine:
             "settings": self.settings_view(),
             "health": self.health(),
             "screen": {
-                "entry": "MACD(12,26,9) crosses its signal line on a closed one-minute premium bar (zero-cross NOT required)",
-                "bar_seconds": BAR_SECONDS,
+                "vix_policy": self.entry_policy(),
+                "entry": f"MACD(12,26,9) crosses its signal line on a closed {self.signal_seconds // 60}-minute premium bar (zero-cross NOT required)",
+                "bar_seconds": BAR_SECONDS, "signal_bar_seconds": self.signal_seconds,
                 "max_premium_pct_of_spot": self.settings.blast_max_premium_pct,
                 "min_side_breadth": self.settings.blast_min_breadth,
                 "min_off_recent_high_pct": self.settings.blast_min_off_high_pct,

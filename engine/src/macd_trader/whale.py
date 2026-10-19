@@ -45,6 +45,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from .sessions import session_bounds as instrument_session_bounds
 from .greeks import contract_delta
 from .regimes import regime_for, spans_a_break
 
@@ -62,6 +63,34 @@ HALF_LIFE_SECONDS = 900.0
 # A1's rolling median needs thirty minutes of prints before it judges, so a
 # live re-detection over the trailing slice has to reach a little past that.
 A_LIVE_LOOKBACK_MS = 35 * 60 * 1000
+# A feed gap: every heartbeat instrument (index futures and spots) silent this
+# long. The next update of any contract then carries all the volume traded
+# through the gap as one "print" -- on 29 Sep 2026 a 64 s gap at 10:05:37 made
+# a 293,150-contract NIFTY futures cluster the day's top large print.
+FEED_GAP_SECONDS = 10
+FEED_CATCHUP_MS = 60_000
+HEARTBEAT_SYMBOLS = ("NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX")
+# Outside the NIFTY/BANKNIFTY derivatives (whose lot and freeze the regime
+# fixes) a lot is 1 share or a Fyers contract lot, and a 10x-median cluster or
+# a repeated clip can be a few thousand rupees. Name-level patterns must also
+# be worth money: (A1 large print, A3 child) minimum notional in rupees, by
+# kind -- a premium's notional for options.
+WHALE_NOTIONAL_FLOOR = {"cash": (5_000_000, 500_000), "option": (1_000_000, 100_000),
+                        "future": (2_500_000, 250_000)}
+# Fyers batches trades into one update, so on a liquid stock a cluster ten
+# times the median size and over the floor is routine (16,624 of them across
+# the F&O stocks on 29 Sep 2026). Outside the futures tracker a large print
+# must also be this share of the instrument's own trailing-window volume.
+LARGE_PRINT_WINDOW_SHARE = 0.10
+# Five equal clips at steady spacing happen by chance in a liquid contract's
+# common sizes (a 2-lot NIFTY option clip, 229 "icebergs" in a day). Outside
+# the futures tracker the repeated clip must stand out from the flow it hides in.
+CHILD_MIN_MEDIAN_MULTIPLE = 3.0
+# ...and repeat like a working order: five equal clips an hour and a half
+# apart (SBIN, 850 shares, ~4,840 s) is coincidence, not an iceberg.
+CHILD_MAX_INTERVAL_SECONDS = 120
+# How far apart the scanned instruments are re-read live (minutes).
+NAMES_SCAN_EVERY_MINUTES = 5
 
 SESSION_OPEN = time(9, 15)
 SLOT_MINUTES = 15
@@ -218,6 +247,8 @@ class WhaleEvent:
     score: float
     evidence: str
     layer: str = "A"
+    # Detection-time features (whale_tuning scores and calibrates on them).
+    features: dict | None = None
 
 
 def underlying_of(symbol: str) -> str:
@@ -248,14 +279,18 @@ def lot_size(symbol: str, day: str) -> int:
 # Clock
 # ---------------------------------------------------------------------------
 
-def session_span(day: str) -> tuple[int, int]:
+def session_span(day: str, symbol: str | None = None) -> tuple[int, int]:
     """UTC seconds of the F&O session on an IST date, open to the regime's close.
 
     The regime end, not a fixed 15:30: since 3 Aug 2026 the derivatives
     session runs to 15:40, and the last ten minutes are where expiry-day
     unwinds and closing-auction hedges land — the window the tracker most
-    wants to see.
+    wants to see. With ``symbol`` it is that instrument's own continuous
+    session (sessions.session_bounds): a cash equity stops at its 15:15
+    closing-auction cut-off, whose match is not a directional print.
     """
+    if symbol:
+        return instrument_session_bounds(symbol, day)
     opened = datetime.combine(date.fromisoformat(day), SESSION_OPEN, IST)
     hour, minute = (int(part) for part in regime_for(day).session_end.split(":"))
     closed = opened.replace(hour=hour, minute=minute)
@@ -293,7 +328,34 @@ def _one(connection: sqlite3.Connection, sql: str, params: tuple = ()) -> dict |
 # Layer A
 # ---------------------------------------------------------------------------
 
-def detect(symbol: str, day: str, prints: list[tuple[int, float, int, int]]) -> list[WhaleEvent]:
+def default_params(symbol: str, day: str, lot: int | None = None) -> dict:
+    """The thresholds an instrument is judged by before it has been tuned.
+
+    whale_tuning.fit_params replaces these per symbol from its own baseline
+    (its print-size percentiles and daily turnover); these are the fallback
+    and the prior that fitting shrinks toward.
+    """
+    regime_lot = _regime_lot_root(symbol)
+    lot = max(1, lot_size(symbol, day) if regime_lot or not lot else int(lot))
+    # The NIFTY/BANKNIFTY futures keep the tracker's original rule: the
+    # composite and its alerts are calibrated on it.
+    legacy = regime_lot and instrument_kind(symbol) == "future"
+    large_floor, child_floor = (0, 0) if legacy else WHALE_NOTIONAL_FLOOR.get(instrument_kind(symbol), (0, 0))
+    return {
+        "legacy": legacy, "lot": lot,
+        "large_multiple": LARGE_PRINT_MULTIPLE, "large_min_lots": MIN_LARGE_PRINT_LOTS,
+        "large_min_qty": 0, "large_floor": large_floor,
+        "window_share": 0.0 if legacy else LARGE_PRINT_WINDOW_SHARE,
+        "child_floor": child_floor, "child_min_qty": 0,
+        "child_multiple": 0.0 if legacy else CHILD_MIN_MEDIAN_MULTIPLE,
+        "child_repeats": CHILD_MIN_REPEATS, "child_max_cv": CHILD_MAX_CV,
+        "child_max_interval": None if legacy else CHILD_MAX_INTERVAL_SECONDS,
+        "source": "default",
+    }
+
+
+def detect(symbol: str, day: str, prints: list[tuple[int, float, int, int]],
+           lot: int | None = None, params: dict | None = None) -> list[WhaleEvent]:
     """Layer A over one symbol's session.
 
     ``prints`` are ``(ts_ms, price, quantity, side)`` for volume-bearing
@@ -301,9 +363,16 @@ def detect(symbol: str, day: str, prints: list[tuple[int, float, int, int]]) -> 
     the traded size of the update, which on a batched feed is a cluster, not a
     single trade — the freeze-size test tolerates that by matching the
     cluster, which is what a slicer's child order looks like after batching.
+
+    ``params`` are the instrument's own thresholds (whale_tuning), merged over
+    default_params; every event carries the detection-time features its
+    calibrated score is built from.
     """
     freeze = freeze_quantity(symbol, day)
-    lot = max(1, lot_size(symbol, day))
+    p = {**default_params(symbol, day, lot), **(params or {})}
+    lot = max(1, int(p["lot"]))
+    legacy = bool(p["legacy"])
+    window_volume = 0
     events: list[WhaleEvent] = []
     window: deque = deque()          # (ts_ms, qty) for the rolling median
     # The same quantities kept in sorted order. Re-sorting the whole deque on
@@ -315,25 +384,33 @@ def detect(symbol: str, day: str, prints: list[tuple[int, float, int, int]]) -> 
     by_size: dict[int, list[int]] = {}
     slicer_marked: set[int] = set()
 
+    def features(qty: float, price: float, median: float | None) -> dict:
+        return {"median": median, "window_volume": window_volume,
+                "window_share": round(qty / window_volume, 4) if window_volume else None,
+                "notional": round(qty * price)}
+
     for ts_ms, price, qty, side in prints:
         if qty <= 0:
             continue
         window.append((ts_ms, qty))
+        window_volume += qty
         insort(ordered, qty)
         while window and ts_ms - window[0][0] > MEDIAN_WINDOW_SECONDS * 1000:
             _, dropped = window.popleft()
+            window_volume -= dropped
             del ordered[bisect_left(ordered, dropped)]
-        # A1 — against the rolling median, once there is a window to judge by.
-        if len(ordered) >= 30:
-            median = ordered[len(ordered) // 2]
-            if median > 0 and qty >= LARGE_PRINT_MULTIPLE * median and qty >= MIN_LARGE_PRINT_LOTS * lot:
-                events.append(WhaleEvent(symbol, ts_ms, "large_print", side, qty, price,
-                                         round(math.log(qty / median), 3),
-                                         f"{qty} vs 30m median {median}"))
+        median = ordered[len(ordered) // 2] if len(ordered) >= 30 else None
+        # A1 — against the rolling median and the instrument's own size scale.
+        if (median and qty >= p["large_multiple"] * median and qty >= p["large_min_lots"] * lot
+                and qty >= p["large_min_qty"] and qty * price >= p["large_floor"]
+                and qty >= p["window_share"] * window_volume):
+            events.append(WhaleEvent(symbol, ts_ms, "large_print", side, qty, price,
+                                     round(math.log(qty / median), 3),
+                                     f"{qty} vs 30m median {median}", features=features(qty, price, median)))
         # A2 — exactly the freeze limit.
         if freeze and qty == freeze:
             events.append(WhaleEvent(symbol, ts_ms, "freeze_print", side, qty, price, 1.0,
-                                     f"freeze-size {qty} ({qty // lot} lots)"))
+                                     f"freeze-size {qty} ({qty // lot} lots)", features=features(qty, price, median)))
             freeze_hits.append((ts_ms, side))
             while freeze_hits and ts_ms - freeze_hits[0][0] > SLICER_WINDOW_SECONDS * 1000:
                 freeze_hits.popleft()
@@ -342,22 +419,27 @@ def detect(symbol: str, day: str, prints: list[tuple[int, float, int, int]]) -> 
                 slicer_marked.add(ts_ms)
                 events.append(WhaleEvent(symbol, ts_ms, "slicer", side, qty, price,
                                          round(1.0 + 0.5 * len(same), 3),
-                                         f"{len(same)} freeze-size prints in {SLICER_WINDOW_SECONDS}s"))
+                                         f"{len(same)} freeze-size prints in {SLICER_WINDOW_SECONDS}s",
+                                         features=features(qty, price, median)))
         # A3 — the same non-lot size, machine-regular.
-        if qty != lot and qty % lot == 0:
+        if (qty != lot and qty % lot == 0 and qty * price >= p["child_floor"] and qty >= p["child_min_qty"]
+                and (not p["child_multiple"] or (median and qty >= p["child_multiple"] * median))):
             times = by_size.setdefault(qty, [])
             times.append(ts_ms)
-            if len(times) >= CHILD_MIN_REPEATS:
-                recent = times[-CHILD_MIN_REPEATS:]
+            repeats = int(p["child_repeats"])
+            if len(times) >= repeats:
+                recent = times[-repeats:]
                 gaps = [b - a for a, b in zip(recent, recent[1:])]
                 mean = sum(gaps) / len(gaps)
-                if mean > 0:
+                if mean > 0 and (p["child_max_interval"] is None or mean <= p["child_max_interval"] * 1000):
                     cv = math.sqrt(sum((g - mean) ** 2 for g in gaps) / len(gaps)) / mean
-                    if cv < CHILD_MAX_CV:
+                    if cv < p["child_max_cv"]:
                         events.append(WhaleEvent(
                             symbol, ts_ms, "constant_child", side, qty, price,
                             round(1.5 - cv, 3),
-                            f"{CHILD_MIN_REPEATS}x {qty} every ~{mean / 1000:.1f}s (cv {cv:.2f})"))
+                            f"{repeats}x {qty} every ~{mean / 1000:.1f}s (cv {cv:.2f})",
+                            features={**features(qty, price, median), "child_every_s": round(mean / 1000, 1),
+                                      "child_cv": round(cv, 3)}))
                         by_size[qty] = []
     return events
 
@@ -385,7 +467,7 @@ def _updates(ticks: sqlite3.Connection, symbol: str, day: str, since_ms: int | N
     """
     from .ofi import OFIState
     from .orderflow import classify_update
-    start, end = session_span(day)
+    start, end = session_span(day, symbol)
     rows = ticks.execute(
         """SELECT t.ts_ms, t.ltp, t.cum_volume, t.last_qty, t.bid, t.ask, t.bid_qty, t.ask_qty,
                   t.tbq, t.tsq
@@ -395,20 +477,29 @@ def _updates(ticks: sqlite3.Connection, symbol: str, day: str, since_ms: int | N
     ofi = OFIState(symbol=symbol)
     prev_vol = prev_price = prev_book = prev_pending = None
     last_side = 0
+    traded = False
     for ts_ms, ltp, cum_volume, last_qty, bid, ask, bid_qty, ask_qty, tbq, tsq in rows:
         contribution = ofi.update(ts_ms / 1000.0, bid, ask, bid_qty, ask_qty)
+        # The update's traded size is the cumulative-volume delta -- the
+        # cluster detect() documents -- with last_qty only when no cumulative
+        # total is sent, as OrderFlowTracker and the condenser do. Fyers
+        # repeats last_qty on quote and OI updates, so preferring it turned
+        # every quote into a print of the last trade's size.
         size = 0
-        if last_qty:
-            size = int(last_qty)
-        elif cum_volume is not None and prev_vol is not None:
-            size = max(0, int(cum_volume) - prev_vol)
-        if cum_volume is not None:
+        if cum_volume:
+            if prev_vol is not None:
+                size = max(0, int(cum_volume) - prev_vol)
             prev_vol = int(cum_volume)
+        elif last_qty:
+            size = max(0, int(last_qty))
         book, pending = prev_book, prev_pending
         prev_book, prev_pending = (bid, ask), (tbq, tsq)
         if size <= 0:
             yield int(ts_ms), float(ltp), 0, 0, contribution, ofi
             continue
+        if (not book or book[0] is None or book[1] is None) and not traded:
+            book = (bid, ask)   # no book seen before the first print: its own quote
+        traded = True
         buy_change = sell_change = None
         if pending and pending[0] is not None and tbq is not None:
             buy_change = tbq - pending[0]
@@ -426,18 +517,69 @@ def _updates(ticks: sqlite3.Connection, symbol: str, day: str, since_ms: int | N
 
 
 def prints_for(ticks: sqlite3.Connection, symbol: str, day: str,
-               since_ms: int | None = None) -> list[tuple[int, float, int, int]]:
-    """Volume-bearing raw updates for one session, classified against the prior book."""
-    return [(ts_ms, ltp, size, side)
-            for ts_ms, ltp, size, side, _, _ in _updates(ticks, symbol, day, since_ms) if size > 0]
+               since_ms: int | None = None,
+               gaps: list[tuple[int, int]] | None = None) -> list[tuple[int, float, int, int]]:
+    """Volume-bearing raw updates for one session, classified against the prior book.
+
+    With ``gaps`` (feed_gaps), an update whose interval since the symbol's
+    previous one spans a feed gap is dropped: its size is the volume traded
+    while the feed was silent, not a print anyone placed.
+    """
+    out = []
+    previous = None
+    for ts_ms, ltp, size, side, _, _ in _updates(ticks, symbol, day, since_ms):
+        # The catch-up lands on the first update after the feed resumes; an
+        # illiquid contract quiet across a gap but printing long after it is
+        # not one.
+        after_gap = bool(gaps) and previous is not None and any(
+            previous <= start and end <= ts_ms <= end + FEED_CATCHUP_MS for start, end in gaps)
+        previous = ts_ms
+        if size > 0 and not after_gap:
+            out.append((ts_ms, ltp, size, side))
+    return out
 
 
-def detect_recent(ticks: sqlite3.Connection, symbol: str, day: str, now_ms: int) -> list[WhaleEvent]:
+def feed_gaps(ticks: sqlite3.Connection, day: str) -> list[tuple[int, int]]:
+    """[start_ms, end_ms] spans in which every heartbeat instrument was silent."""
+    start, end = session_span(day)
+    try:
+        ids = [row[0] for row in ticks.execute(
+            f"""SELECT id FROM tick_symbols
+                WHERE symbol IN ({",".join("?" * len(HEARTBEAT_SYMBOLS))}) OR symbol LIKE '%FUT'""",
+            HEARTBEAT_SYMBOLS)]
+        if not ids:
+            return []
+        stamps = [row[0] for row in ticks.execute(
+            f"""SELECT ts_ms FROM ticks WHERE symbol_id IN ({",".join("?" * len(ids))})
+                AND ts_ms >= ? AND ts_ms < ? ORDER BY ts_ms""", (*ids, start * 1000, end * 1000))]
+    except sqlite3.OperationalError:
+        return []
+    return [(a, b) for a, b in zip(stamps, stamps[1:]) if b - a >= FEED_GAP_SECONDS * 1000]
+
+
+def instrument_kind(symbol: str) -> str:
+    """"cash", "future", "option" or "index" for the name list."""
+    body = symbol.split(":", 1)[-1].upper()
+    if body.endswith("-INDEX"):
+        return "index"
+    if body.endswith("-EQ"):
+        return "cash"
+    if body.endswith("FUT"):
+        return "future"
+    return "option" if body.endswith(("CE", "PE")) else "cash"
+
+
+def _regime_lot_root(symbol: str) -> bool:
+    return underlying_of(symbol) in ("NIFTY", "BANKNIFTY")
+
+
+def detect_recent(ticks: sqlite3.Connection, symbol: str, day: str, now_ms: int,
+                  gaps: list[tuple[int, int]] | None = None) -> list[WhaleEvent]:
     """Layer A over the trailing slice, so aggression exists during the
     session and not only after the night job. The slice starts with no
     carry-forward, so A3's size history differs from the full-day pass; the
     nightly run overwrites with the full-day result."""
-    return detect(symbol, day, prints_for(ticks, symbol, day, now_ms - A_LIVE_LOOKBACK_MS))
+    return detect(symbol, day, prints_for(ticks, symbol, day, now_ms - A_LIVE_LOOKBACK_MS, gaps))
 
 
 def save_events(connection: sqlite3.Connection, day: str, events: list[WhaleEvent]) -> int:
@@ -455,12 +597,16 @@ def save_events(connection: sqlite3.Connection, day: str, events: list[WhaleEven
 
 
 def events_for(connection: sqlite3.Connection, day: str, symbol: str | None = None,
-               limit: int = 300) -> list[dict]:
+               limit: int = 300, futures_only: bool = False) -> list[dict]:
     try:
         where, params = "day = ?", [day]
         if symbol:
             where += " AND symbol = ?"
             params.append(symbol)
+        elif futures_only:
+            # The futures panel: Layer A now also scans every stock and option
+            # for the name list, whose events must not crowd these out.
+            where += " AND symbol LIKE '%FUT'"
         cursor = connection.execute(
             f"""SELECT * FROM whale_events WHERE {where} ORDER BY score DESC, ts_ms DESC LIMIT ?""",
             (*params, limit))
@@ -966,7 +1112,7 @@ def minute_flow_from_ticks(ticks: sqlite3.Connection, symbol: str, day: str) -> 
 def minute_flow_from_condensed(ticks: sqlite3.Connection, symbol: str, day: str) -> list[tuple]:
     """The futures leg from tick_minute_flow, for days the raw tier has already
     been condensed away. Running sums, so the row shape matches the live one."""
-    start, end = session_span(day)
+    start, end = session_span(day, symbol)
     try:
         minutes = ticks.execute(
             """SELECT f.minute_ts, f.close, f.buy_volume, f.sell_volume, f.volume, f.trades, f.ofi
@@ -1508,3 +1654,368 @@ def eod(history: sqlite3.Connection, day: str, underlying: str, futures_symbol: 
              d_call, d_put, fut_oi, fut_pdoi, avg_trade, pct, json.dumps(top_oi), json.dumps(top_d),
              json.dumps(walls), score, z, len(priors), futures_symbol, skipped))
     return {**row, "status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Names: Layer A across the captured universe, one row per instrument
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_OPTION_SYMBOL = _re.compile(
+    r"^(?P<root>[A-Z0-9&\-]+?)(?P<yy>\d{2})(?P<expiry>[A-Z]{3}|[1-9OND]\d{2})"
+    r"(?P<strike>\d+(?:\.\d+)?)(?P<right>CE|PE)$")
+_MEDIAN = _re.compile(r"^(\d+) vs 30m median (\d+)")
+_CHILD = _re.compile(r"^(\d+)x (\d+) every ~([\d.]+)s \(cv ([\d.]+)\)")
+
+
+def traded_symbols(ticks: sqlite3.Connection, day: str, since_ms: int | None = None) -> list[str]:
+    """Contracts with ticks in the session (or since ``since_ms``); indices carry no volume."""
+    start, end = session_span(day)
+    rows = ticks.execute(
+        """SELECT DISTINCT s.symbol FROM ticks t JOIN tick_symbols s ON s.id = t.symbol_id
+           WHERE t.ts_ms >= ? AND t.ts_ms < ?""",
+        (max(start * 1000, since_ms or 0), end * 1000)).fetchall()
+    return sorted(row[0] for row in rows if not row[0].endswith("-INDEX"))
+
+
+def scan(ticks: sqlite3.Connection, day: str, symbols: list[str], *, since_ms: int | None = None,
+         lots: dict[str, int] | None = None, gaps: list[tuple[int, int]] | None = None,
+         params: dict[str, dict] | None = None, on_prints=None) -> list[WhaleEvent]:
+    """Layer A over many instruments, feed-gap catch-ups excluded.
+
+    ``params`` maps a symbol to its tuned thresholds; ``on_prints(symbol,
+    prints)`` sees each symbol's print list (the nightly fingerprint) so the
+    session is walked once.
+    """
+    events: list[WhaleEvent] = []
+    for symbol in symbols:
+        prints = prints_for(ticks, symbol, day, since_ms, gaps)
+        if on_prints is not None:
+            on_prints(symbol, prints)
+        if prints:
+            events.extend(detect(symbol, day, prints, (lots or {}).get(symbol), (params or {}).get(symbol)))
+    return events
+
+
+def describe(symbol: str) -> dict:
+    """Kind, underlying and (for an option) strike and right, from the ticker."""
+    kind = instrument_kind(symbol)
+    body = symbol.split(":", 1)[-1]
+    out = {"kind": kind, "underlying": underlying_of(symbol), "strike": None, "right": None}
+    if kind == "option":
+        match = _OPTION_SYMBOL.match(body)
+        if match:
+            out.update(underlying=match["root"], strike=float(match["strike"]), right=match["right"])
+    elif kind == "future":
+        out["underlying"] = _re.sub(r"\d{2}[A-Z]{3}FUT$", "", body)
+    return out
+
+
+def _session_volume(ticks: sqlite3.Connection | None, symbol: str, day: str) -> int | None:
+    if ticks is None:
+        return None
+    start, end = session_span(day, symbol)
+    # First and last tick of the session by the (symbol_id, ts_ms) index: two
+    # seeks, where MAX-MIN read every tick of the day (5 s for 150 names).
+    try:
+        found = ticks.execute("SELECT id FROM tick_symbols WHERE symbol = ?", (symbol,)).fetchone()
+        if not found:
+            return None
+        edges = []
+        for order in ("ASC", "DESC"):
+            row = ticks.execute(
+                f"""SELECT cum_volume FROM ticks WHERE symbol_id = ? AND ts_ms >= ? AND ts_ms < ?
+                    AND cum_volume > 0 ORDER BY ts_ms {order} LIMIT 1""",
+                (found[0], start * 1000, end * 1000)).fetchone()
+            edges.append(row[0] if row else None)
+    except sqlite3.OperationalError:
+        return None
+    if edges[0] is None or edges[1] is None or edges[1] <= edges[0]:
+        return None
+    return int(edges[1] - edges[0])
+
+
+def _clock(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, IST).strftime("%H:%M:%S")
+
+
+def names(history: sqlite3.Connection, ticks: sqlite3.Connection | None, day: str, *,
+          lots: dict[str, int] | None = None, kind: str | None = None, limit: int = 100) -> list[dict]:
+    """The day's Layer A events rolled up into a ranked list of instruments.
+
+    Each row says what was seen and with which parameters: the largest print
+    (size, lots, multiple of its 30-minute median, rupee notional, time), the
+    constant child size (clip x repeats, spacing, regularity), freeze-size
+    prints and slicer bursts, the side the whale volume leaned, and its share
+    of the instrument's session volume. Ranked by the strongest single event
+    plus a small credit for repetition, so one outsized print and a steady
+    iceberg both surface.
+    """
+    try:
+        rows = history.execute(
+            """SELECT symbol, ts_ms, kind, side, quantity, price, score, evidence
+               FROM whale_events WHERE day = ? AND layer = 'A' ORDER BY ts_ms""", (day,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    grouped: dict[str, list] = {}
+    for row in rows:
+        grouped.setdefault(row[0], []).append(row)
+    out = []
+    for symbol, events in grouped.items():
+        meta = describe(symbol)
+        if kind and meta["kind"] != kind:
+            continue
+        lot = max(1, int((lots or {}).get(symbol) or lot_size(symbol, day)))
+        counts: dict[str, int] = {}
+        buy = sell = 0
+        for _sym, _ts, event_kind, side, qty, _price, _score, _ev in events:
+            counts[event_kind] = counts.get(event_kind, 0) + 1
+            if side > 0:
+                buy += qty or 0
+            elif side < 0:
+                sell += qty or 0
+        top = max(events, key=lambda row: row[6])
+        large = [row for row in events if row[2] == "large_print"]
+        largest = max(large or events, key=lambda row: row[4] or 0)
+        largest_multiple = None
+        match = _MEDIAN.match(largest[7] or "")
+        if match and int(match[2]) > 0:
+            largest_multiple = round(int(match[1]) / int(match[2]), 1)
+        children = [row for row in events if row[2] == "constant_child"]
+        child = None
+        if children:
+            last = children[-1]
+            parsed = _CHILD.match(last[7] or "")
+            child = {"size": last[4], "lots": (last[4] or 0) // lot, "repeats_per_run": int(parsed[1]) if parsed else None,
+                     "runs": len(children), "every_seconds": float(parsed[3]) if parsed else None,
+                     "cv": float(parsed[4]) if parsed else None, "side": last[3],
+                     "notional": round((last[4] or 0) * (last[5] or 0)), "last_at": _clock(last[1])}
+        volume = _session_volume(ticks, symbol, day)
+        large_qty = sum(row[4] or 0 for row in large)
+        patterns = []
+        if large:
+            patterns.append(f"{len(large)} large print{'s' if len(large) > 1 else ''}"
+                            + (f", max {largest_multiple}x median" if largest_multiple else ""))
+        if child:
+            lots_text = f" ({child['lots']} lots)" if lot > 1 else ""
+            patterns.append(f"iceberg: {child['size']}{lots_text} clips, {child['runs']} run"
+                            f"{'s' if child['runs'] > 1 else ''}"
+                            + (f" every ~{child['every_seconds']}s" if child["every_seconds"] else ""))
+        if counts.get("freeze_print"):
+            patterns.append(f"{counts['freeze_print']} freeze-size prints")
+        if counts.get("slicer"):
+            patterns.append(f"{counts['slicer']} slicer bursts")
+        score = round(top[6] + 0.3 * math.log1p(len(events) - 1), 3)
+        out.append({
+            "symbol": symbol, **meta, "lot": lot, "score": score, "events": len(events),
+            "counts": counts, "patterns": patterns,
+            "top": {"kind": top[2], "side": top[3], "quantity": top[4], "price": top[5],
+                    "score": top[6], "evidence": top[7], "at": _clock(top[1])},
+            "largest": {"quantity": largest[4], "lots": (largest[4] or 0) // lot, "price": largest[5],
+                        "notional": round((largest[4] or 0) * (largest[5] or 0)),
+                        "median_multiple": largest_multiple, "side": largest[3], "at": _clock(largest[1])},
+            "child": child,
+            "side": "buy" if buy > 1.5 * sell else "sell" if sell > 1.5 * buy else "mixed",
+            "buy_quantity": buy, "sell_quantity": sell,
+            "session_volume": volume,
+            "large_share_pct": round(100 * large_qty / volume, 2) if volume else None,
+            "first_at": _clock(events[0][1]), "last_at": _clock(events[-1][1]),
+        })
+    out.sort(key=lambda row: row["score"], reverse=True)
+    out = out[:limit]
+    # Calibrated P(moves their way) per name: its best event today, scored by
+    # the latest calibration run's feature weights (whale_tuning).
+    if out and history.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='whale_event_features'").fetchone():
+        from .whale_tuning import latest_calibration, probability
+        weights, base_rate, run_id = latest_calibration(history)
+        best: dict[str, tuple] = {}
+        for symbol, bins_text, feats in history.execute(
+                "SELECT symbol, bins, features FROM whale_event_features WHERE day = ?", (day,)):
+            bins = json.loads(bins_text)
+            chance = probability(bins, weights, base_rate)
+            if symbol not in best or (chance or 0) > (best[symbol][0] or 0):
+                best[symbol] = (chance, bins, json.loads(feats))
+        for row in out:
+            if row["symbol"] in best:
+                chance, bins, feats = best[row["symbol"]]
+                row.update(probability=chance, calibration_run=run_id, features=bins,
+                           size_vs_p999=feats.get("size_vs_p999"), turnover_share_pct=feats.get("turnover_share_pct"))
+    # Since the name entered the list: its first event today, then the bars.
+    if out and _has_entries(history):
+        entries = {row[0]: row[1:] for row in history.execute(
+            "SELECT symbol, entry_ts, entry_price, side FROM whale_entries WHERE day = ?", (day,))}
+        for row in out:
+            entry = entries.get(row["symbol"])
+            if entry:
+                row["entry"] = {"at": _clock(entry[0]), "price": entry[1], "side": entry[2],
+                                **entry_performance(history, row["symbol"], entry[0], entry[1], entry[2])}
+    return out
+
+
+def names_thresholds() -> dict:
+    """The parameters the list was built with, for the page to state."""
+    return {"large_print_multiple": LARGE_PRINT_MULTIPLE, "median_window_minutes": MEDIAN_WINDOW_SECONDS // 60,
+            "large_print_window_share_pct": round(100 * LARGE_PRINT_WINDOW_SHARE),
+            "min_large_print_lots": MIN_LARGE_PRINT_LOTS, "child_min_repeats": CHILD_MIN_REPEATS,
+            "child_max_cv": CHILD_MAX_CV, "child_min_median_multiple": CHILD_MIN_MEDIAN_MULTIPLE,
+            "child_max_interval_seconds": CHILD_MAX_INTERVAL_SECONDS, "slicer_window_seconds": SLICER_WINDOW_SECONDS,
+            "slicer_min_prints": SLICER_MIN_PRINTS, "feed_gap_seconds": FEED_GAP_SECONDS,
+            "notional_floor": {kind: {"large_print": a, "child": b}
+                               for kind, (a, b) in WHALE_NOTIONAL_FLOOR.items()},
+            "scan_every_minutes": NAMES_SCAN_EVERY_MINUTES}
+
+
+# ---------------------------------------------------------------------------
+# Entries: what an instrument did after it entered the whale list
+# ---------------------------------------------------------------------------
+
+ENTRY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS whale_entries (
+  symbol TEXT NOT NULL, day TEXT NOT NULL, entry_ts INTEGER NOT NULL, entry_price REAL NOT NULL,
+  side INTEGER NOT NULL, kind TEXT NOT NULL, score REAL, evidence TEXT, recorded_at TEXT NOT NULL,
+  PRIMARY KEY (symbol, day)
+)"""
+# How long an entry is followed: the rest of its day and this many more sessions.
+FOLLOW_SESSIONS = 5
+FORWARD_MINUTES = (15, 30, 60)
+
+
+def record_entries(history: sqlite3.Connection, day: str) -> int:
+    """First appearance of each name on ``day``'s list, from its earliest Layer A event.
+
+    Kept once (INSERT OR IGNORE): a later, bigger event the same day does not
+    move the entry, because the question is what happened AFTER the list first
+    showed the name.
+    """
+    history.execute(ENTRY_SCHEMA)
+    rows = history.execute(
+        """SELECT symbol, MIN(ts_ms) FROM whale_events WHERE day = ? AND layer = 'A' GROUP BY symbol""",
+        (day,)).fetchall()
+    added = 0
+    stamp = datetime.now(UTC).isoformat()
+    with history:
+        for symbol, first_ts in rows:
+            event = history.execute(
+                """SELECT price, side, kind, score, evidence FROM whale_events
+                   WHERE day = ? AND layer = 'A' AND symbol = ? AND ts_ms = ? ORDER BY score DESC LIMIT 1""",
+                (day, symbol, first_ts)).fetchone()
+            if not event or not event[0]:
+                continue
+            added += history.execute(
+                """INSERT OR IGNORE INTO whale_entries
+                   (symbol, day, entry_ts, entry_price, side, kind, score, evidence, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (symbol, day, int(first_ts), float(event[0]), int(event[1] or 0), event[2],
+                 event[3], event[4], stamp)).rowcount
+    return added
+
+
+def _has_entries(history: sqlite3.Connection) -> bool:
+    return history.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'whale_entries'").fetchone() is not None
+
+
+def _pct(value: float, base: float) -> float:
+    return round((value / base - 1.0) * 100.0, 2)
+
+
+def entry_performance(history: sqlite3.Connection, symbol: str, entry_ts_ms: int, entry_price: float,
+                      side: int, follow_sessions: int = FOLLOW_SESSIONS) -> dict:
+    """Max and min return after entry, when they happened, and where it is now.
+
+    From the durable 1-minute bars, the entry minute onward, over the rest of
+    the entry session and ``follow_sessions`` more. ``favourable``/``adverse``
+    read the move in the direction of the whale's side (a sell entry gains
+    when price falls); a sideless entry has neither.
+    """
+    start = entry_ts_ms // 1000 // 60 * 60
+    rows = history.execute(
+        """SELECT timestamp, high, low, close FROM historical_candles
+           WHERE symbol = ? AND timeframe_seconds = 60 AND timestamp >= ? ORDER BY timestamp LIMIT 6000""",
+        (symbol, start)).fetchall()
+    days: list[str] = []
+    high = low = None
+    high_ts = low_ts = None
+    last = last_ts = None
+    forward: dict[str, float | None] = {f"{m}m": None for m in FORWARD_MINUTES}
+    for ts, bar_high, bar_low, close in rows:
+        day = datetime.fromtimestamp(ts, IST).date().isoformat()
+        if not days or days[-1] != day:
+            if len(days) > follow_sessions:
+                break
+            days.append(day)
+        if bar_high is not None and (high is None or bar_high > high):
+            high, high_ts = float(bar_high), ts
+        if bar_low is not None and (low is None or bar_low < low):
+            low, low_ts = float(bar_low), ts
+        if close is not None:
+            last, last_ts = float(close), ts
+            for minutes in FORWARD_MINUTES:
+                key = f"{minutes}m"
+                if forward[key] is None and ts >= start + minutes * 60:
+                    forward[key] = _pct(float(close), entry_price)
+    if high is None or low is None or not entry_price:
+        return {"bars": 0, "sessions": 0}
+    max_return, min_return = _pct(high, entry_price), _pct(low, entry_price)
+    stamp = lambda ts: datetime.fromtimestamp(ts, IST).strftime("%d %b %H:%M") if ts else None
+    out = {
+        "bars": len(rows), "sessions": len(days),
+        "max_return_pct": max_return, "max_at": stamp(high_ts),
+        "min_return_pct": min_return, "min_at": stamp(low_ts),
+        "last_return_pct": _pct(last, entry_price) if last else None, "last_at": stamp(last_ts),
+        "forward": forward, "complete": len(days) > follow_sessions,
+    }
+    if side > 0:
+        out.update(favourable_pct=max_return, adverse_pct=min_return)
+    elif side < 0:
+        out.update(favourable_pct=round(-min_return, 2), adverse_pct=round(-max_return, 2))
+    return out
+
+
+def performance(history: sqlite3.Connection, since: str, until: str, *, kind: str | None = None,
+                limit: int = 500) -> dict:
+    """Every entry in [since, until] with its performance, and summaries by side and pattern."""
+    if not _has_entries(history):
+        return {"since": since, "until": until, "follow_sessions": FOLLOW_SESSIONS, "summary": {},
+                "by_side": {}, "by_pattern": {}, "entries": []}
+    rows = history.execute(
+        """SELECT symbol, day, entry_ts, entry_price, side, kind, score, evidence FROM whale_entries
+           WHERE day >= ? AND day <= ? ORDER BY day DESC, entry_ts DESC LIMIT ?""",
+        (since, until, limit)).fetchall()
+    entries = []
+    for symbol, day, entry_ts, price, side, event_kind, score, evidence in rows:
+        meta = describe(symbol)
+        if kind and meta["kind"] != kind:
+            continue
+        perf = entry_performance(history, symbol, entry_ts, price, side)
+        entries.append({"symbol": symbol, **meta, "day": day, "entry_at": _clock(entry_ts),
+                        "entry_price": price, "side": side, "pattern": event_kind, "score": score,
+                        "evidence": evidence, **perf})
+
+    def summarise(group: list[dict]) -> dict:
+        measured = [row for row in group if row.get("bars")]
+        sided = [row for row in measured if "favourable_pct" in row]
+        mean = lambda values: round(sum(values) / len(values), 2) if values else None
+        return {
+            "entries": len(group), "measured": len(measured),
+            "avg_max_return_pct": mean([row["max_return_pct"] for row in measured]),
+            "avg_min_return_pct": mean([row["min_return_pct"] for row in measured]),
+            "avg_favourable_pct": mean([row["favourable_pct"] for row in sided]),
+            "avg_adverse_pct": mean([row["adverse_pct"] for row in sided]),
+            # Did the move in the whale's direction outrun the move against it?
+            "went_their_way_pct": round(100 * sum(1 for row in sided
+                                                  if row["favourable_pct"] > -row["adverse_pct"]) / len(sided), 1)
+            if sided else None,
+        }
+    by_pattern: dict[str, list] = {}
+    for row in entries:
+        by_pattern.setdefault(row["pattern"], []).append(row)
+    return {
+        "since": since, "until": until, "follow_sessions": FOLLOW_SESSIONS,
+        "summary": summarise(entries),
+        "by_side": {label: summarise([row for row in entries if row["side"] == side])
+                    for label, side in (("buy", 1), ("sell", -1))},
+        "by_pattern": {pattern: summarise(group) for pattern, group in by_pattern.items()},
+        "entries": entries,
+    }

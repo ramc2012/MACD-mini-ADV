@@ -117,3 +117,37 @@ def test_portfolio_limits_restrict_new_buys_but_preserve_holdings_and_exits(mana
         await manager.submit("TEST", "SELL", lots=1)
         assert not manager.portfolio.positions
     asyncio.run(scenario())
+
+
+def test_a_held_position_is_sellable_after_its_contract_leaves_the_selection(tmp_path):
+    repository = TradeRepository(str(tmp_path / "held.sqlite3"))
+    manager = ExecutionManager(Settings(symbols_csv="TEST", slippage_bps=5), NoBrokerOrders(), Portfolio(1_000_000),
+                               repository, EventHub())
+    symbol = "NSE:SBIN26OCT800CE"
+    manager.set_tradable_contracts({symbol: 50})
+    manager.set_quote(symbol, 10.0)
+    asyncio.run(manager.submit(symbol, "BUY", lots=2))
+    manager.set_tradable_contracts({"NSE:SBIN26OCT820CE": 50})       # rolled out of today's selection
+    with pytest.raises(ValueError, match="not on the watchlist"):
+        asyncio.run(manager.submit(symbol, "BUY", lots=1))           # new exposure is still refused
+    asyncio.run(manager.on_tick(symbol, 6.5))                          # below the 30% hard stop: must exit, not raise
+    assert symbol not in manager.portfolio.positions
+    repository.close()
+
+
+def test_a_cash_starved_pyramid_add_is_not_retried_on_every_tick(tmp_path):
+    """30 Sep 2026: 3,170 REJECTED add orders -- one per tick while the price sat above the add level."""
+    repository = TradeRepository(str(tmp_path / "adds.sqlite3"))
+    settings = Settings(symbols_csv="TEST", slippage_bps=5, max_trade_lots=4, auto_trade=True)
+    manager = ExecutionManager(settings, NoBrokerOrders(), Portfolio(1_100), repository, EventHub())
+    symbol = "NSE:SBIN26OCT800CE"
+    manager.set_tradable_contracts({symbol: 100})
+    manager.set_quote(symbol, 10.0)
+    asyncio.run(manager.submit(symbol, "BUY", lots=1))        # Rs ~1,000 of Rs 1,100: no cash for an add
+    for price in [11.0] * 200:                                  # +10%: above the +7.5% add level, every tick
+        asyncio.run(manager.on_tick(symbol, price))
+    rejected = [o for o in repository.rows("orders") if o["status"] == "REJECTED"]
+    assert rejected == [] and manager.portfolio.positions[symbol].lots == 1
+    asyncio.run(manager.on_tick(symbol, 6.9))                   # the stop is still live
+    assert symbol not in manager.portfolio.positions
+    repository.close()

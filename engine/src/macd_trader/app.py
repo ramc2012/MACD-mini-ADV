@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from contextlib import asynccontextmanager, suppress
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from typing import Literal
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
@@ -18,6 +21,7 @@ from .alerts import AlertManager
 from .brokers import create_broker
 from .config import ENVIRONMENT_ONLY, Settings, settings
 from .chart_history import load_chart_history
+from .candle_store import store_historical_candles
 from . import desk_routes
 from .api_models import OrderInput, _as_json
 from .dispersion import load as load_dispersion
@@ -50,6 +54,12 @@ alert_manager = AlertManager(engine)
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await engine.start()
+    if os.environ.get("MACD_LOOP_WATCHDOG") == "1":
+        # Exit on a wedged event loop so Docker restarts the engine (self_heal.LoopWatchdog). Container-only.
+        from .self_heal import LoopWatchdog
+        engine.loop_watchdog = LoopWatchdog(engine.settings.engine_role,
+                                            marker_dir=os.path.dirname(os.path.abspath(engine.settings.database_path)))
+        engine.loop_watchdog.start()
     persist_settings(engine.settings)
     persist_credentials(engine.settings)
     alert_manager.start()
@@ -242,6 +252,33 @@ async def option_ratios(
         raise HTTPException(500, f"Ratio history is unavailable: {exc}") from exc
 
 
+@app.get("/api/heatmap/atm", dependencies=[Depends(authorize)])
+async def atm_heatmap(as_of: str | None = None):
+    """ATM call and put premium change per underlying, period to date (1H, 4H, 1D, 1W, 1M).
+
+    ``as_of`` (YYYY-MM-DD) replays the map at that day's close with that day's ATM contracts."""
+    try:
+        day = date.fromisoformat(as_of) if as_of else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="as_of must be YYYY-MM-DD") from exc
+    return await engine.atm_heatmap(day)
+
+
+@app.get("/api/sector-wheel", dependencies=[Depends(authorize)])
+async def sector_wheel():
+    """Own and NIFTY-relative returns over 1, 5, 20 and 60 sessions for indices, sectors and F&O stocks."""
+    return await engine.sector_wheel()
+
+
+@app.get("/api/trend-rotation", dependencies=[Depends(authorize)])
+async def trend_rotation(kind: Literal["CE", "PE", "SPOT"] = "CE",
+                         timeframe_seconds: int = Query(default=1800)):
+    """Absolute price trend states for ATM calls, ATM puts or spots. Read-only diagnostics."""
+    if timeframe_seconds not in (1800, 3600, 86400):
+        raise HTTPException(422, "Use 1800, 3600 or 86400 seconds")
+    return await engine.trend_rotation(kind, timeframe_seconds)
+
+
 @app.get("/api/dispersion", dependencies=[Depends(authorize)])
 async def dispersion(
     timeframe_seconds: int | None = Query(default=None, ge=60, le=86_400),
@@ -289,6 +326,12 @@ async def orders(limit: int = Query(default=10_000, ge=1, le=100_000)):
 @app.get("/api/trades", dependencies=[Depends(authorize)])
 async def trades(limit: int = Query(default=10_000, ge=1, le=100_000)):
     return engine.repository.rows("trades", limit)
+
+
+@app.get("/api/risk/greeks", dependencies=[Depends(authorize)])
+async def risk_greeks():
+    """Net delta, theta and vega of every paper book (display only)."""
+    return engine.book_greeks()
 
 
 @app.get("/api/portfolio", dependencies=[Depends(authorize)])
@@ -355,10 +398,77 @@ class BlastSettingsInput(BaseModel):
     target_notional: float | None = Field(default=None, ge=0, le=5_000_000)
     max_premium_pct: float | None = Field(default=None, gt=0, le=100)
     min_breadth: float | None = Field(default=None, ge=0.0, le=1.0)
+    vix_adaptive_enabled: bool | None = None
+    vix_reference: float | None = Field(default=None, ge=5.0, le=100.0)
+    vix_breadth_adjustment: float | None = Field(default=None, ge=-0.25, le=0.25)
+    vix_max_age_seconds: float | None = Field(default=None, ge=30.0, le=3600.0)
+    rich_premium_max_multiple: float | None = Field(default=None, ge=1.0, le=4.0)
     min_off_high_pct: float | None = Field(default=None, ge=0.0, le=99.0)
     hard_stop_pct: float | None = Field(default=None, gt=0, lt=1)
     trail_activation_pct: float | None = Field(default=None, gt=0, lt=5)
     trail_pct: float | None = Field(default=None, gt=0, lt=1)
+
+
+def _smart_lane(name: str):
+    lane = engine.smart_lanes.get(name)
+    if lane is None:
+        raise HTTPException(404, f"no smart lane {name}")
+    return lane
+
+
+@app.get("/api/lanes", dependencies=[Depends(authorize)])
+async def smart_lanes_index():
+    """The smart lanes (smart_lane.py): one paper book per configured capital, same rules."""
+    return {"lanes": [await asyncio.to_thread(lane.summary) for lane in engine.smart_lanes.lanes]}
+
+
+@app.get("/api/lanes/{name}/snapshot", dependencies=[Depends(authorize)])
+async def smart_lane_snapshot(name: str):
+    return _smart_lane(name).snapshot()
+
+
+@app.get("/api/lanes/{name}/summary", dependencies=[Depends(authorize)])
+async def smart_lane_summary(name: str):
+    return await asyncio.to_thread(_smart_lane(name).summary)
+
+
+class CloseSmartPositionInput(BaseModel):
+    symbol: str = Field(min_length=3, max_length=64)
+    expected_quantity: int = Field(gt=0)
+
+
+@app.post("/api/lanes/{name}/close-position", dependencies=[Depends(authorize)])
+async def close_smart_position(name: str, payload: CloseSmartPositionInput):
+    _smart_lane(name)
+    try:
+        order = await engine.close_smart_paper_position(name, payload.symbol, payload.expected_quantity)
+    except PermissionError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return _as_json(order)
+
+
+@app.get("/api/lanes/{name}/trades", dependencies=[Depends(authorize)])
+async def smart_lane_trades(name: str, limit: int = Query(default=500, ge=1, le=5000)):
+    return {"trades": await asyncio.to_thread(_smart_lane(name).trades, limit)}
+
+
+@app.get("/api/lanes/{name}/journal", dependencies=[Depends(authorize)])
+async def smart_lane_journal(name: str, day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                             decision: str | None = Query(default=None, pattern=r"^[A-Z_]{2,40}$"),
+                             limit: int = Query(default=300, ge=1, le=5000)):
+    """Every entry decision -- taken, or why not -- with the score, cut and sizing it was made on."""
+    lane = _smart_lane(name)
+    rows = await asyncio.to_thread(lambda: lane.journal_rows(day=day, decision=decision, limit=limit))
+    return {"rows": rows, "days": await asyncio.to_thread(lane.journal_days)}
+
+
+@app.get("/api/lanes/{name}/equity", dependencies=[Depends(authorize)])
+async def smart_lane_equity(name: str):
+    return {"equity": await asyncio.to_thread(_smart_lane(name).equity_curve)}
 
 
 @app.get("/api/blast/snapshot", dependencies=[Depends(authorize)])
@@ -443,19 +553,20 @@ async def equity_history(
     period: Literal["1d", "1w", "1m", "all"] = Query(default="1d"),
     timeframe_seconds: int = Query(default=60, ge=5, le=86_400),
 ):
-    from datetime import datetime, timedelta, timezone
+    """Equity by trading session, not wall clock: 1D is the latest session with
+    samples, 1W the last 5, 1M the last 21. A 24-hour window left the curve empty
+    every weekend, holiday and morning before the open."""
+    sessions = {"1d": 1, "1w": 5, "1m": 21}.get(period)
+    since = None
+    if sessions:
+        from datetime import date
 
-    spans = {"1d": timedelta(days=1), "1w": timedelta(days=7), "1m": timedelta(days=31)}
-    cutoff = datetime.now(timezone.utc) - spans[period] if period in spans else None
-    rows = engine.repository.equity_rows(200_000)
-    buckets: dict[int, dict] = {}
-    for row in rows:
-        moment = datetime.fromisoformat(row["timestamp"])
-        if cutoff and moment < cutoff:
-            continue
-        bucket = int(moment.timestamp()) // timeframe_seconds * timeframe_seconds
-        buckets[bucket] = {**row, "timestamp": datetime.fromtimestamp(bucket, timezone.utc).isoformat()}
-    return [buckets[key] for key in sorted(buckets)]
+        from . import market_calendar
+        # Holidays and weekends carry the odd startup mark; they are not sessions.
+        days = [day for day in await asyncio.to_thread(engine.repository.equity_days)
+                if market_calendar.is_trading_day(date.fromisoformat(day))]
+        since = days[-sessions] if len(days) >= sessions else (days[0] if days else None)
+    return await asyncio.to_thread(engine.repository.equity_buckets, since, timeframe_seconds)
 
 
 _RRG_TTL_SECONDS = 300
@@ -468,7 +579,9 @@ async def _compute_and_store_rrg(key: str, timeframe_seconds: int, window: int, 
     value = await asyncio.to_thread(
         compute_rrg,
         engine.settings.research_database_path,
-        list(engine.settings.symbols),
+        # The real NSE sector and broad indices ride along (engine.context_indices), so the page can plot them
+        # directly instead of only averaging member stocks.
+        list(dict.fromkeys([*engine.settings.symbols, *(engine.context_indices or engine.settings.context_indices)])),
         "NSE:NIFTY50-INDEX",
         timeframe_seconds,
         window,
@@ -749,7 +862,11 @@ async def fyers_credentials(payload: FyersCredentialsInput):
     return {"saved": True, "redirect_uri": new_settings.fyers_redirect_uri}
 
 
-async def install_fyers_token(access_token: str) -> dict:
+async def install_fyers_token(access_token: str, described: dict | None = None) -> dict:
+    if described and described.get("expires_at") and described["expires_at"] <= datetime.now(UTC):
+        expired = described["expires_at"].astimezone(IST).strftime("%d %b %H:%M")
+        raise HTTPException(400, f"That access token expired at {expired} IST -- Fyers tokens last until 06:00 IST "
+                                 "the next morning. Log in again (step 1) for today's.")
     merged = {**desired_settings().model_dump(), "fyers_access_token": access_token}
     new_settings = Settings(**merged)
     # Validate the token with a fast /profile probe BEFORE persisting, then
@@ -762,7 +879,10 @@ async def install_fyers_token(access_token: str) -> dict:
         await probe.connect()
         accepted_expiry = probe.token_expiry()
     except Exception as exc:
-        raise HTTPException(400, f"Fyers rejected the token: {exc}") from exc
+        client = new_settings.fyers_client_id or "this app"
+        raise HTTPException(400, "Fyers did not accept this access token -- it is invalid, revoked, or was issued "
+                                 f"for a different app than {client}. Log in again (step 1) and paste the redirect "
+                                 "address in step 2.") from exc
     finally:
         await probe.close()
     persist_settings(new_settings)
@@ -781,7 +901,10 @@ async def fyers_exchange(payload: AuthCodeInput):
         pasted = payload.auth_code.strip()
         if "://" in pasted:
             query = parse_qs(urlparse(pasted).query)
-            pasted = str((query.get("auth_code") or query.get("code") or [pasted])[0])
+            if not query.get("auth_code"):
+                raise HTTPException(400, "That address has no auth_code in it -- copy the full address of the page "
+                                         "Fyers redirected to after you logged in.")
+            pasted = str(query["auth_code"][0])
         tokens = await engine.broker.exchange_auth_code(pasted)
         return await install_fyers_token(tokens["access_token"])
     except HTTPException:
@@ -792,7 +915,16 @@ async def fyers_exchange(payload: AuthCodeInput):
 
 @app.post("/api/auth/fyers/access-token", dependencies=[Depends(authorize)])
 async def fyers_access_token(payload: AccessTokenInput):
-    return await install_fyers_token(payload.access_token)
+    """Install a pasted access token -- or, if what was pasted is really the redirect address or an
+    auth code (the usual mix-up after logging in), exchange it instead of failing with a token error."""
+    from .brokers import describe_fyers_token
+    pasted = describe_fyers_token(payload.access_token)
+    if pasted["kind"] in ("redirect", "auth_code"):
+        if not pasted["value"]:
+            raise HTTPException(400, "That address has no auth_code in it -- copy the full address of the page "
+                                     "Fyers redirected to after you logged in.")
+        return await fyers_exchange(AuthCodeInput(auth_code=pasted["value"]))
+    return await install_fyers_token(pasted["value"], described=pasted)
 
 
 @app.get("/api/auth/fyers/callback", response_class=HTMLResponse)
@@ -945,6 +1077,39 @@ async def internal_quotes(payload: QuotesInput):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"broker quotes failed: {exc}") from exc
     return fast_json(quotes)
+
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+class BackfillInput(BaseModel):
+    symbol: str = Field(min_length=3, max_length=64)
+    since: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+
+_backfill_lock = asyncio.Lock()
+
+
+@app.post("/api/internal/backfill-minutes", dependencies=[Depends(authorize)])
+async def internal_backfill_minutes(payload: BackfillInput):
+    """Download ``symbol``'s 1-minute bars since ``since`` into the durable store.
+
+    For the desk's past profiles (a previous month, earlier weeks): this
+    process is the only Fyers client. One symbol at a time, so a page opening
+    several charts cannot burst the history rate limit; Fyers serves at most
+    100 days of 1-minute history per request.
+    """
+    start = datetime.fromisoformat(payload.since).replace(tzinfo=IST)
+    start = max(start, datetime.now(IST) - timedelta(days=95))
+    async with _backfill_lock:
+        try:
+            rows = await engine.broker.history_range(payload.symbol, 60, start, datetime.now(IST))
+        except Exception as exc:  # noqa: BLE001 - relayed to the desk
+            raise HTTPException(502, f"broker history failed: {exc}") from exc
+        stored = await asyncio.to_thread(
+            store_historical_candles, engine.settings.research_database_path, rows)
+    return {"symbol": payload.symbol, "rows": stored,
+            "first": rows[0].timestamp if rows else None, "last": rows[-1].timestamp if rows else None}
 
 
 @app.put("/api/internal/settings", dependencies=[Depends(authorize)])

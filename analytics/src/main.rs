@@ -74,8 +74,16 @@ async fn main() {
     axum::serve(listener, app).await.expect("analytics server failed");
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"ok": true}))
+/// Always 200 while the service answers, so container checks only test
+/// liveness; `ok` is false when the live pipeline is not storing bars.
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    match state.live {
+        Some(live) => {
+            let (ok, live) = live.health();
+            Json(serde_json::json!({"ok": ok, "live": live}))
+        }
+        None => Json(serde_json::json!({"ok": true})),
+    }
 }
 
 fn live_unavailable() -> Response {
@@ -105,7 +113,7 @@ struct ScanQuery {
 async fn live_scan(State(state): State<AppState>, Query(query): Query<ScanQuery>) -> Response {
     let Some(live) = state.live else { return live_unavailable() };
     let sort = query.sort.as_deref().unwrap_or("abs_histogram");
-    let rows = live.scan(sort, query.limit.unwrap_or(50).clamp(1, 500), query.warm_only.unwrap_or(false));
+    let rows = live.scan(sort, query.limit.unwrap_or(50).clamp(1, 2000), query.warm_only.unwrap_or(false));
     Json(serde_json::json!({ "sort": sort, "rows": rows })).into_response()
 }
 

@@ -8,7 +8,7 @@ import {
   type BlastForm, type FunnelKey,
 } from "./blastMath";
 import type {
-  BlastBook, BlastCandidate, BlastJournalResponse, BlastJournalSummary, BlastSnapshot, BlastVerdictSummary,
+  BlastBook, BlastCandidate, BlastEntryPolicy, BlastJournalResponse, BlastJournalSummary, BlastSnapshot, BlastVerdictSummary,
   ClosedPosition, Order, Portfolio, Position, Trade,
 } from "./types";
 
@@ -59,8 +59,9 @@ const FUNNEL_LABEL: Record<FunnelKey, string> = {
   taken: "Taken",
 };
 
-export function BlastLanePage({ snapshot, live, liveOrders, liveTrades, revision, onSnapshot, onOpenPosition }: {
+export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, revision, onSnapshot, onOpenPosition }: {
   snapshot?: BlastSnapshot;
+  policy?: BlastEntryPolicy;
   /** Candidates pushed over the stream since the last snapshot. */
   live: BlastCandidate[];
   liveOrders: Order[];
@@ -193,7 +194,7 @@ export function BlastLanePage({ snapshot, live, liveOrders, liveTrades, revision
     </div>
 
     <div className="blast-body">
-      {tab === "OVERVIEW" && <Overview snapshot={snapshot} summary={summary} recent={recent} error={todayError} />}
+      {tab === "OVERVIEW" && <Overview snapshot={snapshot} policy={policy} summary={summary} recent={recent} error={todayError} />}
       {tab === "JOURNAL" && <JournalTab rows={journalRows} days={days} day={day} reason={reason} today={today}
         onDay={setDay} onReason={setReason} loading={journalLoading} error={journalError} />}
       {tab === "POSITIONS" && <PositionsTab portfolio={portfolio} closed={closed} onOpenPosition={onOpenPosition} />}
@@ -213,21 +214,25 @@ function Verdict({ reason }: { reason: string }) {
   return <span className={`verdict ${meta.tone}`} title={meta.help}>{meta.label}</span>;
 }
 
-function Overview({ snapshot, summary, recent, error }: {
-  snapshot: BlastSnapshot; summary?: BlastJournalSummary; recent: BlastCandidate[]; error: string;
+function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
+  snapshot: BlastSnapshot; policy?: BlastEntryPolicy; summary?: BlastJournalSummary; recent: BlastCandidate[]; error: string;
 }) {
   const [verdictSort, setVerdictSort] = useState<SortState>({ key: "reason", direction: "asc" });
   const [recentSort, setRecentSort] = useState<SortState>({ key: "at", direction: "desc" });
   const settings = snapshot.settings;
+  const policy = livePolicy ?? snapshot.screen.vix_policy;
+  const normalPremium = policy?.normal_premium_limit_pct ?? settings.max_premium_pct;
+  const hardPremium = policy?.hard_premium_limit_pct ?? settings.max_premium_pct;
+  const breadthFloor = policy?.min_side_breadth ?? settings.min_breadth;
   const funnel = screenFunnel(summary);
   const cleared = (key: FunnelKey) => funnel.find((step) => step.key === key)?.count ?? 0;
   const gates: { key: string; title: string; rule: string; detail: string; count?: number }[] = [
     { key: "event", title: "Entry event", rule: "MACD crosses its signal line",
-      detail: "MACD 12/26/9 on a closed one-minute premium bar, whatever the strategy timeframe. The zero-cross is not required: almost every screened candidate still has MACD below zero." },
-    { key: "premium", title: "Premium vs spot", rule: `≤ ${trim(settings.max_premium_pct)}% of spot`, count: cleared("premium"),
-      detail: "The load-bearing leg. In walk-forward, dropping it halved the rate at which picks doubled." },
-    { key: "breadth", title: "Own-side breadth", rule: `≥ ${trim(settings.min_breadth * 100)}% above zero`, count: cleared("breadth"),
-      detail: "Share of tracked contracts on the same side whose one-minute premium MACD is above zero, counting contracts with a bar in the last five minutes." },
+      detail: snapshot.screen.entry },
+    { key: "premium", title: "Premium vs spot", rule: `Normal ≤ ${trim(normalPremium)}% · maximum ${trim(hardPremium)}%`, count: cleared("premium"),
+      detail: "Above the normal limit, the ticket shrinks by (normal limit ÷ premium ratio)². A 2× premium receives at most 25% of the usual ticket." },
+    { key: "breadth", title: "Own-side breadth", rule: `≥ ${trim(breadthFloor * 100)}% above zero`, count: cleared("breadth"),
+      detail: "The floor adjusts with India VIX. The minimum same-side cohort is still required." },
     { key: "offHigh", title: "Off its recent high", rule: `≥ ${trim(settings.min_off_high_pct)}% below`, count: cleared("offHigh"),
       detail: `High of the last ${snapshot.screen.recent_high_lookback_bars} closed one-minute bars, not counting the bar being judged.` },
     { key: "liquid", title: "Liquidity", rule: `≤ ${trim(snapshot.screen.max_volume_share_pct)}% of its own volume`, count: cleared("liquid"),
@@ -252,6 +257,9 @@ function Overview({ snapshot, summary, recent, error }: {
   return <div className="blast-grid">
     <section className="panel blast-screen">
       <div className="panel-title"><span>Screen</span><span>{cleared("judged")} judged today</span></div>
+      <p className="blast-note">{policy?.active
+        ? `India VIX ${number.format(policy.vix ?? 0)} · premium and breadth limits adjusted`
+        : `VIX ${policy?.vix_status ?? "unavailable"} · fixed premium and breadth limits apply`}</p>
       <div className="blast-gates">{gates.map((gate) => <div className="blast-gate" key={gate.key}>
         <b>{gate.title}</b><code>{gate.rule}</code>
         <small>{gate.detail}{gate.count !== undefined ? ` Cleared today: ${gate.count}.` : ""}</small>
@@ -312,6 +320,11 @@ function JournalTab({ rows, days, day, reason, today, onDay, onReason, loading, 
     { key: "spot", label: "Spot", value: (row) => row.spot ?? LOW, render: (row) => (finite(row.spot) ? number.format(row.spot) : "—") },
     { key: "premium_pct", label: "Prem / spot", value: (row) => row.premium_pct ?? LOW, render: (row) => pct(row.premium_pct) },
     { key: "breadth", label: "Breadth", value: (row) => row.breadth ?? LOW, render: (row) => (finite(row.breadth) ? pct(row.breadth * 100, 0) : "—") },
+    { key: "vix", label: "VIX / floor", value: (row) => row.entry_policy?.vix ?? LOW,
+      render: (row) => row.entry_policy ? `${finite(row.entry_policy.vix) ? number.format(row.entry_policy.vix) : "—"} / ${pct(row.entry_policy.min_side_breadth * 100, 0)}` : "—" },
+    { key: "ticket", label: "Ticket", value: (row) => row.entry_size_multiplier ?? row.premium_size_multiplier ?? LOW,
+      render: (row) => { const scale = row.entry_size_multiplier ?? row.premium_size_multiplier;
+        return <span title={row.entry_rejection ?? "Share of the usual entry ticket"}>{finite(scale) ? pct(scale * 100, 0) : "—"}</span>; } },
     { key: "off_high", label: "Off high", value: (row) => row.off_high_pct ?? LOW, render: (row) => signed(row.off_high_pct) },
     { key: "macd", label: "MACD / signal", value: (row) => row.macd, render: (row) => `${row.macd.toFixed(3)} / ${row.signal.toFixed(3)}` },
     { key: "bars", label: "Bars", value: (row) => row.lookback_bars },
@@ -439,7 +452,7 @@ function BookPanel({ title, count, error, loaded, children }: { title: string; c
   </section>;
 }
 
-type NumericField = Exclude<keyof BlastForm, "enabled" | "auto_trade">;
+type NumericField = Exclude<keyof BlastForm, "enabled" | "auto_trade" | "vix_adaptive_enabled">;
 
 function SettingsTab({ snapshot, onSaved }: { snapshot: BlastSnapshot; onSaved: (next: BlastSnapshot) => void }) {
   const [form, setForm] = useState<BlastForm>(() => toForm(snapshot.settings));
@@ -524,9 +537,21 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: BlastSnapshot; onSaved: 
     <div className="settings-section">
       <h3>Screen</h3>
       <div className="settings-grid three">
-        {field("max_premium_pct", "Premium limit · % of spot", "Premium as a percentage of the underlying's price. The strongest leg.", { step: "0.1" })}
-        {field("min_breadth_pct", "Breadth floor · %", "Share of same-side contracts with premium MACD above zero.", { step: "1" })}
+        {field("max_premium_pct", "Base premium limit · % of spot", "Normal premium limit at the reference VIX.", { step: "0.1" })}
+        {field("min_breadth_pct", "Base breadth floor · %", "Same-side breadth required at the reference VIX.", { step: "1" })}
         {field("min_off_high_pct", "Below recent high · %", "How far below its own recent high the premium must be.", { step: "1" })}
+      </div>
+    </div>
+
+    <div className="settings-section">
+      <h3>VIX and rich-premium sizing</h3>
+      <label className="toggle"><input type="checkbox" checked={form.vix_adaptive_enabled}
+        onChange={(event) => setField("vix_adaptive_enabled", event.target.checked)} />Adjust premium and breadth limits with India VIX</label>
+      <div className="settings-grid three">
+        {field("vix_reference", "Reference VIX", "Base rules apply at this VIX. The VIX ratio is bounded from 0.5× to 2×.", { step: "1" })}
+        {field("vix_breadth_adjustment_pct", "Breadth adjustment · percentage points", "Change when VIX doubles. A negative value lowers the required breadth.", { step: "1" })}
+        {field("rich_premium_max_multiple", "Maximum rich premium · × normal limit", "Richer premiums receive smaller tickets; 2× premium means at most 25% of the usual ticket.", { step: "0.1" })}
+        {field("vix_max_age_seconds", "Maximum VIX quote age · seconds", "Missing or older VIX quotes keep the fixed rules.", { step: "30" })}
       </div>
     </div>
 

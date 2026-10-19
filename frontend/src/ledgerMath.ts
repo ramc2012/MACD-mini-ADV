@@ -131,3 +131,13 @@ export function completedRoundTrips(trades: Trade[]): RoundTrip[] {
   }
   return result;
 }
+
+/** Same rolling book window as Closed today, including weekends and exchange holidays. */
+export function bookFillCounts(trades: Trade[], now: number, holidays: ReadonlySet<string> = new Set()) {
+  const start = closedBookStart(now, holidays);
+  const fills = [...new Map(trades.map((r) => [r.trade_id, r])).values()].filter((r) => {
+    const time = Date.parse(r.timestamp);
+    return time >= start && time <= now && r.quantity > 0;
+  });
+  return { start, buys: fills.filter((r) => r.side === "BUY").length, sells: fills.filter((r) => r.side === "SELL").length };
+}

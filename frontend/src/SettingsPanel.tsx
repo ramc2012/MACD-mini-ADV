@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { responseErrorMessage } from "./apiError";
+import { extractAuthCode, tokenLeft } from "./sessionClock";
 import { API_TOKEN, API_URL } from "./runtime";
 
 type RuntimeSettings = {
@@ -46,33 +47,25 @@ type RuntimeSettings = {
   broker: { status: string; error?: string; token_expires_at?: string | null; token_expired?: boolean; symbols?: string[] };
 };
 
-// "connecting" is a transient state, not a failure — styling it as an error
-// put a red box and a green box on screen at the same time.
-function brokerTone(status: string) {
-  if (status === "connected") return "settings-message";
-  if (status === "error" || status === "token_expired" || status === "stale") return "settings-error";
-  return "settings-pending";
-}
-
-function brokerLabel(status: string) {
-  if (status === "token_expired") return "daily token expired — reconnect below";
-  if (status === "stale") return "connected but not receiving ticks";
-  if (status === "connecting") return "connecting…";
-  return status;
-}
-
 const headers = { "content-type": "application/json", ...(API_TOKEN ? { "x-macd-token": API_TOKEN } : {}) };
 
-export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () => void }) {
+type PanelTab = "FYERS" | "ALERTS" | "STRATEGY";
+type LiveBroker = { status: string; error?: string | null; token_expires_at?: string | null; symbol_count?: number };
+
+const IST_EXPIRY = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+
+export function SettingsPanel({ open, onClose, initialTab = "FYERS" }: { open: boolean; onClose: () => void; initialTab?: PanelTab }) {
   const panelRef = useRef<HTMLElement>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   const [settings, setSettings] = useState<RuntimeSettings>();
-  const [panelTab, setPanelTab] = useState<"BROKER" | "STRATEGY">("BROKER");
+  const [panelTab, setPanelTab] = useState<PanelTab>(initialTab);
+  const [live, setLive] = useState<LiveBroker>();
+  const [clock, setClock] = useState(() => Date.now());
   const [symbols, setSymbols] = useState("");
   const [accessToken, setAccessToken] = useState("");
   const [appSecret, setAppSecret] = useState("");
-  const [authCode, setAuthCode] = useState("");
+  const [authInput, setAuthInput] = useState("");
   const [authUrl, setAuthUrl] = useState("");
   const [botToken, setBotToken] = useState("");
   const [message, setMessage] = useState("");
@@ -108,6 +101,23 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
       document.removeEventListener("focusin", onFocus);
       if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
     };
+  }, [open]);
+
+  useEffect(() => { if (open) setPanelTab(initialTab); }, [open, initialTab]);
+
+  // The status card reads the live broker state, not the settings snapshot.
+  useEffect(() => {
+    if (!open) return;
+    let stopped = false;
+    const poll = () => {
+      setClock(Date.now());
+      void fetch(`${API_URL}/health`).then((r) => r.json()).then((health) => {
+        if (!stopped && health?.broker) setLive(health.broker as LiveBroker);
+      }).catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 5000);
+    return () => { stopped = true; clearInterval(timer); };
   }, [open]);
 
   useEffect(() => {
@@ -248,13 +258,14 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
       }
       if (popup && !popup.closed) {
         popup.location.replace(loginUrl.href);
-        setMessage("Complete login in the Fyers window. If it ends on the Fyers redirect page, copy auth_code from its URL and paste it below.");
+        setMessage("Log in on the Fyers window. When it lands on the redirect page, copy that page's full address into step 2.");
       } else {
         setAuthUrl(loginUrl.href);
         setError("Your browser blocked the Fyers login window. Use the login link below.");
       }
     } catch (reason) {
       popup?.close();
+      setMessage("");
       setError(reason instanceof Error ? reason.message : "Could not open Fyers login");
     } finally { setSaving(false); }
   }
@@ -292,9 +303,12 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
       } : old);
       setMessage("Token verified and saved — the Fyers market-data feed is reconnecting. "
         + "This panel will confirm when the watchlist is live.");
-      setAccessToken(""); setAuthCode("");
+      setAccessToken(""); setAuthInput("");
       setRebuilding(true);
-    } catch (reason) { setError(reason instanceof Error ? reason.message : "Fyers connection failed"); }
+    } catch (reason) {
+      setMessage(""); setProgress("");
+      setError(reason instanceof Error ? reason.message : "Fyers connection failed");
+    }
     finally { setSaving(false); }
   }
 
@@ -302,29 +316,16 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
     <section ref={panelRef} className="settings-panel" role="dialog" aria-modal="true" aria-label="Trading settings">
       <div className="settings-heading"><div><h2>Trading settings</h2><p>Real broker data · local paper execution</p></div><button aria-label="Close settings" onClick={onClose}>×</button></div>
       {!settings ? <div className="settings-loading">{error ? <><strong>Settings unavailable</strong><p>{error}</p><button onClick={() => window.location.reload()}>Retry</button></> : "Loading settings…"}</div> : <div className="settings-body">
-        <div className="watch-tabs settings-tabs">{(["BROKER", "STRATEGY"] as const).map((key) => <button key={key} className={panelTab === key ? "active" : ""} onClick={() => setPanelTab(key)}>{key === "BROKER" ? "Broker connection" : "Strategy"}</button>)}</div>
-        {panelTab === "BROKER" && <div className="settings-section">
-          <h3>Fyers settings</h3>
-          <div className="settings-grid">
-            <label>Feed<select value="fyers" disabled><option value="fyers">Fyers live data</option></select></label>
-            <label>Execution<input value="PAPER ONLY" disabled /></label>
-            <label>Fyers client ID<input value={settings.fyers_client_id} onChange={(e) => setSettings({ ...settings, fyers_client_id: e.target.value })} placeholder="ABCD1234-100" /></label>
-            <label>App secret<input type="password" value={appSecret} onChange={(e) => setAppSecret(e.target.value)} placeholder={settings.fyers_secret_configured ? "Saved — leave blank to keep" : "Fyers app secret"} /></label>
-            <label className="wide">Redirect URL<input value={settings.fyers_redirect_uri} onChange={(e) => setSettings({ ...settings, fyers_redirect_uri: e.target.value })} /></label>
-          </div>
-          <div className="oauth-actions"><button className="primary" disabled={saving} onClick={() => void openFyersLogin()}>Open Fyers login</button><button className="secondary" disabled={saving} onClick={() => void saveFyersCredentials()}>Save app details</button></div>
-          {authUrl && <p className="field-help">Login link: <a href={authUrl} target="_blank" rel="noopener noreferrer">Open Fyers in a new tab</a> · <a href={authUrl}>Use this tab</a></p>}
-          <div className="token-paste"><label>Authorization code<input value={authCode} onChange={(e) => setAuthCode(e.target.value)} placeholder="Paste auth_code from the Fyers redirect URL" /></label><button disabled={saving || !authCode.trim()} onClick={() => void connectWith("/api/auth/fyers/exchange", { auth_code: authCode.trim() })}>Exchange code</button></div>
-          <div className="token-paste"><label>Daily access token<input type="password" value={accessToken} onChange={(e) => setAccessToken(e.target.value)} placeholder={settings.fyers_access_token_configured ? "Paste today’s replacement token" : "Paste today’s Fyers access token"} /></label><button className="connect-button" disabled={saving || !accessToken.trim()} onClick={() => void connectWith("/api/auth/fyers/access-token", { access_token: accessToken.trim() })}>Connect Fyers</button></div>
-          <p className="field-help">Fyers requires a fresh daily access token. The token is stored only in the local Docker runtime volume and is never returned to the browser. Automatic refresh is not used.</p>
-          <div className={brokerTone(settings.broker.status)}>
-            Broker: {brokerLabel(settings.broker.status)}
-            {settings.broker.status === "error" && settings.broker.error ? ` — ${settings.broker.error}` : ""}
-            {" · daily token "}{settings.fyers_access_token_configured ? "saved" : "not saved"}
-            {settings.broker.token_expires_at ? ` · expires ${new Date(settings.broker.token_expires_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", day: "2-digit", month: "short", hour12: false })} IST` : ""}
-            {progress ? ` · ${progress}` : ""}
-          </div>
-          <h3 style={{ marginTop: 18 }}>Telegram alerts</h3>
+        <div className="watch-tabs settings-tabs">{(["FYERS", "ALERTS", "STRATEGY"] as const).map((key) => <button key={key} className={panelTab === key ? "active" : ""} onClick={() => setPanelTab(key)}>{key === "FYERS" ? "Fyers login" : key === "ALERTS" ? "Alerts" : "Strategy"}</button>)}</div>
+        {panelTab === "FYERS" && <FyersLogin
+          settings={settings} live={live} clock={clock} saving={saving} progress={progress} message={message} error={error}
+          appSecret={appSecret} setAppSecret={setAppSecret} authInput={authInput} setAuthInput={setAuthInput}
+          accessToken={accessToken} setAccessToken={setAccessToken} authUrl={authUrl}
+          onSettings={setSettings} onOpenLogin={() => void openFyersLogin()} onSaveApp={() => void saveFyersCredentials()}
+          onExchange={(code) => void connectWith("/api/auth/fyers/exchange", { auth_code: code })}
+          onToken={() => void connectWith("/api/auth/fyers/access-token", { access_token: accessToken.trim() })} />}
+        {panelTab === "ALERTS" && <div className="settings-section">
+          <h3>Telegram alerts</h3>
           <div className="token-paste"><label>Bot token<input type="password" value={botToken} onChange={(e) => setBotToken(e.target.value)} placeholder={settings.telegram_configured ? "Saved — leave blank to keep" : "123456:ABC… from @BotFather"} /></label><button disabled={saving || (!botToken.trim() && !settings.telegram_chat_id)} onClick={() => void saveAuxiliary({ ...(botToken.trim() ? { telegram_bot_token: botToken.trim() } : {}), telegram_chat_id: settings.telegram_chat_id, day_loss_alert_rupees: Number(settings.day_loss_alert_rupees) || 0 }, "Alert settings saved.")}>Save alerts</button></div>
           <div className="settings-grid">
             <label>Chat ID<input value={settings.telegram_chat_id} onChange={(e) => setSettings({ ...settings, telegram_chat_id: e.target.value })} placeholder="Your chat id (message @userinfobot)" /></label>
@@ -332,7 +333,6 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
           </div>
           <p className="field-help">Alerts: broker down or feed stale during market hours, day P&L breaching the level above, and event-loop saturation. Alert only — nothing is halted automatically. Status: {settings.telegram_configured ? "configured" : "not configured"}.</p>
           {message && <div className="settings-message">{message}</div>}{error && <div className="settings-error">{error}</div>}
-          <p className="field-help">Watchlist: 210 F&O stocks plus NIFTY, SENSEX, BANKNIFTY and MIDCPNIFTY. The app selects ATM CE and PE contracts for trading and adjacent strikes for analysis. The stock list follows the FYERS NSE F&O instrument master dated 25 September 2026.</p>
         </div>}
         {panelTab === "STRATEGY" && <div className="settings-section">
           <h3>Strategy</h3>
@@ -390,5 +390,81 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
         </div>}
       </div>}
     </section>
+  </div>;
+}
+
+
+type FyersLoginProps = {
+  settings: RuntimeSettings; live?: LiveBroker; clock: number; saving: boolean; progress: string; message: string; error: string;
+  appSecret: string; setAppSecret: (value: string) => void; authInput: string; setAuthInput: (value: string) => void;
+  accessToken: string; setAccessToken: (value: string) => void; authUrl: string;
+  onSettings: (value: RuntimeSettings) => void; onOpenLogin: () => void; onSaveApp: () => void;
+  onExchange: (code: string) => void; onToken: () => void;
+};
+
+/** The morning routine first: status, then three steps; one-time app setup and the manual token are folded away. */
+function FyersLogin(props: FyersLoginProps) {
+  const { settings, live, clock, saving, progress, message, error } = props;
+  const status = live?.status || settings.broker.status;
+  const expiresAt = live?.token_expires_at ?? settings.broker.token_expires_at;
+  const token = tokenLeft(expiresAt, new Date(clock));
+  const connected = status === "connected" && !token.expired;
+  const appReady = !!settings.fyers_client_id.trim() && settings.fyers_secret_configured;
+  const code = extractAuthCode(props.authInput);
+  const headline = connected ? "Connected to Fyers" : status === "connecting" ? "Connecting…"
+    : token.expired && settings.fyers_access_token_configured ? "Today's login needed" : status === "stale" ? "Connected, but no ticks arriving" : "Not connected";
+  const tone = connected ? "ok" : status === "connecting" ? "pending" : "down";
+  return <div className="settings-section fyers-login">
+    <div className={`login-status login-${tone}`}>
+      <div className="login-headline"><i aria-hidden="true" /><div><b>{headline}</b>
+        <small>{connected ? `Daily token valid until ${expiresAt ? IST_EXPIRY.format(new Date(expiresAt)) : "—"} IST · ${token.text}`
+          : live?.error || settings.broker.error || "Fyers issues a new access token every day; log in once each morning."}</small></div></div>
+      <dl>
+        <div><dt>Client ID</dt><dd>{settings.fyers_client_id || "—"}</dd></div>
+        <div><dt>Instruments live</dt><dd>{live?.symbol_count ?? "—"}</dd></div>
+        <div><dt>Execution</dt><dd>Paper only</dd></div>
+      </dl>
+      {progress && <p className="login-progress">{progress}</p>}
+    </div>
+
+    {!appReady && <div className="settings-error">Set up the Fyers app details below once before the first login.</div>}
+    <ol className={`login-steps${connected ? " done" : ""}`}>
+      {connected && <p className="login-already">You're logged in for today. Log in again only if the feed fails or the token is revoked.</p>}
+      <li>
+        <div className="login-step-head"><span>1</span><b>Log in on Fyers</b></div>
+        <p>Opens fyers.in in a popup. You sign in there — nothing sensitive is typed into this app.</p>
+        <button className="primary" disabled={saving || !appReady} onClick={props.onOpenLogin}>Open Fyers login</button>
+        {props.authUrl && <p className="field-help">Popup blocked: <a href={props.authUrl} target="_blank" rel="noopener noreferrer">open Fyers in a new tab</a></p>}
+      </li>
+      <li>
+        <div className="login-step-head"><span>2</span><b>Paste the redirect address</b></div>
+        <p>After login Fyers lands on a page whose address contains <code>auth_code</code>. Paste the whole address — or just the code.</p>
+        <input className="login-input" value={props.authInput} onChange={(e) => props.setAuthInput(e.target.value)}
+          placeholder="https://trade.fyers.in/api-login/redirect-uri/index.html?s=ok&auth_code=…" spellCheck={false} autoComplete="off" />
+        {props.authInput.trim() && <small className={code ? "login-detect ok" : "login-detect bad"}>{code ? `✓ auth code found (${code.slice(0, 8)}…)` : "No auth_code in that text — copy the full address of the Fyers redirect page"}</small>}
+      </li>
+      <li>
+        <div className="login-step-head"><span>3</span><b>Connect</b></div>
+        <p>The code is exchanged for today's token on the server and the feed reconnects; this card turns green when the watchlist is live.</p>
+        <button className="primary" disabled={saving || !code} onClick={() => code && props.onExchange(code)}>{saving ? "Connecting…" : "Connect Fyers"}</button>
+      </li>
+    </ol>
+    {message && <div className="settings-message">{message}</div>}{error && <div className="settings-error">{error}</div>}
+
+    <details className="login-more" open={!appReady}>
+      <summary>Fyers app details <small>{appReady ? "saved" : "required once"}</small></summary>
+      <div className="settings-grid">
+        <label>Fyers client ID<input value={settings.fyers_client_id} onChange={(e) => props.onSettings({ ...settings, fyers_client_id: e.target.value })} placeholder="ABCD1234-100" /></label>
+        <label>App secret<input type="password" value={props.appSecret} onChange={(e) => props.setAppSecret(e.target.value)} placeholder={settings.fyers_secret_configured ? "Saved — leave blank to keep" : "Fyers app secret"} /></label>
+        <label className="wide">Redirect URL<input value={settings.fyers_redirect_uri} onChange={(e) => props.onSettings({ ...settings, fyers_redirect_uri: e.target.value })} /></label>
+      </div>
+      <div className="oauth-actions"><button className="secondary" disabled={saving} onClick={props.onSaveApp}>Save app details</button></div>
+    </details>
+    <details className="login-more">
+      <summary>Paste an access token instead <small>advanced</small></summary>
+      <div className="token-paste"><label>Daily access token<input type="password" value={props.accessToken} onChange={(e) => props.setAccessToken(e.target.value)} placeholder="Paste today's Fyers access token" /></label><button disabled={saving || !props.accessToken.trim()} onClick={props.onToken}>Connect</button></div>
+      {/auth_code=|:\/\//.test(props.accessToken) && <small className="login-detect bad">This is the redirect address, not an access token — it will be exchanged as an auth code (step 2 does the same).</small>}
+    </details>
+    <p className="field-help">Tokens are stored only in the local Docker runtime volume and never returned to the browser. Automatic refresh is not used. Watchlist: 210 F&O stocks plus NIFTY, SENSEX, BANKNIFTY and MIDCPNIFTY, with ATM, adjacent and next-series index contracts.</p>
   </div>;
 }

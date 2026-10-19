@@ -433,7 +433,7 @@ def analyse_rules(train: list[dict], test: list[dict]) -> list[dict]:
     for name, predicate in predicates:
         selected_train = [row for row in train if predicate(row)]
         selected_test = [row for row in test if predicate(row)]
-        if len(selected_train) < 20 or len(selected_test) < 2:
+        if len(selected_train) < 20:
             continue
         train_metrics = metrics(selected_train)
         test_metrics = metrics(selected_test)
@@ -452,7 +452,7 @@ def analyse_rules(train: list[dict], test: list[dict]) -> list[dict]:
         })
     results.sort(
         key=lambda item: (
-            item["positive_train_blocks"], item["holdout_positive"],
+            item["positive_train_blocks"],
             item["train"]["profit_factor"] or 0.0, item["train"]["average_return_pct"],
         ),
         reverse=True,
@@ -523,6 +523,15 @@ def main() -> None:
             "enriched_events": len(enriched),
             "selected_before_overlap": len(selected),
             "executable": len(executable),
+        },
+        "selection": {
+            "thresholds": "training feature quantiles and prespecified thresholds only",
+            "ranking": "positive training blocks, training profit factor, training average return",
+            "minimum_training_trades": 20,
+            "holdout_used_for_rule_selection": False,
+            "holdout_independence_verified": False,
+            "evidence_status": "diagnostic; entry cohort and exit overlay originated in previously inspected research",
+            "validated_for_deployment": False,
         },
         "baseline": {"train": metrics(train), "test": metrics(test), "train_blocks": [metrics(block) for block in date_blocks(train)]},
         "rules_tested": len(rules),

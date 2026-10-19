@@ -32,7 +32,8 @@ def _profile(symbol: str, touches) -> Profile:
 
 
 def _seeded(engine: MPEngine, underlying: str, *, buy: int, sell: int) -> Profile:
-    profile = _profile(underlying, [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5)])
+    # Three brackets: entries wait for the initial balance (A, B) to complete.
+    profile = _profile(underlying, [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5), (616, 100.5)])
     engine.profiles.profiles[underlying] = profile
     state = FlowState(underlying)
     state.buy_volume, state.sell_volume = buy, sell
@@ -321,3 +322,15 @@ class TestSessionTape:
             assert tape.or_high == 105 and tape.or_low == 95
             assert tape.opening_range_complete
             assert tape.channel() == (105, 95)
+
+
+def test_no_entry_until_the_initial_balance_completes():
+    with tempfile.TemporaryDirectory() as folder:
+        engine = _engine(folder)
+        underlying = "NSE:SBIN-EQ"
+        profile = _profile(underlying, [(555, 100.0), (560, 101.0), (590, 100.5), (600, 100.5)])
+        engine.profiles.profiles[underlying] = profile
+        engine.flow.states[underlying] = FlowState(underlying)
+        engine.tapes.on_price(underlying, profile.day, 100.5, 0, 610)
+        engine.set_directional_scope([underlying])
+        assert engine.evaluate(underlying, 105.0, 610, commit=True) == (None, "initial balance still forming")

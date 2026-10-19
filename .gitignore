@@ -12,3 +12,35 @@ engine/runtime/
 engine/.venv/
 **/__pycache__/
 .pytest_cache/
+compose.override.yaml
+
+# Local agent state, build metadata and copied dependencies.
+.claude/
+**/*.egg-info/
+**/.deps/
+.DS_Store
+
+# Runtime/research stores and generated evidence stay on this machine.
+*.sqlite3*
+*.pkl
+*.pem
+/reports/
+/source_preservation_check.json
+/reviews/*.png
+/reviews/*.json
+/reviews/*.log
+/engine/docs/selection-review-2026-10-03/deployed-before/
+/engine/docs/selection-review-2026-10-03/frontend-before/
+/engine/docs/selection-review-2026-10-03/preservation.json
+/engine/docs/selection-review-2026-10-03/verification.json
+
+# Preserve reproducible research code and findings, not market-data dumps,
+# generated trades, compiled libraries or copied third-party packages.
+/research/**/*
+!/research/**/
+!/research/**/*.py
+!/research/**/*.md
+!/research/**/*.sh
+!/research/**/*.ipynb
+!/research/**/.gitignore
+**/.deps/

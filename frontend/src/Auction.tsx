@@ -67,19 +67,22 @@ export function AuctionPage() {
 
   const context = useEndpoint<AuctionContext>(symbol ? `/api/auction/context/${encodeURIComponent(symbol)}` : null, [symbol]);
   const rates = useEndpoint<BaseRates>(symbol ? `/api/auction/base-rates/${encodeURIComponent(symbol)}` : null, [symbol]);
-  const [flowDay, setFlowDay] = useState("");
-  const flow = useEndpoint<AuctionFlow>(
-    symbol ? `/api/auction/flow/${encodeURIComponent(symbol)}${flowDay ? `?day=${flowDay}` : ""}` : null, [symbol, flowDay]);
-
-  const regimeId = context.data?.regime.regime_id;
-  const journal = useEndpoint<SetupJournal>(
-    symbol ? `/api/auction/setups/${encodeURIComponent(symbol)}${regimeId ? `?regime_id=${regimeId}` : ""}` : null, [symbol, regimeId]);
   // Windows land once a minute; fetched on symbol change alone, the panel would show the open all day.
   const [minute, setMinute] = useState(0);
   useEffect(() => {
     const timer = window.setInterval(() => setMinute((count) => count + 1), 60_000);
     return () => window.clearInterval(timer);
   }, []);
+  const [flowDay, setFlowDay] = useState("");
+  // A session still in the raw tier grows by the minute; a condensed one never
+  // changes, so only the latest (or an explicitly chosen) day needs the tick.
+  const flow = useEndpoint<AuctionFlow>(
+    symbol ? `/api/auction/flow/${encodeURIComponent(symbol)}${flowDay ? `?day=${flowDay}` : ""}` : null,
+    [symbol, flowDay, flowDay ? 0 : minute]);
+
+  const regimeId = context.data?.regime.regime_id;
+  const journal = useEndpoint<SetupJournal>(
+    symbol ? `/api/auction/setups/${encodeURIComponent(symbol)}${regimeId ? `?regime_id=${regimeId}` : ""}` : null, [symbol, regimeId]);
   const whale = useEndpoint<WhaleView>("/api/auction/whale", [symbol, minute]);
 
   const reference = context.data;
@@ -113,7 +116,9 @@ export function AuctionPage() {
       <BaseRatePanel rates={rates.data} error={rates.error} />
       <SetupPanel journal={journal.data} />
       <WhalePanel view={whale.data} />
+      <WhaleNamesPanel minute={minute} />
     </div>}
+    {!reference && <WhaleNamesPanel minute={minute} />}
   </section>;
 }
 
@@ -283,7 +288,7 @@ function FlowChart({ series, loading }: { series: AuctionFlow["series"]; loading
     if (series.length) api.current.chart.timeScale().fitContent();
   }, [series]);
   return <div className="auction-chart" ref={element}>
-    {!series.length && <div className="chart-empty">{loading ? "Loading session flow…" : "No condensed flow for this session yet."}</div>}
+    {!series.length && <div className="chart-empty">{loading ? "Loading session flow…" : "No recorded flow for this session yet."}</div>}
   </div>;
 }
 
@@ -449,4 +454,322 @@ function WhalePanel({ view }: { view?: WhaleView }) {
     <p className="auction-note">Shapes, not names. A slicer is three freeze-size prints on one side inside a
       minute; a strike's flow arrow is classified prints where the desk streams the leg and a premium proxy elsewhere.</p>
   </section>;
+}
+
+
+type WhaleName = {
+  symbol: string; kind: "cash" | "future" | "option" | "index"; underlying: string;
+  strike: number | null; right: "CE" | "PE" | null; lot: number; score: number; events: number;
+  counts: Record<string, number>; patterns: string[];
+  top: { kind: string; side: number; quantity: number; price: number; score: number; evidence: string; at: string };
+  largest: { quantity: number; lots: number; price: number; notional: number; median_multiple: number | null; side: number; at: string };
+  child: { size: number; lots: number; runs: number; every_seconds: number | null; cv: number | null; side: number; notional: number; last_at: string } | null;
+  side: "buy" | "sell" | "mixed"; buy_quantity: number; sell_quantity: number;
+  session_volume: number | null; large_share_pct: number | null; first_at: string; last_at: string;
+  entry?: EntryPerf & { at: string; price: number; side: number };
+  probability?: number | null; calibration_run?: number | null; features?: Record<string, string>;
+  size_vs_p999?: number | null; turnover_share_pct?: number | null;
+};
+type EntryPerf = {
+  bars?: number; sessions?: number; max_return_pct?: number; max_at?: string; min_return_pct?: number; min_at?: string;
+  last_return_pct?: number | null; last_at?: string; favourable_pct?: number; adverse_pct?: number;
+  forward?: Record<string, number | null>; complete?: boolean;
+};
+type PerfSummary = { entries?: number; measured?: number; avg_max_return_pct?: number | null; avg_min_return_pct?: number | null;
+  avg_favourable_pct?: number | null; avg_adverse_pct?: number | null; went_their_way_pct?: number | null };
+type WhalePerformance = {
+  since: string; until: string; follow_sessions: number; summary: PerfSummary;
+  by_side: Record<string, PerfSummary>; by_pattern: Record<string, PerfSummary>;
+  entries: (EntryPerf & { symbol: string; kind: string; underlying: string; strike: number | null; right: string | null;
+    day: string; entry_at: string; entry_price: number; side: number; pattern: string; score: number; evidence: string })[];
+};
+const pct = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+const tone = (value: number | null | undefined) => value == null ? "" : value > 0 ? "positive" : value < 0 ? "negative" : "";
+type WhaleNames = {
+  day: string; count: number; names: WhaleName[];
+  thresholds: { large_print_multiple: number; median_window_minutes: number; min_large_print_lots: number;
+    child_min_repeats: number; child_max_cv: number; slicer_window_seconds: number; slicer_min_prints: number;
+    feed_gap_seconds: number; scan_every_minutes: number;
+    notional_floor: Record<string, { large_print: number; child: number }> };
+  feed_gaps: { from: string; to: string; seconds: number }[];
+};
+
+const WHALE_KINDS = [["", "All"], ["cash", "Stocks"], ["future", "Futures"], ["option", "Options"]] as const;
+const QTY = new Intl.NumberFormat("en-IN");
+const rupees = (value: number | null | undefined) => {
+  if (value == null || !Number.isFinite(value)) return "—";
+  if (value >= 1e7) return `₹${(value / 1e7).toFixed(2)} Cr`;
+  if (value >= 1e5) return `₹${(value / 1e5).toFixed(1)} L`;
+  return `₹${QTY.format(Math.round(value))}`;
+};
+const instrumentLabel = (row: WhaleName) => row.kind === "option" && row.strike != null
+  ? `${row.underlying} ${QTY.format(row.strike)} ${row.right}` : row.symbol.replace(/^NSE:|^BSE:/, "");
+
+/** Every contract with a Layer A pattern today, ranked, with the numbers behind each pattern. */
+function WhaleNamesPanel({ minute }: { minute: number }) {
+  const [kind, setKind] = useState("");
+  const [mode, setMode] = useState<"NAMES" | "PERFORMANCE" | "TUNING">("NAMES");
+  const names = useEndpoint<WhaleNames>(mode === "NAMES" ? `/api/auction/whale/names?limit=150${kind ? `&kind=${kind}` : ""}` : null, [kind, minute, mode]);
+  const perf = useEndpoint<WhalePerformance>(mode === "PERFORMANCE" ? `/api/auction/whale/performance?days=10${kind ? `&kind=${kind}` : ""}` : null, [kind, minute, mode]);
+  const data = names.data;
+  const t = data?.thresholds;
+  return <section className="panel auction-whale-names">
+    <div className="panel-title"><span>Whale names · large prints, icebergs, freeze-size slicing</span>
+      <span>{data ? `${data.count} names · ${data.day}` : names.loading ? "Loading…" : ""}</span></div>
+    <div className="auction-whale-names-bar">
+      <div className="radar-filter" role="tablist" aria-label="View">
+        <button className={mode === "NAMES" ? "active" : ""} aria-pressed={mode === "NAMES"} onClick={() => setMode("NAMES")}>Today's names</button>
+        <button className={mode === "PERFORMANCE" ? "active" : ""} aria-pressed={mode === "PERFORMANCE"} onClick={() => setMode("PERFORMANCE")}
+          title="Every entry to the list over the last 10 days, and what the instrument did after it">Performance after entry</button>
+        <button className={mode === "TUNING" ? "active" : ""} aria-pressed={mode === "TUNING"} onClick={() => setMode("TUNING")}
+          title="Per-instrument thresholds, feature weights and the nightly calibration runs">Tuning</button>
+      </div>
+      <div className="radar-filter" role="tablist" aria-label="Instrument kind">
+        {WHALE_KINDS.map(([key, label]) => <button key={key || "all"} className={kind === key ? "active" : ""}
+          aria-pressed={kind === key} onClick={() => setKind(key)}>{label}</button>)}
+      </div>
+    </div>
+    {mode === "TUNING" ? <WhaleTuningView /> : mode === "PERFORMANCE" ? <WhalePerformanceView view={perf.data} loading={perf.loading} error={perf.error} /> : <>
+    {names.error && <p className="auction-note">{names.error}</p>}
+    <div className="auction-whale-names-scroll">
+      <table className="auction-rate-table auction-whale-names-table">
+        <thead><tr>
+          <th>#</th><th>Instrument</th><th>Patterns</th><th>Lean</th>
+          <th>Largest print</th><th>× median</th><th>Notional</th><th>Iceberg clip</th>
+          <th>Freeze / slicer</th><th>Whale % of vol</th><th>Events</th><th>Score</th><th>Seen</th>
+          <th title="First appearance on today's list: time and price of its first pattern">Entry</th>
+          <th title="Best and worst move from the entry price since entry (minute bars)">Max since entry</th>
+          <th>Min since entry</th><th>Now</th>
+          <th title="Calibrated probability the move goes the whale's way (≥ half the instrument's typical 30-minute move), from the latest tuning run">P(their way)</th>
+        </tr></thead>
+        <tbody>
+          {(data?.names || []).map((row, index) => <tr key={row.symbol} title={row.top.evidence}>
+            <td>{index + 1}</td>
+            <td><b>{instrumentLabel(row)}</b><small> {row.kind === "cash" ? "stock" : row.kind}{row.lot > 1 ? ` · lot ${row.lot}` : ""}</small></td>
+            <td>{row.patterns.join(" · ") || row.top.kind.replace(/_/g, " ")}</td>
+            <td className={row.side === "buy" ? "positive" : row.side === "sell" ? "negative" : ""}>{row.side}</td>
+            <td>{QTY.format(row.largest.quantity)}{row.lot > 1 ? ` (${QTY.format(row.largest.lots)} lots)` : ""} @ {row.largest.price} · {row.largest.at} {sideLabel(row.largest.side)}</td>
+            <td>{row.largest.median_multiple != null ? `${row.largest.median_multiple}×` : "—"}</td>
+            <td>{rupees(row.largest.notional)}</td>
+            <td>{row.child ? `${QTY.format(row.child.size)} × ${row.child.runs} run${row.child.runs > 1 ? "s" : ""}${row.child.every_seconds ? ` · every ${row.child.every_seconds}s` : ""}${row.child.cv != null ? ` · cv ${row.child.cv}` : ""} · ${rupees(row.child.notional)}` : "—"}</td>
+            <td>{(row.counts.freeze_print || 0) + (row.counts.slicer || 0) ? `${row.counts.freeze_print || 0} / ${row.counts.slicer || 0}` : "—"}</td>
+            <td>{row.large_share_pct != null ? `${row.large_share_pct}%` : "—"}</td>
+            <td>{row.events}</td>
+            <td>{row.score.toFixed(2)}</td>
+            <td>{row.first_at === row.last_at ? row.first_at : `${row.first_at}–${row.last_at}`}</td>
+            <td>{row.entry ? `${row.entry.at} @ ${row.entry.price}` : "—"}</td>
+            <td className={tone(row.entry?.max_return_pct)}>{pct(row.entry?.max_return_pct)}{row.entry?.max_at ? <small> {row.entry.max_at.slice(-5)}</small> : null}</td>
+            <td className={tone(row.entry?.min_return_pct)}>{pct(row.entry?.min_return_pct)}{row.entry?.min_at ? <small> {row.entry.min_at.slice(-5)}</small> : null}</td>
+            <td className={tone(row.entry?.last_return_pct)}>{pct(row.entry?.last_return_pct)}</td>
+            <td title={row.features ? Object.entries(row.features).map(([k, v]) => `${k}: ${v}`).join(" · ")
+              + (row.size_vs_p999 != null ? ` · ${row.size_vs_p999}× own p99.9` : "") : "not calibrated yet"}>
+              {row.probability != null ? `${(row.probability * 100).toFixed(0)}%` : "—"}</td>
+          </tr>)}
+          {data && !data.names.length && <tr><td colSpan={18} className="empty">No whale patterns recorded for this filter yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+    {t && <p className="auction-note">
+      Large print ≥ {t.large_print_multiple}× the {t.median_window_minutes}-minute median size and ≥ {t.min_large_print_lots} lots;
+      iceberg = {t.child_min_repeats}+ identical clips at regular spacing (cv &lt; {t.child_max_cv}); slicer = {t.slicer_min_prints}+ freeze-size
+      prints in {t.slicer_window_seconds}s (NIFTY/BANKNIFTY). Minimum notional — stocks {rupees(t.notional_floor.cash?.large_print)} / clip {rupees(t.notional_floor.cash?.child)},
+      options {rupees(t.notional_floor.option?.large_print)} / {rupees(t.notional_floor.option?.child)} premium. Continuous session only; the updates
+      straight after a feed gap of {t.feed_gap_seconds}s+ are excluded{data?.feed_gaps.length ? ` (today: ${data.feed_gaps.map((g) => `${g.from}–${g.to}`).join(", ")})` : ""}.
+      Re-scanned every {t.scan_every_minutes} min during the session; the nightly pass redoes the whole day. Sizes are feed clusters, not single orders.
+    </p>}
+    </>}
+  </section>;
+}
+
+/** Entries to the list over the last days, and what each instrument did after it entered. */
+function WhalePerformanceView({ view, loading, error }: { view?: WhalePerformance; loading: boolean; error: string }) {
+  if (error) return <p className="auction-note">{error}</p>;
+  if (!view) return <p className="muted">{loading ? "Loading…" : ""}</p>;
+  const cards: [string, PerfSummary | undefined][] = [["All entries", view.summary], ["Buy side", view.by_side.buy], ["Sell side", view.by_side.sell],
+    ...Object.entries(view.by_pattern).map(([k, v]) => [k.replace(/_/g, " "), v] as [string, PerfSummary])];
+  return <>
+    <div className="auction-whale-perf-cards">
+      {cards.filter(([, s]) => s && s.entries).map(([label, s]) => <div key={label}>
+        <span>{label} · {s!.measured}/{s!.entries}</span>
+        <b className={tone(s!.avg_favourable_pct)}>{s!.went_their_way_pct != null ? `${s!.went_their_way_pct}% their way` : "—"}</b>
+        <small>avg max {pct(s!.avg_max_return_pct)} · avg min {pct(s!.avg_min_return_pct)}{s!.avg_favourable_pct != null ? ` · with ${pct(s!.avg_favourable_pct)} / against ${pct(s!.avg_adverse_pct)}` : ""}</small>
+      </div>)}
+    </div>
+    <div className="auction-whale-names-scroll">
+      <table className="auction-rate-table auction-whale-names-table">
+        <thead><tr><th>Day</th><th>Instrument</th><th>Pattern</th><th>Side</th><th>Entry</th>
+          <th>+15m</th><th>+30m</th><th>+60m</th><th>Max</th><th>Min</th><th>With side</th><th>Against</th><th>Now</th><th>Followed</th></tr></thead>
+        <tbody>
+          {view.entries.map((row) => <tr key={`${row.symbol}-${row.day}`} title={row.evidence}>
+            <td>{row.day}</td>
+            <td><b>{row.kind === "option" && row.strike != null ? `${row.underlying} ${row.strike} ${row.right}` : row.symbol.replace(/^NSE:|^BSE:/, "")}</b></td>
+            <td>{row.pattern.replace(/_/g, " ")}</td>
+            <td className={row.side > 0 ? "positive" : row.side < 0 ? "negative" : ""}>{sideLabel(row.side)}</td>
+            <td>{row.entry_at} @ {row.entry_price}</td>
+            {["15m", "30m", "60m"].map((k) => <td key={k} className={tone(row.forward?.[k])}>{pct(row.forward?.[k])}</td>)}
+            <td className={tone(row.max_return_pct)}>{pct(row.max_return_pct)}<small> {row.max_at ?? ""}</small></td>
+            <td className={tone(row.min_return_pct)}>{pct(row.min_return_pct)}<small> {row.min_at ?? ""}</small></td>
+            <td className={tone(row.favourable_pct)}>{pct(row.favourable_pct)}</td>
+            <td className={tone(row.adverse_pct)}>{pct(row.adverse_pct)}</td>
+            <td className={tone(row.last_return_pct)}>{pct(row.last_return_pct)}</td>
+            <td>{row.sessions ?? 0}/{view.follow_sessions + 1} sessions{row.complete ? " · done" : ""}</td>
+          </tr>)}
+          {!view.entries.length && <tr><td colSpan={14} className="empty">No entries recorded in this window yet.</td></tr>}
+        </tbody>
+      </table>
+    </div>
+    <p className="auction-note">An entry is a name's first appearance on a day's list, at the price of its first pattern. Returns come from
+      1-minute bars over the rest of that session and {view.follow_sessions} more. "With side" is the best move in the whale's direction
+      (up for a buy, down for a sell), "against" the worst; "their way" counts entries whose move with the side exceeded the move against it.</p>
+  </>;
+}
+
+
+type TuningBin = { n: number; hits: number; hit_rate: number; weight: number; avg_ret30_pct: number | null };
+type TuningOverview = {
+  latest: ({ run_id: number; as_of: string; labelled: number; base_rate: number | null; top_quintile_hit_rate?: number;
+    mean_brier?: number; features: Record<string, Record<string, TuningBin>> }) | null;
+  runs: { run_id: number; created_at: string; as_of: string; labelled: number; base_rate: number | null;
+    top_quintile_hit_rate?: number | null; mean_brier?: number | null }[];
+  params: { symbols: number; overrides: number; avg_sensitivity: number | null; tightened: number; loosened: number };
+  pending_labels: number; constants: Record<string, unknown>;
+};
+type TuningParam = { symbol: string; kind: string; sensitivity: number; source: string | null; large_min_qty: number | null;
+  large_floor: number | null; child_min_qty: number | null; child_floor: number | null; window_share: number | null;
+  legacy: boolean | null; disabled?: boolean | null; baseline_sessions: number | null; p50: number | null; p99: number | null;
+  p999: number | null; turnover: number | null; typical_move_pct: number | null; override: Record<string, unknown> | null };
+type TuningSymbol = { symbol: string; params: Record<string, unknown>; sensitivity: number; override: Record<string, unknown> | null;
+  baseline: Record<string, number | null> | null; fitted_for: string | null;
+  fingerprints: { day: string; prints: number; volume: number; notional: number; p50: number; p90: number; p99: number; p999: number; max_qty: number }[];
+  events: { day: string; at: string; kind: string; side: number; bins: Record<string, string>; features: Record<string, unknown>;
+    probability: number | null; ret30: number | null; typical_move: number | null; hit: number | null }[] };
+
+/** Per-instrument thresholds, the feature weights outcomes have taught, and the runs that taught them. */
+function WhaleTuningView() {
+  const [revision, setRevision] = useState(0);
+  const [query, setQuery] = useState("");
+  const [picked, setPicked] = useState("");
+  const [running, setRunning] = useState("");
+  const overview = useEndpoint<TuningOverview>("/api/auction/whale/tuning", [revision]);
+  const params = useEndpoint<TuningParam[]>(`/api/auction/whale/tuning/params?limit=400${query ? `&q=${encodeURIComponent(query)}` : ""}`, [query, revision]);
+  const detail = useEndpoint<TuningSymbol>(picked ? `/api/auction/whale/tuning/symbol/${encodeURIComponent(picked)}` : null, [picked, revision]);
+  const latest = overview.data?.latest;
+  const runNow = () => {
+    setRunning("Running…");
+    void fetch(`${API_URL}/api/auction/whale/tuning/run`, { method: "POST", headers: headers() })
+      .then(async (response) => {
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || "run failed");
+        setRunning(`Run ${body.calibration_run}: ${body.events} events on ${body.names} names · ${body.labelled} labelled · ${body.refitted} refitted`);
+        setRevision((n) => n + 1);
+      })
+      .catch((error) => setRunning(error instanceof Error ? error.message : "run failed"));
+  };
+  return <div className="whale-tuning">
+    <WhaleStudyBlock />
+    <div className="auction-whale-perf-cards">
+      <div><span>Latest calibration</span><b>{latest ? `run ${latest.run_id} · ${latest.as_of}` : "none yet"}</b>
+        <small>{latest ? `${latest.labelled} labelled · base ${latest.base_rate != null ? (latest.base_rate * 100).toFixed(1) + "%" : "—"} · top-20% ${latest.top_quintile_hit_rate != null ? (latest.top_quintile_hit_rate * 100).toFixed(1) + "%" : "—"} · Brier ${latest.mean_brier ?? "—"}` : "runs nightly after the close"}</small></div>
+      <div><span>Tuned instruments</span><b>{overview.data?.params.symbols ?? 0}</b>
+        <small>{overview.data ? `${overview.data.params.overrides} overrides · sensitivity avg ${overview.data.params.avg_sensitivity ?? "—"} · ${overview.data.params.tightened} tightened / ${overview.data.params.loosened} loosened` : ""}</small></div>
+      <div><span>Awaiting outcome</span><b>{overview.data?.pending_labels ?? 0}</b><small>events whose next hour has not traded yet</small></div>
+      <div><span>Run the loop</span><button className="of-toggle" onClick={runNow} disabled={running === "Running…"}>Run tuning now</button>
+        <small>{running || "rescan · fingerprint · label · calibrate · refit (after the close)"}</small></div>
+    </div>
+    {latest && Object.keys(latest.features || {}).length > 0 && <div className="whale-tuning-weights">
+      {Object.entries(latest.features).map(([feature, bins]) => <table key={feature} className="auction-rate-table">
+        <thead><tr><th>{feature.replace(/_/g, " ")}</th><th>n</th><th>hit</th><th title="log-odds vs base rate, shrunk toward 0 for small n">weight</th><th>avg 30m</th></tr></thead>
+        <tbody>{Object.entries(bins).sort((a, b) => b[1].weight - a[1].weight).map(([value, bin]) => <tr key={value}>
+          <td>{value.replace(/_/g, " ")}</td><td>{bin.n}</td><td>{(bin.hit_rate * 100).toFixed(0)}%</td>
+          <td className={bin.weight > 0.05 ? "positive" : bin.weight < -0.05 ? "negative" : ""}>{bin.weight > 0 ? "+" : ""}{bin.weight.toFixed(2)}</td>
+          <td className={tone(bin.avg_ret30_pct)}>{pct(bin.avg_ret30_pct)}</td></tr>)}</tbody>
+      </table>)}
+    </div>}
+    <div className="whale-tuning-split">
+      <div>
+        <input className="whale-tuning-search" type="search" placeholder="Filter symbols…" value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="auction-whale-names-scroll">
+          <table className="auction-rate-table auction-whale-names-table">
+            <thead><tr><th>Instrument</th><th>Source</th><th>Sens.</th><th>Sessions</th><th>p50 / p99.9 clip</th><th>Turnover</th>
+              <th>Large ≥ qty</th><th>Large ≥ ₹</th><th>Clip ≥ qty</th><th>Clip ≥ ₹</th><th>30m move</th></tr></thead>
+            <tbody>{(params.data || []).map((row) => <tr key={row.symbol} className={picked === row.symbol ? "openable-row active" : "openable-row"}
+              onClick={() => setPicked(row.symbol)}>
+              <td><b>{row.symbol.replace(/^NSE:|^BSE:/, "")}</b><small> {row.kind}{row.legacy ? " · legacy" : ""}{row.disabled ? " · off" : ""}</small></td>
+              <td>{row.source}{row.override ? " ✎" : ""}</td><td>{row.sensitivity}</td><td>{row.baseline_sessions ?? 0}</td>
+              <td>{row.p50 != null ? `${QTY.format(row.p50)} / ${QTY.format(row.p999 ?? 0)}` : "—"}</td><td>{rupees(row.turnover)}</td>
+              <td>{row.large_min_qty ? QTY.format(row.large_min_qty) : "—"}</td><td>{rupees(row.large_floor)}</td>
+              <td>{row.child_min_qty ? QTY.format(row.child_min_qty) : "—"}</td><td>{rupees(row.child_floor)}</td>
+              <td>{row.typical_move_pct != null ? `${row.typical_move_pct}%` : "—"}</td></tr>)}
+              {params.data && !params.data.length && <tr><td colSpan={11} className="empty">No instrument has been tuned yet — the first run fits them.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {picked && <TuningSymbolPanel view={detail.data} symbol={picked} onSaved={() => setRevision((n) => n + 1)} />}
+    </div>
+  </div>;
+}
+
+function TuningSymbolPanel({ view, symbol, onSaved }: { view?: TuningSymbol; symbol: string; onSaved: () => void }) {
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [status, setStatus] = useState("");
+  useEffect(() => {
+    const o = view?.override || {};
+    setForm(Object.fromEntries(["sensitivity", "large_min_qty", "large_floor", "window_share", "child_min_qty", "child_floor"]
+      .map((k) => [k, o[k] != null ? String(o[k]) : ""])));
+    setStatus("");
+  }, [view]);
+  const save = (clear = false) => {
+    const body = clear ? null : Object.fromEntries(Object.entries(form).filter(([, v]) => v.trim() !== "").map(([k, v]) => [k, Number(v)]));
+    void fetch(`${API_URL}/api/auction/whale/tuning/symbol/${encodeURIComponent(symbol)}`, {
+      method: "PUT", headers: { ...(headers() || {}), "content-type": "application/json" }, body: JSON.stringify(body),
+    }).then(async (response) => {
+      if (!response.ok) throw new Error((await response.json()).detail || "save failed");
+      setStatus(clear ? "Override cleared" : "Saved — thresholds refitted"); onSaved();
+    }).catch((error) => setStatus(error instanceof Error ? error.message : "save failed"));
+  };
+  const labelled = (view?.events || []).filter((e) => e.hit != null);
+  return <aside className="whale-tuning-detail">
+    <div className="panel-title"><span>{symbol.replace(/^NSE:|^BSE:/, "")}</span><span>{view?.fitted_for ? `fitted for ${view.fitted_for}` : ""}</span></div>
+    {view?.params && <p className="auction-note">
+      Large print ≥ {String(view.params.large_multiple)}× 30m median, ≥ {QTY.format(Number(view.params.large_min_qty || 0))} qty,
+      ≥ {rupees(Number(view.params.large_floor || 0))}, ≥ {(Number(view.params.window_share || 0) * 100).toFixed(0)}% of window volume ·
+      clip ≥ {QTY.format(Number(view.params.child_min_qty || 0))} qty and {rupees(Number(view.params.child_floor || 0))} · sensitivity {view.sensitivity}
+      {labelled.length ? ` · ${labelled.filter((e) => e.hit).length}/${labelled.length} labelled events went their way` : ""}</p>}
+    <div className="whale-tuning-form">
+      {Object.keys(form).map((key) => <label key={key}><span>{key.replace(/_/g, " ")}</span>
+        <input value={form[key]} placeholder="auto" onChange={(e) => setForm({ ...form, [key]: e.target.value })} /></label>)}
+      <button className="of-toggle" onClick={() => save(false)}>Pin override</button>
+      <button className="of-toggle" onClick={() => save(true)}>Clear</button>
+      <small>{status}</small>
+    </div>
+    <table className="auction-rate-table"><thead><tr><th>Day</th><th>Prints</th><th>p50</th><th>p90</th><th>p99.9</th><th>Max</th><th>Turnover</th></tr></thead>
+      <tbody>{(view?.fingerprints || []).map((f) => <tr key={f.day}><td>{f.day}</td><td>{QTY.format(f.prints)}</td><td>{QTY.format(f.p50)}</td>
+        <td>{QTY.format(f.p90)}</td><td>{QTY.format(f.p999)}</td><td>{QTY.format(f.max_qty)}</td><td>{rupees(f.notional)}</td></tr>)}</tbody></table>
+    <table className="auction-rate-table"><thead><tr><th>Event</th><th>Features</th><th>P</th><th>30m</th><th>Hit</th></tr></thead>
+      <tbody>{(view?.events || []).slice(0, 40).map((e) => <tr key={`${e.day}-${e.at}-${e.kind}`}>
+        <td>{e.day.slice(5)} {e.at} {e.kind.replace(/_/g, " ")} {sideLabel(e.side)}</td>
+        <td><small>{e.bins.size_vs_p999} p99.9 · {e.bins.window_share} win · {e.bins.turnover_share} t/o · {e.bins.time} · rep {e.bins.repeat}</small></td>
+        <td>{e.probability != null ? `${(e.probability * 100).toFixed(0)}%` : "—"}</td>
+        <td className={tone(e.ret30)}>{pct(e.ret30)}</td>
+        <td>{e.hit == null ? "…" : e.hit ? "✓" : "✗"}</td></tr>)}</tbody></table>
+  </aside>;
+}
+
+
+type StudySummary = { latest: null | { study_id: number; since: string; until: string; verdict: string; events: number; symbols: number;
+  sessions: number; test?: { hit_rate?: number; n: number }; control_test?: { hit_rate?: number; n: number };
+  test_quintiles?: { hit_rate?: number; lift?: number; z?: number | null; n: number }[] };
+  studies: { study_id: number; since: string; until: string; verdict: string }[] };
+
+/** The walk-forward edge study of minute-level whale spikes (whale_study.py). */
+function WhaleStudyBlock() {
+  const study = useEndpoint<StudySummary>("/api/auction/whale/study", []);
+  const s = study.data?.latest;
+  if (!s) return null;
+  return <div className="whale-study">
+    <b>Edge study #{s.study_id}</b> <span>{s.since} → {s.until} · {s.events.toLocaleString("en-IN")} spikes · {s.symbols} instruments · {s.sessions} sessions</span>
+    <p>{s.verdict}. Spikes {s.test?.hit_rate != null ? `${(s.test.hit_rate * 100).toFixed(1)}%` : "—"} vs ordinary minutes {s.control_test?.hit_rate != null ? `${(s.control_test.hit_rate * 100).toFixed(1)}%` : "—"}.
+      Held-out quintiles: {(s.test_quintiles || []).map((q) => q.hit_rate != null ? `${(q.hit_rate * 100).toFixed(0)}%` : "—").join(" → ")}.</p>
+  </div>;
 }

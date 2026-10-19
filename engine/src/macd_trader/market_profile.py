@@ -16,6 +16,7 @@ resolution its book actually quotes at.
 """
 from __future__ import annotations
 
+import math
 import string
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -356,21 +357,7 @@ class Profile:
             if self.first_bracket is not None and self.first_bracket > 0:
                 return "unobserved"
             return "forming"
-        if self.ib_high is None or self.ib_low is None or self.high is None or self.low is None:
-            return "forming"
-        ib_range = self.ib_high - self.ib_low
-        if ib_range <= 0:
-            return "forming"
-        extension = ((self.high - self.ib_high) + (self.ib_low - self.low)) / ib_range
-        up = self.high > self.ib_high
-        down = self.low < self.ib_low
-        if extension <= 0.05:
-            return "normal_day"
-        if up and down:
-            return "neutral_day"
-        if extension >= 1.0:
-            return "trend_day_up" if up else "trend_day_down"
-        return "normal_variation_up" if up else "normal_variation_down"
+        return ib_day_type(self.high, self.low, self.ib_high, self.ib_low)
 
     def position(self) -> str:
         """Where the last print sits relative to value — the trade context."""
@@ -384,21 +371,51 @@ class Profile:
             return "below_value"
         return "in_value"
 
-    def snapshot(self, max_levels: int | None = 90) -> dict:
+    def rows(self, row_size: float | None) -> list[tuple[float, set, float]]:
+        """(row price, brackets, volume) per display row, highest first.
+
+        A row spans [price, price + row_size): its TPO letters are the union of
+        the brackets that traded anywhere inside it, its volume the sum. At the
+        tick (or with no row size) each traded level is its own row.
+        """
+        if not row_size or row_size <= self.tick_size + 1e-9:
+            return [(level, self.tpo[level], self.volume.get(level, 0.0))
+                    for level in sorted(self.tpo, reverse=True)]
+        merged: dict[float, list] = {}
+        for level, brackets in self.tpo.items():
+            key = round(math.floor(level / row_size + 1e-9) * row_size, 8)
+            row = merged.setdefault(key, [set(), 0.0])
+            row[0] |= brackets
+            row[1] += self.volume.get(level, 0.0)
+        return [(price, merged[price][0], merged[price][1]) for price in sorted(merged, reverse=True)]
+
+    def snapshot(self, max_levels: int | None = 90, row_size: float | None = None,
+                 scale: dict | None = None) -> dict:
+        """The published profile. ``row_size`` aggregates the ladder for display.
+
+        POC, value area, IB, open and day type are always the tick-precision
+        figures the desk trades on; only ``levels`` and the display single
+        prints are per row. Rows are summed, never sampled, so the thinning
+        below is a last resort for a ladder still wider than ``max_levels``.
+        """
         vah, val = self.value_area()
-        levels = sorted(self.tpo, reverse=True)
-        levels_total = len(levels)
-        single_prints = self.single_prints
-        if max_levels is not None and max_levels > 0 and len(levels) > max_levels:
-            step = len(levels) / max_levels
-            levels = [levels[int(i * step)] for i in range(max_levels)]
+        aggregated = bool(row_size and row_size > self.tick_size + 1e-9)
+        rows = self.rows(row_size if aggregated else None)
+        levels_total = len(rows)
+        single_prints = ([price for price, brackets, _volume in sorted(rows) if len(brackets) == 1]
+                         if aggregated else self.single_prints)
+        if max_levels is not None and max_levels > 0 and len(rows) > max_levels:
+            step = len(rows) / max_levels
+            rows = [rows[int(i * step)] for i in range(max_levels)]
         return {
             "symbol": self.symbol,
             "day": self.day,
             "tick_size": self.tick_size,
+            "row_size": row_size if aggregated else self.tick_size,
+            "row_scale": scale,
             "levels_total": levels_total,
-            "levels_returned": len(levels),
-            "levels_sampled": len(levels) < levels_total,
+            "levels_returned": len(rows),
+            "levels_sampled": len(rows) < levels_total,
             "single_prints_total": len(single_prints),
             "single_prints_sampled": max_levels is not None and len(single_prints) > 20,
             "open": self.open_price,
@@ -431,12 +448,12 @@ class Profile:
             ],
             "levels": [
                 {
-                    "price": level,
-                    "tpo": len(self.tpo[level]),
-                    "letters": "".join(letter_for(i) for i in sorted(self.tpo[level])),
-                    "volume": round(self.volume.get(level, 0.0)),
+                    "price": price,
+                    "tpo": len(brackets),
+                    "letters": "".join(letter_for(i) for i in sorted(brackets)),
+                    "volume": round(volume),
                 }
-                for level in levels
+                for price, brackets, volume in rows
             ],
         }
 
@@ -464,3 +481,26 @@ class ProfileBook:
 
     def get(self, symbol: str) -> Profile | None:
         return self.profiles.get(symbol)
+
+
+def ib_day_type(high: float | None, low: float | None, ib_high: float | None, ib_low: float | None) -> str:
+    """The desk's day type: range extension beyond the initial balance.
+
+    One function for the live profile and the stored session tier, so the label the desk traded on during the
+    day is the label the next morning's context reads (they disagreed on all six symbols checked on 14 Oct 2026).
+    """
+    if ib_high is None or ib_low is None or high is None or low is None:
+        return "forming"
+    ib_range = ib_high - ib_low
+    if ib_range <= 0:
+        return "forming"
+    extension = ((high - ib_high) + (ib_low - low)) / ib_range
+    up = high > ib_high
+    down = low < ib_low
+    if extension <= 0.05:
+        return "normal_day"
+    if up and down:
+        return "neutral_day"
+    if extension >= 1.0:
+        return "trend_day_up" if up else "trend_day_down"
+    return "normal_variation_up" if up else "normal_variation_down"

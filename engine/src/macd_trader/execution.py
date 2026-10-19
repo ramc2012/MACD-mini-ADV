@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import math
+import time
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
@@ -12,6 +13,8 @@ from .events import EventHub, json_value
 from .models import Order, Signal, Trade
 
 IST = ZoneInfo("Asia/Kolkata")
+# After a failed or unaffordable pyramid add, that contract is not tried again for this long.
+ADD_RETRY_SECONDS = 300.0
 
 
 def _session_day(moment: datetime) -> date:
@@ -34,14 +37,22 @@ class ExecutionManager:
         self.portfolio = portfolio
         self.repository = repository
         self.events = events
+        self._add_blocked_until: dict[str, float] = {}
         self.orders: dict[str, Order] = {}
         if settings.execution_mode == "paper":
             self.orders = {order.order_id: order for order in repository.load_open_orders()}
         self.last_prices: dict[str, float] = {}
         self.last_price_at: dict[str, datetime] = {}
+        # symbol -> the latest Tick (with bid/ask), shared from the engine so every lane fills against the
+        # same book. None (tests, the desk) falls back to slippage_bps.
+        self.quote_source = None
+        # symbol -> the underlying's session order flow (entry_context.EntryFlow.context), logged at entries.
+        self.entry_context = None
+        self.paper_fill_basis = {"quoted_spread": 0, "last_price_bps": 0}
         self._lock = asyncio.Lock()
         self.tradable_symbols: set[str] = set(settings.symbols)
         self.lot_sizes: dict[str, int] = {symbol: 1 for symbol in settings.symbols}
+        self.contract_expiries: dict[str, str | None] = {}
         self.exit_reasons: dict[str, str] = {}
         # Symbols whose next SELL was armed by an automated exit. A SELL that
         # arrives without one is a manual ticket and is labelled MANUAL, so a
@@ -94,6 +105,20 @@ class ExecutionManager:
                 self._cancel(order)
         self.expire_previous_session_orders()
 
+    def set_contract_expiries(self, expiries: dict[str, str | None]) -> None:
+        """Retain known metadata for entry checks, including carried contracts."""
+        self.contract_expiries.update(expiries)
+
+    def _check_buy_expiry(self, symbol: str) -> None:
+        if symbol not in self.contract_expiries:
+            return
+        try:
+            expiry = date.fromisoformat(str(self.contract_expiries[symbol])[:10])
+        except ValueError:
+            raise ValueError(f"Contract expiry is unavailable for {symbol}; BUY blocked") from None
+        if expiry < datetime.now(IST).date():
+            raise ValueError(f"Expired contract {symbol} ({expiry.isoformat()}); BUY blocked")
+
     def expire_previous_session_orders(self, today: date | None = None) -> None:
         """Resting paper tickets are day orders, as on the exchange.
 
@@ -140,9 +165,15 @@ class ExecutionManager:
         signal: Signal | None = None,
         _exit_stage: int | None = None,
     ) -> Order:
-        if symbol not in self.tradable_symbols:
+        position = self.portfolio.positions.get(symbol)
+        # Selling what the book already holds is never a watchlist question: on
+        # 30 Sep a blast holding carried from the day before was no longer in
+        # the day's selection, its stop could not be filled, and the ValueError
+        # raised inside the tick path stopped the whole Fyers stream.
+        held_exit = side == "SELL" and position is not None and position.quantity > 0
+        if symbol not in self.tradable_symbols and not held_exit:
             raise ValueError(f"{symbol} is not on the watchlist")
-        lot_size = self.lot_sizes.get(symbol, 0)
+        lot_size = self.lot_sizes.get(symbol, 0) or (position.lot_size if held_exit and position.lot_size > 1 else 0)
         if lot_size < 1:
             raise ValueError(f"Lot size is unavailable for {symbol}; order blocked")
         if lots is not None:
@@ -158,6 +189,8 @@ class ExecutionManager:
             raise PermissionError("Live orders are locked; set MACD_ALLOW_LIVE_ORDERS=true explicitly")
         if self.settings.execution_mode == "live" and symbol.endswith("-INDEX"):
             raise ValueError("Index spot symbols are not tradable; configure a futures or option contract")
+        if side == "BUY":
+            self._check_buy_expiry(symbol)
         order = Order(
             symbol=symbol,
             side=side,
@@ -219,10 +252,10 @@ class ExecutionManager:
         return order
 
     async def _paper_fill(self, order: Order, *, exit_stage: int | None = None) -> None:
+        if order.side == "BUY":
+            self._check_buy_expiry(order.symbol)
         price = self._fresh_price(order.symbol)
-        slip = price * self.settings.slippage_bps / 10_000
-        fill_price = price + slip if order.side == "BUY" else price - slip
-        fill_price = round(fill_price, 4)
+        fill_price = round(self._paper_price(order.symbol, order.side, price), 4)
         if order.order_type == "LIMIT":
             fill_price = min(fill_price, order.limit_price) if order.side == "BUY" else max(fill_price, order.limit_price)
         self._check_paper_capacity(order, order.limit_price if order.order_type == "LIMIT" else fill_price)
@@ -261,6 +294,8 @@ class ExecutionManager:
                     position.entry_stage = prior_entry_stage + order.lots
             if exit_stage is not None and position:
                 position.exit_stage = exit_stage
+            if order.side == "BUY" and existing_position is None and self.entry_context is not None:
+                self._record_entry_context(order)
             if closed is not None:
                 closed.exit_reason = self.exit_reasons.get(order.symbol)
             portfolio_snapshot = self.portfolio_snapshot()
@@ -322,9 +357,73 @@ class ExecutionManager:
             return False
         return True
 
+    def _add_allowed(self, symbol: str, price: float, lot_size: int) -> bool:
+        """A pyramid add is attempted only when cash covers a lot, and not while backing off from a failed one."""
+        if time.monotonic() < self._add_blocked_until.get(symbol, 0.0):
+            return False
+        lot = self.lot_sizes.get(symbol) or lot_size
+        if lot < 1 or price * lot * (1 + self.settings.slippage_bps / 10_000) > self.portfolio.cash:
+            self._add_blocked_until[symbol] = time.monotonic() + ADD_RETRY_SECONDS
+            return False
+        return True
+
     def set_quote(self, symbol: str, price: float, timestamp: datetime | None = None) -> None:
         self.last_prices[symbol] = price
         self.last_price_at[symbol] = timestamp or datetime.now(UTC)
+
+    async def settle_expired(self, symbol: str, price: float, reason: str) -> dict | None:
+        """Close a holding whose contract expired while the app was down, at an administered settlement price.
+
+        submit() cannot do it: the contract is off today's watchlist and has no live quote. This writes the
+        closing fill through the same durable path as a paper fill (self_heal.settle_expired_books).
+        """
+        async with self._lock:
+            position = self.portfolio.positions.get(symbol)
+            if position is None or position.quantity <= 0 or price is None or not math.isfinite(price) or price < 0:
+                return None
+            order = Order(symbol, "SELL", position.quantity, lots=max(1, position.lots), lot_size=position.lot_size,
+                          status="FILLED", fill_price=round(price, 4))
+            order.broker_order_id = f"PAPER-SETTLE-{order.order_id[:8]}"
+            trade = Trade(order.order_id, symbol, "SELL", position.quantity, round(price, 4),
+                          lots=max(1, position.lots), lot_size=position.lot_size)
+            self.exit_reasons[symbol] = reason
+            closed = self.portfolio.apply_trade(trade)
+            if closed is not None:
+                closed.exit_reason = reason
+            self.orders[order.order_id] = order
+            snapshot = self.portfolio_snapshot()
+            if closed is not None:
+                snapshot["closed_positions"] = [json_value(closed), *snapshot["closed_positions"]]
+            self.repository.save_paper_fill(order, trade, self.portfolio.positions.values(), closed, snapshot)
+        self.events.publish("portfolio", self.portfolio_snapshot())
+        return json_value(closed) if closed is not None else {}
+
+    def _record_entry_context(self, order: Order) -> None:
+        """Log the underlying's session order flow at a new position's entry. Never blocks the fill."""
+        try:
+            context = self.entry_context(order.symbol)
+            if context is not None:
+                self.repository.save_entry_context(
+                    order.order_id, datetime.now(UTC).isoformat(), order.symbol,
+                    {**context, "fill_price": order.fill_price, "lane": self.portfolio.lane})
+        except Exception:  # noqa: BLE001 -- measurement only
+            pass
+
+    def _paper_price(self, symbol: str, side: str, price: float) -> float:
+        """Where a paper order fills: across the quoted spread when a two-sided quote from the same tick as the
+        fresh price is in hand (settings.paper_cross_spread), else last price +/- slippage_bps."""
+        slip = price * self.settings.slippage_bps / 10_000
+        fallback = price + slip if side == "BUY" else price - slip
+        tick = self.quote_source(symbol) if self.quote_source is not None and self.settings.paper_cross_spread else None
+        bid, ask = getattr(tick, "bid", None), getattr(tick, "ask", None)
+        # The quote must ride on the tick that delivered this price, or it describes a different moment.
+        same_tick = tick is not None and abs(float(getattr(tick, "ltp", 0) or 0) - price) <= 1e-9
+        if not (same_tick and bid and ask and 0 < bid <= ask and math.isfinite(bid) and math.isfinite(ask)):
+            self.paper_fill_basis["last_price_bps"] += 1
+            return fallback
+        cap = price * self.settings.paper_max_half_spread_pct / 100
+        self.paper_fill_basis["quoted_spread"] += 1
+        return min(ask, price + cap) if side == "BUY" else max(bid, price - cap)
 
     def _fresh_price(self, symbol: str) -> float:
         price = self.last_prices.get(symbol)
@@ -412,12 +511,17 @@ class ExecutionManager:
         if self.settings.auto_trade and position.entry_stage < self.settings.max_trade_lots:
             stage_index = max(0, position.entry_stage - 1)
             threshold = round(anchor * (1 + scale_in_levels[stage_index]), 4) if stage_index < len(scale_in_levels) else None
-            if threshold is not None and price >= threshold:
+            if threshold is not None and price >= threshold and self._add_allowed(symbol, price, position.lot_size):
                 try:
                     await self.submit(symbol, "BUY", lots=1)
                     return
                 except (ValueError, RuntimeError, PermissionError):
-                    pass  # A rejected add must not suppress protective exits.
+                    # A rejected add must not suppress protective exits -- and
+                    # must not be retried on the very next tick: on 30 Sep a
+                    # cash-starved book re-submitted adds on every tick while
+                    # the price sat above the level, 3,170 REJECTED orders, each
+                    # written to disk twice with a full sync.
+                    self._add_blocked_until[symbol] = time.monotonic() + ADD_RETRY_SECONDS
 
         # Bank partial profits while retaining the last lot for the existing
         # 25%-from-peak trailing stop.
@@ -464,6 +568,8 @@ class ExecutionManager:
                 "max_positions": self.settings.max_positions,
                 "min_cash_reserve": self.settings.min_cash_reserve,
                 "slippage_bps": self.settings.slippage_bps,
+                "paper_cross_spread": self.settings.paper_cross_spread,
+                "paper_fill_basis": dict(self.paper_fill_basis),
                 "target_position_notional": self.settings.target_position_notional,
                 "max_target_entry_lots": self.settings.max_target_entry_lots,
                 "scale_in_profit_pct": [7.5, 15, 22.5] if self.settings.max_trade_lots > 1 else [],

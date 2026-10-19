@@ -18,6 +18,7 @@ from .chart_history import aggregate_session_candles
 from .models import Candle
 from .settings_store import RuntimeSettingsStore
 from .universe import INDEX_SPOTS, SPOT_SYMBOLS
+from . import sqlite_journal
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -36,10 +37,9 @@ class HistoricalStore:
         self.path = target
         self.db = sqlite3.connect(target)
         self.db.row_factory = sqlite3.Row
-        # DELETE journaling is slower than WAL but is reliable on Docker Desktop
-        # bind mounts, where shared-memory WAL files can intermittently return EIO.
-        self.db.execute("PRAGMA journal_mode=DELETE")
-        self.db.execute("PRAGMA synchronous=NORMAL")
+        # WAL on a local filesystem; DELETE on a Docker Desktop bind mount,
+        # where shared-memory WAL files can intermittently return EIO.
+        sqlite_journal.configure(self.db, str(target), rollback_sync="NORMAL")
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS historical_candles (
           symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,

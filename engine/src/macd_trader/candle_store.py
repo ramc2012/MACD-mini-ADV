@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import RLock
 
+from . import sqlite_journal
 from .models import Candle
 
 FLUSH_INTERVAL_SECONDS = 10.0
@@ -83,15 +84,9 @@ class LiveCandleWriter:
         try:
             connection = sqlite3.connect(self._path, timeout=30)
             try:
-                # NOT WAL. This file lives on a Docker Desktop bind mount,
-                # whose virtualised filesystem does not reliably provide the
-                # shared-memory and byte-range locking WAL requires. The trade
-                # book was corrupted this way; historical.sqlite3 is the last
-                # writer still using it. (Corruption here predates the pragma —
-                # a 4GB file under constant writes on this mount is fragile
-                # regardless — but WAL removes none of that risk and adds some.)
-                connection.execute("PRAGMA journal_mode=DELETE")
-                connection.execute("PRAGMA synchronous=FULL")
+                # WAL on a local filesystem, the rollback journal on a bind
+                # mount (see sqlite_journal: WAL corrupted a trade book there).
+                sqlite_journal.configure(connection, self._path)
                 connection.execute("""
                     CREATE TABLE IF NOT EXISTS historical_candles (
                       symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
@@ -171,8 +166,7 @@ def store_historical_candles(
         return 0
     connection = sqlite3.connect(database_path, timeout=30)
     try:
-        connection.execute("PRAGMA journal_mode=DELETE")
-        connection.execute("PRAGMA synchronous=FULL")
+        sqlite_journal.configure(connection, database_path)
         connection.execute("""
             CREATE TABLE IF NOT EXISTS historical_candles (
               symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
@@ -223,8 +217,7 @@ def prune_history(
     connection = sqlite3.connect(database_path, timeout=60)
     deleted = {"candles": 0, "indicators": 0, "vacuumed": 0}
     try:
-        connection.execute("PRAGMA journal_mode=DELETE")
-        connection.execute("PRAGMA synchronous=FULL")
+        sqlite_journal.configure(connection, database_path)
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "historical_candles" not in tables:
             return deleted

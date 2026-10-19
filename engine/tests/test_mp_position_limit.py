@@ -47,6 +47,7 @@ class TestPropagation:
             _reconfigure_lock=asyncio.Lock(),
         )
         obj.reconfigure_strategy = TradingEngine.reconfigure_strategy.__get__(obj)
+        obj._apply_capital_change = TradingEngine._apply_capital_change.__get__(obj)
         return obj
 
     def test_a_saved_limit_reaches_the_running_desk(self):

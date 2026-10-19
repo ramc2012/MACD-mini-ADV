@@ -114,6 +114,7 @@ def test_nightly_retries_a_locked_database_instead_of_writing_the_day_off(monkey
     # The nightly loop is desk code (macd_trader.desk); patch its clock there.
     from macd_trader import desk as desk_module
     monkeypatch.setattr(desk_module, "datetime", Clock)
+    monkeypatch.setattr(desk_module, "session_history_coverage", lambda *_: {"complete": True})
     sleeps = {"n": 0}
 
     async def fast_sleep(_seconds):

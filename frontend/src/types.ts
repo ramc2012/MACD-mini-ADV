@@ -16,7 +16,7 @@ export type SpotWatchRow = { symbol: string; tick?: Tick; indicator?: Indicator 
 export type OptionWatchRow = SpotWatchRow & {
   sector?: string; underlying: string; spot_symbol: string; option_type: "CE" | "PE"; strike: number; expiry: string;
   selection_price: number; liquidity_volume: number; oi: number; retained: boolean; lot_size: number;
-  moneyness: "ITM" | "ATM" | "OTM"; analysis_only: boolean;
+  moneyness: "ITM" | "ATM" | "OTM" | "NEXT-ITM" | "NEXT-ATM" | "NEXT-OTM"; analysis_only: boolean;
   // Modelled, not fed: implied vol solved from the premium, then gamma -> GEX.
   iv?: number | null; gamma?: number | null; gex?: number | null;
 };
@@ -30,7 +30,7 @@ export type Order = {
   status: string; fill_price?: number; signal_id?: string; created_at: string;
 };
 export type Trade = {
-  trade_id: string; symbol: string; side: string; quantity: number; lots: number; lot_size: number; price: number; timestamp: string;
+  trade_id: string; order_id?: string; symbol: string; side: string; quantity: number; lots: number; lot_size: number; price: number; timestamp: string;
   fees?: number;
 };
 export type Position = {
@@ -64,7 +64,7 @@ export type Portfolio = {
 };
 export type ClosedBook = { closed_positions?: ClosedPosition[] };
 export type Snapshot = {
-  broker: { name: string; status: string; symbols: string[]; error?: string };
+  broker: { name: string; status: string; symbols: string[]; error?: string; token_expires_at?: string | null; token_expired?: boolean };
   config: { feed_mode: string; timeframe_seconds: number; fast: number; slow: number; signal: number; bb: number[]; kama: number[]; kama_rsi?: number[]; kama_roc?: number[]; entry_confirmations?: { macd_zero_cross_up: boolean; kama: boolean; kama_rsi: boolean; kama_roc: boolean }; entry_volume_ratio: number; signal_mode: string; auto_trade: boolean; market_holidays?: string[] };
   // Only symbols absent from spot_watchlist and option_watchlist.
   watchlist: { symbol: string; tick?: Tick }[];
@@ -104,6 +104,7 @@ export type ResearchOpenPosition = {
 export type StreamEvent = { seq: number; type: string; data: unknown };
 
 export type HealthInfo = {
+  blast?: BlastHealth;
   history_error_details?: Record<string, string>; warmup?: { required: number; with_indicators: number };
   session_open?: boolean; feed_alive?: boolean; observed_at?: string; feed_recoveries?: number; preopen_refreshes?: number;
   status: string; error?: string; uptime_seconds: number; feed_connects: number; ticks_total: number;
@@ -342,13 +343,20 @@ export type BlastSettings = {
   enabled: boolean; auto_trade: boolean; initial_capital: number; max_positions: number; target_notional: number;
   // Percent of spot, fraction of contracts, percent below the recent high.
   max_premium_pct: number; min_breadth: number; min_off_high_pct: number;
+  vix_adaptive_enabled: boolean; vix_reference: number; vix_breadth_adjustment: number;
+  vix_max_age_seconds: number; rich_premium_max_multiple: number;
   // Fractions: 0.5 is a 50% stop.
   hard_stop_pct: number; trail_activation_pct: number; trail_pct: number;
 };
 export type BlastHealth = {
+  entry_policy?: BlastEntryPolicy;
   enabled: boolean; auto_trade: boolean; evaluated_since_start: number; taken_since_start: number; watching: number;
   open_positions: number; symbols_with_history: number; last_candidate_at: string | null; broker_access: string; error: string | null;
   bar_seconds?: number; warmed_symbols?: number; last_warm_at?: string | null; late_bars_skipped?: number;
+};
+export type BlastEntryPolicy = {
+  version: string; active: boolean; vix_status: string; vix: number | null; vix_age_seconds: number | null;
+  normal_premium_limit_pct: number; hard_premium_limit_pct: number; min_side_breadth: number;
 };
 export type BlastVerdictSummary = { reason: string; count: number; resolved: number; mean_mfe_pct: number | null; mean_mae_pct: number | null };
 export type BlastJournalSummary = { day: string | null; evaluated: number; taken: number; verdicts: BlastVerdictSummary[] };
@@ -361,10 +369,14 @@ export type BlastCandidate = {
   taken: number; reason: string; order_id: string | null; watch_until: string | null;
   // Written back by the forward watcher; absent on a live frame.
   mfe_pct?: number | null; mae_pct?: number | null; resolved?: boolean;
+  entry_policy?: BlastEntryPolicy; premium_size_multiplier?: number | null;
+  planned_target_notional?: number | null; entry_size_multiplier?: number; entry_target_notional?: number;
+  entry_rejection?: string;
 };
 export type BlastSnapshot = {
   lane: "blast"; enabled: boolean; auto_trade: boolean; settings: BlastSettings; health: BlastHealth;
   screen: { entry: string; max_premium_pct_of_spot: number; min_side_breadth: number; min_off_recent_high_pct: number;
+            vix_policy?: BlastEntryPolicy;
             recent_high_lookback_bars: number; max_volume_share_pct: number;
             journal_horizon_hours: number; bar_seconds?: number };
   risk: { hard_stop_pct: number; trailing_activation_profit_pct: number; trailing_stop_pct: number;

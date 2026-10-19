@@ -42,5 +42,7 @@ def test_startup_quotes_mark_positions_without_calling_execution():
 def test_execution_session_gate_rejects_premarket_and_after_hours():
     assert regular_session_open(datetime(2026, 8, 18, 9, 14, tzinfo=UTC)) is True
     assert regular_session_open(datetime(2026, 8, 18, 3, 29, tzinfo=UTC)) is False
-    assert regular_session_open(datetime(2026, 8, 18, 10, 1, tzinfo=UTC)) is False
+    # 15:31 IST is still F&O's session since the Aug 2026 regime; 15:41 is not.
+    assert regular_session_open(datetime(2026, 8, 18, 10, 1, tzinfo=UTC)) is True
+    assert regular_session_open(datetime(2026, 8, 18, 10, 11, tzinfo=UTC)) is False
     assert regular_session_open(datetime(2026, 8, 23, 5, 0, tzinfo=UTC)) is False

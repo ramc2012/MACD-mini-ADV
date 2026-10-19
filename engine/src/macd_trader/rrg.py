@@ -1,9 +1,10 @@
 """Relative Rotation Graph data vs a benchmark (NIFTY 50).
 
 Computes public-domain approximations of the JdK RS-Ratio / RS-Momentum pair:
-    rs        = 100 * close(symbol) / close(benchmark)
+    rs        = EMA(100 * close(symbol) / close(benchmark), RS_SMOOTH)
     rs_ratio  = 100 + z-score(rs, window)
-    rs_momo   = 100 + z-score(one-bar change of rs_ratio, window)
+    rs_momo   = EMA(100 + z-score(one-bar change of rs_ratio, window), MOMENTUM_SMOOTH)
+The two EMAs keep tails readable: unsmoothed daily momentum jumps 2-3 units a bar and draws spaghetti.
 Both series are read from the locally stored 1-minute candles aggregated to
 the requested timeframe, so no broker calls are made.
 """
@@ -18,6 +19,9 @@ from .models import Candle
 from .sectors import sector_of
 
 LOOKBACK_DAYS = 45
+RS_SMOOTH, MOMENTUM_SMOOTH = 5, 3
+# Daily bars need far more calendar time than intraday ones for the same number of points.
+DAILY_LOOKBACK_DAYS = 110
 
 
 def _closes(connection: sqlite3.Connection, symbol: str, timeframe_seconds: int, since: int) -> dict[int, float]:
@@ -34,6 +38,13 @@ def _closes(connection: sqlite3.Connection, symbol: str, timeframe_seconds: int,
         for row in rows
     ]
     return {candle.timestamp: candle.close for candle in aggregate_session_candles(source, timeframe_seconds)}
+
+
+def _ema(values: list[float], span: int) -> list[float]:
+    alpha, out = 2 / (span + 1), []
+    for value in values:
+        out.append(value if not out else out[-1] + alpha * (value - out[-1]))
+    return out
 
 
 def _z_series(values: list[float], window: int) -> list[float]:
@@ -64,14 +75,16 @@ def compute_rrg(
     window: int = 14,
     tail: int = 8,
 ) -> dict:
-    since = int((datetime.now(UTC) - timedelta(days=LOOKBACK_DAYS)).timestamp())
+    lookback = DAILY_LOOKBACK_DAYS if timeframe_seconds >= 86_400 else LOOKBACK_DAYS
+    since = int((datetime.now(UTC) - timedelta(days=lookback)).timestamp())
     connection = sqlite3.connect(database_path, timeout=30)
     try:
         bench = _closes(connection, benchmark, timeframe_seconds, since)
         bench_ts = sorted(bench)
         rows: list[dict] = []
         unmapped: list[str] = []
-        need = window * 2 + tail
+        # Two smoothing windows, then as much tail as the history allows (at least two points).
+        need = window * 2 + 2
         for symbol in symbols:
             if symbol == benchmark:
                 continue
@@ -79,10 +92,10 @@ def compute_rrg(
             timestamps = [ts for ts in bench_ts if ts in closes]
             if len(timestamps) < need:
                 continue
-            rs = [100.0 * closes[ts] / bench[ts] for ts in timestamps]
+            rs = _ema([100.0 * closes[ts] / bench[ts] for ts in timestamps], RS_SMOOTH)
             rs_ratio = _z_series(rs, window)
             changes = [rs_ratio[i] - rs_ratio[i - 1] for i in range(1, len(rs_ratio))]
-            rs_momo = _z_series(changes, window)
+            rs_momo = _ema(_z_series(changes, window), MOMENTUM_SMOOTH)
             count = min(len(rs_ratio) - 1, len(rs_momo), tail)
             if count < 2:
                 continue

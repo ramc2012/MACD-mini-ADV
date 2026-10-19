@@ -76,3 +76,32 @@ export function nearestPriceIndex(rows: LadderRow[], price: number | null | unde
   if (lo > 0 && Math.abs(rows[lo - 1].price - price) < Math.abs(rows[lo].price - price)) return lo - 1;
   return lo;
 }
+
+/**
+ * The ladder's row step: the server's ATR-scaled row when it publishes one,
+ * else the exchange tick. Every profile view steps by this one value, so the
+ * auction ladder and the order-flow profile draw the same rows.
+ */
+export function profileRowStep(profile: { row_size?: number | null; tick_size?: number | null }): number | null {
+  const row = profile.row_size;
+  if (row != null && Number.isFinite(row) && row > 0) return row;
+  const tick = profile.tick_size;
+  return tick != null && Number.isFinite(tick) && tick > 0 ? tick : null;
+}
+
+/**
+ * Does the row starting at `rowPrice` contain `value`? A row spans
+ * [price, price + step): an aggregated row's price is its lower edge, and a
+ * tick-precision POC, VAH or IB level falls inside exactly one row.
+ */
+export function rowContains(rowPrice: number, step: number, value: number | null | undefined): boolean {
+  if (value == null || !Number.isFinite(value) || !(step > 0)) return false;
+  const eps = step * 1e-6;
+  return value >= rowPrice - eps && value < rowPrice + step - eps;
+}
+
+/** Does the row starting at `rowPrice` overlap the closed range [low, high]? */
+export function rowOverlaps(rowPrice: number, step: number, low: number, high: number): boolean {
+  const eps = step * 1e-6;
+  return rowPrice <= high + eps && rowPrice + step > low + eps;
+}

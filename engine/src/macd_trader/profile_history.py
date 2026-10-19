@@ -46,6 +46,8 @@ CANDLES = "candles"
 # originally built on: each minute contributes one unit at its close. Stored
 # under its own source name so a TPO POC is never mistaken for a volume POC.
 CANDLES_TPO = "candles_tpo"
+# A tick-built session must cover at least this share of the minutes the stored bars hold, or bars are used.
+TICK_COVERAGE_MIN = 0.8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS session_profiles (
@@ -67,6 +69,9 @@ CREATE TABLE IF NOT EXISTS session_profiles (
   levels INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL,
   built_at TEXT NOT NULL,
+  -- The live desk's day type (range extension beyond the IB, market_profile.ib_day_type). day_type above is the
+  -- value-area-coverage reading the nightly setups use; the two are different rules, so both are kept.
+  ib_day_type TEXT,
   PRIMARY KEY (symbol, day)
 );
 CREATE INDEX IF NOT EXISTS idx_session_profiles_day ON session_profiles(day);
@@ -91,6 +96,11 @@ CREATE TABLE IF NOT EXISTS period_profiles (
 
 def ensure_tables(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    # CREATE TABLE IF NOT EXISTS never widens an existing table.
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(session_profiles)")}
+    if "ib_day_type" not in columns:
+        connection.execute("ALTER TABLE session_profiles ADD COLUMN ib_day_type TEXT")
+        connection.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +189,14 @@ def day_type(high: float | None, low: float | None,
 # Sources
 # ---------------------------------------------------------------------------
 
-def session_bounds(day: str) -> tuple[int, int]:
-    opened = datetime.combine(date.fromisoformat(day), time(9, 15), IST)
-    return int(opened.timestamp()), int((opened + timedelta(hours=6, minutes=15)).timestamp())
+def session_bounds(day: str, symbol: str | None = None) -> tuple[int, int]:
+    """[open, close) epoch seconds: ``symbol``'s own session, else the whole market's.
+
+    Delegates to sessions.session_bounds so F&O runs to 15:40 and a cash
+    equity stops at its 15:15 closing-auction cut-off (regime 2026-08).
+    """
+    from .sessions import session_bounds as instrument_bounds
+    return instrument_bounds(symbol, day)
 
 
 def ladder_levels(ticks: sqlite3.Connection, symbol: str, day: str) -> dict[float, list[float]]:
@@ -197,7 +212,7 @@ def ladder_levels(ticks: sqlite3.Connection, symbol: str, day: str) -> dict[floa
 
 def minute_flow(ticks: sqlite3.Connection, symbol: str, day: str) -> list[tuple]:
     """(minute_ts, open, high, low, close, volume, buy, sell, trades) for a session."""
-    start, end = session_bounds(day)
+    start, end = session_bounds(day, symbol)
     return ticks.execute(
         """SELECT f.minute_ts, f.open, f.high, f.low, f.close, f.volume,
                   f.buy_volume, f.sell_volume, f.trades
@@ -208,9 +223,36 @@ def minute_flow(ticks: sqlite3.Connection, symbol: str, day: str) -> list[tuple]
     ).fetchall()
 
 
+def raw_session(ticks: sqlite3.Connection, symbol: str, day: str) -> tuple[dict[float, list[float]], list[tuple]]:
+    """(ladder, minute rows) for a day still in the raw tick tier, by tick_store.condense_ticks.
+
+    Same shapes as ladder_levels / minute_flow. Empty when the day has no raw ticks (already condensed and
+    deleted, or never captured) or nothing traded (an index).
+    """
+    from .tick_store import condense_ticks
+    start_ms = int(datetime.combine(date.fromisoformat(day), time(0, 0), IST).timestamp() * 1000)
+    try:
+        rows = [tuple(row) for row in ticks.execute(
+            """SELECT t.symbol_id, t.ts_ms, t.ltp, t.cum_volume, t.last_qty, t.bid, t.ask,
+                      t.bid_qty, t.ask_qty, t.tbq, t.tsq
+               FROM ticks t JOIN tick_symbols s ON s.id = t.symbol_id
+               WHERE s.symbol = ? AND t.ts_ms >= ? AND t.ts_ms < ? ORDER BY t.ts_ms""",
+            (symbol, start_ms, start_ms + 86_400_000))]
+    except sqlite3.OperationalError:
+        return {}, []                     # a store with no raw tier (condensed-only, or a test fixture)
+    if not rows:
+        return {}, []
+    open_s, close_s = session_bounds(day, symbol)
+    minute, ladder, _raw = condense_ticks(rows, {rows[0][0]: (open_s * 1000, close_s * 1000)})
+    levels = {float(price): [float(buy), float(sell)] for (_sid, price), (buy, sell) in ladder.items()}
+    minutes = [(ts, b["open"], b["high"], b["low"], b["close"], b["volume"], b["buy_volume"], b["sell_volume"], b["trades"])
+               for (_sid, ts), b in sorted(minute.items())]
+    return levels, minutes
+
+
 def candle_minutes(history: sqlite3.Connection, symbol: str, day: str) -> list[tuple]:
     """Fallback source: durable minute bars, which carry no aggressor side."""
-    start, end = session_bounds(day)
+    start, end = session_bounds(day, symbol)
     return history.execute(
         """SELECT timestamp, open, high, low, close, volume FROM historical_candles
            WHERE symbol = ? AND timeframe_seconds = 60 AND timestamp >= ? AND timestamp < ?
@@ -260,6 +302,11 @@ class SessionProfile:
     def day_type(self) -> str:
         return day_type(self.high, self.low, self.vah, self.val)
 
+    @property
+    def ib_day_type(self) -> str:
+        from .market_profile import ib_day_type
+        return ib_day_type(self.high, self.low, self.ib_high, self.ib_low)
+
     def position_of(self, price: float) -> str:
         if self.vah is None or self.val is None:
             return "unknown"
@@ -282,6 +329,20 @@ def session_levels(ticks: sqlite3.Connection | None, history: sqlite3.Connection
     if ticks is not None:
         ladder = ladder_levels(ticks, symbol, day)
         rows = minute_flow(ticks, symbol, day)
+        if not (ladder and rows):
+            # The ladder is written when raw ticks are condensed, days after the session; the nightly build runs
+            # the same evening. Condense the raw tier here with the condenser's own loop, or every fresh session
+            # is stored from candles with no buy/sell split (all 2,599 rows 28 Sep - 14 Oct 2026 were).
+            ladder, rows = raw_session(ticks, symbol, day)
+        if ladder and rows and history is not None:
+            # A session the tick store only partly caught (a host crash, a feed gap) must not replace the full
+            # day the minute bars hold: on 8 Oct 2026 the ticks stopped at 09:18.
+            try:
+                bars = len(candle_minutes(history, symbol, day))
+            except sqlite3.OperationalError:
+                bars = 0                  # a store with no minute bars cannot contradict the ticks
+            if bars and len(rows) < TICK_COVERAGE_MIN * bars:
+                ladder, rows = {}, []
         if ladder and rows:
             levels = {price: buy + sell for price, (buy, sell) in ladder.items()}
             return levels, LADDER, {
@@ -377,8 +438,8 @@ def save_sessions(connection: sqlite3.Connection, profiles: list[SessionProfile]
             """INSERT OR REPLACE INTO session_profiles
                (symbol, day, open, high, low, close, poc, vah, val, ib_high, ib_low,
                 volume, buy_volume, sell_volume, cumulative_delta, imbalance, trades,
-                day_type, open_type, single_prints, value_migration, levels, source, built_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                day_type, open_type, single_prints, value_migration, levels, source, built_at, ib_day_type)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 (p.symbol, p.day, p.open, p.high, p.low, p.close, p.poc, p.vah, p.val,
                  p.ib_high, p.ib_low, p.volume, p.buy_volume, p.sell_volume,
@@ -386,7 +447,7 @@ def save_sessions(connection: sqlite3.Connection, profiles: list[SessionProfile]
                  (open_types or {}).get(f"{p.symbol}:{p.day}"),
                  json.dumps(p.single_prints[:60]),
                  (migrations or {}).get(f"{p.symbol}:{p.day}", "unknown"),
-                 p.levels, p.source, stamp)
+                 p.levels, p.source, stamp, p.ib_day_type)
                 for p in profiles
             ],
         )

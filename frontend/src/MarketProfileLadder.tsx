@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { bracketIndex, bracketLetters, bracketTime, ladderRows, nearestPriceIndex, priceDigits, type LadderLevel } from "./profileLadderMath";
+import { bracketIndex, bracketLetters, bracketTime, ladderRows, nearestPriceIndex, priceDigits, type LadderLevel, profileRowStep, rowContains, rowOverlaps } from "./profileLadderMath";
 import "./MarketProfileLadder.css";
 
 export type LadderProfile = {
@@ -8,6 +8,8 @@ export type LadderProfile = {
   vah: number | null; val: number | null; ib_high: number | null; ib_low: number | null;
   single_prints: number[]; levels: LadderLevel[];
   tick_size?: number; levels_total?: number; levels_sampled?: boolean;
+  row_size?: number | null;
+  row_scale?: { basis: string; atr: number | null; atr_sessions: number; rows_per_atr: number } | null;
   first_bracket?: number | null; partial_capture?: boolean;
 };
 
@@ -23,7 +25,8 @@ export function MarketProfileLadder({ profile }: { profile: LadderProfile }) {
   const [viewportHeight, setViewportHeight] = useState(360);
   const [expanded, setExpanded] = useState(false);
   const complete = profile.levels_sampled === false && (profile.levels_total ?? profile.levels.length) === profile.levels.length;
-  const rows = useMemo(() => ladderRows(profile.levels, profile.tick_size, complete), [profile.levels, profile.tick_size, complete]);
+  const step = profileRowStep(profile);
+  const rows = useMemo(() => ladderRows(profile.levels, step, complete), [profile.levels, step, complete]);
   const letters = useMemo(() => bracketLetters(profile.levels, profile.brackets), [profile.levels, profile.brackets]);
   const digits = useMemo(() => priceDigits(profile.tick_size, profile.levels), [profile.tick_size, profile.levels]);
   const maxVolume = useMemo(() => profile.levels.reduce((max, row) => Math.max(max, Number.isFinite(row.volume) ? row.volume : 0), 1), [profile.levels]);
@@ -83,15 +86,19 @@ export function MarketProfileLadder({ profile }: { profile: LadderProfile }) {
   };
   const first = Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN);
   const last = Math.min(rows.length, Math.ceil((scrollTop + viewportHeight) / ROW_H) + OVERSCAN);
-  const tick = profile.tick_size && profile.tick_size > 0 ? profile.tick_size : 0.01;
-  const at = (value: number | null | undefined, price: number) => value != null && Number.isFinite(value)
-    && Math.abs(value - price) <= tick / 2 + 1e-7;
+  const rowStep = step ?? 0.01;
+  // Levels stay tick-precise on the server; tag the row each one falls inside.
+  const at = (value: number | null | undefined, price: number) => rowContains(price, rowStep, value);
+  const scale = profile.row_scale;
+  const rowLabel = scale?.basis === "daily_atr" && scale.atr != null
+    ? `rows ₹${rowStep} · ${scale.atr_sessions}-day ATR ₹${scale.atr} ÷ ${scale.rows_per_atr}`
+    : scale?.basis === "session_range" ? `rows ₹${rowStep} · today's range (no ATR history)` : `rows ₹${rowStep} · tick`;
 
   return <div className={`mp-ladder${expanded ? " mp-ladder-expanded" : ""}`} aria-label={`TPO Market Profile for ${profile.symbol}`}>
     <div className="mp-ladder-toolbar">
       <div className="mp-ladder-source">
         <b>{profile.symbol.split(":").pop()}</b>
-        <span>· {quantity.format(profile.levels.length)} / {quantity.format(totalLevels)} captured price levels</span>
+        <span>· {quantity.format(profile.levels.length)} / {quantity.format(totalLevels)} price rows · {rowLabel}</span>
         <span className={sampled ? "mp-ladder-sampled" : "mp-ladder-exact"}>{sampled ? "SAMPLED" : complete ? partialCapture ? "FULL CAPTURED LADDER" : "FULL LADDER" : "SOURCE RESOLUTION UNKNOWN"}</span>
       </div>
       <div className="mp-ladder-actions">
@@ -128,12 +135,12 @@ export function MarketProfileLadder({ profile }: { profile: LadderProfile }) {
               const high = at(profile.high, row.price);
               const low = at(profile.low, row.price);
               const single = !partialCapture && profile.brackets >= 2 && (singlePrints.has(row.price) || row.tpo === 1);
-              const inValue = profile.vah != null && profile.val != null && row.price <= profile.vah && row.price >= profile.val;
+              const inValue = profile.vah != null && profile.val != null && rowOverlaps(row.price, rowStep, profile.val, profile.vah);
               const marks = [poc && "TPO POC", vpoc && "VPOC", vah && "VAH", val && "VAL",
                 ibh && "IB high", ibl && "IB low", high && "Session high", low && "Session low", single && "Single TPO"].filter(Boolean);
               const badge = [poc && "POC", vpoc && "VPOC", vah && "VAH", val && "VAL",
                 ibh && "IBH", ibl && "IBL", high && "H", low && "L", single && "SP"].filter(Boolean).join(" ");
-              const title = `${row.price.toFixed(digits)} · ${row.tpo} TPO · ${quantity.format(row.volume)} volume${marks.length ? ` · ${marks.join(", ")}` : ""}`;
+              const title = `${row.price.toFixed(digits)}${rowStep > (profile.tick_size ?? rowStep) ? `–${(row.price + rowStep).toFixed(digits)}` : ""} · ${row.tpo} TPO · ${quantity.format(row.volume)} volume${marks.length ? ` · ${marks.join(", ")}` : ""}`;
               return <div key={`${row.price}-${index}`} role="row" aria-rowindex={index + 1}
                 className={`mp-ladder-row${index % 2 ? " is-alt" : ""}${inValue ? " in-value" : ""}${poc ? " is-poc" : ""}${vpoc ? " is-vpoc" : ""}${vah ? " is-vah" : ""}${val ? " is-val" : ""}${row.empty ? " is-empty" : ""}`}
                 style={{ top: index * ROW_H, gridTemplateColumns: gridColumns }} title={title}>

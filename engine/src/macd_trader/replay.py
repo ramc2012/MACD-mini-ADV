@@ -27,6 +27,56 @@ from .orderflow import OrderFlowTracker
 from .profile_history import session_bounds
 
 
+def load_session_ticks(ticks_path: str, symbol: str, start: float, end: float) -> list[Tick]:
+    """One symbol's raw ticks in [start, end) epoch seconds, oldest first.
+
+    Read-only, and read from INSIDE the container that owns the writer: host
+    reads of this bind-mounted file return torn pages while the tick writer is
+    live. A missing archive is an empty session, not an error.
+    """
+    try:
+        connection = sqlite3.connect(f"file:{ticks_path}?mode=ro", uri=True, timeout=30)
+    except sqlite3.OperationalError:
+        return []
+    try:
+        rows = connection.execute(
+            """SELECT t.ts_ms, t.ltp, t.cum_volume, t.last_qty, t.bid, t.ask,
+                      t.bid_qty, t.ask_qty, t.oi, t.tbq, t.tsq
+               FROM ticks t JOIN tick_symbols s ON s.id = t.symbol_id
+               WHERE s.symbol = ? AND t.ts_ms >= ? AND t.ts_ms < ? ORDER BY t.ts_ms""",
+            (symbol, int(start * 1000), int(end * 1000))).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        connection.close()
+    return [
+        Tick(symbol, float(ltp), int(cum_volume or 0),
+             timestamp=datetime.fromtimestamp(ts_ms / 1000.0, UTC),
+             bid=bid, ask=ask, bid_qty=bid_qty, ask_qty=ask_qty, last_qty=last_qty,
+             total_buy_qty=tbq, total_sell_qty=tsq, open_interest=oi)
+        for ts_ms, ltp, cum_volume, last_qty, bid, ask, bid_qty, ask_qty, oi, tbq, tsq in rows
+    ]
+
+
+def session_prints(ticks_path: str, symbol: str, day: str) -> list:
+    """Today's stored ticks for ``symbol`` classified into prints, oldest first.
+
+    The same OrderFlowTracker the live desk runs, over the same ticks in the
+    same order, so these are the prints the desk classified during the
+    session. Seeds a footprint opened mid-session from the open rather than
+    from the tracker's last 400 prints -- on 29 Sep 2026 a HDFCBANK chart
+    opened after the close began at 15:05. CPU-bound: call it off the loop.
+    """
+    start, end = session_bounds(day, symbol)
+    tracker = OrderFlowTracker()
+    prints = []
+    for tick in load_session_ticks(ticks_path, symbol, start, end):
+        row = tracker.on_tick(tick)
+        if row is not None:
+            prints.append(row)
+    return prints
+
+
 class ReplaySession:
     """One symbol, one recorded IST session, rebuilt as of any moment.
 
@@ -54,7 +104,7 @@ class ReplaySession:
         self.symbol = symbol
         self.day = day
         self.timeframe = timeframe_seconds
-        self.session_start, self.session_end = session_bounds(day)
+        self.session_start, self.session_end = session_bounds(day, symbol)
         self.ticks: list[Tick] = []
         self._lock = Lock()
         self._reset()
@@ -62,32 +112,7 @@ class ReplaySession:
     # -- loading -------------------------------------------------------------
 
     def build(self, ticks_path: str) -> "ReplaySession":
-        # Read-only, and read from INSIDE the container that owns the writer:
-        # host reads of this bind-mounted file return torn pages while the tick
-        # writer is live. A missing archive is an empty session, not an error --
-        # the caller turns "nothing recorded" into a 404 either way.
-        try:
-            connection = sqlite3.connect(f"file:{ticks_path}?mode=ro", uri=True, timeout=30)
-        except sqlite3.OperationalError:
-            return self
-        try:
-            rows = connection.execute(
-                """SELECT t.ts_ms, t.ltp, t.cum_volume, t.last_qty, t.bid, t.ask,
-                          t.bid_qty, t.ask_qty, t.oi, t.tbq, t.tsq
-                   FROM ticks t JOIN tick_symbols s ON s.id = t.symbol_id
-                   WHERE s.symbol = ? AND t.ts_ms >= ? AND t.ts_ms < ? ORDER BY t.ts_ms""",
-                (self.symbol, self.session_start * 1000, self.session_end * 1000)).fetchall()
-        except sqlite3.OperationalError:
-            rows = []
-        finally:
-            connection.close()
-        self.ticks = [
-            Tick(self.symbol, float(ltp), int(cum_volume or 0),
-                 timestamp=datetime.fromtimestamp(ts_ms / 1000.0, UTC),
-                 bid=bid, ask=ask, bid_qty=bid_qty, ask_qty=ask_qty, last_qty=last_qty,
-                 total_buy_qty=tbq, total_sell_qty=tsq, open_interest=oi)
-            for ts_ms, ltp, cum_volume, last_qty, bid, ask, bid_qty, ask_qty, oi, tbq, tsq in rows
-        ]
+        self.ticks = load_session_ticks(ticks_path, self.symbol, self.session_start, self.session_end)
         return self
 
     # -- driving -------------------------------------------------------------
@@ -125,7 +150,7 @@ class ReplaySession:
         self._at = at
 
     def payload(self, at: float, bars: int = 60, timeframe_seconds: int | None = None,
-                context: dict | None = None) -> dict:
+                context: dict | None = None, scale: dict | None = None) -> dict:
         """Everything the live /api/mp/footprint returns, as of ``at`` (epoch s)."""
         moment = min(max(float(at), float(self.session_start)), float(self.session_end))
         with self._lock:
@@ -134,7 +159,9 @@ class ReplaySession:
             out = self.book.payload(self.symbol, bars, timeframe_seconds=timeframe_seconds,
                                     flow=flow)
             profile = self.profiles.get(self.symbol)
-            profile_snapshot = profile.snapshot() if profile else None
+            # The same ATR rows the live desk publishes for this symbol and day.
+            profile_snapshot = profile.snapshot(
+                row_size=scale["row_size"] if scale else None, scale=scale) if profile else None
             out["profile"] = profile_snapshot
             out["flow"] = flow or None
             out["ofi"] = (self.ofi.snapshot(moment, timeframe_seconds or self.timeframe)
@@ -153,3 +180,20 @@ class ReplaySession:
             "ticks": len(self.ticks), "position": self._position,
         }
         return out
+
+
+def merge_seed_prints(stored: list, recent: list) -> list:
+    """Stored session prints joined to the live tracker's newest, without overlap.
+
+    The tick store flushes in batches, so the newest seconds are only in the
+    tracker's ``recent``. Exchange stamps have one-second resolution, so the
+    join is on a whole second: when ``recent`` reaches back to the store's
+    last second, that second comes from ``recent`` alone (it holds every print
+    of it); otherwise the store's copy is kept and only later prints added.
+    """
+    if not stored:
+        return list(recent)
+    edge = stored[-1].timestamp
+    if recent and recent[0].timestamp <= edge:
+        return [row for row in stored if row.timestamp < edge] + [row for row in recent if row.timestamp >= edge]
+    return list(stored) + [row for row in recent if row.timestamp > edge]

@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     # touched no winner. Off by default: it changes live exit behaviour.
     macd_invalidation_exit: bool = False
     macd_invalidation_max_mfe_pct: float = Field(default=0.10, ge=0.0, le=1.0)
+    # Entry gate (entry_scorer.py): score each option signal, skip the weakest, spend cash best-first.
+    macd_entry_filter: bool = True
+    macd_entry_skip_fraction: float = Field(default=0.30, ge=0.0, le=0.5)
+    macd_entry_rank_seconds: float = Field(default=15.0, ge=0.0, le=300.0)
     max_positions: int = Field(default=0, ge=0, le=1000)
     min_cash_reserve: float = Field(default=0.0, ge=0)
     # Target rupee exposure for a new paper position. Orders still use whole
@@ -77,6 +81,14 @@ class Settings(BaseSettings):
     trailing_stop_pct: float = 0.25
     initial_capital: float = 1_000_000.0
     slippage_bps: float = 5.0
+    # Paper fills cross the quoted spread: a BUY fills at the ask and a SELL at the bid when the tick that
+    # carried the fresh price also carried a two-sided quote; otherwise last price +/- slippage_bps. At
+    # 5 bps a round trip cost 0.1%, while the median stock-option spread at blast entries was 1.9% of mid
+    # (index options 0.25%), so every stock-option round trip read ~1.8 pp better than it could fill
+    # (research/option_recs_20261015). A side never fills more than paper_max_half_spread_pct beyond the
+    # last price, so a one-sided or junk quote cannot book a fiction in the other direction.
+    paper_cross_spread: bool = True
+    paper_max_half_spread_pct: float = Field(default=5.0, ge=0.0, le=50.0)
     api_token: str = ""
     # Extra browser origins allowed to open the stream socket, comma-separated
     # (e.g. "https://desk.example.ts.net"). Loopback origins are always allowed.
@@ -134,6 +146,14 @@ class Settings(BaseSettings):
     # quote to read, never an instrument to trade; the badge shows "n/a" for
     # as long as no tick has arrived. Blank disables the lookup.
     vix_symbol: str = "NSE:INDIAVIX-INDEX"
+    # Sector and broad-market indices kept on the feed for context only (the ATM heat map's Spot view, to see
+    # which sectors are moving). Never traded. Each is validated with one quotes call at connect and only names the
+    # broker prices are subscribed, so an unknown symbol cannot break the stream. The first nine are the names the
+    # Nomad Curie app already streams from Fyers; the last four follow the same pattern and are kept if they price.
+    context_indices_csv: str = (
+        "NSE:NIFTYIT-INDEX,NSE:NIFTYAUTO-INDEX,NSE:NIFTYPHARMA-INDEX,NSE:NIFTYFMCG-INDEX,NSE:NIFTYMETAL-INDEX,"
+        "NSE:NIFTYENERGY-INDEX,NSE:NIFTYREALTY-INDEX,NSE:FINNIFTY-INDEX,NSE:NIFTYNXT50-INDEX,"
+        "NSE:NIFTYPSUBANK-INDEX,NSE:NIFTYPVTBANK-INDEX,NSE:NIFTYMEDIA-INDEX,NSE:NIFTYINFRA-INDEX")
 
     # --- Blast lane (third book) -----------------------------------------
     # Hunts the option moves the MACD lane cannot reach. Its entry is the
@@ -167,6 +187,15 @@ class Settings(BaseSettings):
     # Fraction of tracked contracts on the SAME side (CE or PE) whose premium
     # MACD is above zero. Below 0.50 the trade is fighting the tape.
     blast_min_breadth: float = Field(default=0.50, ge=0.0, le=1.0)
+    # The base premium/breadth rules apply at this VIX. Scale is bounded
+    # between 0.5x and 2x. Higher VIX lowers breadth (user policy, 13 Oct).
+    blast_vix_adaptive_enabled: bool = True
+    blast_vix_reference: float = Field(default=20.0, ge=5.0, le=100.0)
+    blast_vix_breadth_adjustment: float = Field(default=-0.10, ge=-0.25, le=0.25)
+    blast_vix_max_age_seconds: float = Field(default=900.0, ge=30.0, le=3600.0)
+    # A richer premium can pass up to this multiple of the VIX-adjusted
+    # normal limit, with ticket size reduced by inverse richness squared.
+    blast_rich_premium_max_multiple: float = Field(default=2.0, ge=1.0, le=4.0)
     # Minimum contracts on a side before that side's breadth is trusted at all.
     # A fraction read off three contracts is noise, and the screen would then
     # be gated on nothing.
@@ -181,6 +210,13 @@ class Settings(BaseSettings):
     # 17 Sep). That fill is fiction, and a lane measured on fictional fills
     # measures nothing. Contracts too thin to carry even one lot are declined
     # as TOO_ILLIQUID rather than sized down to a fill that cannot happen.
+    # The bar the MACD(12,26,9) signal-line cross is judged on. 1800 = closed
+    # 30-minute bars (09:15-aligned), the lean default: on one-minute bars the
+    # replay of 16-29 Sep took 2,792 trades against 114, for a lower profit
+    # factor (1.12 vs 1.37) and a result that was negative without its best
+    # 1% of trades. 60 restores the one-minute screen exactly. The recent-high
+    # window and history minimum stay in minutes whatever this is.
+    blast_signal_bar_seconds: int = Field(default=1800, ge=60, le=3600)
     blast_max_volume_share_pct: float = Field(default=2.0, gt=0, le=100)
     # Length of that "recent high" window in ONE-MINUTE bars, whatever
     # timeframe_seconds is: the lane keeps its own minute bars. 750 is two
@@ -203,6 +239,31 @@ class Settings(BaseSettings):
     blast_journal_horizon_hours: float = Field(default=48.0, gt=0, le=720)
     blast_journal_max_watchers: int = Field(default=2_000, ge=0, le=50_000)
     blast_database_path: str = str(RUNTIME_DIR / "blast_trader.sqlite3")
+
+    # Smart lanes (smart_lane.py): two paper books running the best rules the
+    # 2 Oct 2026 research found, one per capital in smart_lane_capitals_csv.
+    # MACD-lane signals: re-checked smart_entry_delay_seconds after the cross,
+    # ranked by the exported ranker (weakest smart_skip_fraction skipped),
+    # sized at smart_ticket_fraction of equity scaled by dispersion; exits at a
+    # 40% stop, a 30% trail from +40%, all out at +100%, staged exits, MACD
+    # invalidation and a 4-session hold limit. Blast-screen candidates are the
+    # second source, managed with the blast lane's own stop and trail.
+    smart_lanes_enabled: bool = True
+    # Book profitable index-option positions in the MACD and smart lanes on extreme index moves
+    # (extreme_booking.py; research/extreme_moves_20261014).
+    extreme_booking_enabled: bool = True
+    smart_lane_capitals_csv: str = "100000,5000000"
+    smart_ticket_fraction: float = Field(default=0.10, gt=0, le=1)
+    smart_entry_delay_seconds: int = Field(default=300, ge=0, le=3600)
+    smart_rank_seconds: float = Field(default=15.0, ge=0, le=300)
+    smart_skip_fraction: float = Field(default=0.30, ge=0, lt=1)
+    smart_hard_stop_pct: float = Field(default=0.40, gt=0, lt=1)
+    smart_trail_activation_pct: float = Field(default=0.40, gt=0, lt=5)
+    smart_trail_pct: float = Field(default=0.30, gt=0, lt=1)
+    smart_target_pct: float = Field(default=1.00, gt=0, le=20)
+    smart_max_hold_sessions: int = Field(default=4, ge=0, le=60)
+    smart_min_dispersion_size: float = Field(default=0.25, gt=0, le=1)
+    smart_blast_source: bool = True
 
     # Raw tick capture. Ticks cannot be backfilled -- Fyers' finest history is
     # 5-second OHLCV -- so the socket's output is the only copy that will ever
@@ -255,6 +316,10 @@ class Settings(BaseSettings):
     # comma-separated YYYY-MM-DD dates: next year's list before a release, or
     # an unscheduled closure. Every session gate reads the combined calendar.
     market_holidays_csv: str = ""
+
+    @property
+    def context_indices(self) -> list[str]:
+        return [s.strip() for s in self.context_indices_csv.split(",") if s.strip()]
 
     @property
     def symbols(self) -> list[str]:

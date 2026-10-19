@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { bracketIndex, bracketLetters, bracketTime, ladderRows, nearestPriceIndex, priceDigits } from "../src/profileLadderMath.ts";
+import { bracketIndex, bracketLetters, bracketTime, ladderRows, nearestPriceIndex, priceDigits, profileRowStep, rowContains, rowOverlaps } from "../src/profileLadderMath.ts";
 
 const levels = [
   { price: 100.10, tpo: 2, letters: "AB", volume: 20 },
@@ -36,4 +36,28 @@ test("TPO headings include only observed brackets and retain their clock time", 
 test("prices use the tick precision published by the profile", () => {
   assert.equal(priceDigits(0.05, levels), 2);
   assert.equal(priceDigits(0.5, levels), 1);
+});
+
+test("the ATR row step wins over the tick, and a legacy payload keeps the tick", () => {
+  assert.equal(profileRowStep({ row_size: 0.5, tick_size: 0.05 }), 0.5);
+  assert.equal(profileRowStep({ tick_size: 0.05 }), 0.05);
+  assert.equal(profileRowStep({ row_size: null, tick_size: null }), null);
+});
+
+test("a tick-precise level is tagged on the one row that contains it", () => {
+  // Rows start at 709.0 and 709.5; VAL 709.05 and POC 709.45 are both in the first.
+  assert.equal(rowContains(709.0, 0.5, 709.05), true);
+  assert.equal(rowContains(709.0, 0.5, 709.45), true);
+  assert.equal(rowContains(709.0, 0.5, 709.5), false);
+  assert.equal(rowContains(709.5, 0.5, 709.5), true);
+  // At the tick the old exact match still holds.
+  assert.equal(rowContains(709.05, 0.05, 709.05), true);
+  assert.equal(rowContains(709.05, 0.05, 709.1), false);
+});
+
+test("a row is in value when any part of it overlaps the value area", () => {
+  assert.equal(rowOverlaps(709.0, 0.5, 709.45, 712.0), true);
+  assert.equal(rowOverlaps(712.0, 0.5, 709.45, 712.0), true);
+  assert.equal(rowOverlaps(712.5, 0.5, 709.45, 712.0), false);
+  assert.equal(rowOverlaps(708.5, 0.5, 709.0, 712.0), false);
 });

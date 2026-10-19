@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from . import setups as setup_catalogue, whale as whale_layer
 from .base_rates import compare_session, grouped_summaries, load, regime_of
@@ -140,6 +142,42 @@ def base_rates(history_path: str, symbol: str, as_of: str | None = None) -> dict
     return {"symbol": symbol, **grouped, "today": today}
 
 
+def _raw_flow_rows(connection: sqlite3.Connection, symbol: str, day: str) -> list[dict]:
+    """Minute flow for a day still in the raw tier, by the nightly condenser.
+
+    The page read only ``tick_minute_flow``, which is written when raw ticks
+    age past their retention -- five days later. Until then every session,
+    today's included, read "no condensed flow" and a cumulative delta of 0
+    beside an order-flow page showing hundreds of thousands of prints.
+    ``condense_ticks`` is the condenser's own loop, so these rows are the
+    ones the night will store.
+    """
+    from .tick_store import condense_ticks
+
+    start = int(datetime.fromisoformat(f"{day}T00:00:00").replace(
+        tzinfo=ZoneInfo("Asia/Kolkata")).timestamp() * 1000)
+    rows = connection.execute(
+        """SELECT t.symbol_id, t.ts_ms, t.ltp, t.cum_volume, t.last_qty, t.bid, t.ask,
+                  t.bid_qty, t.ask_qty, t.tbq, t.tsq
+           FROM ticks t JOIN tick_symbols s ON s.id = t.symbol_id
+           WHERE s.symbol = ? AND t.ts_ms >= ? AND t.ts_ms < ? ORDER BY t.ts_ms""",
+        (symbol, start, start + 86_400_000))
+    from .sessions import session_bounds
+    open_s, close_s = session_bounds(symbol, day)
+    rows = [tuple(row) for row in rows]
+    bounds = {row[0]: (open_s * 1000, close_s * 1000) for row in rows[:1]}
+    minute, _ladder, _raw = condense_ticks(rows, bounds)
+    return [
+        {"minute_ts": ts, "close": b["close"], "volume": b["volume"],
+         "delta": b["buy_volume"] - b["sell_volume"],
+         "buy_volume": b["buy_volume"], "sell_volume": b["sell_volume"],
+         "trades": b["trades"], "ofi": round(b["ofi"], 2), "ofi_events": b["ofi_events"],
+         "avg_confidence": round(b["conf_sum"] / b["conf_volume"], 4) if b["conf_volume"] else None,
+         "avg_spread": round(b["spread_sum"] / b["spread_n"], 4) if b["spread_n"] else None}
+        for (_sid, ts), b in sorted(minute.items(), key=lambda item: item[0][1])
+    ]
+
+
 def flow(ticks_path: str, symbol: str, day: str, limit: int = MAX_FLOW_MINUTES) -> dict:
     """Per-minute OFI, delta and classification confidence for one session.
 
@@ -157,6 +195,13 @@ def flow(ticks_path: str, symbol: str, day: str, limit: int = MAX_FLOW_MINUTES) 
                WHERE s.symbol = ?
                  AND date(f.minute_ts,'unixepoch','+5 hours','+30 minutes') = ?
                ORDER BY f.minute_ts LIMIT ?""", (symbol, day, limit))
+        source = "condensed"
+        if not rows:
+            try:
+                rows = _raw_flow_rows(connection, symbol, day)[:limit]
+                source = "raw" if rows else "none"
+            except sqlite3.OperationalError:
+                source = "none"
     finally:
         connection.close()
     cumulative_delta = cumulative_ofi = 0.0
@@ -176,7 +221,7 @@ def flow(ticks_path: str, symbol: str, day: str, limit: int = MAX_FLOW_MINUTES) 
         })
     confidences = [row["confidence"] for row in series if row["confidence"] is not None]
     return {
-        "symbol": symbol, "day": day, "minutes": len(series), "series": series,
+        "symbol": symbol, "day": day, "minutes": len(series), "series": series, "source": source,
         "cumulative_delta": round(cumulative_delta, 2),
         "cumulative_ofi": round(cumulative_ofi, 2),
         # A sign disagreement between the two is the flag the blueprint calls
@@ -187,15 +232,17 @@ def flow(ticks_path: str, symbol: str, day: str, limit: int = MAX_FLOW_MINUTES) 
 
 
 def flow_days(ticks_path: str, symbol: str, limit: int = 30) -> list[str]:
+    """Sessions with flow to show: condensed ones and those still raw, newest first."""
     connection = _read(ticks_path)
     try:
         rows = _rows(connection, """SELECT DISTINCT
                    date(f.minute_ts,'unixepoch','+5 hours','+30 minutes') AS day
                FROM tick_minute_flow f JOIN tick_symbols s ON s.id = f.symbol_id
                WHERE s.symbol = ? ORDER BY day DESC LIMIT ?""", (symbol, limit))
-        return [row["day"] for row in rows]
+        condensed = [row["day"] for row in rows]
     finally:
         connection.close()
+    return sorted({*condensed, *raw_tick_days(ticks_path, symbol)}, reverse=True)[:limit]
 
 
 def composite(history_path: str, ticks_path: str | None, symbol: str, days: int,
@@ -300,7 +347,7 @@ def whale(history_path: str, day: str, symbol: str | None = None) -> dict:
     """
     connection = _read(history_path)
     try:
-        events = whale_layer.events_for(connection, day, symbol)
+        events = whale_layer.events_for(connection, day, symbol, futures_only=symbol is None)
         by_symbol: dict[str, list] = {}
         for row in events:
             by_symbol.setdefault(row["symbol"], []).append(
@@ -382,3 +429,38 @@ def whale_alerts(history_path: str, day: str, limit: int = 50) -> dict:
         return {"day": day, "alerts": alerts, "precision": precision, "sessions": len(days)}
     finally:
         connection.close()
+
+
+def whale_performance(history_path: str, since: str, until: str, kind: str | None = None) -> dict:
+    """Entries to the whale list and what each instrument did after entering."""
+    connection = _read(history_path)
+    try:
+        return whale_layer.performance(connection, since, until, kind=kind)
+    finally:
+        connection.close()
+
+
+def whale_names(history_path: str, ticks_path: str | None, day: str, *,
+                lots: dict[str, int] | None = None, kind: str | None = None,
+                limit: int = 100) -> dict:
+    """Instruments with Layer A patterns today, ranked, with their parameters."""
+    connection = _read(history_path)
+    ticks = None
+    try:
+        if ticks_path:
+            try:
+                ticks = _read(ticks_path)
+            except sqlite3.OperationalError:
+                ticks = None
+        rows = whale_layer.names(connection, ticks, day, lots=lots, kind=kind, limit=limit)
+        gaps = whale_layer.feed_gaps(ticks, day) if ticks is not None else []
+    finally:
+        connection.close()
+        if ticks is not None:
+            ticks.close()
+    clock = lambda ms: datetime.fromtimestamp(ms / 1000, ZoneInfo("Asia/Kolkata")).strftime("%H:%M:%S")
+    return {
+        "day": day, "names": rows, "count": len(rows),
+        "thresholds": whale_layer.names_thresholds(),
+        "feed_gaps": [{"from": clock(a), "to": clock(b), "seconds": round((b - a) / 1000)} for a, b in gaps],
+    }

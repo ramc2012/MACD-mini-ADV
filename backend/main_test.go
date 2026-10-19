@@ -132,6 +132,27 @@ func TestParallelHealthReportsDependencies(t *testing.T) {
 	}
 }
 
+func TestParallelHealthIsDegradedWhenAnalyticsStopsStoring(t *testing.T) {
+	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer engine.Close()
+	analytics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":false,"live":{"questdb":{"state":"stale"}}}`))
+	}))
+	defer analytics.Close()
+	g, _ := newGateway(engine.URL, analytics.URL)
+	w := httptest.NewRecorder()
+	g.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/parallel/health", nil))
+	var health healthResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health.Status != "degraded" || !health.Analytics.Reachable || health.Analytics.Healthy == nil || *health.Analytics.Healthy {
+		t.Fatalf("unexpected health response: %+v", health)
+	}
+}
+
 func TestWebSocketUpgradeIsTunneled(t *testing.T) {
 	engine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/ws/stream" || r.URL.Query().Get("token") != "secret" {
@@ -247,6 +268,7 @@ func TestDeskRoutesGoToTheDeskAndInternalRoutesStayInside(t *testing.T) {
 	for path, want := range map[string]string{
 		"/api/mp/footprint/NSE:NIFTY26OCTFUT": "desk",
 		"/api/auction/symbols":                "desk",
+		"/api/agent/picks":                    "desk",
 		"/api/snapshot":                       "engine",
 		"/api/blast/snapshot":                 "engine",
 		"/api/mpx":                            "engine",

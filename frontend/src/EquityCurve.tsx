@@ -6,7 +6,10 @@ import { API_TOKEN, API_URL } from "./runtime";
 import type { EquityPoint, LiveEquityPoint, ResearchOpenPosition, ResearchSummary, ResearchTrade, Snapshot } from "./types";
 
 const money = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
-const PERIODS = [{ label: "1D", value: "1d" }, { label: "1W", value: "1w" }, { label: "1M", value: "1m" }, { label: "All", value: "all" }] as const;
+// Trading sessions, not calendar time: 1D is the latest session with samples, so a
+// weekend or holiday still shows the last day traded.
+const PERIODS = [{ label: "1D", value: "1d", title: "Latest session" }, { label: "1W", value: "1w", title: "Last 5 sessions" },
+  { label: "1M", value: "1m", title: "Last 21 sessions" }, { label: "All", value: "all", title: "Every recorded session" }] as const;
 const TIMEFRAMES = [{ label: "5s", value: 5 }, { label: "1m", value: 60 }, { label: "5m", value: 300 }, { label: "30m", value: 1800 }, { label: "1D", value: 86400 }];
 
 export function EquityCurve({ researchRows, researchTrades, researchOpenPositions, summary, parameters, snapshot, researchStatus }: { parameters?: Record<string, unknown>; snapshot?: Snapshot; researchStatus?: string; researchRows: EquityPoint[]; researchTrades: ResearchTrade[]; researchOpenPositions: ResearchOpenPosition[]; summary?: ResearchSummary }) {
@@ -112,7 +115,7 @@ export function EquityCurve({ researchRows, researchTrades, researchOpenPosition
       <div><h1>Equity curve</h1><p>{source === "LIVE" ? "Marked-to-market paper equity — every fill is logged instantly, ticks sampled every 5 seconds" : source === "WINNERS" ? "Hindsight-only: each research trade is included only after knowing it finished profitable; open winners are marked at the latest bar" : "Chronological realized P&L from the latest recorded walk-forward run"}</p></div>
       <div className="rrg-controls">
         {source === "LIVE" && <>
-          <div className="radar-filter">{PERIODS.map((row) => <button key={row.value} className={period === row.value ? "active" : ""} onClick={() => setPeriod(row.value)}>{row.label}</button>)}</div>
+          <div className="radar-filter">{PERIODS.map((row) => <button key={row.value} title={row.title} className={period === row.value ? "active" : ""} onClick={() => setPeriod(row.value)}>{row.label}</button>)}</div>
           <div className="radar-filter">{TIMEFRAMES.map((row) => <button key={row.value} className={timeframe === row.value ? "active" : ""} onClick={() => setTimeframe(row.value)}>{row.label}</button>)}</div>
         </>}
         <div className="equity-toggle">{(["LIVE", "RESEARCH", "WINNERS"] as const).map((key) => <button key={key} className={source === key ? "active" : ""} onClick={() => setSource(key)}>{key === "LIVE" ? `Live paper (${liveRows.length})` : key === "WINNERS" ? `Winners only (${winnerRows.closed + winnerRows.open})` : `Walk-forward (${researchRows.length})`}</button>)}</div>
@@ -137,6 +140,6 @@ export function EquityCurve({ researchRows, researchTrades, researchOpenPosition
       <div><span>Win rate</span><b>{summary ? `${summary.win_rate_pct.toFixed(2)}%` : "—"}</b></div>
       <div><span>Run</span><b>{summary?.run_id || "—"}</b></div>
     </div>}
-    <div className="equity-chart panel" ref={element}>{!points.length && <div className="chart-empty">{source === "LIVE" ? loading ? "Loading equity…" : error ? "Equity unavailable — retry above" : "No equity samples in this period yet — fills log instantly and ticks sample every 5 seconds while the feed is live" : source === "WINNERS" ? "No profitable research trades or marked open winners yet" : "No closed research trades yet"}</div>}</div>
+    <div className="equity-chart panel" ref={element}>{!points.length && <div className="chart-empty">{source === "LIVE" ? loading ? "Loading equity…" : error ? "Equity unavailable — retry above" : "No equity samples recorded yet — fills log instantly and ticks sample every 5 seconds while the feed is live" : source === "WINNERS" ? "No profitable research trades or marked open winners yet" : "No closed research trades yet"}</div>}</div>
   </section>;
 }

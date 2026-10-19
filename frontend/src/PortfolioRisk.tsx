@@ -1,8 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { OptionWatchRow, Portfolio, Snapshot } from "./types";
 
 const money = (value: number) => `₹${value.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
-export function PortfolioRisk({ portfolio, contracts, limits }: { portfolio: Portfolio; contracts: OptionWatchRow[]; limits?: Snapshot["execution"]["risk"] }) {
+export function PortfolioRisk({ portfolio, contracts, limits, open = false }: { portfolio: Portfolio; contracts: OptionWatchRow[]; limits?: Snapshot["execution"]["risk"]; open?: boolean }) {
   const [group, setGroup] = useState<"underlying" | "sector" | "option_type" | "expiry">("underlying");
   const groups = useMemo(() => {
     const metadata = new Map(contracts.map((row) => [row.symbol, row]));
@@ -16,7 +16,9 @@ export function PortfolioRisk({ portfolio, contracts, limits }: { portfolio: Por
     });
     return [...values].sort((a, b) => b[1].value - a[1].value);
   }, [portfolio.positions, contracts, group]);
-  return <details className="portfolio-risk">
+  const details = useRef<HTMLDetailsElement>(null);
+  useEffect(() => { if (details.current && open) details.current.open = true; }, [open]);
+  return <details className="portfolio-risk" ref={details}>
     <summary>Portfolio exposure · Cash {money(portfolio.cash)} · {portfolio.positions.length} positions · Position limit {limits?.max_positions || "off"} · Cash reserve {money(limits?.min_cash_reserve || 0)}</summary>
     <p>Gross option premium value at the latest stored marks; values can be stale when the feed is unavailable. This is not underlying or delta-adjusted exposure.</p>
     <div className="risk-tabs">{(["underlying", "sector", "option_type", "expiry"] as const).map((key) => <button key={key} onClick={() => setGroup(key)} aria-pressed={group === key}>{key === "option_type" ? "CE / PE" : key}</button>)}</div>

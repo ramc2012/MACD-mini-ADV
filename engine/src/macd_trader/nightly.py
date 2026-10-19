@@ -28,20 +28,53 @@ from zoneinfo import ZoneInfo
 from . import positional, setups, whale
 from .profile_builder import _connect, build_range, is_option
 from .profile_history import (
-    MEASUREMENT_SCHEMA, build_session, load_reference, measure_session, save_measurements,
+    CANDLES, MEASUREMENT_SCHEMA, build_session, load_reference, measure_session, save_measurements,
 )
 
 IST = ZoneInfo("Asia/Kolkata")
 
 
+REBUILD_LOOKBACK_DAYS = 21
+
+
+def rebuild_candle_days(ticks_path: str, history_path: str, day: str, underlyings: list[str]) -> list[str]:
+    """Rebuild recent sessions stored from candles once the tick store can give them a real buy/sell split.
+
+    Rows built before the raw-tier fallback (and any built while ticks were missing) stay candle-sourced
+    forever otherwise. Only days the tick store still holds -- as a condensed ladder or as raw ticks -- are
+    rebuilt, so a day with no ticks is not retried every night.
+    """
+    from datetime import date, timedelta
+    since = (date.fromisoformat(day) - timedelta(days=REBUILD_LOOKBACK_DAYS)).isoformat()
+    history = _connect(history_path, read_only=True)
+    ticks = _connect(ticks_path, read_only=True)
+    try:
+        days = [d for (d,) in history.execute(
+            """SELECT DISTINCT day FROM session_profiles WHERE source = ? AND day < ? AND day >= ? ORDER BY day""",
+            (CANDLES, day, since))]
+        held = []
+        for d in days:
+            start = int(datetime.fromisoformat(f"{d}T00:00:00").replace(tzinfo=IST).timestamp() * 1000)
+            if (ticks.execute("SELECT 1 FROM tick_session_ladder WHERE day = ? LIMIT 1", (d,)).fetchone()
+                    or ticks.execute("SELECT 1 FROM ticks WHERE ts_ms >= ? AND ts_ms < ? LIMIT 1",
+                                     (start, start + 86_400_000)).fetchone()):
+                held.append(d)
+    finally:
+        history.close(); ticks.close()
+    if held:
+        build_range(ticks_path, history_path, history_path, held, underlyings)
+    return held
+
+
 def run(ticks_path: str, history_path: str, day: str, symbols: list[str],
-        whale_symbols: list[str] | None = None) -> dict:
+        whale_symbols: list[str] | None = None, lots: dict[str, int] | None = None) -> dict:
     underlyings = sorted({s for s in symbols if not is_option(s)})
     report: dict = {"day": day, "symbols": len(underlyings)}
     if not underlyings:
         return report
 
     report.update(build_range(ticks_path, history_path, history_path, [day], underlyings))
+    report["rebuilt_candle_days"] = rebuild_candle_days(ticks_path, history_path, day, underlyings)
 
     ticks = _connect(ticks_path, read_only=True)
     history_ro = _connect(history_path, read_only=True)
@@ -77,12 +110,25 @@ def run(ticks_path: str, history_path: str, day: str, symbols: list[str],
         report["journal_rows"] = setups.save(out, journal)
         report["positional_fired"] = fired
 
-        events_total = 0
-        for symbol in (whale_symbols or []):
-            prints = whale.prints_for(ticks, symbol, day)
-            events = whale.detect(symbol, day, prints)
-            events_total += whale.save_events(out, day, events)
-        report["whale_events"] = events_total
+        # Layer A over every contract that traded, not only the index futures:
+        # the whale name list. Feed-gap catch-ups are excluded, and the day's
+        # earlier live-slice events for these symbols are replaced by the
+        # full-day pass (A3's repeat history needs the whole session).
+        # ...with each instrument's own tuned thresholds, and the improvement
+        # loop behind them: fingerprint the day, label outcomes, recalibrate
+        # the feature weights, refit tomorrow's thresholds (whale_tuning).
+        from . import whale_tuning
+        tuning = whale_tuning.run(ticks, out, day, lots=lots, whale_symbols=whale_symbols)
+        report["whale_events"] = tuning["events"]
+        report["whale_names"] = tuning["names"]
+        report["feed_gaps"] = tuning["feed_gaps"]
+        report["whale_entries_added"] = tuning["entries_added"]
+        report["whale_tuning"] = tuning
+        # Re-measure the minute-level edge over the trailing 60 days, walk-forward.
+        from datetime import date as _date, timedelta as _timedelta
+        from . import whale_study
+        study = whale_study.run_study(out, (_date.fromisoformat(day) - _timedelta(days=60)).isoformat(), day)
+        report["whale_study"] = {"study_id": study.get("study_id"), "verdict": study.get("verdict")}
 
         # Only the roots the chain collector covers; the tracker has no chain,
         # lot or freeze for SENSEX and would score it against nothing.

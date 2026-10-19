@@ -59,6 +59,19 @@ class TradeRepository:
                     realized_pnl REAL NOT NULL,
                     unrealized_pnl REAL NOT NULL
                 );
+                -- Paper funding changes (initial capital edits). Equity points do not
+                -- record capital, so day P&L subtracts funding added after its anchor.
+                CREATE TABLE IF NOT EXISTS capital_changes (
+                    timestamp TEXT NOT NULL,
+                    delta REAL NOT NULL
+                );
+                -- Measurements taken at each paper entry (entry_context.py); no rule reads them.
+                CREATE TABLE IF NOT EXISTS entry_context (
+                    order_id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
                 -- Lookup index for the per-bar duplicate check. Deliberately
                 -- NOT UNIQUE: existing books already hold duplicates written by
                 -- the very bug this guards against, and a unique index cannot
@@ -295,21 +308,61 @@ class TradeRepository:
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
-    def last_equity_before(self, iso_timestamp: str) -> float | None:
+    def equity_days(self) -> list[str]:
+        """Dates with equity samples, oldest first. Samples are written in UTC,
+        and a session (09:15-15:30 IST) never crosses a UTC date."""
         with self._lock:
-            row = self._connection.execute(
-                "SELECT equity FROM equity_points WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
-                (iso_timestamp,),
-            ).fetchone()
-        return float(row["equity"]) if row else None
+            rows = self._connection.execute(
+                "SELECT DISTINCT substr(timestamp, 1, 10) FROM equity_points ORDER BY 1").fetchall()
+        return [row[0] for row in rows]
 
-    def first_equity_on_or_after(self, iso_timestamp: str) -> float | None:
+    def equity_buckets(self, since: str | None, bucket_seconds: int) -> list[dict]:
+        """The last sample of each ``bucket_seconds`` bucket from ``since`` on, streamed rather than loaded whole."""
+        query = "SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl FROM equity_points"
+        params: tuple = ()
+        if since:
+            query += " WHERE timestamp >= ?"
+            params = (since,)
+        buckets: dict[int, dict] = {}
+        with self._lock:
+            for row in self._connection.execute(query + " ORDER BY timestamp", params):
+                moment = datetime.fromisoformat(row["timestamp"])
+                bucket = int(moment.timestamp()) // bucket_seconds * bucket_seconds
+                buckets[bucket] = {**dict(row), "timestamp": datetime.fromtimestamp(bucket, UTC).isoformat()}
+        return [buckets[key] for key in sorted(buckets)]
+
+    def last_equity_point_before(self, iso_timestamp: str) -> tuple[str, float] | None:
         with self._lock:
             row = self._connection.execute(
-                "SELECT equity FROM equity_points WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT 1",
+                "SELECT timestamp, equity FROM equity_points WHERE timestamp < ? ORDER BY timestamp DESC LIMIT 1",
                 (iso_timestamp,),
             ).fetchone()
-        return float(row["equity"]) if row else None
+        return (row["timestamp"], float(row["equity"])) if row else None
+
+    def first_equity_point_on_or_after(self, iso_timestamp: str) -> tuple[str, float] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT timestamp, equity FROM equity_points WHERE timestamp >= ? ORDER BY timestamp ASC LIMIT 1",
+                (iso_timestamp,),
+            ).fetchone()
+        return (row["timestamp"], float(row["equity"])) if row else None
+
+    def save_entry_context(self, order_id: str, iso_timestamp: str, symbol: str, payload: dict) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO entry_context(order_id, timestamp, symbol, payload) VALUES (?, ?, ?, ?)",
+                (order_id, iso_timestamp, symbol, json.dumps(payload, default=_encode, separators=(",", ":"))))
+
+    def record_capital_change(self, delta: float, iso_timestamp: str) -> None:
+        with self._lock, self._connection:
+            self._connection.execute("INSERT INTO capital_changes(timestamp, delta) VALUES (?, ?)", (iso_timestamp, delta))
+
+    def capital_added_after(self, iso_timestamp: str) -> float:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COALESCE(SUM(delta), 0) AS total FROM capital_changes WHERE timestamp > ?", (iso_timestamp,),
+            ).fetchone()
+        return float(row["total"])
 
     def save_rrg(self, key: str, payload: dict) -> None:
         with self._lock, self._connection:

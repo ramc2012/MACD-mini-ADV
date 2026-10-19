@@ -264,3 +264,17 @@ def test_the_purge_does_not_delete_rows_that_are_still_visible():
         assert len(desk.repository.mp_closed_positions(
             (until - timedelta(hours=2)).astimezone(UTC).isoformat(timespec="seconds"))) == 1
         desk.repository.close()
+
+
+def test_a_position_is_closed_after_the_maximum_hold():
+    from macd_trader.mp_engine import MAX_HOLD_SECONDS
+    with tempfile.TemporaryDirectory() as folder:
+        desk = _desk(folder)
+        _open(desk)
+        _mark(desk, 41.0)
+        asyncio.run(desk._manage_position(SYM, 41.0, 11 * 60))
+        assert SYM in desk.portfolio.positions          # inside the hour: no exit
+        desk.entry_state[SYM]["entered_at"] = (datetime.now(UTC) - timedelta(seconds=MAX_HOLD_SECONDS + 5)).isoformat()
+        asyncio.run(desk._manage_position(SYM, 41.0, 11 * 60))
+        assert SYM not in desk.portfolio.positions
+        assert desk.snapshot()["closed_positions"][0]["exit_reason"] == "MP_TIME"

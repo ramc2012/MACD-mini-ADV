@@ -111,6 +111,8 @@ export type BlastForm = {
   enabled: boolean; auto_trade: boolean;
   initial_capital: string; max_positions: string; target_notional: string;
   max_premium_pct: string; min_breadth_pct: string; min_off_high_pct: string;
+  vix_adaptive_enabled: boolean; vix_reference: string; vix_breadth_adjustment_pct: string;
+  vix_max_age_seconds: string; rich_premium_max_multiple: string;
   hard_stop_pct: string; trail_activation_pct: string; trail_pct: string;
 };
 
@@ -125,6 +127,11 @@ export function toForm(settings: BlastSettings): BlastForm {
     target_notional: asText(settings.target_notional),
     max_premium_pct: asText(settings.max_premium_pct),
     min_breadth_pct: asText(settings.min_breadth * 100),
+    vix_adaptive_enabled: settings.vix_adaptive_enabled ?? true,
+    vix_reference: asText(settings.vix_reference ?? 20),
+    vix_breadth_adjustment_pct: asText((settings.vix_breadth_adjustment ?? -0.10) * 100),
+    vix_max_age_seconds: asText(settings.vix_max_age_seconds ?? 900),
+    rich_premium_max_multiple: asText(settings.rich_premium_max_multiple ?? 2),
     min_off_high_pct: asText(settings.min_off_high_pct),
     hard_stop_pct: asText(settings.hard_stop_pct * 100),
     trail_activation_pct: asText(settings.trail_activation_pct * 100),
@@ -151,10 +158,15 @@ export function fromForm(form: BlastForm): { payload?: BlastSettings; error?: st
     enabled: form.enabled,
     auto_trade: form.auto_trade,
     initial_capital: read(form.initial_capital, "Capital", 1, 1_000_000_000_000),
-    max_positions: read(form.max_positions, "Max open positions", 1, 100, { integer: true }),
+    max_positions: read(form.max_positions, "Max open positions", 1, 1000, { integer: true }),
     target_notional: read(form.target_notional, "Size per entry", 0, 5_000_000),
     max_premium_pct: read(form.max_premium_pct, "Premium limit (% of spot)", 0, 100, { minOpen: true }),
     min_breadth: read(form.min_breadth_pct, "Breadth floor (%)", 0, 100) / 100,
+    vix_adaptive_enabled: form.vix_adaptive_enabled,
+    vix_reference: read(form.vix_reference, "Reference VIX", 5, 100),
+    vix_breadth_adjustment: read(form.vix_breadth_adjustment_pct, "VIX breadth adjustment (points)", -25, 25) / 100,
+    vix_max_age_seconds: read(form.vix_max_age_seconds, "VIX quote age (seconds)", 30, 3600),
+    rich_premium_max_multiple: read(form.rich_premium_max_multiple, "Rich premium multiple", 1, 4),
     min_off_high_pct: read(form.min_off_high_pct, "Distance below the recent high (%)", 0, 99),
     hard_stop_pct: read(form.hard_stop_pct, "Hard stop (%)", 0, 100, { minOpen: true, maxOpen: true }) / 100,
     trail_activation_pct: read(form.trail_activation_pct, "Trail activation (%)", 0, 500, { minOpen: true, maxOpen: true }) / 100,

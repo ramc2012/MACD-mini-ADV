@@ -26,6 +26,7 @@ from __future__ import annotations
 from .market_calendar import is_trading_day
 
 import asyncio
+import math
 import os
 import time
 from contextlib import suppress
@@ -35,6 +36,9 @@ from datetime import UTC, datetime, timedelta, timezone
 from .directional import Bias, SessionTape, TapeBook, evaluate as evaluate_directional
 from .footprint import FootprintBook, confidence_grade
 from .candles import SESSION_CLOSE, SESSION_OPEN
+from .sessions import in_closing_auction, market_open
+from .sessions import in_session as symbol_in_session
+from .profile_scale import cached_scale
 from .market_profile import IST, Profile, ProfileBook, SESSION_OPEN_MINUTE, letter_for
 from .models import Order, Signal, Trade
 from .ofi import OFITracker
@@ -46,7 +50,15 @@ from .repository import TradeRepository
 from .universe import desk_underlying
 
 FORCED_EXIT_MINUTE = 15 * 60 + 20
-MIN_BRACKETS_BEFORE_ENTRY = 2       # let the initial balance form
+# Entries wait for the initial balance (the first HOUR, brackets A and B) to
+# complete: from 10:15. On the 691 signals of 29 Sep - 9 Oct the 09:xx ones
+# averaged -5.7% (lane exits) and, the 12-a-day budget being first-come, they
+# were most of what the book actually bought (user asked to tune, 12 Oct).
+MIN_BRACKETS_BEFORE_ENTRY = 3
+# Option premium decays and these intraday setups mostly play out (or fail)
+# within the hour: a 60-minute exit beat holding to the stops or 15:20 on the
+# same signals (+1.2% vs -0.3% / -3.1% a signal). Four sessions only.
+MAX_HOLD_SECONDS = 3600
 MIN_PREMIUM = 5.0
 # A reclaim only counts if the probe below value was recent; and one signal
 # per symbol per cooldown keeps a standing condition from re-firing.
@@ -194,6 +206,11 @@ class MPSettings:
     brokerage_per_leg: float = 20.0
     allow_overnight_carry: bool = False
     max_notional_per_trade: float = DEFAULT_MAX_NOTIONAL_PER_TRADE
+    # Fill across the quoted spread when the tick that set the mark carried a two-sided quote; else last
+    # price +/- slippage_bps. At 25 bps a side the desk paid 0.5% a round trip while stock-option spreads ran
+    # ~1.9% of mid (research/option_recs_20261015). A side never fills beyond max_half_spread_pct of the mark.
+    cross_spread: bool = True
+    max_half_spread_pct: float = 5.0
 
     def to_dict(self) -> dict:
         return {key: getattr(self, key) for key in self.__annotations__}
@@ -234,6 +251,9 @@ class MPEngine:
         self.orders: dict[str, Order] = {}
         self.last_prices: dict[str, float] = {}
         self.last_price_at: dict[str, datetime] = {}
+        # (ltp, bid, ask) of the latest tick per symbol: paper fills cross the quoted spread (see _fill_price).
+        self.last_quotes: dict[str, tuple] = {}
+        self.fill_basis = {"quoted_spread": 0, "last_price_bps": 0}
         self.signals: list[Signal] = []
         self.entry_state: dict[str, dict] = {}     # symbol -> risk state
         self._setup_state: dict[str, dict] = {}    # symbol -> edge-trigger marks
@@ -243,6 +263,8 @@ class MPEngine:
         self.prints_seen = 0
         self.stale_ticks = 0
         self.off_session_ticks = 0
+        # Cash closing-auction matches today: symbol -> {price, volume, at}.
+        self.closing_auctions: dict[str, dict] = {}
         self.ticks_seen = 0
         self.last_tick_at: datetime | None = None
         self.last_print_at: datetime | None = None
@@ -634,6 +656,22 @@ class MPEngine:
         self.backfilled_rows = rows
         return rows
 
+    def _note_closing_auction(self, tick, moment: datetime) -> None:
+        """Record a cash closing-auction match: price and the volume it added.
+
+        Measured against the flow tracker's last continuous-session total, so
+        the matched quantity is what the auction alone crossed. The latest
+        update in the window wins (indicative prices precede the match).
+        """
+        state = self.flow.states.get(tick.symbol)
+        base = state.last_cum_volume if state is not None else None
+        volume = int(tick.volume or 0)
+        if base is None or volume <= base:
+            return
+        self.closing_auctions[tick.symbol] = {
+            "price": tick.ltp, "volume": volume - base, "at": moment.isoformat(),
+        }
+
     async def on_tick(self, tick) -> None:
         if tick.ltp <= 0:
             return
@@ -664,6 +702,7 @@ class MPEngine:
             self.prints_seen = 0
             self.stale_ticks = 0
             self.off_session_ticks = 0
+            self.closing_auctions.clear()
             self.ticks_seen = 0
             self.last_tick_at = None
             self.last_print_at = None
@@ -692,11 +731,12 @@ class MPEngine:
             self.stale_ticks += 1
             return
 
-        in_session = (
-            is_trading_day(moment.date())
-            and SESSION_OPEN <= moment.timetz().replace(tzinfo=None) < SESSION_CLOSE
-        )
-        if not in_session:
+        if not symbol_in_session(tick.symbol, moment):
+            # The instrument's own session: F&O to 15:40, cash to 15:15. A cash
+            # tick in the closing auction is the auction's match -- one
+            # uncrossing print with no aggressor -- recorded apart from flow.
+            if in_closing_auction(tick.symbol, moment):
+                self._note_closing_auction(tick, moment)
             self.off_session_ticks += 1
             if self.portfolio.mark(tick.symbol, tick.ltp):
                 self._publish("mp_portfolio", self._portfolio_view())
@@ -706,6 +746,7 @@ class MPEngine:
         self.last_tick_at = datetime.now(UTC)
         self.last_prices[tick.symbol] = tick.ltp
         self.last_price_at[tick.symbol] = self.last_tick_at
+        self.last_quotes[tick.symbol] = (tick.ltp, getattr(tick, "bid", None), getattr(tick, "ask", None))
         if not self.settings.enabled and tick.symbol not in self.portfolio.positions:
             return
 
@@ -959,6 +1000,8 @@ class MPEngine:
             reason = "MP_HARD_STOP"
         elif position.trailing_stop and price <= position.trailing_stop:
             reason = "MP_TRAIL"
+        elif self._held_seconds(symbol) >= MAX_HOLD_SECONDS:
+            reason = "MP_TIME"
         else:
             if minute >= FORCED_EXIT_MINUTE:
                 allowed, detail = self.carry_decision(symbol)
@@ -985,7 +1028,32 @@ class MPEngine:
             self.entry_state.setdefault(symbol, {})["exit_reason"] = reason
             await self.submit(symbol, "SELL", position.quantity, note=reason)
 
+    def _held_seconds(self, symbol: str) -> float:
+        entered = self.entry_state.get(symbol, {}).get("entered_at")
+        if not entered:
+            return 0.0
+        try:
+            return (datetime.now(UTC) - datetime.fromisoformat(entered)).total_seconds()
+        except ValueError:
+            return 0.0
+
     # -- execution (paper, this desk's own book) -----------------------------
+
+    def _fill_price(self, symbol: str, side: str, price: float) -> float:
+        slip = price * self.settings.slippage_bps / 10_000
+        fallback = price + slip if side == "BUY" else price - slip
+        quote = self.last_quotes.get(symbol) if self.settings.cross_spread else None
+        if quote is None:
+            self.fill_basis["last_price_bps"] += 1
+            return fallback
+        ltp, bid, ask = quote
+        if not (abs((ltp or 0) - price) <= 1e-9 and bid and ask and 0 < bid <= ask
+                and math.isfinite(bid) and math.isfinite(ask)):
+            self.fill_basis["last_price_bps"] += 1
+            return fallback
+        cap = price * self.settings.max_half_spread_pct / 100
+        self.fill_basis["quoted_spread"] += 1
+        return min(ask, price + cap) if side == "BUY" else max(bid, price - cap)
 
     async def submit(self, symbol: str, side: str, quantity: int, *,
                      signal: Signal | None = None, note: str = "") -> Order | None:
@@ -1008,8 +1076,8 @@ class MPEngine:
                 if not self.settings.enabled:
                     self.last_order_rejection = "desk is disabled"
                     return None
-                if not (is_trading_day(local.date()) and SESSION_OPEN <= local.timetz().replace(tzinfo=None) < SESSION_CLOSE):
-                    self.last_order_rejection = "new entries are blocked outside the regular session"
+                if not symbol_in_session(symbol, local):
+                    self.last_order_rejection = "new entries are blocked outside the instrument's session"
                     return None
                 mark_at = self.last_price_at.get(symbol)
                 if mark_at is None or (datetime.now(UTC) - mark_at).total_seconds() > MAX_ORDER_MARK_AGE_SECONDS:
@@ -1035,9 +1103,7 @@ class MPEngine:
             order.broker_order_id = f"MPPAPER-{order.order_id[:12]}"
             self.orders[order.order_id] = order
             self.repository.save_order(order)
-            slip = price * self.settings.slippage_bps / 10_000
-            fill = price + slip if side == "BUY" else price - slip
-            order.fill_price = round(fill, 4)
+            order.fill_price = round(self._fill_price(symbol, side, price), 4)
             order.status = "FILLED"
             trade = Trade(order.order_id, symbol, side, order.quantity, order.fill_price,
                           lots=order.lots, lot_size=lot,
@@ -1110,7 +1176,15 @@ class MPEngine:
             ))
         else:
             focus = None
-        profile_snapshot = self.profiles.get(focus).snapshot() if focus else None
+        profile = self.profiles.get(focus) if focus else None
+        # ATR rows when the route has already computed them for this symbol
+        # and day (it does so off the loop on a miss); ticks until then.
+        scale = (cached_scale(self.history_database_path, focus, profile.day, profile.tick_size)
+                 if profile is not None else None)
+        profile_snapshot = profile.snapshot(
+            row_size=scale["row_size"] if scale else None, scale=scale) if profile is not None else None
+        if profile_snapshot is not None:
+            profile_snapshot["closing_auction"] = self.closing_auctions.get(focus)
         return {
             "enabled": self.settings.enabled,
             "settings": self.settings.to_dict(),
@@ -1252,11 +1326,7 @@ class MPEngine:
         def age(stamp: datetime | None) -> float | None:
             return round(max(0.0, (now - stamp).total_seconds()), 1) if stamp else None
 
-        local = now.astimezone(IST)
-        session_open = (
-            is_trading_day(local.date())
-            and SESSION_OPEN <= local.timetz().replace(tzinfo=None) < SESSION_CLOSE
-        )
+        session_open = market_open(now)
         classification = self.classification_health()
         blockers = []
         if not self.settings.enabled:
@@ -1290,6 +1360,7 @@ class MPEngine:
             "last_print_age_seconds": age(self.last_print_at),
             "off_session_ticks": self.off_session_ticks,
             "errors_total": self.errors_total,
+            "fill_basis": dict(self.fill_basis),
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "persistence": {

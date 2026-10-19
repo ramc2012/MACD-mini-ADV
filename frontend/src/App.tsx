@@ -1,4 +1,4 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { DEFAULT_LAYERS, DEFAULT_PANES, TradingChart, type PriceStyle } from "./Chart";
 import { chartSourceStatus } from "./chartSource";
 import { useChartReferences } from "./useChartReferences";
@@ -12,6 +12,7 @@ import { API_TOKEN, API_URL } from "./runtime";
 // Pages opened from the tab bar load on first visit, so the trading view
 // does not wait for the footprint, profile, research and analytics code.
 const EquityCurve = lazy(() => import("./EquityCurve").then((m) => ({ default: m.EquityCurve })));
+const TrendRotation = lazy(() => import("./TrendRotation").then((m) => ({ default: m.TrendRotation })));
 const RRGPage = lazy(() => import("./RRG").then((m) => ({ default: m.RRGPage })));
 const MarketProfilePage = lazy(() => import("./MarketProfile").then((m) => ({ default: m.MarketProfilePage })));
 const SignalRadar = lazy(() => import("./SignalRadar").then((m) => ({ default: m.SignalRadar })));
@@ -19,11 +20,19 @@ const RatioPage = lazy(() => import("./RatioChart").then((m) => ({ default: m.Ra
 const AuctionPage = lazy(() => import("./Auction").then((m) => ({ default: m.AuctionPage })));
 const BlastLanePage = lazy(() => import("./BlastLane").then((m) => ({ default: m.BlastLanePage })));
 const QuantAnalyticsPage = lazy(() => import("./QuantAnalytics").then((m) => ({ default: m.QuantAnalyticsPage })));
+const AgentPage = lazy(() => import("./AgentPage").then((m) => ({ default: m.AgentPage })));
+const LanesPage = lazy(() => import("./LanesPage").then((m) => ({ default: m.LanesPage })));
 import { Readiness } from "./Readiness";
 import { PortfolioRisk } from "./PortfolioRisk";
+import { BookGreeks } from "./BookGreeks";
+import { LedgerCounts } from "./LedgerCounts";
+import { AtmHeatmap } from "./AtmHeatmap";
+import { SectorWheel } from "./SectorWheel";
 import { matchesWatchSearch, quoteStamp } from "./watchMath";
+import { sessionState, tokenLeft } from "./sessionClock";
 import { requestJson } from "./requestJson";
 import { useStream } from "./useStream";
+import { optionRowsForTab, WATCH_TABS, type WatchTab } from "./watchTabs";
 import { observedBrokerStatus } from "./feedStatus";
 import type { BlastCandidate, BlastSnapshot, Candle, ChartLayers, ChartMarker, EquityPoint, HealthInfo, Indicator, OptionWatchRow, Order, PaneCollapse, Portfolio, ResearchOpenPosition, ResearchSummary, ResearchTrade, Signal, Snapshot, SpotWatchRow, StreamEvent, Tick, Trade } from "./types";
 
@@ -58,10 +67,11 @@ function readStore<T extends object>(key: string, fallback: T): T {
 const INDEX_UNDERLYINGS = new Set(["NIFTY", "SENSEX", "BANKNIFTY", "MIDCPNIFTY"]);
 // The three the desk quotes at each other across the room; universe.py
 // INDEX_SPOTS is the source of the symbols.
-const HEADER_INDICES: { label: string; symbol: string }[] = [
-  { label: "NIFTY", symbol: "NSE:NIFTY50-INDEX" },
-  { label: "BANKNIFTY", symbol: "NSE:NIFTYBANK-INDEX" },
-  { label: "SENSEX", symbol: "BSE:SENSEX-INDEX" },
+const HEADER_INDICES: { label: string; short: string; symbol: string }[] = [
+  { label: "NIFTY", short: "NIFTY", symbol: "NSE:NIFTY50-INDEX" },
+  { label: "BANKNIFTY", short: "BANK", symbol: "NSE:NIFTYBANK-INDEX" },
+  { label: "SENSEX", short: "SENSEX", symbol: "BSE:SENSEX-INDEX" },
+  { label: "MIDCPNIFTY", short: "MIDCP", symbol: "NSE:MIDCPNIFTY-INDEX" },
 ];
 // A reload used to dump the desk back on the first broker symbol whatever
 // it had been charting.  The stored pick is honoured only while the engine
@@ -99,10 +109,70 @@ export default function App() {
   }, []);
   const [researchParameters, setResearchParameters] = useState<Record<string, unknown>>();
   const [health, setHealth] = useState<HealthInfo>();
-  const [page, setPage] = useState<"TERMINAL" | "QUANT" | "EQUITY" | "RRG" | "DISPERSION" | "RATIOS" | "AUCTION" | "PROFILE" | "BLAST" | LedgerTab>("TERMINAL");
+  // Top navigation is by lane; each lane keeps its own views inside it.
+  // The open page lives in the URL hash (#/MACD/MARKET/HEATMAP) so a browser refresh reopens it.
+  const [route] = useState(readRoute);
+  const [lane, setLane] = useState<Lane>(() => pick(LANES, route[0], "MACD"));
+  const [macdView, setMacdView] = useState<MacdView>(() => pick(MACD_VIEWS, route[0] === "MACD" ? route[1] : undefined, "TERMINAL"));
+  const [auctionView, setAuctionView] = useState<"AUCTION" | "PROFILE">(() => pick(AUCTION_VIEWS, route[0] === "AUCTION" ? route[1] : undefined, "AUCTION"));
+  const page = lane === "MACD" ? macdView : lane === "AUCTION" ? auctionView : lane;
+  // Grouped pages: each keeps its own full page under a sub-tab bar.
+  const [performanceView, setPerformanceView] = useState<"STATISTICS" | "EQUITY">(() => pick(PERFORMANCE_VIEWS, route[1] === "PERFORMANCE" ? route[2] : undefined, "STATISTICS"));
+  const [marketView, setMarketView] = useState<"RRG" | "DISPERSION" | "RATIOS" | "HEATMAP" | "WHEEL" | "TREND">(() => pick(MARKET_VIEWS, route[1] === "MARKET" ? route[2] : undefined, "RRG"));
+  useEffect(() => {
+    const parts: string[] = [lane];
+    if (lane === "MACD") {
+      parts.push(macdView);
+      if (macdView === "PERFORMANCE") parts.push(performanceView);
+      if (macdView === "MARKET") parts.push(marketView);
+    } else if (lane === "AUCTION") parts.push(auctionView);
+    const hash = `#/${parts.join("/")}`;
+    if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
+  }, [lane, macdView, auctionView, performanceView, marketView]);
+  useEffect(() => {
+    // Manual edits of the hash (or a pasted link) switch the page without a reload.
+    const onHash = () => {
+      const next = readRoute();
+      setLane(pick(LANES, next[0], "MACD"));
+      if (next[0] === "MACD") setMacdView(pick(MACD_VIEWS, next[1], "TERMINAL"));
+      if (next[0] === "AUCTION") setAuctionView(pick(AUCTION_VIEWS, next[1], "AUCTION"));
+      if (next[1] === "PERFORMANCE") setPerformanceView(pick(PERFORMANCE_VIEWS, next[2], "STATISTICS"));
+      if (next[1] === "MARKET") setMarketView(pick(MARKET_VIEWS, next[2], "RRG"));
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  // Chart pages need the height: the six-card summary collapses to one line
+  // there unless the viewer chose otherwise (remembered per browser).
+  const [summaryPref, setSummaryPref] = useState<"compact" | "full" | null>(() => {
+    try { const v = window.localStorage.getItem("macd.summary"); return v === "compact" || v === "full" ? v : null; } catch { return null; }
+  });
+  const summaryCompact = summaryPref ? summaryPref === "compact" : page === "PROFILE" || page === "AUCTION" || page === "QUANT" || page === "AGENT";
+  const toggleSummary = () => {
+    const next = summaryCompact ? "full" : "compact";
+    setSummaryPref(next);
+    try { window.localStorage.setItem("macd.summary", next); } catch { /* per-viewer convenience only */ }
+  };
+  // Pages size themselves to what is left below the header stack, measured,
+  // not assumed: a fixed 152px left the Profile/Flow chart squeezed and the
+  // page overflowing whenever the header wrapped or the summary was taller.
+  const chromeRef = useRef<HTMLDivElement>(null);
+  const [chromeHeight, setChromeHeight] = useState(152);
+  useEffect(() => {
+    const el = chromeRef.current;
+    if (!el) return;
+    const measure = () => setChromeHeight(Math.round(el.getBoundingClientRect().height));
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"FYERS" | "ALERTS" | "STRATEGY">("FYERS");
+  const openSettings = (tab: "FYERS" | "ALERTS" | "STRATEGY") => { setSettingsTab(tab); setSettingsOpen(true); };
   const [watchSearch, setWatchSearch] = useState("");
-  const [watchTab, setWatchTab] = useState<"SPOT" | "CE" | "PE">("SPOT");
+  const [watchTab, setWatchTab] = useState<WatchTab>("SPOT");
   const [watchSort, setWatchSort] = useState<{ key: WatchSortKey; direction: "asc" | "desc" }>({ key: "instrument", direction: "asc" });
   const [chartPeriod, setChartPeriod] = useState<ChartPeriod>(() => {
     const stored = readKey(CHART_PERIOD_STORE) as ChartPeriod | null;
@@ -203,6 +273,7 @@ export default function App() {
     if (event.type === "blast_trade") setBlastTrades((old) => mergeRows(old, [event.data as Trade], "trade_id"));
   }, []);
   const connected = useStream(onEvent);
+  const ledgerReady = loadStatus.Orders === "" && loadStatus.Trades === "" && orders.length < 100_000 && trades.length < 100_000;
   const dispersion = useDispersionSeries(snapshot?.option_watchlist || [], indicators, snapshot?.config.timeframe_seconds || 1800);
 
   useEffect(() => {
@@ -360,7 +431,7 @@ export default function App() {
     // `ticks` is replaced 10x/s, so this sort ran 10x/s on every page — 1.5ms
     // a pass to order rows that only the terminal renders.
     if (page !== "TERMINAL") return [];
-    const rows: (SpotWatchRow | OptionWatchRow)[] = watchTab === "SPOT" ? snapshot?.spot_watchlist || [] : (snapshot?.option_watchlist || []).filter((row) => row.option_type === watchTab);
+    const rows: (SpotWatchRow | OptionWatchRow)[] = watchTab === "SPOT" ? snapshot?.spot_watchlist || [] : optionRowsForTab(snapshot?.option_watchlist || [], watchTab);
     const direction = watchSort.direction === "asc" ? 1 : -1;
     return rows.filter((row) => matchesWatchSearch(row, watchSearch)).sort((a, b) => compareWatch(a, b, watchSort.key, ticks, indicators) * direction);
   }, [page, watchTab, watchSearch, snapshot, watchSort, ticks, indicators]);
@@ -432,6 +503,7 @@ export default function App() {
   // out of the percentage rather than out of clipped glyphs.
   const brokerStatus = observedBrokerStatus(snapshot?.broker.status, health, healthUpdated);
   const brokerDown = !!snapshot && brokerStatus !== "connected";
+  const token = tokenLeft(snapshot?.broker.token_expires_at, new Date(quoteNow));
   const lastHistoryBar = visibleCandles[visibleCandles.length - 1];
   const formingBar = chartReady ? current[selected] : undefined;
   const latestChartBar = formingBar && (!lastHistoryBar || formingBar.timestamp >= lastHistoryBar.timestamp) ? formingBar : lastHistoryBar;
@@ -444,40 +516,52 @@ export default function App() {
     timeframeSeconds: snapshot?.config.timeframe_seconds,
     loading: chartLoading,
   });
-  return <main>
+  return <main style={{ "--chrome-h": `${chromeHeight}px` } as CSSProperties}>
+    <div className="shell-top" ref={chromeRef}>
     <header className={brokerDown ? "feed-alarm" : undefined}>
       <div className="brand"><span className="logo">M</span><strong>MACD Trader</strong><span className="parallel-badge" title="Parallel React terminal through the Go API gateway">PARALLEL</span></div>
-      <div className="index-strip">{HEADER_INDICES.map((row) => <IndexTicker key={row.symbol} label={row.label} tick={ticks[row.symbol]} observedAt={quoteNow} />)}</div>
+      <div className="index-strip">{HEADER_INDICES.map((row) => <IndexTicker key={row.symbol} label={row.label} short={row.short} tick={ticks[row.symbol]} observedAt={quoteNow} />)}</div>
       <div className="status">
-        <span className={connected ? "dot online" : "dot"} />{connected ? "Linked" : "Reconnecting"}
-        <span className={`feed-dot${feedTone(brokerStatus, health)}`} role="img" aria-label={feedTitle(snapshot, health, brokerStatus)} title={feedTitle(snapshot, health, brokerStatus)}>●</span>
-        {brokerDown ? <b className="feed-down">{brokerStatus.toUpperCase()}</b> : undefined}
-        <span className={healthTone(health) ? "feed-badge" : "mode alert"} title={`${feedHealth(health)} · ${health?.ticks_total ?? 0} ticks · ${health?.candles_closed ?? 0} candles closed · ${(health?.feed_connects ?? 1) - 1} reconnects · ${health?.stream_clients ?? 0} clients`}>{feedRate(health)}</span>
+        <SessionChip now={quoteNow} holidays={snapshot?.config.market_holidays} health={health} />
+        {brokerDown || token.expired
+          ? <button className="fyers-login-cta" onClick={() => openSettings("FYERS")} title={feedTitle(snapshot, health, brokerStatus)}>
+              <span className="feed-dot" aria-hidden="true">●</span>{token.expired ? "Log in to Fyers" : `Fyers ${brokerStatus.replace("_", " ")}`}
+            </button>
+          : <button className="fyers-chip" onClick={() => openSettings("FYERS")} title={`${feedTitle(snapshot, health, brokerStatus)} · stream ${connected ? "linked" : "reconnecting"} · token ${token.text}`}>
+              <span className={`feed-dot${feedTone(brokerStatus, health)}`} aria-hidden="true">●</span>Fyers<small>{connected ? token.text : "reconnecting"}</small>
+            </button>}
         <span className="mode">{snapshot?.execution.mode || "—"}</span>
         <span className="header-date">{IST_HEADER_DAY.format(new Date())}</span>
-        <button className="settings-button settings-glyph" onClick={() => setSettingsOpen(true)} aria-label="Settings" title="Settings">⚙</button>
+        <button className="settings-button settings-glyph" onClick={() => openSettings("FYERS")} aria-label="Settings" title="Settings">⚙</button>
       </div>
     </header>
-    <nav className="main-tabs" aria-label="Main navigation">{(["TERMINAL", "QUANT", "PORTFOLIO", "ORDERS", "TRADES", "STATISTICS", "EQUITY", "RRG", "DISPERSION", "RATIOS", "AUCTION", "PROFILE", "BLAST", "SIGNALS"] as const).map((tab) => <button key={tab} className={page === tab ? "active" : ""} aria-current={page === tab ? "page" : undefined} onClick={() => setPage(tab)}>{tab === "TERMINAL" ? "Trading terminal" : tab === "QUANT" ? "Quant analytics" : tab === "STATISTICS" ? "Trade statistics" : tab === "EQUITY" ? "Equity curve" : tab === "RRG" ? "RRG" : tab === "DISPERSION" ? "Dispersion" : tab === "RATIOS" ? "Premium ratios" : tab === "AUCTION" ? "Auction" : tab === "PROFILE" ? "Profile / Flow" : tab === "BLAST" ? "Blast lane" : tab.charAt(0) + tab.slice(1).toLowerCase()}<span>{tab === "BLAST" ? blastBadge : tab === "EQUITY" ? researchEquity.length : tab === "DISPERSION" ? (dispersion.current ? `${dispersion.current.ceAbove}/${dispersion.current.peAbove}` : "") : navCount(tab, orders, trades, portfolio, signals)}</span></button>)}</nav>
+    <nav className="main-tabs" aria-label="Lanes">{LANES.map(([key, label]) => <button key={key} className={lane === key ? "active" : ""} aria-current={lane === key ? "page" : undefined} onClick={() => setLane(key)}>{label}<span>{key === "MACD" ? portfolio.positions.length || "" : key === "BLAST" ? blastBadge : ""}</span></button>)}</nav>
+    {lane === "MACD" && <SubTabs className="lane-views" value={macdView} options={MACD_VIEWS} onChange={setMacdView}
+      titles={{ ORDERS: "All saved order attempts, including filled and rejected orders", TRADES: "Executed buy and sell fills; includes partial exits" }}
+      badges={{ PORTFOLIO: portfolio.positions.length || "", ORDERS: loadStatus.Orders === "" ? orders.length : "…", TRADES: loadStatus.Trades === "" ? trades.length : "…", SIGNALS: signals.length || "",
+        MARKET: dispersion.current ? `${dispersion.current.ceAbove}/${dispersion.current.peAbove}` : "" }} />}
+    {lane === "AUCTION" && <SubTabs className="lane-views" value={auctionView} options={AUCTION_VIEWS} onChange={setAuctionView} />}
     {Object.entries(loadStatus).some(([, message]) => message) && <div className="data-status" role="status">
       {Object.entries(loadStatus).filter(([, message]) => message).map(([name, message]) => <span key={name}>{name}: {message}</span>)}
       <button onClick={() => setSnapshotRevision((n) => n + 1)}>Retry data</button>
     </div>}
-    <section className="metrics">
+    {lane === "MACD" && <><section className={summaryCompact ? "metrics compact" : "metrics"}>
       <Metric label="Equity" value={snapshot ? `₹${money.format(portfolio.equity)}` : "—"} />
       <Metric label="Day P&L (vs last close)" value={dayPnl === undefined ? "—" : `₹${money.format(dayPnl)}`} tone={dayPnl} />
       <Metric label="Realized (inception)" value={snapshot ? `₹${money.format(portfolio.realized_pnl)}` : "—"} tone={portfolio.realized_pnl} />
       <Metric label="Unrealized" value={snapshot ? `₹${money.format(portfolio.unrealized_pnl)}` : "—"} tone={portfolio.unrealized_pnl} />
       <Metric label="Open positions" value={snapshot ? `${portfolio.positions.length} · ₹${money.format(portfolio.market_value)}` : "—"} />
       <Metric label="Today's activity" value={`${todayActivity.fills} fills · ${todayActivity.orders} orders · ${todayActivity.signals} signals`} />
-    </section>
-    <Readiness health={health} error={healthError} updated={healthUpdated} />
-    {page === "PORTFOLIO" && <PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} />}
-    {page === "STATISTICS" && (loadStatus.Orders || loadStatus.Trades) ? <section className="panel recovery-panel" role="status">Completed-trade statistics require the full ledger. {loadStatus.Orders || loadStatus.Trades}</section> : page === "TERMINAL" ? <div className="workspace terminal-workspace">
+      <button type="button" className="metrics-toggle" onClick={toggleSummary}
+        title={summaryCompact ? "Show the full summary cards" : "Collapse the summary to one line"}
+        aria-pressed={summaryCompact}>{summaryCompact ? "▾" : "▴"}</button>
+    </section></>}
+    </div>
+    {page === "PERFORMANCE" && performanceView === "STATISTICS" && (loadStatus.Orders || loadStatus.Trades) ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} /><section className="panel recovery-panel" role="status">Completed-trade statistics require the full ledger. {loadStatus.Orders || loadStatus.Trades}</section></> : page === "TERMINAL" ? <div className="workspace terminal-workspace">
       <aside className="watchlist panel">
-        <div className="panel-title">Market watch <span>{watchRows.length} / {watchTab === "SPOT" ? snapshot?.spot_watchlist.length || 0 : snapshot?.option_watchlist.filter((r) => r.option_type === watchTab).length || 0}</span></div>
+        <div className="panel-title">Market watch <span>{watchRows.length} / {watchTab === "SPOT" ? snapshot?.spot_watchlist.length || 0 : optionRowsForTab(snapshot?.option_watchlist || [], watchTab).length}</span></div>
         <div className="watch-search"><input aria-label="Search market watch" type="search" placeholder="Search symbol, strike or expiry…" value={watchSearch} onChange={(event) => setWatchSearch(event.target.value)} /><button disabled={!watchSearch} onClick={() => setWatchSearch("")}>Clear</button></div>
-        <div className="watch-tabs">{(["SPOT", "CE", "PE"] as const).map((tab) => <button className={watchTab === tab ? "active" : ""} onClick={() => setWatchTab(tab)} key={tab}>{tab}</button>)}</div>
+        <div className="watch-tabs">{WATCH_TABS.map((tab) => <button className={watchTab === tab.key ? "active" : ""} onClick={() => setWatchTab(tab.key)} key={tab.key}>{tab.label}</button>)}</div>
         <div className="watch-head">{(["instrument", "ltp", "change", "macd", "gex", "volume"] as WatchSortKey[]).map((key) => <button key={key} onClick={() => sortWatch(key)}>{key === "ltp" ? "LTP" : key === "macd" ? "MACD" : key === "gex" ? "GEX" : key.charAt(0).toUpperCase() + key.slice(1)}<small>{watchSort.key === key ? (watchSort.direction === "asc" ? "▲" : "▼") : "↕"}</small></button>)}</div>
         {watchGroups.map((group) => <div key={group.label} className="watch-group"><div className="watch-group-title">{group.label}<span>{group.rows.length}</span></div>{group.rows.map((row) => { const points = indicators[row.symbol] || []; return <WatchRow key={row.symbol} row={row} tick={ticks[row.symbol] || row.tick} indicator={points[points.length - 1] || row.indicator} selected={selected === row.symbol} onSelect={selectWatchRow} observedAt={quoteNow} />; })}</div>)}
         {!watchRows.length && <p className="watch-empty" role="status">{watchSearch ? "No matching instruments. Try another symbol or clear the search." : "Waiting for market watch data…"}</p>}
@@ -508,9 +592,9 @@ export default function App() {
           timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
           fitKey={`${selected}:${snapshot?.config.timeframe_seconds}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
-    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : page === "RRG" ? <RRGPage /> : page === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : page === "RATIOS" ? <RatioPage options={snapshot?.option_watchlist || []} /> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "BLAST" ? <BlastLanePage snapshot={blast} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : <TradingLedger tab={page} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} />}</Suspense>}
+    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "LANES" ? <LanesPage ticks={ticks} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage />: marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</Suspense>}
     {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
-    <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    <SettingsPanel open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />
   </main>;
 }
 
@@ -520,10 +604,30 @@ function mergeRows<Row extends Record<string, unknown>>(current: Row[], incoming
   return [...rows.values()];
 }
 
-// STATISTICS carries no badge: it used to show the walk-forward trade count, which the page no longer reports.
-function navCount(tab: string, orders: Order[], trades: Trade[], portfolio: Portfolio, signals: Signal[]) {
-  return tab === "ORDERS" ? orders.length : tab === "TRADES" ? trades.length : tab === "PORTFOLIO" ? portfolio.positions.length : tab === "SIGNALS" ? signals.length : "";
+function readRoute(): string[] {
+  try { return decodeURIComponent(window.location.hash).replace(/^#\/?/, "").split("/").filter(Boolean); } catch { return []; }
 }
+function pick<T extends string>(options: readonly (readonly [T, string])[], value: string | undefined, fallback: T): T {
+  return (options.find(([key]) => key === value)?.[0] ?? fallback) as T;
+}
+const PERFORMANCE_VIEWS = [["STATISTICS", "Trade statistics"], ["EQUITY", "Equity curve"]] as const;
+const MARKET_VIEWS = [["RRG", "RRG"], ["TREND", "Trend rotation"], ["DISPERSION", "Dispersion"], ["RATIOS", "Premium ratios"], ["HEATMAP", "ATM heat map"], ["WHEEL", "Sector wheel"]] as const;
+
+type Lane = "MACD" | "LANES" | "BLAST" | "AUCTION" | "AGENT";
+type MacdView = "TERMINAL" | Exclude<LedgerTab, "STATISTICS"> | "PERFORMANCE" | "QUANT" | "MARKET" | "STATUS";
+const LANES = [["MACD", "MACD lane"], ["LANES", "Smart lanes"], ["BLAST", "Blast lane"], ["AUCTION", "Auction desk"], ["AGENT", "Option agent"]] as const;
+const MACD_VIEWS = [["TERMINAL", "Terminal"], ["PORTFOLIO", "Portfolio"], ["STATUS", "Status"], ["ORDERS", "Orders"], ["TRADES", "Trades"], ["PERFORMANCE", "Performance"],
+  ["SIGNALS", "Signals"], ["QUANT", "Quant analytics"], ["MARKET", "Market breadth"]] as const;
+const AUCTION_VIEWS = [["AUCTION", "Desk"], ["PROFILE", "Profile / Flow"]] as const;
+
+/** The view switch inside a lane, and inside a grouped view (Performance, Market breadth). */
+function SubTabs<T extends string>({ value, options, onChange, badges, titles, className = "" }: {
+  value: T; options: readonly (readonly [T, string])[]; onChange: (view: T) => void;
+  badges?: Partial<Record<T, string | number>>; titles?: Partial<Record<T, string>>; className?: string;
+}) {
+  return <nav className={`sub-tabs ${className}`} aria-label="Views">{options.map(([key, label]) => <button key={key} title={titles?.[key]} className={value === key ? "active" : ""} aria-current={value === key ? "page" : undefined} onClick={() => onChange(key)}>{label}{badges?.[key] !== undefined && badges[key] !== "" && <span>{badges[key]}</span>}</button>)}</nav>;
+}
+
 
 // toLocaleTimeString builds a fresh Intl formatter on every call. Measured
 // against a hoisted one: 16.0ms vs 0.98ms to paint 651 watch rows, and the
@@ -561,9 +665,6 @@ function feedHealth(health?: HealthInfo) {
 
 // The tick-rate badge gives its age suffix up to the index strip; the full
 // "12/s · 4s ago" text stays in the badge title.
-function feedRate(health?: HealthInfo) {
-  return health ? health.session_open ? `${health.tick_rate_per_second}/s` : "Closed" : "—";
-}
 
 // The whale badge was the only surface that read health.chain.error and
 // health.chain.whale_error; the Auction page renders chain data but not its
@@ -587,11 +688,6 @@ function feedTitle(snapshot: Snapshot | undefined, health: HealthInfo | undefine
   return parts.join(" · ");
 }
 
-function healthTone(health?: HealthInfo) {
-  if (!health) return false;
-  const age = health.last_tick_age_seconds;
-  return health.status === "connected" && age !== undefined && age !== null && age < 120;
-}
 
 function Metric({ label, value, tone }: { label: string; value: string; tone?: number }) {
   return <div><span>{label}</span><b className={tone === undefined ? "" : tone >= 0 ? "positive" : "negative"}>{value}</b></div>;
@@ -599,18 +695,42 @@ function Metric({ label, value, tone }: { label: string; value: string; tone?: n
 
 // Header quotes move at the full 10Hz tick rate; memoising per index stops a
 // NIFTY print from re-rendering the BANKNIFTY and SENSEX cells beside it.
-const IndexTicker = memo(function IndexTicker({ label, tick, observedAt }: { label: string; tick?: Tick; observedAt: number }) {
+const IndexTicker = memo(function IndexTicker({ label, short, tick, observedAt }: { label: string; short: string; tick?: Tick; observedAt: number }) {
   const finite = (value?: number | null) => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
   const ltp = finite(tick?.ltp);
   const change = finite(tick?.change ?? (ltp !== undefined && tick?.prev_close ? ltp - tick.prev_close : undefined));
   const pct = finite(tick?.change_pct ?? (change !== undefined && tick?.prev_close ? change / tick.prev_close * 100 : undefined));
   const tone = change === undefined ? "" : change >= 0 ? "positive" : "negative";
   const stamp = quoteStamp(tick?.timestamp, observedAt);
-  return <span className={`index-tick${stamp.aged ? " quote-old" : ""}`} title={`Exchange quote: ${stamp.title}`}>
-    <b>{label}{stamp.aged && <em className="quote-age">{stamp.old ? "prior" : "aged"}</em>}</b>
-    <span className={tone}>{ltp === undefined ? "—" : money.format(ltp)}</span>
-    <small className={tone}>{change === undefined ? "—" : `${change >= 0 ? "+" : ""}${money.format(change)}`}</small>
-    {pct === undefined ? undefined : <i className={`index-pct ${tone}`}>{`${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</i>}
+  // A brief flash on each new print, so a moving index reads as moving.
+  const previous = useRef<number | undefined>(undefined);
+  const [flash, setFlash] = useState("");
+  useEffect(() => {
+    const before = previous.current;
+    previous.current = ltp;
+    if (ltp === undefined || before === undefined || ltp === before) return;
+    setFlash(ltp > before ? "ix-flash-up" : "ix-flash-down");
+    const timer = window.setTimeout(() => setFlash(""), 650);
+    return () => window.clearTimeout(timer);
+  }, [ltp]);
+  return <div className={`ix ${tone} ${flash}${stamp.aged ? " quote-old" : ""}`} title={`${label} · ${stamp.old ? "previous close" : stamp.aged ? "delayed quote" : "live"} · exchange quote ${stamp.title}`}>
+    <div className="ix-row">
+      <span className="ix-name"><span className="ix-full">{label}</span><span className="ix-short">{short}</span></span>
+      {stamp.aged && <span className="ix-aged" aria-label={stamp.old ? "previous close" : "delayed quote"} />}
+      {pct !== undefined && <span className={`ix-pill ${tone}`}>{pct >= 0 ? "▲" : "▼"} {Math.abs(pct).toFixed(2)}%</span>}
+    </div>
+    <div className="ix-row">
+      <span className="ix-ltp">{ltp === undefined ? "—" : money.format(ltp)}</span>
+      <span className={`ix-chg ${tone}`}>{change === undefined ? "" : `${change >= 0 ? "+" : ""}${money.format(change)}`}</span>
+    </div>
+  </div>;
+});
+
+const SessionChip = memo(function SessionChip({ now, holidays, health }: { now: number; holidays?: string[]; health?: HealthInfo }) {
+  const state = sessionState(new Date(now), holidays);
+  const rate = state.phase === "open" && health?.session_open ? ` · ${health.tick_rate_per_second}/s` : "";
+  return <span className={`session-chip session-${state.phase}`} title={health ? `${feedHealth(health)} · ${health.ticks_total ?? 0} ticks · ${health.candles_closed ?? 0} candles closed` : state.label}>
+    <i aria-hidden="true" />{state.label}{rate}<small>{state.detail}</small>
   </span>;
 });
 
@@ -618,12 +738,12 @@ const IndexTicker = memo(function IndexTicker({ label, tick, observedAt }: { lab
 // this the whole tab reconciles every time.
 const WatchRow = memo(function WatchRow({ row, tick, indicator, selected, onSelect, observedAt }: { observedAt: number; row: SpotWatchRow | OptionWatchRow; tick?: Tick; indicator?: Indicator; selected: boolean; onSelect: (symbol: string) => void }) {
   const option = "option_type" in row ? row : undefined;
-  const change = tick?.change ?? (tick?.prev_close ? tick.ltp - tick.prev_close : undefined);
-  const pct = tick?.change_pct ?? (change !== undefined && tick?.prev_close ? change / tick.prev_close * 100 : undefined);
   const stamp = quoteStamp(tick?.timestamp, observedAt);
+  const change = stamp.untraded ? undefined : tick?.change ?? (tick?.prev_close ? tick.ltp - tick.prev_close : undefined);
+  const pct = stamp.untraded ? undefined : tick?.change_pct ?? (change !== undefined && tick?.prev_close ? change / tick.prev_close * 100 : undefined);
   return <button title={`${row.symbol} · Exchange quote: ${stamp.title}`} className={`${selected ? "watch-row active" : "watch-row"}${stamp.aged ? " quote-old" : ""}`} onClick={() => onSelect(row.symbol)}>
     <span><b>{option ? `${option.underlying} ${money.format(option.strike)} ${option.option_type}` : row.symbol.split(":")[1].replace("-EQ", "")}</b><small>{option ? `${option.moneyness || "ATM"} · ${option.expiry} · LOT ${option.lot_size || "—"}` : row.symbol.split(":")[0]}{option?.retained ? " · HELD" : ""}</small></span>
-    <span>{tick ? money.format(tick.ltp) : "—"}<small>{stamp.label}</small></span>
+    <span>{tick && !stamp.untraded ? money.format(tick.ltp) : "—"}<small>{stamp.label}</small></span>
     <span className={(change || 0) >= 0 ? "positive" : "negative"}>{change === undefined ? "—" : `${change >= 0 ? "+" : ""}${money.format(change)}`}<small>{pct === undefined ? "" : `${pct.toFixed(2)}%`}</small></span>
     <span className={(indicator?.macd || 0) >= 0 ? "positive" : "negative"}>{indicator ? indicator.macd.toFixed(2) : "—"}</span>
     <span className={gexTone(option)} title={option?.iv != null ? `IV ${option.iv}% · dealer gamma per 1% move` : "GEX needs open interest and a spot mark"}>

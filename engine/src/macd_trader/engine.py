@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import sqlite3
 import time
 from collections import defaultdict, deque
 from contextlib import suppress
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .brokers import Broker, create_broker
@@ -17,8 +20,9 @@ from .candle_store import (
 from .tick_store import TickStore
 from .regimes import regime_for
 from .rollover import days_to_expiry, first_tradable, is_futures_symbol, Expiry
+from .sessions import in_session, market_close, market_open
 from .candles import CandleAggregator
-from .chart_history import load_chart_history
+from .chart_history import aggregate_session_candles, load_chart_history
 from .config import Settings
 from .contracts import ContractSelector
 from .events import EventHub, json_value
@@ -27,6 +31,11 @@ from .execution import ExecutionManager
 from .models import Candle, Tick, Trade
 from . import market_calendar
 from .blast_engine import BlastEngine
+from .smart_lane import SmartLanes
+from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
+from .option_greeks import book_greeks
+from .entry_context import EntryFlow, is_underlying
+from . import self_heal
 from .desk import (  # noqa: F401 - re-exported; tests and callers read them here
     NIGHTLY_MAX_ATTEMPTS, QUOTES_BACKOFF_MAX_SECONDS, QUOTES_BACKOFF_SECONDS,
     TICK_MAINTENANCE_INTERVAL_SECONDS, DeskMixin, desk_settings,
@@ -48,6 +57,11 @@ LIVE_WARMUP_SOURCE_ROWS = 20_000
 # Fyers permits bounded minute-history requests.  Ninety calendar days is
 # enough to supply the retained live-bar window for a newly listed contract.
 NEW_CONTRACT_HISTORY_DAYS = 90
+# Strategy bars a stale or empty symbol is refilled with at connect.
+WARMUP_HISTORY_BARS = 150
+# Pause between background history requests for new contracts (see
+# Engine._backfill_contract_history): well under the per-minute limit.
+HISTORY_BACKFILL_PACE_SECONDS = 1.0
 # The ratio backfill runs off a browser poll, so a leg whose download fails
 # would re-request on every refresh. Fyers rate-limits per endpoint — the desk
 # collected 429s on /data/quotes on 4 Sep — so a failed attempt stands that leg
@@ -57,10 +71,18 @@ NEW_CONTRACT_HISTORY_DAYS = 90
 # than a transient failure does.
 RATIO_BACKFILL_RETRY_SECONDS = 300.0
 RATIO_BACKFILL_EMPTY_RETRY_SECONDS = 3_600.0
-# Warm-up concurrency is already bounded inside warm() by history_slots(3).
+# Warm-up concurrency is bounded inside warm() by two lanes: stored-history loads and broker downloads.
 # What rate-limited a restart into 138 dead contracts was the RETRY policy:
 # three attempts 0.5s apart all land inside the same per-minute window.
 WARMUP_ATTEMPTS = 5
+# Stored-history loads are ~0.02 s of SQLite and aggregation; broker downloads are seconds each. Separate lanes
+# so cheap loads never queue behind downloads. Loads run ONE at a time: measured on 16 Oct 2026, 666 loads took
+# 18 s serially and 88 s six at a time (SQLite releasing the GIL while the aggregation competes for it -- a
+# convoy). The download lane is network-bound, sized for the 2026-10-16 data-API limits and paced, with the
+# existing 429 back-off on top.
+WARMUP_LOAD_CONCURRENCY = 1
+WARMUP_DOWNLOAD_CONCURRENCY = 4
+WARMUP_DOWNLOAD_PACING_SECONDS = 0.2
 # Seconds to wait after a 429, per attempt. Fyers' history window is per-minute,
 # so the tail has to clear a minute to be worth anything.
 WARMUP_RATE_LIMIT_BACKOFF = (4.0, 12.0, 30.0, 65.0)
@@ -114,15 +136,40 @@ SIGNAL_STALENESS_GRACE_SECONDS = 120
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def _drop_expired(symbols: list[str], known_expiries: dict[str, str], today) -> list[str]:
+    """Remove option contracts whose expiry has passed from a subscription.
+
+    FYERS rejects an expired contract at subscribe time. On 5 Oct a SENSEX
+    weekly that expired on 1 Oct, still held by the blast book, was the one bad
+    symbol in 1,610. Futures, spots and anything unparseable are kept.
+    """
+    from .option_agent import parse_option
+
+    kept = []
+    for symbol in symbols:
+        expiry = known_expiries.get(symbol)
+        if expiry is None and symbol.endswith(("CE", "PE")):
+            parsed = parse_option(symbol)
+            expiry = parsed["expiry"] if parsed else None
+        if expiry is not None and str(expiry)[:10] < today.isoformat():
+            continue
+        kept.append(symbol)
+    return kept
+
+
 def minute_closed_moment(candle) -> datetime:
     """The IST wall-clock moment a closed candle belongs to."""
     return datetime.fromtimestamp(candle.timestamp, UTC).astimezone(IST)
 
 
 def regular_session_open(moment: datetime | None = None) -> bool:
-    """True only during the NSE cash/derivatives session on a trading day."""
-    local = (moment or datetime.now(IST)).astimezone(IST)
-    return market_calendar.is_trading_day(local.date()) and (9, 15) <= (local.hour, local.minute) < (15, 30)
+    """True while any segment is in its continuous session on a trading day.
+
+    The market-wide question (maintenance, feed watchdog, health). Whether one
+    instrument's print belongs to the session is sessions.in_session: F&O runs
+    to 15:40 and cash stops at 15:15 for its closing auction since Aug 2026.
+    """
+    return market_open(moment)
 
 
 def fo_session_open(moment: datetime | None = None) -> bool:
@@ -155,6 +202,24 @@ def preopen_window(moment: datetime | None = None) -> bool:
     return market_calendar.is_trading_day(local.date()) and PREOPEN_WATCH_START <= (local.hour, local.minute) < (9, 15)
 
 
+
+def _smart_lanes(engine) -> list:
+    """The engine's smart lanes, or none -- tests drive engine methods on bare stand-ins."""
+    lanes = getattr(engine, "smart_lanes", None)
+    return lanes.lanes if lanes is not None else []
+
+
+def _held_contract_lots(engine) -> dict[str, int]:
+    """Retention covers every book without expanding its entry universe."""
+    held = {s: p.lot_size for s, p in engine.portfolio.positions.items() if p.quantity > 0}
+    held.update(engine.desk_holdings())
+    blast = getattr(engine, "blast", None)
+    if blast is not None:
+        held.update({s: p.lot_size for s, p in blast.portfolio.positions.items() if p.quantity > 0})
+    for lane in _smart_lanes(engine):
+        held.update({s: p.lot_size for s, p in lane.portfolio.positions.items() if p.quantity > 0})
+    return held
+
 class TradingEngine(DeskMixin):
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -168,6 +233,9 @@ class TradingEngine(DeskMixin):
         self.candles = CandleAggregator(settings.timeframe_seconds)
         self.history: dict[str, deque[Candle]] = defaultdict(lambda: deque(maxlen=500))
         self.history_errors: dict[str, str] = {}
+        self.warmup_report: dict = {}
+        self.history_backfill: dict = {}
+        self._history_backfill_task: asyncio.Task | None = None
         self._warming_symbols: set[str] = set()
         self._warm_live_candles: dict[str, list[Candle]] = defaultdict(list)
         self.position_mark_errors: dict[str, str] = {}
@@ -215,6 +283,9 @@ class TradingEngine(DeskMixin):
         # reboot inside a cooldown, and a dead feed then went unrecovered.
         self._last_feed_recovery = float("-inf")
         self.feed_recoveries = 0
+        self.lane_errors: dict[str, dict] = {}
+        from .entry_scorer import EntryGate
+        self.entry_gate = EntryGate(settings, settings.research_database_path)
         self._preopen_refresh_day: str | None = None
         self.preopen_refreshes = 0
         self.signals_dropped_stale = 0
@@ -275,6 +346,25 @@ class TradingEngine(DeskMixin):
         # signal-line cross the MACD lane deliberately ignores.
         self.blast = BlastEngine(settings.blast_database_path, settings, self.broker, self.events)
         self._blast_task: asyncio.Task | None = None
+        # Fourth and fifth books: the smart lanes (smart_lane.py), the research's
+        # best rules at two capitals. Fed MACD-lane signals and blast-screen passes.
+        self.smart_lanes = SmartLanes(settings, self.broker, self.events)
+        self.extreme_booker = ExtremeBooker(settings.research_database_path)
+        # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
+        # priced them, and the blast journal reads the spread and IV inputs at each candidate.
+        self.outage_repair: dict | None = None
+        self.context_indices: list[str] = []
+        self.context_indices_status: dict = {}
+        self.expired_settlements: list[dict] = []
+        self._self_heal_task: asyncio.Task | None = None
+        self.entry_flow = EntryFlow()
+        quote = lambda symbol: self.latest_ticks.get(symbol)  # noqa: E731
+        for execution in (self.execution, self.blast.execution, *[lane.execution for lane in _smart_lanes(self)]):
+            execution.quote_source = quote
+            execution.entry_context = self.entry_flow.context
+        self.blast.quote_source = quote
+        self.blast.history_path = settings.research_database_path
+        self.blast.candidate_listeners.append(self._offer_blast_candidate)
         self.candle_writer = LiveCandleWriter(settings.research_database_path)
         self.tick_store = TickStore(settings.tick_database_path, settings.tick_retention_days,
                                     settings.flow_retention_days)
@@ -300,12 +390,18 @@ class TradingEngine(DeskMixin):
         async with self._reconfigure_lock:
             await self.connect_feed()
         self.events.publish("snapshot_required", {"reason": "startup_complete"})
+        await self._settle_expired()
+        self._self_heal_task = asyncio.create_task(self._self_heal_loop())
         self._rollover_task = asyncio.create_task(self._rollover_loop())
         self._session_close_task = asyncio.create_task(self._session_close_loop())
         self._watchdog_task = asyncio.create_task(self._feed_watchdog_loop())
         self._expiry_flatten_task = asyncio.create_task(self._expiry_flatten_loop())
         self._dispersion_task = asyncio.create_task(self._dispersion_loop())
         self._blast_task = asyncio.create_task(self._blast_maintenance_loop())
+        self.smart_lanes.start()
+        self._entry_gate_task = asyncio.create_task(self.entry_gate.run(
+            lambda: self.execution, lambda: self.portfolio, self._queued_macd_entry_rejection,
+        ))
         if self.desk_local:
             self._nightly_task = asyncio.create_task(self._nightly_loop())
             self._chain_task = asyncio.create_task(self._chain_loop())
@@ -380,6 +476,50 @@ class TradingEngine(DeskMixin):
                     return True
             day += timedelta(days=1)
         return False
+
+    def _last_completed_session(self, today: date | None = None) -> date:
+        day = (today or datetime.now(IST).date()) - timedelta(days=1)
+        while not market_calendar.is_trading_day(day):
+            day -= timedelta(days=1)
+        return day
+
+    def _history_checked_path(self) -> Path:
+        return Path(self.settings.research_database_path).with_name("history_checked.json")
+
+    def _history_checked(self) -> dict[str, str]:
+        if getattr(self, "_history_checked_cache", None) is None:
+            try:
+                self._history_checked_cache = json.loads(self._history_checked_path().read_text())
+            except (OSError, ValueError):
+                self._history_checked_cache = {}
+        return self._history_checked_cache
+
+    def _history_checked_current(self, symbol: str) -> bool:
+        """The broker was already asked for this symbol after the last completed session."""
+        seen = self._history_checked().get(symbol)
+        return bool(seen) and seen >= self._last_completed_session().isoformat()
+
+    def _mark_history_checked(self, symbol: str) -> None:
+        checked = self._history_checked()
+        checked[symbol] = self._last_completed_session().isoformat()
+        try:
+            self._history_checked_path().write_text(json.dumps(checked))
+        except OSError:
+            pass
+
+    def new_contract_needs_history(self, candles) -> bool:
+        """Must a contract new to the watchlist download before it warms?
+
+        Only when its stored bars fall short or stop before a session. One
+        that already streamed -- as an ITM/OTM or NEXT-series leg, or an agent
+        pick -- replays from the store (~25 ms) with no request. And a download
+        is only the warm-up window; the rest of the 90 days follows in the
+        background (:meth:`_backfill_contract_history`). Fetching all 90 days
+        inline took 1 Oct's warm-up to nine minutes, almost all of it 225 new
+        strikes' downloads. A newly listed option can legitimately have fewer
+        bars than needed; it stays non-mature until real bars accrue.
+        """
+        return len(candles) < self.minimum_warmup_bars() or self.stored_history_is_stale(candles)
 
     def minimum_warmup_bars(self) -> int:
         """Bars required before this contract's indicators are trustworthy.
@@ -614,11 +754,14 @@ class TradingEngine(DeskMixin):
         try:
             await self.broker.connect()
             self._auth_validated_date = datetime.now(IST).date().isoformat()
-            held_positions = {
-                symbol: position.lot_size for symbol, position in self.portfolio.positions.items()
-            }
-            held_positions.update(self.desk_holdings())
+            strategy_held = set(self.portfolio.positions) | set(self.desk_holdings())
+            held_positions = _held_contract_lots(self)
             held = await self.contract_selector.restore_held_contracts(held_positions)
+            # Metadata recovered only for another book's carried holding is
+            # management-only; it must not become a fresh MACD entry candidate.
+            for row in held:
+                if row.symbol not in strategy_held and row.selection_price == 0:
+                    row.analysis_only = True
             # During an in-process rollover the selector already holds the
             # contract metadata. Prefer it, but fall back to the durable
             # snapshot after an API restart.
@@ -643,27 +786,47 @@ class TradingEngine(DeskMixin):
             # strategy's entry universe. Held contracts remain manageable.
             self.option_symbols = [
                 row.symbol for row in contracts
-                if not row.analysis_only or row.retained or row.symbol in held_positions
+                if not row.analysis_only or row.symbol in strategy_held
             ]
             self.analysis_option_symbols = {
                 row.symbol for row in contracts if row.symbol not in self.option_symbols
             }
+            # The option agent's recent picks stay on the feed for their 1-3 day
+            # hold, analysis-only: live marks on its page, and the minute bars its
+            # outcome labels are measured from, after the strike leaves the ladder.
+            try:
+                from .option_agent import watch_symbols
+                agent_watch = await asyncio.to_thread(watch_symbols, self.settings.research_database_path)
+                self.analysis_option_symbols |= agent_watch - set(self.option_symbols)
+            except Exception:  # noqa: BLE001 -- a research read must never block the feed
+                pass
+            # The entry gate's reference data (previous-session volume, 5-session-back close):
+            # read in the background so contract selection never waits on it.
+            asyncio.create_task(self.entry_gate.refresh_reference(
+                [*self.option_symbols, *{row.spot_symbol for row in contracts}]))
             await self._resolve_futures_series()
+            self.context_indices = await self._validated_context_indices()
             # The desk's own instruments must be subscribed too: it watches
             # index futures, which are in neither the spot universe nor the
             # option list.
-            self.all_symbols = list(dict.fromkeys(
+            self.all_symbols = _drop_expired(list(dict.fromkeys(
                 [*self.settings.symbols, *self.option_symbols, *self.analysis_option_symbols, *self.mp_spot_symbols(),
+                 *self.context_indices,
+                 # Keep the shared reference subscribed even if adaptation is
+                 # toggled off, so enabling it does not require a feed restart.
+                 *([self.settings.vix_symbol] if self.settings.vix_symbol else []),
                  # A position opened in the outgoing series still has to be
                  # marked and exited, so it stays subscribed after the roll.
                  *self.portfolio.positions, *self.desk_holdings(),
                  # Stream subscription only, so a blast holding keeps its stop
                  # and trail live. Subscribing is not a fetch: it rides the
                  # websocket the engine already holds open.
-                 *self.blast.portfolio.positions]))
+                 *self.blast.portfolio.positions, *[s for smart in _smart_lanes(self) for s in smart.held_symbols()]])),
+                {row.symbol: row.expiry for row in contracts}, datetime.now(IST).date())
             self.strategy = MACDStrategyManager(self.settings, self.events, self.option_symbols)
             tradable = {row.symbol: row.lot_size for row in contracts if row.symbol in self.option_symbols}
             self.execution.set_tradable_contracts(tradable)
+            self.execution.set_contract_expiries({row.symbol: row.expiry for row in contracts})
             self.blast.set_tradable_contracts(tradable)
             self.blast.set_contract_context({
                 row.symbol: {
@@ -677,18 +840,41 @@ class TradingEngine(DeskMixin):
                 }
                 for row in contracts if row.symbol in self.option_symbols
             })
-            self.blast.set_resolvers(spot_price=self.spot_price)
+            self.blast.set_resolvers(spot_price=self.spot_price,
+                                     vix_quote=lambda: self.latest_ticks.get(self.settings.vix_symbol))
+            lane_context = {
+                row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
+                             "expiry": row.expiry, "volume": row.volume, "oi": row.oi}
+                for row in contracts if row.symbol in self.option_symbols
+            }
+            for lane in _smart_lanes(self):
+                lane.set_tradable_contracts(tradable)
+                lane.set_contract_context(lane_context)
+                lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point)
             self.configure_desk(tradable)
             await self._refresh_position_marks()
 
-            history_slots = asyncio.Semaphore(3)
+            # Self-heal: download the session minutes the app did not capture (host down, feed dead) BEFORE
+            # warm-up, so no indicator steps across a hole. On 15 Oct 2026 this took a manual backfill.
+            try:
+                self.outage_repair = await self_heal.repair_outage(
+                    self.broker, self.settings.research_database_path, list(self.all_symbols))
+            except Exception as exc:  # noqa: BLE001 -- a repair must never block the feed
+                self.outage_repair = {"error": f"{type(exc).__name__}: {exc}"[:300]}
+
+            # Two lanes (boot, 16 Oct 2026): stored-history loads are ~0.1 s each and must not queue behind
+            # broker downloads, which take seconds each and are retried with back-off when Fyers is flaky.
+            load_slots = asyncio.Semaphore(WARMUP_LOAD_CONCURRENCY)
+            download_slots = asyncio.Semaphore(WARMUP_DOWNLOAD_CONCURRENCY)
             new_contracts = set(self.contract_selector.new_symbols)
-            downloaded_bars: list[Candle] = []
+            expiry_by_symbol = {row.symbol: row.expiry for row in contracts}
+            history_backfill: list[str] = []
+            downloaded: set[str] = set()
 
             async def warm(symbol: str) -> None:
                 for attempt in range(WARMUP_ATTEMPTS):
                     try:
-                        async with history_slots:
+                        async with load_slots:
                             stored = await asyncio.to_thread(
                                 load_chart_history,
                                 self.settings.research_database_path,
@@ -706,43 +892,56 @@ class TradingEngine(DeskMixin):
                                 self.settings.kama_roc_period,
                                 source_row_limit=LIVE_WARMUP_SOURCE_ROWS,
                             )
-                            broker_rows = []
-                            needed = self.minimum_warmup_bars()
-                            if symbol in new_contracts:
-                                # Pull the complete available history once when
-                                # a contract first enters the watchlist.  An
-                                # unchanged, newly-listed option can legitimately
-                                # have fewer than ``needed`` bars; re-requesting
-                                # the same unavailable past on every restart only
-                                # delays the websocket.  It remains non-mature
-                                # until real bars accrue in the durable store.
-                                try:
-                                    broker_rows = await self.broker.history_range(
-                                        symbol,
-                                        self.settings.timeframe_seconds,
-                                        datetime.now(UTC) - timedelta(days=NEW_CONTRACT_HISTORY_DAYS),
-                                        datetime.now(UTC),
-                                    )
-                                except Exception:
-                                    if len(stored["candles"]) < needed:
-                                        raise
-                            elif not stored["candles"] or self.stored_history_is_stale(stored["candles"]):
-                                if stored["candles"]:
-                                    self.history_gaps[symbol] = datetime.fromtimestamp(
-                                        stored["candles"][-1].timestamp, UTC).astimezone(IST).date().isoformat()
-                                try:
-                                    broker_rows = await self.broker.history(symbol, self.settings.timeframe_seconds, 150)
-                                except Exception:
-                                    # A restart warms hundreds of contracts at once.  If
-                                    # Fyers rate-limits a supplemental request, retain the
-                                    # already durable research history rather than dropping
-                                    # the whole symbol from the live strategy state.
-                                    if not stored["candles"]:
-                                        raise
-                            if broker_rows:
-                                if self.settings.timeframe_seconds == 60:
-                                    downloaded_bars.extend(broker_rows)
-                                await asyncio.sleep(0.20)
+                        broker_rows = []
+                        minute_rows = []
+                        needed = self.minimum_warmup_bars()
+                        if symbol in new_contracts:
+                            # The rest of its 90 days follows in the
+                            # background once the feed is warm.
+                            history_backfill.append(symbol)
+                        if symbol in new_contracts and self.new_contract_needs_history(stored["candles"]):
+                            try:
+                                async with download_slots:
+                                    broker_rows, minute_rows = await self._download_warmup_history(symbol)
+                                    await asyncio.sleep(WARMUP_DOWNLOAD_PACING_SECONDS)
+                            except Exception:
+                                if len(stored["candles"]) < needed:
+                                    raise
+                        elif symbol not in new_contracts and (
+                                not stored["candles"] or (self.stored_history_is_stale(stored["candles"])
+                                                          and not self._history_checked_current(symbol))):
+                            if stored["candles"]:
+                                self.history_gaps[symbol] = datetime.fromtimestamp(
+                                    stored["candles"][-1].timestamp, UTC).astimezone(IST).date().isoformat()
+                            try:
+                                async with download_slots:
+                                    broker_rows, minute_rows = await self._download_warmup_history(symbol)
+                                    await asyncio.sleep(WARMUP_DOWNLOAD_PACING_SECONDS)
+                                # A quiet contract can have nothing newer to give: remember that it was
+                                # asked, or every boot downloads it again (35 of 71 downloads on 16 Oct).
+                                self._mark_history_checked(symbol)
+                            except Exception:
+                                # A restart warms hundreds of contracts at once.  If
+                                # Fyers rate-limits a supplemental request, retain the
+                                # already durable research history rather than dropping
+                                # the whole symbol from the live strategy state.
+                                if not stored["candles"]:
+                                    raise
+                        if minute_rows:
+                            downloaded.add(symbol)
+                            # Persist per symbol: a 90-day minute download for
+                            # every rolled contract is millions of rows, too
+                            # many to hold until the whole warm-up finishes.
+                            try:
+                                await asyncio.to_thread(
+                                    store_historical_candles,
+                                    self.settings.research_database_path,
+                                    minute_rows,
+                                    None,
+                                    expiry_by_symbol,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - cache failure must not kill the feed
+                                self.candle_writer.last_error = f"history cache failed: {exc}"
                         rows_by_time = {row.timestamp: row for row in stored["candles"]}
                         rows_by_time.update({row.timestamp: row for row in broker_rows})
                         rows = [rows_by_time[key] for key in sorted(rows_by_time)]
@@ -785,23 +984,105 @@ class TradingEngine(DeskMixin):
             self.status = "connected"
             self.error = None
             self._stream_task = asyncio.create_task(self._run_broker_stream())
+            warm_started = time.monotonic()
             await asyncio.gather(*(warm(symbol) for symbol in warm_symbols))
-            if downloaded_bars:
+            self.warmup_report = {
+                "finished_at": datetime.now(IST).isoformat(timespec="seconds"),
+                "seconds": round(time.monotonic() - warm_started, 1),
+                "symbols": len(warm_symbols), "new_contracts": len(new_contracts & set(warm_symbols)),
+                "downloaded": len(downloaded), "selection": dict(self.contract_selector.selection_source),
+            }
+            if downloaded:
+                # The blast lane seeded from the store before these strikes'
+                # bars landed; fold them in now (it reads only newer bars).
                 try:
-                    await asyncio.to_thread(
-                        store_historical_candles,
-                        self.settings.research_database_path,
-                        downloaded_bars,
-                        None,
-                        {row.symbol: row.expiry for row in contracts},
-                    )
-                except Exception as exc:  # noqa: BLE001 - cache failure must not kill the feed
-                    self.candle_writer.last_error = f"history cache failed: {exc}"
+                    await self.blast.warm_from_store(self.settings.research_database_path, sorted(downloaded))
+                except Exception as exc:  # noqa: BLE001
+                    self.blast.error = f"minute-bar warm-up failed: {exc}"
+            if history_backfill:
+                backfill = getattr(self, "_history_backfill_task", None)
+                if backfill and not backfill.done():
+                    backfill.cancel()
+                self._history_backfill_task = asyncio.create_task(
+                    self._backfill_contract_history(list(dict.fromkeys(history_backfill)), expiry_by_symbol))
+            if self.context_indices:
+                self._context_backfill_task = asyncio.create_task(self._backfill_context_indices())
         except Exception as exc:
             self.status = "error"
             self.error = str(exc)
         finally:
             self.events.publish("broker", self.broker_status())
+
+    async def _backfill_contract_history(self, symbols: list[str], expiry_by_symbol: dict[str, str]) -> None:
+        """The older part of each new contract's 90 days, one request at a time, after warm-up.
+
+        Charts, ratio history and research read these bars; no indicator
+        needs them, so they no longer hold up the morning warm-up. Paced well
+        under the history rate limit, and a 429 waits past the minute window.
+        """
+        report = self.history_backfill = {
+            "pending": len(symbols), "stored": 0, "rows": 0, "errors": {},
+            "started_at": datetime.now(IST).isoformat(timespec="seconds"), "finished_at": None,
+        }
+        now = datetime.now(UTC)
+        end = now - timedelta(days=max(0, self._warmup_window_days() - 1))
+        start = now - timedelta(days=NEW_CONTRACT_HISTORY_DAYS)
+        for symbol in symbols:
+            for attempt in range(3):
+                try:
+                    minutes = await self.broker.history_range(symbol, 60, start, end)
+                    if minutes:
+                        await asyncio.to_thread(store_historical_candles, self.settings.research_database_path,
+                                                minutes, None, expiry_by_symbol)
+                        report["rows"] += len(minutes)
+                    report["stored"] += 1
+                    report["errors"].pop(symbol, None)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - background fill; the feed is unaffected
+                    report["errors"][symbol] = str(exc)[:160]
+                    await asyncio.sleep(65.0 if "429" in str(exc) else 5.0)
+            report["pending"] -= 1
+            await asyncio.sleep(HISTORY_BACKFILL_PACE_SECONDS)
+        report["finished_at"] = datetime.now(IST).isoformat(timespec="seconds")
+
+    async def _download_warmup_history(
+        self, symbol: str, days: int | None = None,
+    ) -> tuple[list[Candle], list[Candle]]:
+        """Fetch history as (strategy-timeframe bars, minute bars to persist).
+
+        The durable store holds only one-minute bars, and a download used to be
+        persisted only when the strategy itself ran on one minute. On the
+        30-minute timeframe every new contract's 90-day history lived in
+        memory alone: the blast lane, ratio charts and chart history found no
+        bars for the freshly rolled series, and each restart downloaded it
+        again. Download minutes instead and build the strategy bars from them
+        with the same session-aligned buckets the stored-history path uses.
+
+        ``days`` requests a fixed window (a newly listed contract); otherwise
+        the window covers ``WARMUP_HISTORY_BARS`` strategy bars.
+        """
+        timeframe = self.settings.timeframe_seconds
+        end = datetime.now(UTC)
+        if timeframe <= 60:
+            if days is None:
+                minutes = await self.broker.history(symbol, timeframe, WARMUP_HISTORY_BARS)
+            else:
+                minutes = await self.broker.history_range(symbol, timeframe, end - timedelta(days=days), end)
+            return minutes, minutes
+        if days is None:
+            days = self._warmup_window_days()
+        minutes = await self.broker.history_range(symbol, 60, end - timedelta(days=days), end)
+        return aggregate_session_candles(minutes, timeframe), minutes
+
+    def _warmup_window_days(self) -> int:
+        """Calendar days holding ``WARMUP_HISTORY_BARS`` strategy bars, with room for holidays."""
+        timeframe = self.settings.timeframe_seconds
+        if timeframe <= 60:
+            return 1
+        sessions = -(-WARMUP_HISTORY_BARS * timeframe // (375 * 60))
+        return min(NEW_CONTRACT_HISTORY_DAYS, sessions * 7 // 5 + 5)
 
     def _finish_symbol_warmup(self, symbol: str, historical: list[Candle]) -> None:
         """Replay history then bars received during download, exactly once."""
@@ -824,12 +1105,15 @@ class TradingEngine(DeskMixin):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Always keep the reason. A failure that arrived while the status
+            # was already "error" used to be swallowed, so a stream dying the
+            # same way on every watchdog restart showed "error" with no text.
+            self.error = str(exc) or type(exc).__name__
             if self.status == "connected":
                 self.status = "error"
-                self.error = str(exc)
                 with suppress(Exception):
                     await asyncio.wait_for(self.broker.close(), FEED_STEP_TIMEOUT)
-                self.events.publish("broker", self.broker_status())
+            self.events.publish("broker", self.broker_status())
 
     async def _refresh_position_marks(self) -> None:
         """Apply read-only REST marks without running paper exit logic.
@@ -843,7 +1127,9 @@ class TradingEngine(DeskMixin):
         # The blast lane's holdings are deliberately NOT in this request. That
         # lane never causes a broker call; it is valued below from whatever
         # this call and the stream have already put in memory.
-        symbols = list(dict.fromkeys([*self.portfolio.positions, *mp_positions]))
+        smart_lanes = _smart_lanes(self)
+        symbols = list(dict.fromkeys([*self.portfolio.positions, *mp_positions,
+                                     *[s for lane in smart_lanes for s in lane.portfolio.positions]]))
         blast = getattr(self, "blast", None)
         if not symbols:
             if blast is not None and blast.mark_from(self.latest_ticks):
@@ -861,6 +1147,8 @@ class TradingEngine(DeskMixin):
                 self.position_mark_errors[symbol] = "Fyers returned no positive startup mark"
                 continue
             self.portfolio.mark(symbol, tick.ltp)
+            for lane in smart_lanes:
+                lane.portfolio.mark(symbol, tick.ltp)
             if mp is not None:
                 mp.portfolio.mark(symbol, tick.ltp)
                 mp.last_prices[symbol] = tick.ltp
@@ -889,6 +1177,13 @@ class TradingEngine(DeskMixin):
             await asyncio.wait_for(self.broker.close(), FEED_STEP_TIMEOUT)
         # revalidates the daily token
         await asyncio.wait_for(self.broker.connect(), FEED_STEP_TIMEOUT)
+        # A restart that crosses an expiry must not resubscribe the dead series.
+        self.all_symbols = _drop_expired(self.all_symbols, {}, datetime.now(IST).date())
+        # The replacement socket is what the status now describes. Leaving the
+        # old "error" in place meant _run_broker_stream ignored the next failure
+        # and a recovered feed stayed red.
+        self.status = "connected"
+        self.error = None
         # Via _run_broker_stream, not broker.stream directly: the wrapper is
         # what turns a socket that stops into status="error" and a published
         # broker event. Restarting past it meant a replacement socket could
@@ -942,7 +1237,6 @@ class TradingEngine(DeskMixin):
             async with asyncio.timeout(FEED_STEP_TIMEOUT * 4):
                 async with self._reconfigure_lock:
                     await self.restart_stream()
-            self.error = None
         except Exception as exc:  # noqa: BLE001 — retry on the next sweep
             self.error = f"feed recovery failed: {exc}"
         finally:
@@ -1043,6 +1337,9 @@ class TradingEngine(DeskMixin):
         return False
 
     async def disconnect_feed(self) -> None:
+        backfill = getattr(self, "_history_backfill_task", None)
+        if backfill and not backfill.done():
+            backfill.cancel()
         if self._stream_task:
             self._stream_task.cancel()
             # A dead websocket task can already hold the auth error that
@@ -1060,13 +1357,24 @@ class TradingEngine(DeskMixin):
         with suppress(asyncio.CancelledError, TimeoutError, Exception):
             await asyncio.wait_for(self.broker.close(), FEED_STEP_TIMEOUT)
 
+    def _apply_capital_change(self, initial_capital: float) -> None:
+        """Change only the paper account's funding base, keeping every position and
+        realized result. A later restart reaches the same state by replaying the
+        durable trades from the new initial capital. The change is logged so day
+        P&L does not count new funding as profit (or a withdrawal as a loss)."""
+        capital_delta = initial_capital - self.settings.initial_capital
+        if not capital_delta:
+            return
+        self.portfolio.initial_capital = initial_capital
+        self.portfolio.cash += capital_delta
+        self.repository.record_capital_change(capital_delta, datetime.now().astimezone().isoformat())
+        if self._day_baseline_equity is not None:
+            self._day_baseline_equity += capital_delta
+
     async def reconfigure(self, new_settings: Settings) -> None:
         async with self._reconfigure_lock:
             await self.disconnect_feed()
-            capital_delta = new_settings.initial_capital - self.settings.initial_capital
-            if capital_delta:
-                self.portfolio.initial_capital = new_settings.initial_capital
-                self.portfolio.cash += capital_delta
+            self._apply_capital_change(new_settings.initial_capital)
             self.settings = new_settings
             self.calendar_rejected = market_calendar.configure(new_settings.market_holidays_csv)
             self.broker = create_broker(new_settings)
@@ -1074,6 +1382,9 @@ class TradingEngine(DeskMixin):
             self.execution.broker = self.broker
             self.blast.rebind_broker(self.broker)
             self.blast.apply_settings(new_settings)
+            for smart in _smart_lanes(self):
+                smart.broker.rebind(self.broker)
+                smart.apply_settings(new_settings)
             self.mp.settings.max_positions = new_settings.mp_max_positions
             self.mp.settings.max_trades_per_day = new_settings.mp_max_trades_per_day
             self.mp.vix_symbol = new_settings.vix_symbol
@@ -1098,14 +1409,7 @@ class TradingEngine(DeskMixin):
         """Apply paper-strategy settings without reconnecting the live broker feed."""
         async with self._reconfigure_lock:
             timeframe_changed = new_settings.timeframe_seconds != self.settings.timeframe_seconds
-            capital_delta = new_settings.initial_capital - self.settings.initial_capital
-            if capital_delta:
-                # Preserve every position and realized result while changing
-                # only the paper account's funding base. A later restart
-                # reaches the same state by replaying the durable trades from
-                # the new initial capital.
-                self.portfolio.initial_capital = new_settings.initial_capital
-                self.portfolio.cash += capital_delta
+            self._apply_capital_change(new_settings.initial_capital)
             self.settings = new_settings
             self.calendar_rejected = market_calendar.configure(new_settings.market_holidays_csv)
             self.execution.settings = new_settings
@@ -1122,6 +1426,8 @@ class TradingEngine(DeskMixin):
             self.mp.settings.max_positions = new_settings.mp_max_positions
             self.mp.settings.max_trades_per_day = new_settings.mp_max_trades_per_day
             self.blast.apply_settings(new_settings)
+            for smart in _smart_lanes(self):
+                smart.apply_settings(new_settings)
 
             if timeframe_changed:
                 self.history.clear()
@@ -1164,7 +1470,7 @@ class TradingEngine(DeskMixin):
 
     async def stop(self) -> None:
         for name in ("_startup_task", "_expiry_flatten_task", "_tick_maintenance_task",
-                     "_blast_task", "_history_prune_task", "_desk_status_task"):
+                     "_blast_task", "_history_prune_task", "_desk_status_task", "_self_heal_task"):
             task = getattr(self, name, None)
             if task:
                 task.cancel()
@@ -1208,12 +1514,66 @@ class TradingEngine(DeskMixin):
         await self.disconnect_feed()
         await self.mp.stop()
         await self.blast.stop()
+        if getattr(self, "smart_lanes", None) is not None:
+            await self.smart_lanes.stop()
         if self.bus is not None:
             await self.bus.stop()
         with suppress(Exception):
             self.repository.save_position_excursions(self.portfolio.positions.values())
         self.repository.close()
         self.status = "stopped"
+        self_heal.mark_clean_shutdown(self.settings.database_path, self.settings.engine_role)
+
+    async def _manage_analysis_holdings(self, tick: Tick, exchange_at: datetime) -> None:
+        """Analysis legs cannot enter, but holdings still receive risk handling."""
+        managers = []
+        if tick.symbol in self.portfolio.positions:
+            managers.append(("macd", self.execution))
+        if tick.symbol in self.blast.portfolio.positions:
+            managers.append(("blast", self.blast.execution))
+        managers.extend((lane.name, lane.execution) for lane in _smart_lanes(self)
+                        if tick.symbol in lane.portfolio.positions)
+        current_print = (exchange_at.astimezone(IST).date() == self.last_tick_at.astimezone(IST).date()
+                         and in_session(tick.symbol, exchange_at)
+                         and in_session(tick.symbol, self.last_tick_at))
+        for name, manager in managers:
+            try:
+                if current_print:
+                    await manager.on_tick(tick.symbol, tick.ltp, self.last_tick_at)
+                else:
+                    manager.portfolio.mark(tick.symbol, tick.ltp)
+            except Exception as exc:
+                self.lane_errors[name] = {"count": self.lane_errors.get(name, {}).get("count", 0) + 1,
+                                          "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
+                                          "at": datetime.now(UTC).isoformat()}
+        if managers and current_print:
+            try:
+                await self._exit_expiring_position(tick.symbol)
+            except Exception as exc:
+                self.lane_errors["expiry"] = {"count": self.lane_errors.get("expiry", {}).get("count", 0) + 1,
+                                              "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
+                                              "at": datetime.now(UTC).isoformat()}
+
+    async def close_smart_paper_position(self, name: str, symbol: str, expected_quantity: int):
+        """Explicit user close, priced from a new quote request, with a durable SELL."""
+        lane = next((lane for lane in _smart_lanes(self) if lane.name == name), None)
+        if lane is None:
+            raise ValueError("Unknown smart lane")
+        if self.settings.execution_mode != "paper" or lane.execution.settings.execution_mode != "paper":
+            raise PermissionError("This close action is paper-only")
+        position = lane.portfolio.positions.get(symbol)
+        if position is None or position.quantity != expected_quantity or expected_quantity <= 0:
+            raise ValueError("Holding quantity changed; refresh the position before closing")
+        quotes = await self.broker.quotes([symbol])
+        quote = quotes.get(symbol)
+        if quote is None or not math.isfinite(quote.ltp) or quote.ltp <= 0:
+            raise RuntimeError("No valid broker quote available for the requested close")
+        position = lane.portfolio.positions.get(symbol)
+        if position is None or position.quantity != expected_quantity:
+            raise ValueError("Holding quantity changed during quote refresh")
+        lane.execution.set_quote(symbol, quote.ltp, datetime.now(UTC))
+        lane.execution.arm_exit(symbol, "MANUAL_USER_CLOSE")
+        return await lane.execution.submit(symbol, "SELL", expected_quantity)
 
     async def on_tick(self, tick: Tick) -> None:
         if not tick.symbol or tick.ltp <= 0:
@@ -1234,6 +1594,7 @@ class TradingEngine(DeskMixin):
             if first_report:
                 self.events.publish("broker", self.broker_status())
             return
+        self.entry_gate.days.observe(tick.symbol, tick.ltp, exchange_at)
         if previous is not None:
             previous_at = previous.timestamp if previous.timestamp.tzinfo else previous.timestamp.replace(tzinfo=UTC)
             if exchange_at < previous_at:
@@ -1245,13 +1606,14 @@ class TradingEngine(DeskMixin):
         if self.desk_local:
             await self._desk_on_tick(tick, analysis_only)
         _, minute_closed = self.minute_candles.on_tick(tick)
-        if minute_closed and regular_session_open(minute_closed_moment(minute_closed)):
+        if minute_closed and in_session(minute_closed.symbol, minute_closed_moment(minute_closed)):
             self.candle_writer.add(minute_closed, resolve_expiry(minute_closed.symbol, self.contract_selector.contracts))
             if not analysis_only:
                 # The blast lane screens one-minute bars whatever the strategy
                 # timeframe is; that is the resolution its screen was measured at.
                 await self.blast.on_minute_bar(minute_closed, tick.timestamp)
         if analysis_only:
+            await self._manage_analysis_holdings(tick, exchange_at)
             # latest_ticks was updated above, so the next snapshot still carries
             # this leg's true price — only the per-tick frame is rationed.
             if now - self._analysis_published.get(tick.symbol, 0.0) >= ANALYSIS_TICK_PUBLISH_SECONDS:
@@ -1264,19 +1626,46 @@ class TradingEngine(DeskMixin):
         await self._publish_tick(tick, analysis_only=False)
         current_session_print = (
             exchange_at.astimezone(IST).date() == self.last_tick_at.astimezone(IST).date()
-            and regular_session_open(exchange_at)
+            and in_session(tick.symbol, exchange_at)
         )
-        if regular_session_open() and current_session_print:
+        if in_session(tick.symbol, self.last_tick_at) and current_session_print:
+            if is_underlying(tick.symbol):
+                try:
+                    self.entry_flow.on_tick(tick)
+                except Exception as exc:  # noqa: BLE001 -- measurement must not cost the feed
+                    self.entry_flow.error = f"{type(exc).__name__}: {exc}"[:200]
             # Measure executable quote freshness by receipt, consistently
             # with feed health; Fyers exchange stamps can lag on valid quotes.
-            await self.execution.on_tick(tick.symbol, tick.ltp, self.last_tick_at)
-            await self.blast.on_tick(tick.symbol, tick.ltp, self.last_tick_at, session_open=True)
-            await self._exit_expiring_position(tick.symbol)
+            steps = [("macd", lambda: self.execution.on_tick(tick.symbol, tick.ltp, self.last_tick_at)),
+                     ("blast", lambda: self.blast.on_tick(tick.symbol, tick.ltp, self.last_tick_at, session_open=True)),
+                     ("expiry", lambda: self._exit_expiring_position(tick.symbol))]
+            steps += [(smart.name, (lambda smart=smart: smart.execution.on_tick(tick.symbol, tick.ltp, self.last_tick_at)))
+                      for smart in _smart_lanes(self)]
+            for lane, step in steps:
+                try:
+                    await step()
+                except Exception as exc:  # noqa: BLE001 -- one lane must not stop the feed or the other lanes
+                    self.lane_errors[lane] = {"count": self.lane_errors.get(lane, {}).get("count", 0) + 1,
+                                              "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
+                                              "at": datetime.now(UTC).isoformat()}
+            if self.settings.extreme_booking_enabled and (tick.symbol in EXTREME_SPOTS or self.extreme_booker.pending):
+                try:
+                    books = [self.execution, *[smart.execution for smart in _smart_lanes(self)]]
+                    if tick.symbol in EXTREME_SPOTS:
+                        await self.extreme_booker.on_index_tick(tick.symbol, tick.ltp, books)
+                    else:
+                        await self.extreme_booker.on_option_tick(tick.symbol, books)
+                except Exception as exc:  # noqa: BLE001 -- booking must not stop the feed
+                    self.lane_errors["extreme_booking"] = {"count": self.lane_errors.get("extreme_booking", {}).get("count", 0) + 1,
+                                                           "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
+                                                           "at": datetime.now(UTC).isoformat()}
         else:
             # Prior-session and off-session prints may value a holding, but
             # must not refresh the executable quote or trigger paper risk.
             self.portfolio.mark(tick.symbol, tick.ltp)
             self.blast.portfolio.mark(tick.symbol, tick.ltp)
+            for smart in _smart_lanes(self):
+                smart.portfolio.mark(tick.symbol, tick.ltp)
         if tick.symbol in self.portfolio.positions:
             self.contract_selector.retain(tick.symbol)
         # Candle building and SIGNAL GENERATION are both session-gated. Gating
@@ -1288,13 +1677,6 @@ class TradingEngine(DeskMixin):
         if current is None:
             return
         self.events.publish("candle", current)
-        # Evaluate the forming premium candle against a cloned indicator state
-        # so an eligible entry is sent at the triggering tick, not at close.
-        signal = (None if current.symbol in self._warming_symbols
-                  else self.strategy.on_live_candle(current))
-        if signal and self._signal_bar_is_current(signal) and self.repository.save_signal(signal):
-            self.signals_emitted += 1
-            await self.execution.on_signal(signal)
         if now - self._last_equity_save >= 5:
             self._last_equity_save = now
             self.repository.save_equity_point(self.portfolio.snapshot())
@@ -1311,9 +1693,334 @@ class TradingEngine(DeskMixin):
             point = self.strategy.points.get(closed.symbol)
             if point is not None:
                 await self.execution.on_closed_bar(closed.symbol, point.macd)
+                for smart in _smart_lanes(self):
+                    try:
+                        await smart.execution.on_closed_bar(closed.symbol, point.macd)
+                    except Exception as exc:  # noqa: BLE001
+                        smart.error = f"invalidation {closed.symbol}: {type(exc).__name__}: {exc}"[:300]
             if signal and self._signal_bar_is_current(signal) and self.repository.save_signal(signal):
                 self.signals_emitted += 1
-                await self.execution.on_signal(signal)
+                await self._route_signal(signal)
+        # Commit the prior bar before previewing the new one. Otherwise the
+        # boundary tick skips a close and can duplicate the prior zero-cross.
+        signal = (None if current.symbol in self._warming_symbols
+                  else self.strategy.on_live_candle(current))
+        if signal and self._signal_bar_is_current(signal) and self.repository.save_signal(signal):
+            self.signals_emitted += 1
+            await self._route_signal(signal)
+
+    async def _route_signal(self, signal) -> None:
+        """Option BUY signals go through the entry gate; everything else straight to execution.
+
+        Every tradable option BUY is also offered to the smart lanes, whatever
+        the MACD lane does with it -- each lane keeps its own book. Features are
+        computed once: building them counts the signal into the crowd tally.
+        """
+        gate = self.entry_gate
+        gate.settings = self.settings
+        contract = self.contract_selector.contracts.get(signal.symbol)
+        features = None
+        feature_error = None
+        option_buy = (signal.side == "BUY" and contract is not None
+                      and signal.symbol in self.execution.tradable_symbols)
+        if option_buy:
+            try:
+                features = self._entry_features(signal, contract)
+            except Exception as exc:  # noqa: BLE001 -- a scoring fault must not cost the entry
+                feature_error = f"features {signal.symbol}: {type(exc).__name__}: {exc}"[:300]
+            for smart in _smart_lanes(self):
+                try:
+                    smart.on_macd_signal(signal, contract.option_type, features)
+                except Exception as exc:  # noqa: BLE001
+                    smart.error = f"intake {signal.symbol}: {type(exc).__name__}: {exc}"[:300]
+        if (not gate.enabled or not option_buy or not self.settings.auto_trade
+                or signal.symbol in self.portfolio.positions):
+            await self.execution.on_signal(signal)
+            return
+        if features is None:
+            gate.error = feature_error
+            await self.execution.on_signal(signal)
+            return
+        gate.admit(signal, features)
+
+    def _offer_blast_candidate(self, row: dict) -> None:
+        for smart in _smart_lanes(self):
+            smart.on_blast_candidate(row)
+
+    def _queued_macd_entry_rejection(self, signal) -> str | None:
+        """Recheck a ranked BUY against the current bar and executable quote.
+
+        Ranking delays an entry. A cross that faded during that wait, or whose
+        originating bar has been superseded, is no longer an entry candidate.
+        This check is read-only and does not consume the strategy's one-shot
+        marker; risk exits keep their own execution path.
+        """
+        symbol = signal.symbol
+        bucket = getattr(signal, "evaluated_candle_timestamp", None)
+        if bucket is None or symbol in self._warming_symbols:
+            return "NO_CURRENT_MACD"
+        if not self._signal_bar_is_current(signal):
+            return "BAR_STALE"
+        indicator = self.strategy.indicators.get(symbol)
+        current = self.candles.current.get(symbol)
+        point = self.strategy.points.get(symbol)
+        if indicator is None or current is None or indicator.count + 1 <= self.settings.slow_period:
+            return "NO_CURRENT_MACD"
+        if current.timestamp != bucket and (point is None or point.timestamp != bucket):
+            return "BAR_STALE"
+        try:
+            price = self.execution._fresh_price(symbol)
+        except RuntimeError:
+            return "STALE_PRICE"
+        preview = indicator.preview(price)
+        if preview.macd <= 0:
+            return "MACD_FADED"
+        if current.timestamp == bucket:
+            if preview.previous_macd is None or preview.previous_macd > 0:
+                return "MACD_FADED"
+        elif point.macd <= 0:
+            return "MACD_FADED"
+        if any((self.settings.require_kama_confirmation,
+                self.settings.require_kama_rsi_confirmation,
+                self.settings.require_kama_roc_confirmation)):
+            kama_indicator = copy.deepcopy(self.strategy.kama[symbol])
+            old_kama = kama_indicator.value
+            kama = kama_indicator.update(price)
+            kama_ok = kama is not None and old_kama is not None and price > kama > old_kama
+            rsi_ok = roc_ok = False
+            if self.settings.require_kama_rsi_confirmation:
+                rsi = copy.deepcopy(self.strategy.kama_rsi[symbol]).update(kama) if kama is not None else None
+                rsi_ok = rsi is not None and rsi >= self.settings.kama_rsi_min
+            if self.settings.require_kama_roc_confirmation:
+                roc = copy.deepcopy(self.strategy.kama_roc[symbol]).update(kama) if kama is not None else None
+                roc_ok = roc is not None and roc > self.settings.kama_roc_min
+            if not self.strategy._confirmations_pass(kama_ok, rsi_ok, roc_ok):
+                return "CONFIRMATION_FADED"
+        return None
+
+    def _smart_macd_confirm(self, symbol: str, bucket: int | None, price: float) -> bool | None:
+        """Is the cross still standing? The committed bar once the signal bar has closed, else the intrabar preview."""
+        point = self.strategy.points.get(symbol)
+        if bucket is not None and point is not None and point.timestamp >= bucket:
+            return point.macd > 0
+        indicator = self.strategy.indicators.get(symbol)
+        if indicator is None or not price or price <= 0:
+            return None
+        return indicator.preview(price).macd > 0
+
+    def _entry_features(self, signal, contract) -> dict:
+        from .entry_scorer import NIFTY, build_features
+        gate = self.entry_gate
+        symbol = signal.symbol
+        spot_symbol = contract.spot_symbol
+        spot_tick = self.latest_ticks.get(spot_symbol)
+        nifty_tick = self.latest_ticks.get(NIFTY)
+        option_tick = self.latest_ticks.get(symbol)
+        spot_open, _, _ = gate.days.get(spot_symbol)
+        day_open, day_high, day_low = gate.days.get(symbol)
+        bucket = signal.evaluated_candle_timestamp or int(datetime.now(UTC).timestamp())
+        same, other = gate.crowd(int(bucket), contract.option_type)
+        # A closed-bar signal has already appended its own positive point.
+        # The model's dip and slope features describe the history BEFORE the
+        # signal bar, consistently with the intrabar path and training data.
+        history = [point.macd for point in (self.strategy.point_history.get(symbol) or ())
+                   if point.timestamp < bucket]
+        return build_features(
+            price=self.execution.last_prices.get(symbol) or signal.price,
+            side=1 if contract.option_type == "CE" else -1, strike=float(contract.strike), expiry=str(contract.expiry),
+            now=datetime.now(UTC), is_index=spot_symbol.endswith("-INDEX"),
+            spot=spot_tick.ltp if spot_tick else None, spot_prev_close=spot_tick.prev_close if spot_tick else None,
+            spot_open=spot_open, spot_close_5d=gate.close_5d.get(spot_symbol),
+            spot_vwap=spot_tick.avg_trade_price if spot_tick else None,
+            nifty=nifty_tick.ltp if nifty_tick else None, nifty_prev_close=nifty_tick.prev_close if nifty_tick else None,
+            day_open=day_open, day_high=day_high, day_low=day_low,
+            option_prev_close=option_tick.prev_close if option_tick else None,
+            volume_today=float(option_tick.volume) if option_tick else 0.0,
+            prior_day_volume=gate.prior_volume.get(symbol, 0.0),
+            macd_history=history, macd_preview=float(signal.macd), crowd_same=same, crowd_other=other)
+
+    async def _validated_context_indices(self) -> list[str]:
+        """Context-only sector/broad indices the broker actually prices (config.context_indices_csv).
+
+        One quotes request validates them all, once per day; a name the broker does not know is dropped rather
+        than handed to the websocket subscription. If the check itself fails, nothing extra is subscribed.
+        """
+        today = datetime.now(IST).date().isoformat()
+        cached = getattr(self, "_context_indices_checked", None)
+        if cached and cached[0] == today:
+            return cached[1]
+        candidates = self.settings.context_indices
+        if not candidates:
+            return []
+        try:
+            quotes = await asyncio.wait_for(self.broker.quotes(candidates), FEED_STEP_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 -- context only; never block the feed
+            self.context_indices_status = {"checked": today, "error": f"{type(exc).__name__}: {exc}"[:200]}
+            return []
+        valid = [s for s in candidates if (tick := quotes.get(s)) is not None and tick.ltp and tick.ltp > 0]
+        self.context_indices_status = {"checked": today, "valid": valid, "rejected": [s for s in candidates if s not in valid]}
+        self._context_indices_checked = (today, valid)
+        return valid
+
+    async def _backfill_context_indices(self) -> None:
+        """About 100 days of minute history for context indices that have less, so 1W/1M moves and a daily RRG exist at once."""
+        from .self_heal import last_captured
+        for symbol in list(getattr(self, "context_indices", [])):
+            try:
+                last = await asyncio.to_thread(last_captured, self.settings.research_database_path, symbol)
+                count = await asyncio.to_thread(self._stored_minutes, symbol)
+                if count >= 375 * 55 and last and (datetime.now(UTC) - last) < timedelta(days=4):
+                    continue
+                end = datetime.now(IST)
+                rows = await self.broker.history_range(symbol, 60, end - timedelta(days=99), end)   # Fyers caps 1-minute ranges at 100 days
+                await asyncio.to_thread(store_historical_candles, self.settings.research_database_path, rows)
+                await asyncio.sleep(0.3)
+            except Exception as exc:  # noqa: BLE001
+                self.context_indices_status = {**getattr(self, "context_indices_status", {}),
+                                               "backfill_error": f"{symbol}: {type(exc).__name__}: {exc}"[:200]}
+
+    def _stored_minutes(self, symbol: str) -> int:
+        with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=30) as db:
+            return db.execute("SELECT COUNT(*) FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60",
+                              (symbol,)).fetchone()[0]
+
+    async def atm_heatmap(self, as_of: date | None = None) -> dict:
+        """ATM CE/PE premium changes over 1H..1M per underlying (atm_heatmap.py); cached for 30 s.
+
+        ``as_of`` replays the map at that day's close with the ATM contracts of that day (a past day never
+        changes, so its answer is kept)."""
+        from . import atm_heatmap
+        context = list(dict.fromkeys([*(self.context_indices or self.settings.context_indices),
+                                      *([self.settings.vix_symbol] if self.settings.vix_symbol else [])]))
+        if as_of is not None:
+            as_of = atm_heatmap._first_session_on_or_after(as_of)   # a holiday or weekend means the next session
+        if as_of is not None and as_of < datetime.now(IST).date():
+            history = self.__dict__.setdefault("_atm_heatmap_history", {})
+            if as_of not in history:
+                path = self.settings.research_database_path
+                contracts = await asyncio.to_thread(atm_heatmap.historical_contracts, path, as_of)
+                close = datetime.combine(as_of, atm_heatmap.CLOSE, IST)
+                result = await asyncio.to_thread(atm_heatmap.build, path, contracts, {}, close, context)
+                if not result["rows"]:
+                    return result
+                history[as_of] = result
+            return history[as_of]
+        cached = getattr(self, "_atm_heatmap_cache", None)
+        if cached and time.monotonic() - cached[0] < 30:
+            return cached[1]
+        contracts = [
+            {"underlying": c.underlying, "spot_symbol": c.spot_symbol, "option_type": c.option_type,
+             "symbol": c.symbol, "strike": c.strike, "expiry": c.expiry}
+            for c in self.contract_selector.contracts.values()
+            if getattr(c, "moneyness", "ATM") == "ATM" and not getattr(c, "analysis_only", False)
+        ]
+        if not contracts:
+            # No live selection yet (still connecting, or the day's broker token is not in): use the last
+            # saved selection, so the map still shows the most recent ATM contracts off-hours.
+            try:
+                saved = json.loads(Path(self.settings.contract_snapshot_path).read_text())
+                contracts = [{key: row.get(key) for key in ("underlying", "spot_symbol", "option_type", "symbol", "strike", "expiry")}
+                             for row in saved.get("contracts", [])
+                             if str(row.get("moneyness") or "ATM").upper() == "ATM" and not row.get("analysis_only")]
+            except (OSError, ValueError):
+                contracts = []
+        live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
+        result = await asyncio.to_thread(atm_heatmap.build, self.settings.research_database_path, contracts, live, None, context)
+        if result["rows"]:                       # never cache the empty answer of a still-selecting engine
+            self._atm_heatmap_cache = (time.monotonic(), result)
+        return result
+
+    def _wheel_symbols(self) -> list[str]:
+        broad = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX", "NSE:MIDCPNIFTY-INDEX"]
+        return list(dict.fromkeys([*broad, *(self.context_indices or self.settings.context_indices),
+                                   *[s for s in self.settings.symbols if s.endswith("-EQ")]]))
+
+    async def sector_wheel(self) -> dict:
+        """Own and NIFTY-relative 1/5/20/60-session returns (sector_wheel.py); cached 60 s. Daily closes are
+        refreshed in the background once per completed session."""
+        from . import sector_wheel
+        task = getattr(self, "_wheel_refresh_task", None)
+        if (task is None or task.done()) and getattr(self, "_wheel_refreshed_for", None) != sector_wheel.last_completed_session(datetime.now(IST)):
+            async def run() -> None:
+                report = await sector_wheel.refresh(self.broker, self.settings.research_database_path, self._wheel_symbols())
+                self.wheel_refresh_report = {**report, "at": datetime.now(UTC).isoformat()}
+                if not report["errors"] and not await asyncio.to_thread(
+                        sector_wheel.stale_symbols, self.settings.research_database_path, self._wheel_symbols(), datetime.now(IST)):
+                    self._wheel_refreshed_for = sector_wheel.last_completed_session(datetime.now(IST))
+                self._sector_wheel_cache = None
+            self._wheel_refresh_task = asyncio.create_task(run())
+        cached = getattr(self, "_sector_wheel_cache", None)
+        if cached and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
+        result = await asyncio.to_thread(sector_wheel.build, self.settings.research_database_path, self._wheel_symbols(), live)
+        result["refreshing"] = not self._wheel_refresh_task.done()
+        if result["rows"]:
+            self._sector_wheel_cache = (time.monotonic(), result)
+        return result
+
+    async def trend_rotation(self, kind: str, timeframe: int) -> dict:
+        from . import trend_rotation
+        key = (kind, timeframe)
+        cache = self.__dict__.setdefault("_trend_rotation_cache", {})
+        tasks = self.__dict__.setdefault("_trend_rotation_tasks", {})
+        if key in cache and time.monotonic() - cache[key][0] < 60:
+            return cache[key][1]
+        if key not in tasks or tasks[key].done():
+            async def compute():
+                if kind == "SPOT":
+                    instruments = [{"symbol": s, "spot_symbol": s} for s in dict.fromkeys(
+                        [*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
+                        if s.endswith(("-EQ", "-INDEX"))]
+                else:
+                    # Reuse the current ATM identities, including saved selection during connection warm-up.
+                    heatmap = await self.atm_heatmap()
+                    instruments = [{"symbol": row[kind.lower()]["symbol"], "underlying": row["underlying"],
+                                    "spot_symbol": row["spot_symbol"], "strike": row[kind.lower()]["strike"],
+                                    "expiry": row["expiry"]}
+                                   for row in heatmap["rows"] if kind.lower() in row]
+                result = await asyncio.to_thread(trend_rotation.build, self.settings.research_database_path,
+                                                 instruments, kind, timeframe)
+                if instruments:
+                    cache[key] = (time.monotonic(), result)
+                return result
+            tasks[key] = asyncio.create_task(compute())
+        return await asyncio.shield(tasks[key])
+
+    def warmup_status(self) -> dict:
+        wanted = set(self.settings.symbols) | set(self.option_symbols)
+        return {"required": len(wanted), "with_indicators": sum(symbol in self.strategy.points for symbol in wanted)}
+
+    def _books(self) -> list[tuple[str, object]]:
+        return [("macd", self.execution), ("blast", self.blast.execution),
+                *[(lane.name, lane.execution) for lane in _smart_lanes(self)]]
+
+    async def _settle_expired(self) -> None:
+        """Close holdings whose contract expired while the app was down (self_heal.settle_expired_books)."""
+        try:
+            settled = await self_heal.settle_expired_books(self._books(), self.settings.research_database_path)
+        except Exception as exc:  # noqa: BLE001 -- recovery must not stop startup
+            self.lane_errors["self_heal"] = {"at": datetime.now(UTC).isoformat(), "error": f"{type(exc).__name__}: {exc}"[:300]}
+            return
+        unresolved = [row for row in settled if row.get("error")]
+        if unresolved:
+            self.lane_errors["self_heal"] = {"at": datetime.now(UTC).isoformat(),
+                "error": "expired settlement unresolved", "positions": unresolved}
+        else:
+            self.lane_errors.pop("self_heal", None)
+        if settled:
+            self.expired_settlements = [*settled, *self.expired_settlements][:50]
+            self.events.publish("snapshot_required", {"reason": "expired_positions_settled"})
+
+    async def _self_heal_loop(self) -> None:
+        """After each session's close, settle any expiry the 15:20 exit could not sell (no fresh quote, app restarting)."""
+        done: str | None = None
+        while True:
+            await asyncio.sleep(60)
+            now = datetime.now(IST)
+            if market_calendar.is_trading_day(now.date()) and (now.hour, now.minute) >= (15, 35) and done != now.date().isoformat():
+                done = now.date().isoformat()
+                await self._settle_expired()
 
     async def _exit_expiring_position(self, symbol: str) -> None:
         # The blast lane judges expiry from its own recorded contract, so a
@@ -1346,7 +2053,7 @@ class TradingEngine(DeskMixin):
             today = now.date().isoformat()
             if not market_calendar.is_trading_day(now.date()) or self._flushed_session == today:
                 continue
-            if (now.hour, now.minute) < (15, 30):
+            if now.time() < market_close(now.date()):
                 continue
             self._flushed_session = today
             for candle in self.candles.flush():
@@ -1359,7 +2066,7 @@ class TradingEngine(DeskMixin):
                 signal = self.strategy.on_closed_candle(candle)
                 if signal and self.repository.save_signal(signal):
                     self.signals_emitted += 1
-                    await self.execution.on_signal(signal)
+                    await self._route_signal(signal)
             for candle in self.minute_candles.flush():
                 self.candle_writer.add(candle, resolve_expiry(candle.symbol, self.contract_selector.contracts))
             await self.mp.close_positions()
@@ -1373,9 +2080,11 @@ class TradingEngine(DeskMixin):
         for its stop and trail, which the stream subscription supplies, and
         warming it would be a history request made for that lane alone.
         """
+        # Boot priority (16 Oct 2026): what the books hold first, then the underlyings, then the band. Both
+        # warm-up lanes queue in this order, so open positions have indicators first after a restart.
         return list(dict.fromkeys([
-            *self.settings.symbols, *self.option_symbols, *self.mp_spot_symbols(),
             *self.portfolio.positions, *self.desk_holdings(),
+            *self.settings.symbols, *self.mp_spot_symbols(), *self.option_symbols,
         ]))
 
     def spot_price(self, spot_symbol: str | None) -> float | None:
@@ -1398,6 +2107,8 @@ class TradingEngine(DeskMixin):
             try:
                 await asyncio.to_thread(self.blast.flush_watchers)
                 self.blast.sweep_closed_positions()
+                for smart in _smart_lanes(self):
+                    smart.sweep_closed_positions()
             except Exception as exc:  # noqa: BLE001 - journalling must not die
                 self.blast.error = f"journal flush failed: {exc}"
 
@@ -1643,26 +2354,39 @@ class TradingEngine(DeskMixin):
         """Implied vol, gamma and GEX for one contract from live marks.
 
         Uses the option's own last trade for the premium and the underlying's
-        last trade for spot; open interest prefers the live tick and falls back
-        to the value captured at selection.
+        last trade for spot. Both exchange quotes must be fresh; the selection
+        reference is an underlying price, never an option premium. Open
+        interest prefers the live tick and falls back to the selection value.
         """
+        blank = {"iv": None, "gamma": None, "gex": None}
+        moment = datetime.now(UTC)
         option_tick = self.latest_ticks.get(contract.symbol)
         spot_tick = self.latest_ticks.get(contract.spot_symbol)
-        premium = option_tick.ltp if option_tick else contract.selection_price
-        spot = spot_tick.ltp if spot_tick else None
+        for tick in (option_tick, spot_tick):
+            if tick is None or not math.isfinite(tick.ltp) or tick.ltp <= 0:
+                self._greeks_cache.pop(contract.symbol, None)
+                return blank
+            stamp = tick.timestamp if tick.timestamp.tzinfo else tick.timestamp.replace(tzinfo=UTC)
+            age = (moment - stamp).total_seconds()
+            if age < -5 or age > self.settings.order_quote_max_age_seconds:
+                self._greeks_cache.pop(contract.symbol, None)
+                return blank
+        premium = option_tick.ltp
+        spot = spot_tick.ltp
         open_interest = None
         if option_tick is not None and option_tick.open_interest is not None:
             open_interest = option_tick.open_interest
         elif contract.oi:
             open_interest = contract.oi
         if not spot or open_interest is None:
-            return {"iv": None, "gamma": None, "gex": None}
+            self._greeks_cache.pop(contract.symbol, None)
+            return blank
         inputs = (float(premium or 0), float(spot), int(open_interest), self.settings.risk_free_rate)
         now = time.monotonic()
         cached = self._greeks_cache.get(contract.symbol)
-        # Reuse while the marks are unchanged, and for a few seconds even when
-        # they move: a display snapshot does not need a fresh solve per tick.
-        if cached and (cached[1] == inputs or now - cached[0] < GREEKS_CACHE_SECONDS):
+        # Throttle display solves for a few seconds, but elapsed time changes
+        # expiry even if prices stand still. Quote validity is checked first.
+        if cached and 0 <= now - cached[0] < GREEKS_CACHE_SECONDS:
             return cached[2]
         result = contract_gex(
             premium=inputs[0],
@@ -1673,6 +2397,7 @@ class TradingEngine(DeskMixin):
             open_interest=inputs[2],
             lot_size=int(contract.lot_size or 0),
             rate=inputs[3],
+            now=moment,
         )
         self._greeks_cache[contract.symbol] = (now, inputs, result)
         return result
@@ -1680,6 +2405,7 @@ class TradingEngine(DeskMixin):
     def snapshot(self) -> dict:
         listed = set(self.settings.symbols) | set(self.contract_selector.contracts)
         desk_held = self.desk_holdings()
+        held_contracts = _held_contract_lots(self)
         return json_value(
             {
                 "broker": self.broker_status(),
@@ -1725,7 +2451,7 @@ class TradingEngine(DeskMixin):
                         "selection_price": contract.selection_price,
                         "liquidity_volume": contract.volume,
                         "oi": contract.oi,
-                        "retained": contract.retained or contract.symbol in self.portfolio.positions or contract.symbol in desk_held,
+                        "retained": contract.retained or contract.symbol in held_contracts,
                         "moneyness": contract.moneyness,
                         "analysis_only": contract.analysis_only,
                         "lot_size": contract.lot_size,
@@ -1750,6 +2476,7 @@ class TradingEngine(DeskMixin):
                     "selection_date": self._selection_date,
                     "rollover": "new ATM contracts selected daily after 08:45 IST; held contracts remain until exit; expiry exit at 15:20 IST",
                     "errors": self.contract_selector.errors,
+                    "source": self.contract_selector.selection_source,
                 },
                 # Last two bars per symbol only — the full series for the
                 # selected chart streams from /api/chart, and shipping 636×500
@@ -1774,14 +2501,56 @@ class TradingEngine(DeskMixin):
         today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
         if self._day_baseline_date != today:
             midnight_utc = datetime.fromisoformat(f"{today}T00:00:00+05:30").astimezone(UTC).isoformat()
-            baseline = self.repository.last_equity_before(midnight_utc)
-            if baseline is None:
+            point = self.repository.last_equity_point_before(midnight_utc)
+            if point is None:
                 # No history before today (fresh equity log) — anchor to the
                 # first sample of the day so day P&L still means something.
-                baseline = self.repository.first_equity_on_or_after(midnight_utc)
-            self._day_baseline_equity = baseline
+                point = self.repository.first_equity_point_on_or_after(midnight_utc)
+            # Funding added after the anchor (e.g. a raise after yesterday's
+            # close) is capital, not today's profit.
+            self._day_baseline_equity = (
+                None if point is None else point[1] + self.repository.capital_added_after(point[0]))
             self._day_baseline_date = today
         return self._day_baseline_equity
+
+    def book_greeks(self) -> dict:
+        """Delta, theta and vega of every paper book's open options (option_greeks.book_greeks).
+
+        The limits are gross premium caps, which do not show direction: on 14 Oct 2026 the MACD book held
+        36 CE / 7 PE, Rs 5.5 Cr of net long underlying delta on Rs 1.07 Cr of equity. Display only; no
+        rule reads it. Spot is the latest tick, else the last stored minute close (off-session).
+        """
+        from .option_agent import parse_option
+        now = datetime.now(UTC)
+        stored: dict[str, float | None] = {}
+
+        def spot_price(spot_symbol: str) -> float | None:
+            tick = self.latest_ticks.get(spot_symbol)
+            if tick is not None and tick.ltp and tick.ltp > 0:
+                return tick.ltp
+            if spot_symbol not in stored:
+                try:
+                    with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=5) as db:
+                        row = db.execute("""SELECT close FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60
+                                            ORDER BY timestamp DESC LIMIT 1""", (spot_symbol,)).fetchone()
+                    stored[spot_symbol] = float(row[0]) if row else None
+                except sqlite3.Error:
+                    stored[spot_symbol] = None
+            return stored[spot_symbol]
+
+        def spot_of(symbol: str):
+            parsed = parse_option(symbol)
+            if not parsed or not parsed.get("spot"):
+                return None
+            spot = spot_price(parsed["spot"])
+            return (spot, parsed) if spot else None
+
+        books = [("macd", self.portfolio), ("blast", self.blast.portfolio),
+                 *[(lane.name, lane.portfolio) for lane in _smart_lanes(self)]]
+        return {"as_of": now.isoformat(),
+                "model": "Black-Scholes on spot, r 6.5%, no dividend; delta in rupees of underlying",
+                "books": {name: book_greeks(list(portfolio.positions.items()), portfolio.snapshot()["equity"], spot_of, now)
+                          for name, portfolio in books}}
 
     def health(self) -> dict:
         now = time.monotonic()
@@ -1811,10 +2580,10 @@ class TradingEngine(DeskMixin):
             "history_gaps_repaired": len(self.history_gaps),
             "history_gap_details": dict(list(self.history_gaps.items())[:20]),
             "history_error_details": dict(list(self.history_errors.items())[:20]),
-            "warmup": {
-                "required": len(set(self.settings.symbols) | set(self.option_symbols)),
-                "with_indicators": sum(symbol in self.strategy.points for symbol in set(self.settings.symbols) | set(self.option_symbols)),
-            },
+            "warmup_report": getattr(self, "warmup_report", {}),
+            "history_backfill": {**getattr(self, "history_backfill", {}),
+                                 "errors": len(getattr(self, "history_backfill", {}).get("errors") or {})},
+            "warmup": self.warmup_status(),
             "session_open": regular_session_open(),
             "market_calendar": {**market_calendar.status(datetime.now(IST).date()),
                                 "rejected_tokens": self.calendar_rejected},
@@ -1823,7 +2592,16 @@ class TradingEngine(DeskMixin):
             "feed_alive": self.feed_alive(),
             "token_expired": self.token_expired(),
             "feed_recoveries": self.feed_recoveries,
+            "lane_errors": self.lane_errors,
+            "entry_scoring": self.entry_gate.status(),
             "preopen_refreshes": self.preopen_refreshes,
+            "extreme_booking": self.extreme_booker.health() if self.settings.extreme_booking_enabled else {"enabled": False},
+            "entry_flow": self.entry_flow.health(),
+            "context_indices": self.context_indices_status,
+            "self_heal": {"outage_repair": self.outage_repair, "expired_settlements": self.expired_settlements[:10]},
+            "boot": self_heal.boot_report(self.settings.database_path, self.settings.engine_role, self.warmup_status(),
+                                          getattr(self, "warmup_report", None), getattr(self, "history_backfill", None),
+                                          self.status),
             "signals_dropped_stale": self.signals_dropped_stale,
             "signal_staleness_limit_seconds": self.signal_staleness_limit(),
             "last_stale_drop": self.last_stale_drop,
@@ -1840,6 +2618,7 @@ class TradingEngine(DeskMixin):
                            key: self.desk_status.get(key) for key in ("reachable", "checked_at", "error", "bus")},
                        "bus": self.bus.status() if self.bus else None},
             "blast": self.blast.health(),
+            "smart_lanes": {smart.name: smart.health() for smart in _smart_lanes(self)},
             "rollover": self.rollover_status(),
         }
 

@@ -76,6 +76,7 @@ def trade_outcome(candles: list[Candle], entry_index: int) -> dict:
             exit_price = min(candle.open, entry * 0.70) * 0.9995
             return {
                 "closed": True, "return_pct": (exit_price / entry - 1) * 100,
+                "exit_time": datetime.fromtimestamp(candle.timestamp + 1800, UTC).isoformat(),
                 "mfe_pct": (maximum / entry - 1) * 100, "mae_pct": (minimum / entry - 1) * 100,
                 "exit_reason": "HARD_STOP_30_PCT",
             }
@@ -83,6 +84,7 @@ def trade_outcome(candles: list[Candle], entry_index: int) -> dict:
             exit_price = min(candle.open, trailing) * 0.9995
             return {
                 "closed": True, "return_pct": (exit_price / entry - 1) * 100,
+                "exit_time": datetime.fromtimestamp(candle.timestamp + 1800, UTC).isoformat(),
                 "mfe_pct": (maximum / entry - 1) * 100, "mae_pct": (minimum / entry - 1) * 100,
                 "exit_reason": "TRAILING_STOP_25_PCT",
             }
@@ -92,6 +94,7 @@ def trade_outcome(candles: list[Candle], entry_index: int) -> dict:
     last = candles[-1].close
     return {
         "closed": False, "return_pct": (last / entry - 1) * 100,
+        "exit_time": None,
         "mfe_pct": (maximum / entry - 1) * 100, "mae_pct": (minimum / entry - 1) * 100,
         "exit_reason": "OPEN",
     }
@@ -202,11 +205,31 @@ def quantiles(values: list[float]) -> list[float]:
 
 
 def discover(events: list[dict]) -> dict:
-    closed = [row for row in events if row["closed"]]
-    dates = sorted({row["date"] for row in closed})
+    # Partition by signal dates before inspecting any outcomes. Open positions
+    # must not silently move the held-out dates back into the training period.
+    dates = sorted({row["date"] for row in events})
     test_dates = set(dates[-2:])
-    train = [row for row in closed if row["date"] not in test_dates]
-    test = [row for row in closed if row["date"] in test_dates]
+    test = [row for row in events if row["date"] in test_dates]
+    train = []
+    purged = 0
+    unknown_exit_times = 0
+    test_start = datetime.fromisoformat(min(test_dates)).replace(tzinfo=IST) if test_dates else None
+    for row in events:
+        if row["date"] in test_dates or not row["closed"]:
+            continue
+        try:
+            exit_time = datetime.fromisoformat(row.get("exit_time") or "")
+            if exit_time.tzinfo is None:
+                exit_time = exit_time.replace(tzinfo=IST)
+        except (TypeError, ValueError):
+            # Older archives omitted close times. They can support exploratory
+            # selection, but cannot certify that training labels preceded test.
+            unknown_exit_times += 1
+        else:
+            if test_start is not None and exit_time >= test_start:
+                purged += 1
+                continue
+        train.append(row)
     features = [
         "volume_ratio", "option_ret_1", "option_ret_2", "kama_slope", "above_kama",
         "bb_position", "bb_width_pct", "macd_impulse", "candle_close_location", "candle_range_pct",
@@ -240,23 +263,45 @@ def discover(events: list[dict]) -> dict:
             combinations.append((left, right))
     for combination in combinations:
         selected_train = [row for row in train if all(predicate(row) for _, predicate in combination)]
-        selected_test = [row for row in test if all(predicate(row) for _, predicate in combination)]
-        if len(selected_train) < 12 or len(selected_test) < 4:
+        if len(selected_train) < 12:
             continue
-        train_metrics, test_metrics = metrics(selected_train), metrics(selected_test)
-        if train_metrics["average_return_pct"] <= 0 or test_metrics["average_return_pct"] <= 0:
+        train_metrics = metrics(selected_train)
+        if train_metrics["average_return_pct"] <= 0:
             continue
-        score = min(train_metrics["average_return_pct"], test_metrics["average_return_pct"]) * math.sqrt(len(selected_test))
+        score = train_metrics["average_return_pct"] * math.sqrt(len(selected_train))
         candidates.append({
             "rule": [name for name, _ in combination], "score": round(score, 4),
-            "train": train_metrics, "test": test_metrics,
+            "train": train_metrics, "predicates": [predicate for _, predicate in combination],
         })
     candidates.sort(key=lambda row: row["score"], reverse=True)
+    # Freeze the shortlist first; held-out features, coverage and returns only
+    # affect its reported metrics, never its membership, thresholds or order.
+    shortlist = []
+    for candidate in candidates[:20]:
+        predicates = candidate.pop("predicates")
+        selected_test = [row for row in test if all(predicate(row) for predicate in predicates)]
+        shortlist.append({**candidate, "test": metrics(selected_test)})
     return {
         "split": {"training_dates": [date for date in dates if date not in test_dates], "test_dates": sorted(test_dates)},
+        "selection": {
+            "partition": "last two signal dates; fixed before inspecting closed outcomes",
+            "thresholds": "training feature quantiles only",
+            "ranking": "training average return times square root of training closed trades",
+            "minimum_training_closed_trades": 12,
+            "holdout_used_for_selection": False,
+            "training_labels_purged_at_or_after_test_start": purged,
+            "training_labels_without_verified_exit_time": unknown_exit_times,
+            "holdout_independence_verified": bool(train and test) and unknown_exit_times == 0,
+            "evidence_status": "exploratory_unpurged" if unknown_exit_times else "exploratory_purged",
+            "validated_for_deployment": False,
+            "candidates_considered": len(combinations),
+            "positive_training_candidates": len(candidates),
+        },
         "baseline_train": metrics(train), "baseline_test": metrics(test),
         "large_winner_feature_medians": feature_profiles,
-        "robust_candidates": candidates[:20],
+        # Retain the legacy key for consumers; these are training discoveries,
+        # not certified robust rules (see the explicit selection provenance).
+        "robust_candidates": shortlist,
     }
 
 
@@ -267,7 +312,7 @@ def main() -> None:
     events = build_events(db, contracts)
     result = {
         "generated_at": datetime.now(UTC).isoformat(),
-        "method": "30-minute premium MACD zero-cross events; features frozen at signal; next-bar entry; last two trading dates held out",
+        "method": "30-minute premium MACD zero-cross events; features frozen at signal; next-bar entry; rules selected on purged training labels before last-two-signal-date evaluation",
         "all_events": metrics(events),
         "discovery": discover(events),
         "events": events,

@@ -19,6 +19,8 @@ const candidate = (over: Partial<BlastCandidate> = {}): BlastCandidate => ({
 const SETTINGS: BlastSettings = {
   enabled: true, auto_trade: false, initial_capital: 1_000_000, max_positions: 10, target_notional: 100_000,
   max_premium_pct: 1.2, min_breadth: 0.5, min_off_high_pct: 25, hard_stop_pct: 0.5, trail_activation_pct: 0.3, trail_pct: 0.4,
+  vix_adaptive_enabled: true, vix_reference: 20, vix_breadth_adjustment: -0.10,
+  vix_max_age_seconds: 900, rich_premium_max_multiple: 2,
 };
 
 test("the funnel subtracts each leg in the order the screen applies them", () => {
@@ -98,4 +100,13 @@ test("a save sends only what changed", () => {
 test("the session date is the IST date", () => {
   assert.equal(istDay("2026-09-13T18:29:00Z"), "2026-09-13");
   assert.equal(istDay("2026-09-13T18:30:00Z"), "2026-09-14");
+});
+
+test("VIX controls preserve negative breadth adjustment and the deployed position cap", () => {
+  const form = toForm({ ...SETTINGS, max_positions: 1000 });
+  assert.equal(form.vix_breadth_adjustment_pct, "-10");
+  const result = fromForm(form);
+  assert.equal(result.payload?.vix_breadth_adjustment, -0.1);
+  assert.equal(result.payload?.max_positions, 1000);
+  assert.match(fromForm({ ...form, rich_premium_max_multiple: "5" }).error ?? "", /Rich premium multiple/);
 });

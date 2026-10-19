@@ -22,8 +22,12 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from . import market_calendar, nightly, whale
+from .self_heal import session_history_coverage
 from .rollover import days_to_expiry, is_futures_symbol
 from .universe import INDEX_SPOTS, desk_underlying
+
+# Index instruments (futures, options, spots) by symbol prefix; no F&O stock begins with these.
+INDEX_OPTION_PREFIXES = ("NSE:NIFTY", "NSE:BANKNIFTY", "BSE:SENSEX", "NSE:MIDCPNIFTY")
 
 IST = ZoneInfo("Asia/Kolkata")
 # Fyers rate-limits /data/quotes per endpoint. The futures-OI call is once a
@@ -37,6 +41,17 @@ QUOTES_BACKOFF_MAX_SECONDS = 1800.0
 NIGHTLY_MAX_ATTEMPTS = 60
 # Raw ticks are condensed outside market hours; check periodically.
 TICK_MAINTENANCE_INTERVAL_SECONDS = 900
+# The option agent summarises the earlier sessions at 14:30 (they do not change
+# during the day), emits after the 14:45 feature cutoff and learns once the
+# evening's bars are in. A minute bar is written only when the contract's next
+# tick arrives, so at 14:45:15 thin contracts had no 14:44 bar yet; 14:47 lets
+# those bars land (features still stop at 14:45).
+AGENT_PREPARE_AT = (14, 30, 0)
+AGENT_EMIT_AT = (14, 47, 0)
+AGENT_LEARN_AFTER = (16, 5)
+AGENT_RETRY_SECONDS = 60.0
+# Scheduled and HTTP jobs mutate the same candidates and model archive.
+AGENT_JOB_LOCK = asyncio.Lock()
 
 
 def desk_settings(settings, *, enabled: bool):
@@ -78,6 +93,9 @@ class DeskMixin:
         self.whale_alert_queue: list[dict] = []
         self._quotes_blocked_until = 0.0
         self._quotes_backoff = QUOTES_BACKOFF_SECONDS
+        self.agent_status: dict = {"emitted_day": None, "emit": None, "learned_day": None, "learn": None,
+                                   "backfill": None, "error": None}
+        self._agent_emit_retry_after = 0.0
 
     async def _desk_on_tick(self, tick, analysis_only: bool) -> None:
         """The desk's share of one accepted tick, in the engine's order."""
@@ -94,6 +112,12 @@ class DeskMixin:
                 await self.mp.on_tick(tick)
             except Exception as exc:  # noqa: BLE001 — a desk fault must not kill the feed
                 self.mp.record_error(exc)
+            shadow = getattr(self, "mp_index", None)
+            if shadow is not None:
+                try:
+                    await shadow.on_tick(tick)
+                except Exception as exc:  # noqa: BLE001 — nor may its shadow
+                    shadow.record_error(exc)
 
     def configure_desk(self, lot_sizes: dict[str, int]) -> None:
         """Hand the desk today's contracts, after a (re)selection."""
@@ -106,6 +130,27 @@ class DeskMixin:
         })
         self.mp.set_directional_scope(self.mp_spot_symbols())
         self.mp.set_universe(self.mp_universe())
+        shadow = getattr(self, "mp_index", None)
+        if shadow is not None:
+            # The same desk restricted to index reads: its scope is the index futures, its universe those
+            # futures plus their options. Everything else (lots, contracts, expiries) is the main desk's.
+            scope = [symbol for symbol in self.mp_spot_symbols() if is_futures_symbol(symbol)]
+            shadow.set_lot_sizes(lot_sizes)
+            shadow.set_option_map(self.desk_option_map())
+            shadow.set_position_underlyings(self.desk_position_underlyings())
+            shadow.set_expiring_symbols(set(self.mp.expiring_symbols))
+            shadow.set_directional_scope(scope)
+            shadow.set_universe([symbol for symbol in self.mp_universe()
+                                 if symbol in scope or symbol.startswith(INDEX_OPTION_PREFIXES)])
+
+    def mp_index_shadow_view(self) -> dict | None:
+        """Health and record of the index-only shadow desk (no round-trip rows)."""
+        shadow = getattr(self, "mp_index", None)
+        if shadow is None:
+            return None
+        stats = {key: value for key, value in shadow.statistics().items() if key != "round_trip_rows"}
+        return {"health": shadow.health(), "statistics": stats, "scope": sorted(shadow.directional_scope or []),
+                "open_positions": len(shadow.portfolio.positions), "trades_today": shadow.trades_today}
 
     def expiring_desk_positions(self) -> list[str]:
         return [symbol for symbol, position in self.mp.portfolio.positions.items()
@@ -263,11 +308,17 @@ class DeskMixin:
                 continue
             if (now.hour, now.minute) < (15, 50):
                 continue
+            coverage = await asyncio.to_thread(session_history_coverage,
+                self.settings.research_database_path, now.date(), self.nightly_symbols())
+            if not coverage["complete"]:
+                self.nightly_report = {"day": today, "waiting": "session minute history incomplete",
+                                       "quality": coverage, "partial": True}
+                continue
             try:
                 self.nightly_report = await asyncio.to_thread(
                     nightly.run, self.settings.tick_database_path,
                     self.settings.research_database_path, today,
-                    self.nightly_symbols(), self.whale_symbols())
+                    self.nightly_symbols(), self.whale_symbols(), dict(self.mp.lot_sizes))
                 self._nightly_done = today
                 self._nightly_attempts = 0
             except Exception as exc:  # noqa: BLE001 — memory must not kill the feed
@@ -279,6 +330,81 @@ class DeskMixin:
                                        "attempts": self._nightly_attempts}
                 if self._nightly_attempts >= NIGHTLY_MAX_ATTEMPTS:
                     self._nightly_done = today
+
+    async def _agent_loop(self) -> None:
+        """The option agent's day: picks after the 14:45 cutoff, learning after the close.
+
+        Learning first completes the forward minute bars of every unlabelled
+        candidate (a strike that drifted away from ATM is no longer streamed,
+        and a label missing exactly where the underlying moved would bias the
+        model), then labels whatever has closed and re-judges the models.
+        """
+        while True:
+            await asyncio.sleep(5)
+            now = datetime.now(IST)
+            if not market_calendar.is_trading_day(now.date()):
+                continue
+            try:
+                if await self._agent_step(now):
+                    self.agent_status["error"] = None
+            except Exception as exc:  # noqa: BLE001 — the agent must not kill the desk
+                self.agent_status["error"] = f"{type(exc).__name__}: {exc}"[:300]
+
+    async def _agent_step(self, now: datetime) -> bool:
+        from . import option_agent
+        today = now.date().isoformat()
+        clock = (now.hour, now.minute, now.second)
+        did_work = False
+        async with AGENT_JOB_LOCK:
+            if self.agent_status.get("prepared_day") != today and AGENT_PREPARE_AT <= clock < AGENT_EMIT_AT:
+                did_work = True
+                self.agent_status["prepared_day"] = today
+                started = time.monotonic()
+                await asyncio.to_thread(self._agent_job, lambda h: option_agent.prepare(h, today))
+                self.agent_status["prepare_seconds"] = round(time.monotonic() - started, 1)
+            if (self.agent_status["emitted_day"] != today and AGENT_EMIT_AT <= clock < (15, 30, 0)
+                    and time.monotonic() >= self._agent_emit_retry_after):
+                did_work = True
+                from .agent_equity import known_lots
+                lots = known_lots(dict(self.mp.lot_sizes), self.settings.contract_snapshot_path)
+                started = time.monotonic()
+                self._agent_emit_retry_after = started + AGENT_RETRY_SECONDS
+                self.agent_status["emit"] = await asyncio.to_thread(
+                    self._agent_job, lambda h: option_agent.emit(h, lots=lots))
+                self.agent_status["emit_seconds"] = round(time.monotonic() - started, 1)
+                if self.agent_status["emit"].get("status") in {"emitted", "already_emitted"}:
+                    self.agent_status["emitted_day"] = today
+            if (self.agent_status["learned_day"] != today and clock >= (*AGENT_LEARN_AFTER, 0)
+                    and self._nightly_done == today):
+                self.agent_status["learned_day"] = today
+                did_work = True
+                self.agent_status["backfill"] = await self._agent_backfill(today)
+                self.agent_status["learn"] = await asyncio.to_thread(self._agent_job, option_agent.learn)
+        return did_work
+
+    def _agent_job(self, fn):
+        import sqlite3
+        history = sqlite3.connect(self.settings.research_database_path, timeout=120)
+        try:
+            return fn(history)
+        finally:
+            history.close()
+
+    async def _agent_backfill(self, today: str) -> dict:
+        from . import option_agent
+        first, symbols = await asyncio.to_thread(
+            self._agent_job, lambda h: option_agent.pending_symbols(h, today))
+        stored = failed = 0
+        strategy = getattr(self, "strategy", None)
+        if strategy is None or not symbols:
+            return {"symbols": len(symbols), "rows": 0, "failed": 0}
+        for symbol in symbols:
+            try:
+                stored += (await strategy.backfill_minutes(symbol, first)).get("rows", 0)
+            except Exception:  # noqa: BLE001 — one contract must not stop the rest
+                failed += 1
+            await asyncio.sleep(0.3)
+        return {"symbols": len(symbols), "rows": stored, "failed": failed, "since": first}
 
     async def _chain_loop(self) -> None:
         """Option-chain snapshots every minute during the session.
@@ -401,9 +527,27 @@ class DeskMixin:
                     ticks = sqlite3.connect(f"file:{self.settings.tick_database_path}?mode=ro",
                                             uri=True, timeout=30)
                     try:
+                        gaps = whale.feed_gaps(ticks, day)
                         for symbol in futures.values():
                             whale.save_events(history, day,
-                                              whale.detect_recent(ticks, symbol, day, stamp * 1000))
+                                              whale.detect_recent(ticks, symbol, day, stamp * 1000, gaps))
+                        # The name list: every contract that traded in the
+                        # trailing slice, every few minutes (the nightly pass
+                        # redoes the whole day).
+                        if (stamp // 60) % whale.NAMES_SCAN_EVERY_MINUTES == 0:
+                            from . import whale_tuning
+                            since = stamp * 1000 - whale.A_LIVE_LOOKBACK_MS
+                            universe = whale.traded_symbols(ticks, day, since)
+                            tuned = whale_tuning.load_params(history)
+                            scanned = [event for event in whale.scan(
+                                ticks, day, universe, since_ms=since, lots=dict(self.mp.lot_sizes), gaps=gaps,
+                                params={s: p for s, p in tuned.items() if not p.get("disabled")})
+                                if not tuned.get(event.symbol, {}).get("disabled")]
+                            whale.save_events(history, day, scanned)
+                            whale.record_entries(history, day)
+                            whale_tuning.save_features(history, day, scanned)
+                            whale_tuning.label_outcomes(history, day)
+                            self.chain_status["names_scanned"] = len(universe)
                     finally:
                         ticks.close()
                 except sqlite3.Error as exc:

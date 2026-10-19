@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .indicators import IncrementalBollingerBands, IncrementalKAMA, IncrementalMACD, IncrementalROC, IncrementalRSI
 from .models import Candle, IndicatorPoint
+from . import market_calendar
+from .sessions import in_session, session_close  # noqa: F401  (in_session re-exported)
 
 IST = ZoneInfo("Asia/Kolkata")
+IST_OFFSET_SECONDS = 19_800
+EPOCH_DAY = date(1970, 1, 1)
 
 
 def load_chart_history(
@@ -115,22 +119,38 @@ def load_chart_history(
 def aggregate_session_candles(rows: list[Candle], timeframe_seconds: int) -> list[Candle]:
     # Fyers can include post-close snapshots in an intraday history response.
     # They are not tradable regular-session bars and must not seed indicators,
-    # affect a walk-forward exit, or extend the chart beyond 15:30 IST.
-    session_rows = [
-        row for row in rows
-        if time(9, 15) <= datetime.fromtimestamp(row.timestamp, UTC).astimezone(IST).time() < time(15, 30)
-    ]
+    # affect a walk-forward exit, or extend the chart beyond the instrument's
+    # own close (sessions.session_close: F&O 15:40, cash 15:15 since Aug 2026).
+    #
+    # Each day's session window is resolved once and rows are compared as integers: the per-row datetime
+    # checks were ~0.12 s a symbol and most of a 670-symbol warm-up (154 s on 16 Oct 2026). Same rule as
+    # sessions.in_session: a trading day, 09:15 <= t < the symbol's own close.
+    windows: dict[tuple[str, int], tuple[int, int] | None] = {}
+
+    def window(symbol: str, timestamp: int) -> tuple[int, int] | None:
+        key = (symbol, (timestamp + IST_OFFSET_SECONDS) // 86400)
+        if key not in windows:
+            day = EPOCH_DAY + timedelta(days=key[1])
+            windows[key] = (
+                (int(datetime.combine(day, time(9, 15), IST).timestamp()),
+                 int(datetime.combine(day, session_close(symbol, day), IST).timestamp()))
+                if market_calendar.is_trading_day(day) else None)
+        return windows[key]
+
+    session_rows = []
+    for row in rows:
+        span = window(row.symbol, int(row.timestamp))
+        if span is not None and span[0] <= row.timestamp < span[1]:
+            session_rows.append(row)
     if timeframe_seconds <= 60:
         return session_rows
     buckets: dict[int, Candle] = {}
     for row in session_rows:
-        moment = datetime.fromtimestamp(row.timestamp, UTC).astimezone(IST)
-        session_open = datetime.combine(moment.date(), time(9, 15), IST)
-        elapsed = int((moment - session_open).total_seconds())
+        session_open = window(row.symbol, int(row.timestamp))[0]
+        elapsed = int(row.timestamp) - session_open
         if elapsed < 0:
             continue
-        bucket_time = session_open + timedelta(seconds=(elapsed // timeframe_seconds) * timeframe_seconds)
-        bucket = int(bucket_time.timestamp())
+        bucket = session_open + (elapsed // timeframe_seconds) * timeframe_seconds
         existing = buckets.get(bucket)
         if existing is None:
             buckets[bucket] = Candle(row.symbol, bucket, row.open, row.high, row.low, row.close, row.volume, True)

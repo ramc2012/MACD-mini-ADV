@@ -126,6 +126,21 @@ The lane never asks the broker for data.
   `blast_journal_horizon_hours` (default 48); the high, low, MFE and MAE are
   written back every 30 seconds, and `resolved` flips when the window closes.
   Tracking resumes after a restart.
+- `shadow` (inside each premium-cleared row's payload, since 15 Oct 2026) — measured, never used by
+  a rule: days to expiry, Black-Scholes IV, delta, gamma, theta/day, vega, the underlying's RV20 and IV/RV,
+  and the bid, ask and spread % at the candidate. These test the 15 Oct review's proposed gates (delta band,
+  IV_TOO_EXPENSIVE, SPREAD_TOO_WIDE), which 408 earlier rows could not decide
+  (research/option_recs_20261015). The underlying's order flow joins on later from `tick_minute_flow`.
+- `shadow` (inside each premium-cleared row's payload, since 15 Oct 2026). These fields are measured and no
+  rule reads them:
+  - days to expiry;
+  - Black-Scholes IV, delta, gamma, theta per day and vega;
+  - the underlying's RV20 and IV/RV;
+  - the bid, ask and spread % at the candidate.
+
+  They test the gates the 15 Oct review proposed (delta band, IV_TOO_EXPENSIVE, SPREAD_TOO_WIDE), which 408
+  earlier rows could not decide (research/option_recs_20261015). The underlying's order flow is joined on
+  later from `tick_minute_flow`.
 - `blast_contracts` — the contract behind every entry (underlying, side,
   strike, expiry), which is what the expiry exit reads.
 

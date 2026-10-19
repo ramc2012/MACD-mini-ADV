@@ -10,14 +10,22 @@ export function matchesWatchSearch(row: SpotWatchRow | OptionWatchRow, query: st
 const day = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" });
 const clock = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false });
 const date = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short" });
+// Fyers stamps a contract that has never traded with 1 Jan 1980 IST and a
+// placeholder price. On 29 Sep 2026, 47 freshly rolled October contracts read
+// "01 Jan" beside an LTP no one traded (MIDCPNIFTY 13,825 CE at 1,203).
+const NEVER_TRADED_BEFORE = Date.UTC(2000, 0, 1);
+
 export function quoteStamp(timestamp?: string, observedAt?: string | number) {
   const value = new Date(timestamp || "");
-  if (!Number.isFinite(value.getTime())) return { label: "No quote", title: "unavailable", old: false, aged: false };
+  if (!Number.isFinite(value.getTime())) return { label: "No quote", title: "unavailable", old: false, aged: false, untraded: false };
+  if (value.getTime() < NEVER_TRADED_BEFORE) {
+    return { label: "No trade yet", title: "no trade reported for this contract; the broker price is a placeholder", old: true, aged: true, untraded: true };
+  }
   const now = new Date(observedAt ?? Date.now());
   const old = day.format(value) !== day.format(now);
   const delayed = now.getTime() - value.getTime() > 120_000;
   return {
-    old, aged: old || delayed,
+    old, aged: old || delayed, untraded: false,
     label: old ? date.format(value) : `${clock.format(value)}${delayed ? " · aged" : ""}`,
     title: `${date.format(value)} ${value.getFullYear()}, ${clock.format(value)} IST${old ? " · prior-day quote" : delayed ? " · over 2 minutes old" : ""}`,
   };

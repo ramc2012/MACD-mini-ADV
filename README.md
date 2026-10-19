@@ -15,6 +15,8 @@ docker compose ps
 
 Open [the parallel terminal](http://localhost:3200). The Go gateway is at `http://localhost:8201`, and the QuestDB console is at `http://localhost:9002`. All host ports bind to `127.0.0.1`.
 
+For a machine with IPv6-only upstream access, see [the Fyers network setup](engine/docs/broker_ipv6.md). The machine-local Compose override and credentials stay outside Git.
+
 The separate US Paper Desk is retired from the default deployment. Its source and `us_paper_data` volume are preserved. To run it again, opt in with `docker compose --profile us up -d --build us-backend us-frontend`; see [its module README](us-app/README.md).
 
 The feed is Fyers market data, with execution fixed to paper-only. The engine reports a broker configuration error until you connect your Fyers account in the terminal's **Settings → Broker connection** panel. Settings, Fyers credentials and the contract snapshot live in `runtime/` (bind-mounted). The SQLite databases -- the three paper books, the minute-bar history cache and the tick capture -- live on the `engine_data` named volume, and QuestDB on its own volume; see [Storage](#storage). The earlier simulation databases are preserved in `runtime/simulation-archive-2026-09-23/`, and their QuestDB observations remain in the old `macd-mini-parallel_questdb_data` volume.

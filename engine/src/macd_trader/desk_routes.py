@@ -19,7 +19,9 @@ from pydantic import BaseModel, Field
 
 from . import auction_views
 from .api_models import OrderInput, _as_json
-from .replay import ReplaySession
+from .desk import AGENT_JOB_LOCK as _agent_lock
+from .profile_scale import cached_scale, profile_scale
+from .replay import ReplaySession, merge_seed_prints, session_prints
 from .universe import desk_underlying
 
 router = APIRouter()
@@ -90,6 +92,266 @@ async def auction_whale(day: str | None = None, symbol: str | None = None):
     return await asyncio.to_thread(
         auction_views.whale, engine.settings.research_database_path, day or _ist_today(), symbol)
 
+@router.get("/api/auction/whale/names", dependencies=[Depends(authorize)])
+async def auction_whale_names(day: str | None = None,
+                              kind: str | None = Query(default=None, pattern="^(cash|future|option)$"),
+                              limit: int = Query(default=100, ge=1, le=500)):
+    """Every instrument with a Layer A pattern today, ranked, with its parameters."""
+    return await asyncio.to_thread(
+        auction_views.whale_names, engine.settings.research_database_path,
+        engine.settings.tick_database_path if engine.settings.tick_capture_enabled else None,
+        day or _ist_today(), lots=dict(engine.mp.lot_sizes), kind=kind, limit=limit)
+
+# --- whale tuning: per-instrument thresholds and the calibration loop --------
+
+def _history(read_only: bool = True):
+    import sqlite3
+    path = engine.settings.research_database_path
+    return (sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30) if read_only
+            else sqlite3.connect(path, timeout=60))
+
+
+def _with_history(fn, read_only: bool = True):
+    connection = _history(read_only)
+    try:
+        return fn(connection)
+    finally:
+        connection.close()
+
+
+@router.get("/api/auction/whale/tuning", dependencies=[Depends(authorize)])
+async def whale_tuning_overview(runs: int = Query(default=20, ge=1, le=200)):
+    """The latest calibration (feature weights, hit rates), run history and parameter population."""
+    from . import whale_tuning
+    return await asyncio.to_thread(_with_history, lambda h: whale_tuning.overview(h, runs))
+
+
+@router.get("/api/auction/whale/tuning/params", dependencies=[Depends(authorize)])
+async def whale_tuning_params(q: str | None = Query(default=None, max_length=40),
+                              limit: int = Query(default=300, ge=1, le=2000)):
+    """Every instrument's fitted thresholds, sensitivity, baseline and override."""
+    from . import whale_tuning
+    return await asyncio.to_thread(_with_history, lambda h: whale_tuning.params_table(h, limit, q))
+
+
+@router.get("/api/auction/whale/tuning/symbol/{symbol:path}", dependencies=[Depends(authorize)])
+async def whale_tuning_symbol(symbol: str):
+    """One instrument: fingerprints, baseline, params, override and its labelled events."""
+    from . import whale_tuning
+    return await asyncio.to_thread(_with_history, lambda h: whale_tuning.symbol_view(h, symbol, _ist_today()))
+
+
+@router.put("/api/auction/whale/tuning/symbol/{symbol:path}", dependencies=[Depends(authorize)])
+async def whale_tuning_override(symbol: str, override: dict | None = None):
+    """Pin thresholds for one instrument (keys: whale_tuning.OVERRIDE_KEYS); null clears."""
+    from . import whale_tuning
+    if override:
+        unknown = set(override) - whale_tuning.OVERRIDE_KEYS
+        if unknown:
+            raise HTTPException(400, f"Unknown override keys: {', '.join(sorted(unknown))}")
+    lots = dict(engine.mp.lot_sizes)
+    return await asyncio.to_thread(
+        _with_history, lambda h: whale_tuning.set_override(h, symbol, override, _ist_today(), lots), False)
+
+
+_tuning_lock = asyncio.Lock()
+
+
+@router.get("/api/auction/whale/study", dependencies=[Depends(authorize)])
+async def whale_study_latest(limit: int = Query(default=10, ge=1, le=100)):
+    """The latest walk-forward edge study (minute-level whale spikes) and its predecessors."""
+    from . import whale_study
+    return await asyncio.to_thread(_with_history, lambda h: whale_study.latest(h, limit))
+
+
+@router.post("/api/auction/whale/study/run", dependencies=[Depends(authorize)])
+async def whale_study_run(since: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                          until: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                          force: bool = False):
+    """Re-run the edge study (default: the last 60 days) -- minutes of CPU, so after the close."""
+    from datetime import date, timedelta
+    from . import whale_study
+    from .sessions import market_open
+    if market_open() and not force:
+        raise HTTPException(409, "The study reads every instrument's minute history; run it after the close")
+    if _tuning_lock.locked():
+        raise HTTPException(409, "A tuning or study run is already in progress")
+    end = until or _ist_today()
+    start = since or (date.fromisoformat(end) - timedelta(days=60)).isoformat()
+    async with _tuning_lock:
+        return await asyncio.to_thread(
+            _with_history, lambda h: whale_study.run_study(h, start, end), False)
+
+
+@router.post("/api/auction/whale/tuning/run", dependencies=[Depends(authorize)])
+async def whale_tuning_run(day: str | None = None, force: bool = False):
+    """Run the loop now: rescan the day with tuned params, fingerprint, label, calibrate, refit."""
+    import sqlite3
+    from . import whale_tuning
+    from .sessions import market_open
+    if market_open() and not force:
+        raise HTTPException(409, "The tuning run rescans the whole session and replaces its events; "
+                                 "it runs after the close (pass force=true to run anyway)")
+    if _tuning_lock.locked():
+        raise HTTPException(409, "A tuning run is already in progress")
+    chosen = day or engine.mp.session_day or _ist_today()
+    lots = dict(engine.mp.lot_sizes)
+
+    def job() -> dict:
+        ticks = sqlite3.connect(f"file:{engine.settings.tick_database_path}?mode=ro", uri=True, timeout=30)
+        history = _history(read_only=False)
+        try:
+            return whale_tuning.run(ticks, history, chosen, lots=lots,
+                                    whale_symbols=engine.whale_symbols() if hasattr(engine, "whale_symbols") else None)
+        finally:
+            ticks.close()
+            history.close()
+
+    async with _tuning_lock:
+        return await asyncio.to_thread(job)
+
+
+# --- option agent: 14:45 CE/PE picks for the next 1-3 sessions, and its loop ---
+
+def _agent_lots() -> dict[str, int]:
+    from .agent_equity import known_lots
+    return known_lots(dict(engine.mp.lot_sizes), getattr(engine.settings, "contract_snapshot_path", None))
+
+
+@router.get("/api/agent/picks", dependencies=[Depends(authorize)])
+async def agent_picks(day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                      run_id: int | None = Query(default=None, ge=1)):
+    """One emission (``run_id``, else ``day``'s latest, else the newest): calls, puts, index trades, outcomes."""
+    from . import option_agent
+    lots = _agent_lots()
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.picks_view(h, day, lots, run_id), False)
+
+
+@router.get("/api/agent/runs", dependencies=[Depends(authorize)])
+async def agent_runs(days: int = Query(default=30, ge=1, le=365)):
+    """Every emission: day, model, how far into its 1-3 session hold, and how its picks have done."""
+    from . import option_agent
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.runs_view(h, days), False)
+
+
+@router.get("/api/agent/compare", dependencies=[Depends(authorize)])
+async def agent_compare(run_id: int | None = Query(default=None, ge=1),
+                        horizon: str = Query(default="y", pattern="^(y|r1|r2|r3|live)$")):
+    """One list against the actual top 10 performers among the same day's candidates (per side, and index trades)."""
+    from . import option_agent
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.compare_view(h, run_id, horizon), False)
+
+
+@router.get("/api/agent/compare/summary", dependencies=[Depends(authorize)])
+async def agent_compare_summary(days: int = Query(default=60, ge=1, le=365),
+                                horizon: str = Query(default="y", pattern="^(y|r1|r2|r3|live)$")):
+    """Every list's overlap with the actual top 10, the picks' percentile and capture, and their averages."""
+    from . import option_agent
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.compare_summary(h, days, horizon), False)
+
+
+@router.get("/api/agent/active", dependencies=[Depends(authorize)])
+async def agent_active():
+    """Every pick still inside its hold, across the lists that are still open."""
+    from . import option_agent
+    lots = _agent_lots()
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.active_view(h, lots), False)
+
+
+@router.get("/api/agent/performance", dependencies=[Depends(authorize)])
+async def agent_performance(days: int = Query(default=30, ge=1, le=365)):
+    """Every emission's picks against their day's full candidate set, and the basket curve."""
+    from . import option_agent
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.performance(h, days), False)
+
+
+@router.get("/api/agent/equity", dependencies=[Depends(authorize)])
+async def agent_equity(days: int = Query(default=45, ge=1, le=365),
+                       notional: float = Query(default=10_000, ge=1_000, le=10_000_000)):
+    """Rupee equity curves for every book (top-10 CE/PE, index trades) against their benchmarks."""
+    from datetime import date, timedelta
+    from . import agent_equity as equity
+    since = (date.fromisoformat(_ist_today()) - timedelta(days=days)).isoformat()
+    lots = _agent_lots()
+    return await asyncio.to_thread(_with_history, lambda h: equity.books(h, since, lots, notional), False)
+
+
+@router.get("/api/agent/models", dependencies=[Depends(authorize)])
+async def agent_models(limit: int = Query(default=30, ge=1, le=200)):
+    """Model versions (champion, challengers, retired) with walk-forward metrics and weights."""
+    from . import option_agent
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.models_view(h, limit), False)
+
+
+@router.get("/api/agent/status", dependencies=[Depends(authorize)])
+async def agent_status():
+    status = getattr(engine, "agent_status", None) or {}
+    from . import option_agent
+    from .desk import AGENT_EMIT_AT, AGENT_PREPARE_AT
+    return {**status, "emit_at": ":".join(f"{part:02d}" for part in AGENT_EMIT_AT),
+            "prepare_at": ":".join(f"{part:02d}" for part in AGENT_PREPARE_AT[:2]),
+            "as_of": option_agent.AS_OF.strftime("%H:%M"),
+            "busy": _agent_lock.locked()}
+
+
+@router.post("/api/agent/run", dependencies=[Depends(authorize)])
+async def agent_run(day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    """Emit with the champion from complete, fresh bars at the 14:45 feature cutoff."""
+    from . import option_agent
+    lots = _agent_lots()
+    if _agent_lock.locked():
+        raise HTTPException(409, "The agent is busy")
+    async with _agent_lock:
+        result = await asyncio.to_thread(
+            _with_history, lambda h: option_agent.emit(h, day, source="manual", lots=lots), False)
+        if result.get("status") == "cutoff_not_reached":
+            raise HTTPException(409, f"The 14:45 IST feature cutoff has not closed for {result['day']}. Emit after that cutoff.")
+        return result
+
+
+@router.post("/api/agent/train", dependencies=[Depends(authorize)])
+async def agent_train(force: bool = False):
+    """Label what has closed and re-judge every configuration walk-forward."""
+    from . import option_agent
+    from .sessions import market_open
+    if market_open() and not force:
+        raise HTTPException(409, "Training reads weeks of option bars; it runs after the close (force=true to run anyway)")
+    if _agent_lock.locked():
+        raise HTTPException(409, "The agent is busy")
+    async with _agent_lock:
+        return await asyncio.to_thread(_with_history, option_agent.learn, False)
+
+
+@router.post("/api/agent/bootstrap", dependencies=[Depends(authorize)])
+async def agent_bootstrap(since: str = Query(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                          until: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                          force: bool = False):
+    """Rebuild past candidates and labels from stored minute bars, then train."""
+    from . import option_agent
+    from .sessions import market_open
+    if market_open() and not force:
+        raise HTTPException(409, "The bootstrap reads every option bar in the range; run it after the close")
+    if _agent_lock.locked():
+        raise HTTPException(409, "The agent is busy")
+
+    def job(history):
+        built = option_agent.bootstrap(history, since, until or _ist_today())
+        return {"bootstrap": built, "train": option_agent.train(history, note="bootstrap")}
+
+    async with _agent_lock:
+        return await asyncio.to_thread(_with_history, job, False)
+
+
+@router.get("/api/auction/whale/performance", dependencies=[Depends(authorize)])
+async def auction_whale_performance(days: int = Query(default=10, ge=1, le=60),
+                                    kind: str | None = Query(default=None, pattern="^(cash|future|option)$")):
+    """Every whale-list entry in the last ``days`` calendar days with its max/min return since entry."""
+    from datetime import date, timedelta
+    until = _ist_today()
+    since = (date.fromisoformat(until) - timedelta(days=days)).isoformat()
+    return await asyncio.to_thread(
+        auction_views.whale_performance, engine.settings.research_database_path, since, until, kind)
+
 @router.get("/api/auction/whale/windows/{underlying}", dependencies=[Depends(authorize)])
 async def auction_whale_windows(underlying: str, day: str | None = None):
     """The day's per-window series for one root: composite, option vs futures delta-notional, divergence."""
@@ -124,10 +386,36 @@ class MPSettingsInput(BaseModel):
     brokerage_per_leg: float | None = Field(default=None, ge=0, le=10_000)
     allow_overnight_carry: bool | None = None
 
+async def _scale_for(symbol: str, profile) -> dict:
+    """The ATR row scale for a live profile; SQLite only on the first read of the day."""
+    path = engine.settings.research_database_path
+    cached = cached_scale(path, symbol, profile.day, profile.tick_size)
+    if cached is not None:
+        return cached
+    span = (profile.high - profile.low) if profile.high is not None and profile.low is not None else None
+    return await asyncio.to_thread(profile_scale, path, symbol, profile.day, profile.tick_size, span)
+
+
+async def _profile_snapshot(symbol: str, profile, max_levels: int | None) -> dict:
+    scale = await _scale_for(symbol, profile)
+    snapshot = profile.snapshot(max_levels=max_levels, row_size=scale["row_size"], scale=scale)
+    # A cash equity's closing-auction match, kept out of the profile's volume
+    # and the flow because it has no aggressor; shown beside them instead.
+    snapshot["closing_auction"] = engine.mp.closing_auctions.get(symbol)
+    return snapshot
+
+
 @router.get("/api/mp/snapshot", dependencies=[Depends(authorize)])
 async def mp_snapshot(symbol: str | None = Query(default=None)):
     """Full desk state: profile, order flow, book, current setup."""
-    return engine.mp.snapshot(symbol)
+    result = engine.mp.snapshot(symbol)
+    focus = result.get("focus")
+    profile = engine.mp.profiles.get(focus) if focus else None
+    if profile is not None and (result.get("profile") or {}).get("row_scale") is None:
+        # First read of this symbol today: compute its ATR rows off the loop,
+        # then publish the same rows as the auction ladder and the footprint.
+        result["profile"] = await _profile_snapshot(focus, profile, 90)
+    return result
 
 @router.get("/api/mp/profile/{symbol:path}", dependencies=[Depends(authorize)])
 async def mp_profile(symbol: str, full: bool = Query(default=False),
@@ -138,15 +426,136 @@ async def mp_profile(symbol: str, full: bool = Query(default=False),
     # The polled desk snapshot is deliberately small. A focused auction ladder
     # needs every traded price row, so fetch it explicitly while that view is
     # open instead of thinning away volume and TPO structure.
-    result = {"profile": profile.snapshot(max_levels=None if full else 90)}
+    result = {"profile": await _profile_snapshot(symbol, profile, None if full else 90)}
     if not profile_only:
         result["flow"] = engine.mp.flow.snapshot(symbol)
+    return result
+
+_backfill_tried: dict[tuple[str, str], str] = {}
+
+
+async def _backfill_if_short(symbol: str, day: str, series: dict) -> bool:
+    """Download minute bars when the past profiles lack data; once per symbol a day.
+
+    Short means no stored session in the previous month or fewer than five
+    before today. The engine (the only Fyers client) fetches and stores them;
+    the caller rebuilds. A failure is reported in the series notes, not raised.
+    """
+    from datetime import date, timedelta
+    from .profile_series import DAY_COLUMNS
+
+    today = date.fromisoformat(day)
+    previous_month = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+    have_month = any(column["kind"] == "month" for column in series["columns"])
+    if have_month and series.get("stored_sessions", 0) >= DAY_COLUMNS:
+        return False
+    key = (symbol, day)
+    if key in _backfill_tried:
+        if _backfill_tried[key]:
+            series.setdefault("notes", []).append(_backfill_tried[key])
+        return False
+    try:
+        strategy = getattr(engine, "strategy", None)
+        if strategy is not None:            # desk process: ask the engine
+            outcome = await strategy.backfill_minutes(symbol, previous_month.isoformat())
+            stored = outcome.get("rows", 0)
+        else:                               # single process: this is the engine
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            from .candle_store import store_historical_candles
+            ist = ZoneInfo("Asia/Kolkata")
+            rows = await engine.broker.history_range(
+                symbol, 60, datetime.combine(previous_month, datetime.min.time(), ist), datetime.now(ist))
+            stored = await asyncio.to_thread(
+                store_historical_candles, engine.settings.research_database_path, rows)
+        _backfill_tried[key] = "" if stored else "Fyers returned no older minute history for this contract"
+        return bool(stored)
+    except Exception as exc:  # noqa: BLE001 -- the series still renders what it has
+        _backfill_tried[key] = f"history backfill failed: {str(exc)[:160]}"
+        series.setdefault("notes", []).append(_backfill_tried[key])
+        return False
+
+
+@router.get("/api/mp/profile-series/{symbol:path}", dependencies=[Depends(authorize)])
+async def mp_profile_series(symbol: str, days: int = Query(default=5, ge=1, le=10)):
+    """Previous month, earlier weeks, this week, the last sessions and today on one row grid."""
+    import sqlite3
+    from .profile_series import build_series
+
+    profile = engine.mp.profiles.get(symbol)
+    day = engine.mp.session_day or _ist_today()
+    if profile is not None:
+        scale = await _scale_for(symbol, profile)
+        live = profile.snapshot(max_levels=None, row_size=scale["row_size"], scale=scale)
+    else:
+        scale = await asyncio.to_thread(
+            profile_scale, engine.settings.research_database_path, symbol, day, 0.05)
+        live = None
+
+    def build() -> dict:
+        history = sqlite3.connect(f"file:{engine.settings.research_database_path}?mode=ro", uri=True, timeout=30)
+        ticks = None
+        try:
+            if engine.settings.tick_capture_enabled:
+                try:
+                    ticks = sqlite3.connect(f"file:{engine.settings.tick_database_path}?mode=ro", uri=True, timeout=30)
+                except sqlite3.OperationalError:
+                    ticks = None
+            return build_series(ticks, history, symbol, day, scale["row_size"], live, days)
+        finally:
+            history.close()
+            if ticks is not None:
+                ticks.close()
+
+    result = await asyncio.to_thread(build)
+    if await _backfill_if_short(symbol, day, result):
+        result = await asyncio.to_thread(build)
+    result["row_scale"] = scale
+    result["last"] = profile.last_price if profile is not None else None
+    result["closing_auction"] = engine.mp.closing_auctions.get(symbol)
     return result
 
 @router.get("/api/mp/leaderboard", dependencies=[Depends(authorize)])
 async def mp_leaderboard(limit: int = Query(default=25, ge=1, le=200)):
     """Symbols ranked by how constructive their auction reads right now."""
     return engine.mp.leaderboard(limit)
+
+_seed_locks: dict[str, asyncio.Lock] = {}
+
+
+async def _watch_from_open(symbol: str) -> None:
+    """Start detailed capture seeded with the whole session so far.
+
+    The book only captures symbols a chart has asked for, and it used to seed
+    from the flow tracker's last 400 prints: a liquid contract opened at 15:29
+    began at 15:05. The session's raw ticks are on disk, so classify them off
+    the loop with the desk's own tracker and replay those prints instead,
+    joined to the newest ones the store has not flushed yet.
+    Both CVD legs are still anchored on the tracker's session figures.
+    """
+    book = engine.mp.footprints
+    lock = _seed_locks.setdefault(symbol, asyncio.Lock())
+    async with lock:
+        if book.watching(symbol):  # a concurrent poll seeded it first
+            return
+        day = engine.mp.session_day or _ist_today()
+        try:
+            stored = await asyncio.to_thread(
+                session_prints, engine.settings.tick_database_path, symbol, day)
+        except Exception:  # noqa: BLE001 -- fall back to the tracker's prints
+            stored = []
+        seed = engine.mp.flow.states.get(symbol)
+        # Only the instrument's own session: a tracker restored from a
+        # checkpoint can still hold a cash closing-auction uncross.
+        from datetime import UTC, datetime as _dt
+        from .sessions import in_session
+        recent = [row for row in (seed.recent if seed else [])
+                  if in_session(symbol, _dt.fromtimestamp(row.timestamp, UTC))]
+        prints = merge_seed_prints(stored, recent)
+        book.watch(symbol, seed_prints=prints or None,
+                   session_delta=seed.cumulative_delta if seed else None,
+                   session_weighted_delta=seed.weighted_delta if seed else None)
+
 
 @router.get("/api/mp/footprint/{symbol:path}", dependencies=[Depends(authorize)])
 async def mp_footprint(symbol: str, bars: int = Query(default=60, ge=5, le=180),
@@ -167,22 +576,17 @@ async def mp_footprint(symbol: str, bars: int = Query(default=60, ge=5, le=180),
     """
     book = engine.mp.footprints
     fresh = not book.watching(symbol)
-    # Seed from the flow tracker's retained classified prints so a freshly
-    # opened chart is immediately populated with real clusters, and anchor both
-    # CVD legs on the session figures the tracker already holds — without the
-    # anchor the book's CVD starts at zero on watch() and two numbers a screen
-    # apart are both labelled CVD.
-    seed = engine.mp.flow.states.get(symbol)
-    book.watch(symbol, seed_prints=list(seed.recent) if seed else None,
-               session_delta=seed.cumulative_delta if seed else None,
-               session_weighted_delta=seed.weighted_delta if seed else None)
+    if fresh:
+        await _watch_from_open(symbol)
+    else:
+        book.watch(symbol)  # refresh its place in the LRU
     flow = engine.mp.flow.snapshot(symbol)
     payload = book.payload(symbol, bars, timeframe_seconds=timeframe_seconds, flow=flow)
     payload["subscribed_now"] = fresh
     profile = engine.mp.profiles.get(symbol)
     # ONE profile snapshot, handed to both readers: it is the most expensive
     # thing on this route and session_view used to take a second one.
-    snapshot = profile.snapshot(max_levels=None if profile_full else 90) if profile else None
+    snapshot = await _profile_snapshot(symbol, profile, None if profile_full else 90) if profile else None
     payload["profile"] = snapshot
     payload["flow"] = flow
     setup, reason = engine.mp.live_setups.get(symbol, (None, "no tick yet"))
@@ -255,8 +659,10 @@ async def mp_replay(symbol: str, day: str,
         context = await asyncio.to_thread(
             auction_views.context, engine.settings.research_database_path,
             desk_underlying(symbol) or symbol, day)
+        scale = await asyncio.to_thread(
+            profile_scale, engine.settings.research_database_path, symbol, day, 0.05)
         payload = await asyncio.to_thread(
-            session.payload, at or session.session_start, bars, timeframe_seconds, context)
+            session.payload, at or session.session_start, bars, timeframe_seconds, context, scale)
     payload["context"] = context
     return payload
 

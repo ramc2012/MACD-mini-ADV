@@ -159,6 +159,10 @@ class Broker(ABC):
     async def option_contract_metadata(self, symbols: list[str]) -> dict[str, OptionContractMetadata]:
         return {}
 
+    async def option_master(self, exchanges: list[str]) -> list[OptionContractMetadata]:
+        """Every listed option on these exchanges; empty when the broker has no master."""
+        return []
+
     async def futures_series(self, symbols: list[str]) -> dict[str, list["FuturesSeries"]]:
         """Every listed futures series for each requested symbol's root."""
         return {}
@@ -289,6 +293,22 @@ def _make_resilient_symbol_conversion(original):
     return convert
 
 
+_INDEX_DEPTH_NOTICE = "Index does not have market depth"
+
+
+def _is_partial_subscription_notice(detail: object) -> bool:
+    """True for SDK notices that leave the rest of a subscription live.
+
+    ``FyersDataSocket.__symbol_conversion`` reports rejected symbols (with an
+    ``invalid_symbols`` list) and depth-less indices via on_error, then still
+    subscribes everything that converted. A failed lookup is different: it
+    carries only a message and nothing is subscribed, so it stays fatal.
+    """
+    if not isinstance(detail, dict):
+        return False
+    return bool(detail.get("invalid_symbols")) or detail.get("message") == _INDEX_DEPTH_NOTICE
+
+
 class FyersBroker(Broker):
     name = "fyers"
     data_url = "https://api-t1.fyers.in/data"
@@ -303,13 +323,24 @@ class FyersBroker(Broker):
         self.connected = False
         self._socket = None
         self._tick_buffer: _ThreadsafeTickBuffer | None = None
+        self.handler_errors = 0
+        self.last_handler_error: str | None = None
+        # Symbols FYERS refused at subscribe time (e.g. an expired contract
+        # still held in a book). The rest of the subscription streams on.
+        self.rejected_symbols: list[str] = []
+        self.subscription_notices: list[str] = []
         self._lot_cache_path = Path(settings.contract_snapshot_path).with_name("fyers_lot_sizes.json")
+        self._master_dir = Path(settings.contract_snapshot_path).parent
+        self._master_text: dict[str, tuple[str, str]] = {}
         self._chain_keys_logged = False
 
-    def tick_buffer_status(self) -> dict[str, int]:
-        return self._tick_buffer.status() if self._tick_buffer else {
+    def tick_buffer_status(self) -> dict:
+        status = self._tick_buffer.status() if self._tick_buffer else {
             "pending": 0, "capacity": 4096, "dropped": 0,
         }
+        return {**status, "handler_errors": self.handler_errors, "last_handler_error": self.last_handler_error,
+                "rejected_symbols": list(self.rejected_symbols),
+                "subscription_notices": list(self.subscription_notices)}
 
     def auth_url(self) -> str:
         if not self.settings.fyers_client_id or not self.settings.fyers_secret:
@@ -397,9 +428,16 @@ class FyersBroker(Broker):
         # exchange-feed timestamp and omits last_traded_time.  That is not an
         # LTP time. Clamp such snapshots to the regular-session close.
         if source == "exch_feed_time":
+            # The instrument's own close, not a fixed 15:30: F&O trades to
+            # 15:40 since Aug 2026 and those stamps are real.
+            from .sessions import market_close, session_close
             market_time = parsed.astimezone(ZoneInfo("Asia/Kolkata"))
-            if (market_time.hour, market_time.minute) > (15, 30):
-                parsed = market_time.replace(hour=15, minute=30, second=0, microsecond=0).astimezone(UTC)
+            symbol = payload.get("symbol")
+            close = (session_close(symbol, market_time.date()) if isinstance(symbol, str) and ":" in symbol
+                     else market_close(market_time.date()))
+            if market_time.time().replace(tzinfo=None) > close:
+                parsed = market_time.replace(hour=close.hour, minute=close.minute,
+                                             second=0, microsecond=0).astimezone(UTC)
         return parsed
 
     async def connect(self) -> None:
@@ -456,7 +494,8 @@ class FyersBroker(Broker):
         return [Candle(symbol, int(row[0]), *map(float, row[1:5]), int(row[5]), True) for row in payload.get("candles", [])[-count:]]
 
     async def history_range(self, symbol: str, timeframe_seconds: int, start: datetime, end: datetime) -> list[Candle]:
-        resolution = str(max(1, timeframe_seconds // 60))
+        # Fyers names the daily resolution "D"; minute resolutions are minute counts.
+        resolution = "D" if timeframe_seconds >= 86_400 else str(max(1, timeframe_seconds // 60))
         params = {
             "symbol": symbol,
             "resolution": resolution,
@@ -606,43 +645,99 @@ class FyersBroker(Broker):
             self._lot_cache_path.chmod(0o600)
         return {symbol: cached[symbol] for symbol in symbols if symbol in cached}
 
+    async def _master(self, exchange: str, *, refresh: bool = False) -> str:
+        """One exchange's FO instrument master, fetched at most once a day.
+
+        Three readers (lot sizes, held-contract metadata, futures series) each
+        downloaded the 15 MB file on every call, and contract selection now
+        reads it too. The day's copy is kept in memory and beside the contract
+        snapshot, so a restart re-reads the disk copy instead of the network.
+        ``refresh`` forces a download: NSE adds strikes during the session,
+        and a symbol missing from the morning copy may be listed now.
+        """
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+        held = self._master_text.get(exchange)
+        if held and held[0] == today and not refresh:
+            return held[1]
+        path = self._master_dir / f"fyers_master_{exchange}_FO.csv"
+        if not refresh:
+            try:
+                modified = datetime.fromtimestamp(path.stat().st_mtime, ZoneInfo("Asia/Kolkata")).date().isoformat()
+                if modified == today:
+                    text = path.read_text()
+                    self._master_text[exchange] = (today, text)
+                    return text
+            except OSError:
+                pass
+        url = self.instrument_master_urls.get(exchange)
+        if not url:
+            return ""
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            response = None
+            for attempt in range(4):
+                response = await client.get(url)
+                if response.status_code != 429:
+                    break
+                await asyncio.sleep(2 ** attempt)
+            assert response is not None
+            response.raise_for_status()
+            text = response.text
+        self._master_text[exchange] = (today, text)
+        try:
+            self._master_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        except OSError:
+            pass  # the in-memory copy still serves this process
+        return text
+
+    @staticmethod
+    def _master_options(text: str) -> list[OptionContractMetadata]:
+        rows: list[OptionContractMetadata] = []
+        for row in csv.reader(io.StringIO(text)):
+            # Fyers FO master columns (zero based): lot=3, expiry=8,
+            # ticker=9, root=13, strike=15 and option side=16.
+            if len(row) <= 16:
+                continue
+            option_type = str(row[16]).upper()
+            if option_type not in {"CE", "PE"}:
+                continue
+            try:
+                lot_size = int(float(row[3]))
+                expiry = datetime.fromtimestamp(float(row[8]), UTC).astimezone(
+                    ZoneInfo("Asia/Kolkata")
+                ).date().isoformat()
+                strike = float(row[15])
+            except (TypeError, ValueError, OSError):
+                continue
+            if lot_size > 0:
+                rows.append(OptionContractMetadata(
+                    symbol=row[9], underlying=str(row[13]), option_type=option_type,
+                    strike=strike, expiry=expiry, lot_size=lot_size,
+                ))
+        return rows
+
+    async def option_master(self, exchanges: list[str]) -> list[OptionContractMetadata]:
+        rows: list[OptionContractMetadata] = []
+        for exchange in dict.fromkeys(exchanges):
+            if exchange in self.instrument_master_urls:
+                rows.extend(self._master_options(await self._master(exchange)))
+        return rows
+
     async def option_contract_metadata(self, symbols: list[str]) -> dict[str, OptionContractMetadata]:
         """Rehydrate arbitrary held contracts from the authoritative Fyers master."""
         requested = set(symbols)
         result: dict[str, OptionContractMetadata] = {}
         exchanges = {symbol.split(":", 1)[0] for symbol in requested if ":" in symbol}
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            for exchange in exchanges:
-                url = self.instrument_master_urls.get(exchange)
-                if not url:
-                    continue
-                response = None
-                for attempt in range(4):
-                    response = await client.get(url)
-                    if response.status_code != 429:
-                        break
-                    await asyncio.sleep(2 ** attempt)
-                assert response is not None
-                response.raise_for_status()
-                for row in csv.reader(io.StringIO(response.text)):
-                    # Fyers FO master columns (zero based): lot=3, expiry=8,
-                    # ticker=9, root=13, strike=15 and option side=16.
-                    if len(row) <= 16 or row[9] not in requested:
-                        continue
-                    try:
-                        lot_size = int(float(row[3]))
-                        expiry = datetime.fromtimestamp(float(row[8]), UTC).astimezone(
-                            ZoneInfo("Asia/Kolkata")
-                        ).date().isoformat()
-                        strike = float(row[15])
-                    except (TypeError, ValueError, OSError):
-                        continue
-                    option_type = str(row[16]).upper()
-                    if lot_size > 0 and option_type in {"CE", "PE"}:
-                        result[row[9]] = OptionContractMetadata(
-                            symbol=row[9], underlying=str(row[13]), option_type=option_type,
-                            strike=strike, expiry=expiry, lot_size=lot_size,
-                        )
+        for exchange in exchanges:
+            if exchange not in self.instrument_master_urls:
+                continue
+            for refresh in (False, True):
+                for row in self._master_options(await self._master(exchange, refresh=refresh)):
+                    if row.symbol in requested:
+                        result[row.symbol] = row
+                wanted = {symbol for symbol in requested if symbol.startswith(exchange + ":")}
+                if wanted <= result.keys():
+                    break
         return result
 
     async def futures_series(self, symbols: list[str]) -> dict[str, list[FuturesSeries]]:
@@ -661,36 +756,26 @@ class FyersBroker(Broker):
         if not wanted:
             return {}
         found: dict[tuple[str, str], list[FuturesSeries]] = {key: [] for key in wanted}
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            for exchange in {key[0] for key in wanted}:
-                url = self.instrument_master_urls.get(exchange)
-                if not url:
+        for exchange in {key[0] for key in wanted}:
+            if exchange not in self.instrument_master_urls:
+                continue
+            for row in csv.reader(io.StringIO(await self._master(exchange))):
+                # Same FO master layout as the option lookup: lot=3,
+                # expiry=8, ticker=9, root=13, option side=16. Futures
+                # carry side "XX" and a negative strike.
+                if len(row) <= 16 or str(row[16]).upper() in {"CE", "PE"}:
                     continue
-                response = None
-                for attempt in range(4):
-                    response = await client.get(url)
-                    if response.status_code != 429:
-                        break
-                    await asyncio.sleep(2 ** attempt)
-                assert response is not None
-                response.raise_for_status()
-                for row in csv.reader(io.StringIO(response.text)):
-                    # Same FO master layout as the option lookup: lot=3,
-                    # expiry=8, ticker=9, root=13, option side=16. Futures
-                    # carry side "XX" and a negative strike.
-                    if len(row) <= 16 or str(row[16]).upper() in {"CE", "PE"}:
-                        continue
-                    key = futures_root(str(row[9]))
-                    if key is None or key not in found or key[0] != exchange:
-                        continue
-                    try:
-                        expiry = datetime.fromtimestamp(float(row[8]), UTC).astimezone(
-                            ZoneInfo("Asia/Kolkata")
-                        ).date().isoformat()
-                        lot_size = int(float(row[3]))
-                    except (TypeError, ValueError, OSError):
-                        continue
-                    found[key].append(FuturesSeries(str(row[9]), key[1], expiry, lot_size))
+                key = futures_root(str(row[9]))
+                if key is None or key not in found or key[0] != exchange:
+                    continue
+                try:
+                    expiry = datetime.fromtimestamp(float(row[8]), UTC).astimezone(
+                        ZoneInfo("Asia/Kolkata")
+                    ).date().isoformat()
+                    lot_size = int(float(row[3]))
+                except (TypeError, ValueError, OSError):
+                    continue
+                found[key].append(FuturesSeries(str(row[9]), key[1], expiry, lot_size))
         return {
             symbol: sorted(found[key], key=lambda series: series.expiry)
             for key, requested in wanted.items()
@@ -722,6 +807,8 @@ class FyersBroker(Broker):
         loop = asyncio.get_running_loop()
         tick_buffer = _ThreadsafeTickBuffer(loop)
         self._tick_buffer = tick_buffer
+        self.rejected_symbols = []
+        self.subscription_notices = []
 
         def on_message(message: dict) -> None:
             if not isinstance(message, dict) or "ltp" not in message:
@@ -790,6 +877,20 @@ class FyersBroker(Broker):
 
         def on_error(*details: object) -> None:
             nonlocal subscription_error
+            if _is_partial_subscription_notice(details[0] if details else None):
+                # The SDK subscribes every valid symbol and only REPORTS the
+                # invalid ones (or that an index has no depth). On 5 Oct one
+                # expired SENSEX weekly still held by the blast book turned
+                # this notice into a fatal "subscription failed": the stream
+                # coroutine exited while 1,609 good symbols kept streaming
+                # into a buffer nobody read, for the whole session.
+                notice = details[0]
+                self.rejected_symbols = sorted(set(self.rejected_symbols) | {
+                    str(s) for s in (notice.get("invalid_symbols") or [])})
+                message = str(notice.get("message") or "")[:200]
+                if message and message not in self.subscription_notices:
+                    self.subscription_notices = [*self.subscription_notices, message][-5:]
+                return
             # The SDK reconnects internally and used to have this callback
             # discarded. Wake the coroutine so it can distinguish a transient
             # socket fault from an expired REST session.
@@ -841,7 +942,11 @@ class FyersBroker(Broker):
                 tick = await asyncio.wait_for(tick_buffer.get(), timeout=1)
             except TimeoutError:
                 continue
-            await handler(tick)
+            try:
+                await handler(tick)
+            except Exception as exc:  # noqa: BLE001 -- a handler bug must never end the market-data stream
+                self.handler_errors += 1
+                self.last_handler_error = f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300]
             handled_since_yield += 1
             if handled_since_yield >= 64:
                 handled_since_yield = 0
@@ -880,3 +985,41 @@ class FyersBroker(Broker):
 
 def create_broker(settings: Settings) -> Broker:
     return FyersBroker(settings) if settings.feed_mode == "fyers" else SimulationBroker()
+
+
+def describe_fyers_token(text: str) -> dict:
+    """What a pasted value is, before Fyers is asked: a redirect address, an auth code, an access token.
+
+    Reads the JWT claims only to classify (no signature check -- Fyers remains the judge of validity):
+    ``sub`` says "auth_code" or "access_token"; ``exp`` dates it; ``app_id`` (auth codes) names the app.
+    """
+    from urllib.parse import parse_qs, urlparse
+    value = (text or "").strip()
+    out: dict = {"kind": "unknown", "value": value, "expires_at": None, "app_id": None}
+    if "://" in value or "auth_code=" in value:
+        query = parse_qs(urlparse(value).query if "://" in value else value.split("?", 1)[-1])
+        # Only auth_code: on a Fyers redirect "code" is a status (200, -1), not the authorisation.
+        code = (query.get("auth_code") or [None])[0]
+        out.update(kind="redirect", value=code)
+        if not code:
+            return out
+        value = code
+    if value.count(".") != 2:
+        return out
+    try:
+        import base64
+        import json as _json
+        part = value.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        claims = _json.loads(base64.urlsafe_b64decode(part))
+    except Exception:  # noqa: BLE001 -- not a JWT we can read: let Fyers decide
+        return out
+    subject = str(claims.get("sub") or "").lower()
+    if out["kind"] == "redirect" or subject == "auth_code" or "login" in str(claims.get("iss") or ""):
+        out["kind"] = "auth_code"
+    elif subject == "access_token" or claims.get("fy_id") or claims.get("at_hash"):
+        out["kind"] = "access_token"
+    if claims.get("exp"):
+        out["expires_at"] = datetime.fromtimestamp(float(claims["exp"]), UTC)
+    out["app_id"] = claims.get("app_id")
+    return out

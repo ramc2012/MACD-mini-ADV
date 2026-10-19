@@ -157,17 +157,22 @@ def test_selection_rolls_past_an_expiry_that_is_hours_away():
     so on 25 Aug 2026 the selector picked 427 contracts that settled at 15:30
     that same day. The roll asks for the next listed series instead.
     """
+    from datetime import datetime, timedelta
     from macd_trader.brokers import OptionChain
-    from macd_trader.rollover import Expiry
+    from macd_trader.rollover import IST, Expiry
 
-    front = OptionChain("2026-08-25", 1000.0, [
+    # Dated from today: selection reads the real clock, and fixed dates made
+    # the "next" series expire on 29 Sep 2026 and fail the roll that day.
+    today = datetime.now(IST).date()
+    near, far = today.isoformat(), (today + timedelta(days=35)).isoformat()
+    front = OptionChain(near, 1000.0, [
         OptionChainEntry(strike, side, f"NSE:SBIN26AUG{strike}{side}", volume=10)
         for side in ("CE", "PE") for strike in (990, 1000, 1010)
-    ], [Expiry("2026-08-25", "1787652600"), Expiry("2026-09-29", "1790676600")])
-    back = OptionChain("2026-09-29", 1000.0, [
+    ], [Expiry(near, "1787652600"), Expiry(far, "1790676600")])
+    back = OptionChain(far, 1000.0, [
         OptionChainEntry(strike, side, f"NSE:SBIN26SEP{strike}{side}", volume=10)
         for side in ("CE", "PE") for strike in (990, 1000, 1010)
-    ], [Expiry("2026-08-25", "1787652600"), Expiry("2026-09-29", "1790676600")])
+    ], [Expiry(near, "1787652600"), Expiry(far, "1790676600")])
 
     asked: list[str | None] = []
 
@@ -191,8 +196,8 @@ def test_selection_rolls_past_an_expiry_that_is_hours_away():
     assert asked == [None, "1790676600"]
     assert len(rows) == 6
     assert {row.moneyness for row in rows} == {"ITM", "ATM", "OTM"}
-    assert {row.expiry for row in rows} == {"2026-09-29"}
-    assert selector.rolled == {"NSE:SBIN-EQ": "2026-08-25 -> 2026-09-29"}
+    assert {row.expiry for row in rows} == {far}
+    assert selector.rolled == {"NSE:SBIN-EQ": f"{near} -> {far}"}
 
 
 def test_selection_keeps_the_front_series_when_it_is_not_expiring():
@@ -272,3 +277,95 @@ def test_a_selection_saved_before_the_roll_window_is_not_reused_inside_it():
 
     assert refetched == ["NSE:SBIN-EQ"], "the expiry-day snapshot must not be reused"
     assert rows == []
+
+
+def _index_chains(front_day, next_day):
+    from macd_trader.brokers import OptionChain
+    from macd_trader.rollover import Expiry
+    expiries = [Expiry(front_day, "F"), Expiry(next_day, "N")]
+    front = OptionChain(front_day, 25000.0, [
+        OptionChainEntry(strike, side, f"NSE:NIFTYF{strike}{side}", volume=10)
+        for side in ("CE", "PE") for strike in (24950, 25000, 25050)], expiries)
+    later = OptionChain(next_day, 25000.0, [
+        OptionChainEntry(strike, side, f"NSE:NIFTYN{strike}{side}", volume=10)
+        for side in ("CE", "PE") for strike in (24950, 25000, 25050)], expiries)
+    return front, later
+
+
+def test_index_spots_also_stream_the_next_series_as_analysis_only(tmp_path):
+    front, later = _index_chains("2099-09-29", "2099-10-06")
+    asked = []
+
+    class Broker:
+        async def option_chain(self, symbol, expiry_token=None):
+            asked.append((symbol, expiry_token))
+            if symbol == "NSE:SBIN-EQ":
+                return front
+            return later if expiry_token == "N" else front
+
+        async def preopen_price(self, _symbol):
+            return 25000.0
+
+        async def lot_sizes(self, symbols):
+            return {symbol: 75 for symbol in symbols}
+
+    selector = ContractSelector(Broker(), str(tmp_path / "contracts.json"))
+    rows = asyncio.run(selector.build(["NSE:NIFTY50-INDEX"]))
+    nxt = [row for row in rows if row.moneyness.startswith("NEXT-")]
+    assert {row.moneyness for row in nxt} == {"NEXT-ITM", "NEXT-ATM", "NEXT-OTM"}
+    assert all(row.analysis_only and row.expiry == "2099-10-06" for row in nxt)
+    # The front ladder is untouched: the strategies' ATM is still the front series.
+    atm = [row for row in rows if row.moneyness == "ATM"]
+    assert {row.expiry for row in atm} == {"2099-09-29"} and len(atm) == 2
+    # A stock spot costs no extra request.
+    asked.clear()
+    stock = ContractSelector(Broker(), str(tmp_path / "stock.json"))
+    asyncio.run(stock.build(["NSE:SBIN-EQ"]))
+    assert asked == [("NSE:SBIN-EQ", None)]
+
+
+def test_a_failed_next_series_never_costs_the_front_ladder(tmp_path):
+    front, _later = _index_chains("2099-09-29", "2099-10-06")
+
+    class Broker:
+        async def option_chain(self, _symbol, expiry_token=None):
+            if expiry_token == "N":
+                raise RuntimeError("429 rate limited")
+            return front
+
+        async def preopen_price(self, _symbol):
+            return 25000.0
+
+        async def lot_sizes(self, symbols):
+            return {symbol: 75 for symbol in symbols}
+
+    selector = ContractSelector(Broker(), str(tmp_path / "contracts.json"))
+    rows = asyncio.run(selector.build(["NSE:NIFTY50-INDEX"]))
+    assert len(rows) == 6 and not selector.errors
+    assert "429" in selector.next_series_errors["NSE:NIFTY50-INDEX"]
+
+
+def test_a_saved_index_selection_without_the_next_series_is_refreshed(tmp_path):
+    front, later = _index_chains("2099-09-29", "2099-10-06")
+    calls = []
+
+    class Broker:
+        async def option_chain(self, _symbol, expiry_token=None):
+            calls.append(expiry_token)
+            return later if expiry_token == "N" else front
+
+        async def preopen_price(self, _symbol):
+            return 25000.0
+
+        async def lot_sizes(self, symbols):
+            return {symbol: 75 for symbol in symbols}
+
+    path = str(tmp_path / "contracts.json")
+    first = ContractSelector(Broker(), path)
+    rows = asyncio.run(first.build(["NSE:NIFTY50-INDEX"]))
+    saved = json.loads(open(path).read())
+    saved["contracts"] = [row for row in saved["contracts"] if not row["moneyness"].startswith("NEXT-")]
+    open(path, "w").write(json.dumps(saved))
+    calls.clear()
+    again = asyncio.run(ContractSelector(Broker(), path).build(["NSE:NIFTY50-INDEX"]))
+    assert calls == [None, "N"] and len(again) == len(rows) == 12

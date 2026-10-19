@@ -233,11 +233,19 @@ func (h *streamHub) consume(ctx context.Context) error {
 		if stale {
 			continue
 		}
-		if gap {
-			// The engine dropped events for us. Everything derived from the
-			// ring is now suspect: take a fresh cut on this same connection
-			// and resynchronise every browser from it.
-			h.upstreamGaps.Add(1)
+		// The engine asks for a fresh cut after a startup, reconnect or
+		// rollover. Replaying that marker from the ring after the older cached
+		// snapshot made each browser request a resync, receive the same marker
+		// again and loop five times a second -- the terminal flickered through
+		// "Loading chart history" until the gateway restarted. Take the cut
+		// here instead, once, and let it resynchronise every browser.
+		if gap || frame.Type == "snapshot_required" {
+			// On a gap the engine dropped events for us. Everything derived
+			// from the ring is now suspect: take a fresh cut on this same
+			// connection and resynchronise every browser from it.
+			if gap {
+				h.upstreamGaps.Add(1)
+			}
 			awaitingSnapshot = true
 			if err := conn.Write(ctx, websocket.MessageText, []byte(`{"command":"snapshot"}`)); err != nil {
 				return fmt.Errorf("request snapshot: %w", err)

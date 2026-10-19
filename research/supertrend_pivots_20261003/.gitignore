@@ -1,0 +1,4 @@
+.deps/
+jupyter/
+__pycache__/
+candles5.jsonl.gz

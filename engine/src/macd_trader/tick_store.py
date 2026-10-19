@@ -31,10 +31,16 @@ from datetime import UTC, datetime, timedelta
 from threading import RLock
 from zoneinfo import ZoneInfo
 
+from . import sqlite_journal
+
 IST = ZoneInfo("Asia/Kolkata")
 FLUSH_INTERVAL_SECONDS = 5.0
 MAX_BUFFER_ROWS = 400_000
 DEFAULT_RETENTION_DAYS = 5
+# Exchange times before this are the feed's placeholder for "never traded"
+# (1980-01-01), not sessions: never condensed, purged with stranded raw rows.
+EARLIEST_SESSION_DAY = "2000-01-01"
+EARLIEST_SESSION_MS = 946_665_000_000  # 2000-01-01 00:00 IST
 # Raw ticks are the only tier that is expensive per unit of insight: ~680 MB a
 # session against ~2 MB for the minute rows they condense into. They exist to
 # be replayed while a question is fresh, then to become flow. The derived tiers
@@ -100,6 +106,9 @@ CREATE TABLE IF NOT EXISTS tick_minute_flow (
     -- Volume-weighted confidence of the aggressor classification. A delta
     -- divergence computed on a low-confidence minute is not a signal.
     avg_confidence REAL,
+    -- Open interest on the minute's last tick that carried one. Raw ticks hold OI but are deleted at
+    -- condensation, so without this column no OI-wall or OI-change study can reach past three days.
+    oi INTEGER,
     PRIMARY KEY (symbol_id, minute_ts)
 );
 -- The session volume profile: volume traded at each price, split by aggressor.
@@ -123,11 +132,9 @@ CREATE TABLE IF NOT EXISTS tick_condensed_days (
 
 def _connect(path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=60)
-    # NOT WAL: this file lives on a Docker Desktop bind mount, whose
-    # virtualised filesystem does not reliably provide the shared-memory and
-    # byte-range locking WAL needs. It corrupted the trade book once already.
-    connection.execute("PRAGMA journal_mode=DELETE")
-    connection.execute("PRAGMA synchronous=FULL")
+    # WAL on a local filesystem, the rollback journal on a bind mount, whose
+    # locking WAL cannot rely on (it corrupted the trade book once already).
+    sqlite_journal.configure(connection, path)
     connection.executescript(SCHEMA)
     _migrate(connection)
     return connection
@@ -143,6 +150,7 @@ FLOW_COLUMNS = (
     ("ofi", "REAL"),
     ("ofi_events", "INTEGER NOT NULL DEFAULT 0"),
     ("avg_confidence", "REAL"),
+    ("oi", "INTEGER"),
 )
 TICK_COLUMNS = (("tbq", "INTEGER"), ("tsq", "INTEGER"))
 
@@ -163,6 +171,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
 # bid. Reconstructing a session with this copy therefore disagreed with the live
 # footprint for reasons that had nothing to do with the quote-vs-tick question
 # the reconstruction was meant to measure. One function, one rule.
+from .sessions import session_bounds
 from .ofi import OFIState
 from .orderflow import classify, classify_update  # noqa: F401  (classify re-exported)
 
@@ -193,6 +202,7 @@ class TickStore:
         self.last_error: str | None = None
         self.last_condense: dict | None = None
         self.last_prune: dict | None = None
+        self.last_purge: dict | None = None
 
     # -- capture -------------------------------------------------------------
 
@@ -290,7 +300,8 @@ class TickStore:
             for (day,) in connection.execute(
                 "SELECT DISTINCT date(ts_ms / 1000, 'unixepoch', '+5 hours', '+30 minutes') FROM ticks"
             ):
-                if day and day not in done and datetime.fromisoformat(day).date() <= cutoff:
+                if (day and day not in done and day >= EARLIEST_SESSION_DAY
+                        and datetime.fromisoformat(day).date() <= cutoff):
                     days.add(day)
             return sorted(days)
         finally:
@@ -302,123 +313,18 @@ class TickStore:
         end = start + 86_400_000
         connection = _connect(self._path)
         try:
-            minute: dict[tuple[int, int], dict] = {}
-            ladder: dict[tuple[int, float], list[int]] = {}
-            # Last non-zero side per symbol, for the zero-tick rule — the same
-            # carry-forward the live tracker keeps on FlowState.last_side.
-            previous_side: dict[int, int] = {}
-            previous_price: dict[int, float] = {}
-            previous_volume: dict[int, int] = {}
-            # The book, and the pending totals, as they stood BEFORE the update
-            # being classified -- the ones its trades hit.
-            previous_book: dict[int, tuple] = {}
-            previous_pending: dict[int, tuple] = {}
-            ofi_states: dict[int, OFIState] = {}
-            raw = 0
-
             cursor = connection.execute(
                 """SELECT symbol_id, ts_ms, ltp, cum_volume, last_qty, bid, ask,
-                          bid_qty, ask_qty, tbq, tsq
+                          bid_qty, ask_qty, tbq, tsq, oi
                    FROM ticks WHERE ts_ms >= ? AND ts_ms < ? ORDER BY symbol_id, ts_ms""",
                 (start, end),
             )
-            for (symbol_id, ts_ms, ltp, cum_volume, last_qty, bid, ask,
-                 bid_qty, ask_qty, tbq, tsq) in cursor:
-                raw += 1
-                minute_ts = (ts_ms // 60_000) * 60
-                bucket = minute.setdefault((symbol_id, minute_ts), _empty_minute())
-                bucket["ticks"] += 1
-                if bucket["open"] is None:
-                    bucket["open"] = ltp
-                bucket["close"] = ltp
-                bucket["high"] = ltp if bucket["high"] is None else max(bucket["high"], ltp)
-                bucket["low"] = ltp if bucket["low"] is None else min(bucket["low"], ltp)
-                if bid is not None and ask is not None and ask >= bid:
-                    bucket["spread_sum"] += ask - bid
-                    bucket["spread_n"] += 1
-
-                # Book pressure, measured not inferred. Folded in before the
-                # trade branch because a quote-only update carries no trade but
-                # is still a change in the book.
-                ofi_state = ofi_states.get(symbol_id)
-                if ofi_state is None:
-                    ofi_state = ofi_states[symbol_id] = OFIState(symbol=str(symbol_id))
-                contribution = ofi_state.update(ts_ms / 1000.0, bid, ask, bid_qty, ask_qty)
-                if contribution is not None:
-                    bucket["ofi"] += contribution
-                    bucket["ofi_events"] += 1
-
-                prior_book = previous_book.get(symbol_id)
-                prior_pending = previous_pending.get(symbol_id)
-                previous_book[symbol_id] = (bid, ask)
-                previous_pending[symbol_id] = (tbq, tsq)
-
-                # Traded size: prefer last_qty, else the cumulative-volume delta.
-                size = 0
-                if last_qty:
-                    size = max(0, int(last_qty))
-                elif cum_volume is not None:
-                    prior = previous_volume.get(symbol_id)
-                    if prior is not None:
-                        size = max(0, int(cum_volume) - prior)
-                if cum_volume is not None:
-                    previous_volume[symbol_id] = int(cum_volume)
-
-                if size <= 0:
-                    # Not a trade (quote/OI update). It must NOT advance the
-                    # tick-rule reference, or the next real print is compared
-                    # against its own echo and lands on the equality branch —
-                    # the same defect the live path had.
-                    continue
-                # Against the PRIOR book: classifying a lift at the ask against
-                # the book it just moved reads it as a hit on the bid.
-                prior_bid, prior_ask = prior_book if prior_book else (None, None)
-                buy_change = sell_change = None
-                if prior_pending is not None:
-                    prior_tbq, prior_tsq = prior_pending
-                    if tbq is not None and prior_tbq is not None:
-                        buy_change = tbq - prior_tbq
-                    if tsq is not None and prior_tsq is not None:
-                        sell_change = tsq - prior_tsq
-                verdict = classify_update(
-                    price=ltp, traded=size, last_qty=last_qty,
-                    prior_bid=prior_bid, prior_ask=prior_ask,
-                    prior_price=previous_price.get(symbol_id),
-                    last_side=previous_side.get(symbol_id, 0),
-                    buy_pending_change=buy_change, sell_pending_change=sell_change)
-                side, method = verdict.side, _METHOD_COLUMN[verdict.method]
-                bucket["conf_sum"] += verdict.confidence * size
-                bucket["conf_volume"] += size
-                previous_price[symbol_id] = ltp
-                if side:
-                    previous_side[symbol_id] = side
-
-                bucket["trades"] += 1
-                bucket["volume"] += size
-                bucket["notional"] += size * ltp
-                # A sideless verdict has no method counter of its own: the
-                # side check below books it as unclassified, once.
-                if method is not None:
-                    bucket[f"{method}_n"] += 1
-                if side > 0:
-                    bucket["buy_volume"] += size
-                elif side < 0:
-                    bucket["sell_volume"] += size
-                else:
-                    bucket["unclassified"] += 1
-                key = (symbol_id, round(ltp, 2))
-                cell = ladder.setdefault(key, [0, 0])
-                # Classified size only. This was `side >= 0`, which booked every
-                # UNCLASSIFIED print as a BUY — inventing one-sided pressure in
-                # exactly the zero-tick zone where classification is weakest.
-                # The ladder's two columns are buy/sell by schema, so an
-                # unclassified print belongs in neither; its size is still
-                # counted in the minute row's own volume, and the print in
-                # `unclassified`, so the residual stays visible.
-                if side > 0:
-                    cell[0] += size
-                elif side < 0:
-                    cell[1] += size
+            names = dict(connection.execute("SELECT id, symbol FROM tick_symbols"))
+            bounds = {}
+            for symbol_id, symbol in names.items():
+                start_s, end_s = session_bounds(symbol, day)
+                bounds[symbol_id] = (start_s * 1000, end_s * 1000)
+            minute, ladder, raw = condense_ticks(cursor, bounds)
 
             minute_rows = [
                 (sid, ts, b["open"], b["high"], b["low"], b["close"], b["volume"],
@@ -429,7 +335,7 @@ class TickStore:
                  b["pending_n"], b["conflict_n"], b["unclassified"],
                  round(b["spread_sum"] / b["spread_n"], 4) if b["spread_n"] else None,
                  round(b["ofi"], 2), b["ofi_events"],
-                 round(b["conf_sum"] / b["conf_volume"], 4) if b["conf_volume"] else None)
+                 round(b["conf_sum"] / b["conf_volume"], 4) if b["conf_volume"] else None, b["oi"])
                 for (sid, ts), b in minute.items()
             ]
             ladder_rows = [(sid, day, price, v[0], v[1]) for (sid, price), v in ladder.items()]
@@ -439,8 +345,8 @@ class TickStore:
                    (symbol_id, minute_ts, open, high, low, close, volume, buy_volume,
                     sell_volume, delta, trades, ticks, vwap, quote_n, mid_n, tick_n,
                     zero_tick_n, pending_n, conflict_n, unclassified, avg_spread,
-                    ofi, ofi_events, avg_confidence)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ofi, ofi_events, avg_confidence, oi)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 minute_rows,
             )
             connection.executemany(
@@ -485,7 +391,36 @@ class TickStore:
             connection.close()
 
     def condense_pending(self, now: datetime | None = None) -> list[dict]:
-        return [self.condense_day(day) for day in self.days_pending_condensation(now)]
+        results = [self.condense_day(day) for day in self.days_pending_condensation(now)]
+        self.purge_stranded_raw(now)
+        return results
+
+    def purge_stranded_raw(self, now: datetime | None = None) -> int:
+        """Delete raw ticks that no condensation will ever reach.
+
+        A symbol with no trade yet today streams its LAST trade's exchange
+        time: an option idle since 25 Sep arrives stamped 25 Sep, one that has
+        never traded at the feed's zero time (1980-01-01). Those rows land on
+        days already condensed -- or that were never sessions -- and
+        ``days_pending_condensation`` skips both, so they stayed in the raw
+        table for good: on 1 Oct 2026 it held rows for 1980-01-01, 7-9 Sep
+        and 25 Sep, all long condensed.
+        """
+        moment = (now or datetime.now(IST)).astimezone(IST)
+        cutoff = (moment - timedelta(days=self.retention_days)).date() + timedelta(days=1)
+        cutoff_ms = int(datetime.combine(cutoff, datetime.min.time(), IST).timestamp() * 1000)
+        connection = _connect(self._path)
+        try:
+            deleted = connection.execute(
+                """DELETE FROM ticks WHERE ts_ms < ? AND (
+                     ts_ms < ? OR date(ts_ms / 1000, 'unixepoch', '+5 hours', '+30 minutes')
+                                  IN (SELECT day FROM tick_condensed_days))""",
+                (cutoff_ms, EARLIEST_SESSION_MS)).rowcount
+            connection.commit()
+        finally:
+            connection.close()
+        self.last_purge = {"at": moment.isoformat(timespec="seconds"), "raw_ticks": deleted}
+        return deleted
 
     def vacuum(self) -> None:
         """Reclaim the file space freed by deleting condensed raw ticks."""
@@ -512,7 +447,7 @@ class TickStore:
                 "flow_retention_days": self.flow_retention_days,
                 "last_flush_at": self.last_flush_at.isoformat() if self.last_flush_at else None,
                 "last_error": self.last_error, "last_condense": self.last_condense,
-                "last_prune": self.last_prune}
+                "last_prune": self.last_prune, "last_purge": self.last_purge}
         if not include_database_counts:
             return info
         try:
@@ -531,6 +466,158 @@ class TickStore:
         return info
 
 
+def condense_ticks(rows, bounds: dict | None = None) -> tuple[dict, dict, int]:
+    """Minute flow and a buy/sell ladder from raw tick rows, per symbol.
+
+    ``rows`` are (symbol_id, ts_ms, ltp, cum_volume, last_qty, bid, ask,
+    bid_qty, ask_qty, tbq, tsq[, oi]), ordered by symbol then time. The one
+    implementation behind both the nightly condense (which stores and deletes)
+    and the auction page's read of a day still in the raw tier -- so a
+    session reads the same before and after it is condensed.
+    Returns ({(symbol_id, minute_ts): bucket}, {(symbol_id, price): [buy, sell]}, raw count).
+
+    ``bounds`` maps symbol_id -> (start_ms, end_ms) of that instrument's own
+    continuous session (sessions.session_bounds). Ticks outside it are skipped
+    entirely -- no bucket, no book memory, no volume baseline -- exactly as the
+    live tracker never sees them: the pre-open match and a cash closing-auction
+    uncross (9.5M HDFCBANK shares at 15:29:23 on 29 Sep 2026) carry no
+    aggressor, and the first in-session tick becomes the volume baseline.
+    """
+    minute: dict[tuple[int, int], dict] = {}
+    ladder: dict[tuple[int, float], list[int]] = {}
+    # Last non-zero side per symbol, for the zero-tick rule — the same
+    # carry-forward the live tracker keeps on FlowState.last_side.
+    previous_side: dict[int, int] = {}
+    previous_price: dict[int, float] = {}
+    previous_volume: dict[int, int] = {}
+    # The book, and the pending totals, as they stood BEFORE the update
+    # being classified -- the ones its trades hit.
+    previous_book: dict[int, tuple] = {}
+    previous_pending: dict[int, tuple] = {}
+    ofi_states: dict[int, OFIState] = {}
+    traded: dict[int, bool] = {}
+    raw = 0
+
+    for row in rows:
+        # An optional twelfth field carries OI (the nightly condense selects it; older callers do not).
+        (symbol_id, ts_ms, ltp, cum_volume, last_qty, bid, ask, bid_qty, ask_qty, tbq, tsq) = row[:11]
+        oi = row[11] if len(row) > 11 else None
+        raw += 1
+        if bounds is not None:
+            window = bounds.get(symbol_id)
+            if window is None or not (window[0] <= ts_ms < window[1]):
+                continue
+        minute_ts = (ts_ms // 60_000) * 60
+        bucket = minute.setdefault((symbol_id, minute_ts), _empty_minute())
+        bucket["ticks"] += 1
+        if bucket["open"] is None:
+            bucket["open"] = ltp
+        bucket["close"] = ltp
+        bucket["high"] = ltp if bucket["high"] is None else max(bucket["high"], ltp)
+        bucket["low"] = ltp if bucket["low"] is None else min(bucket["low"], ltp)
+        if oi is not None:
+            bucket["oi"] = oi
+        if bid is not None and ask is not None and ask >= bid:
+            bucket["spread_sum"] += ask - bid
+            bucket["spread_n"] += 1
+
+        # Book pressure, measured not inferred. Folded in before the
+        # trade branch because a quote-only update carries no trade but
+        # is still a change in the book.
+        ofi_state = ofi_states.get(symbol_id)
+        if ofi_state is None:
+            ofi_state = ofi_states[symbol_id] = OFIState(symbol=str(symbol_id))
+        contribution = ofi_state.update(ts_ms / 1000.0, bid, ask, bid_qty, ask_qty)
+        if contribution is not None:
+            bucket["ofi"] += contribution
+            bucket["ofi_events"] += 1
+
+        prior_book = previous_book.get(symbol_id)
+        prior_pending = previous_pending.get(symbol_id)
+        previous_book[symbol_id] = (bid, ask)
+        previous_pending[symbol_id] = (tbq, tsq)
+
+        # Traded size, by the live tracker's rule (OrderFlowTracker.on_tick):
+        # the cumulative-volume delta, with last_qty only when the instrument
+        # sends no cumulative total. Fyers repeats last_qty on every quote and
+        # OI update, so preferring it booked each quote change as a print of
+        # the LAST trade's size and missed every other trade between updates:
+        # HDFCBANK on 29 Sep 2026 condensed to 2.98M shares of a 40.86M
+        # session, and the auction page's delta was 1/52 of the order-flow
+        # page's. The first cumulative total is a baseline, not a print.
+        size = 0
+        if cum_volume:
+            prior = previous_volume.get(symbol_id)
+            if prior is not None:
+                size = max(0, int(cum_volume) - prior)
+            previous_volume[symbol_id] = int(cum_volume)
+        elif last_qty:
+            size = max(0, int(last_qty))
+
+        if size <= 0:
+            # Not a trade (quote/OI update). It must NOT advance the
+            # tick-rule reference, or the next real print is compared
+            # against its own echo and lands on the equality branch —
+            # the same defect the live path had.
+            continue
+        # Against the PRIOR book: classifying a lift at the ask against
+        # the book it just moved reads it as a hit on the bid.
+        prior_bid, prior_ask = prior_book if prior_book else (None, None)
+        if (prior_bid is None or prior_ask is None) and not traded.get(symbol_id):
+            # As the live tracker does: before any print, with no book yet
+            # seen, the tick's own quote is the only one there is.
+            prior_bid, prior_ask = bid, ask
+        traded[symbol_id] = True
+        buy_change = sell_change = None
+        if prior_pending is not None:
+            prior_tbq, prior_tsq = prior_pending
+            if tbq is not None and prior_tbq is not None:
+                buy_change = tbq - prior_tbq
+            if tsq is not None and prior_tsq is not None:
+                sell_change = tsq - prior_tsq
+        verdict = classify_update(
+            price=ltp, traded=size, last_qty=last_qty,
+            prior_bid=prior_bid, prior_ask=prior_ask,
+            prior_price=previous_price.get(symbol_id),
+            last_side=previous_side.get(symbol_id, 0),
+            buy_pending_change=buy_change, sell_pending_change=sell_change)
+        side, method = verdict.side, _METHOD_COLUMN[verdict.method]
+        bucket["conf_sum"] += verdict.confidence * size
+        bucket["conf_volume"] += size
+        previous_price[symbol_id] = ltp
+        if side:
+            previous_side[symbol_id] = side
+
+        bucket["trades"] += 1
+        bucket["volume"] += size
+        bucket["notional"] += size * ltp
+        # A sideless verdict has no method counter of its own: the
+        # side check below books it as unclassified, once.
+        if method is not None:
+            bucket[f"{method}_n"] += 1
+        if side > 0:
+            bucket["buy_volume"] += size
+        elif side < 0:
+            bucket["sell_volume"] += size
+        else:
+            bucket["unclassified"] += 1
+        key = (symbol_id, round(ltp, 2))
+        cell = ladder.setdefault(key, [0, 0])
+        # Classified size only. This was `side >= 0`, which booked every
+        # UNCLASSIFIED print as a BUY — inventing one-sided pressure in
+        # exactly the zero-tick zone where classification is weakest.
+        # The ladder's two columns are buy/sell by schema, so an
+        # unclassified print belongs in neither; its size is still
+        # counted in the minute row's own volume, and the print in
+        # `unclassified`, so the residual stays visible.
+        if side > 0:
+            cell[0] += size
+        elif side < 0:
+            cell[1] += size
+
+    return minute, ladder, raw
+
+
 def _empty_minute() -> dict:
     # A key per method classify() can return. A missing one is not a default of
     # zero, it is a KeyError inside condense_day that aborts the whole day --
@@ -541,7 +628,7 @@ def _empty_minute() -> dict:
             "quote_n": 0, "mid_n": 0, "tick_n": 0, "zero_tick_n": 0,
             "pending_n": 0, "conflict_n": 0, "unclassified": 0,
             "spread_sum": 0.0, "spread_n": 0,
-            "ofi": 0.0, "ofi_events": 0, "conf_sum": 0.0, "conf_volume": 0.0}
+            "ofi": 0.0, "ofi_events": 0, "conf_sum": 0.0, "conf_volume": 0.0, "oi": None}
 
 
 def _int_or_none(value):

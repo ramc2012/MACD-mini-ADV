@@ -16,7 +16,7 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed},
         Arc, Mutex, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -68,6 +68,9 @@ pub struct Stats {
     questdb_tables_ready: AtomicBool,
     questdb_lines: AtomicU64,
     questdb_dropped: AtomicU64,
+    questdb_last_line_ms: AtomicI64,
+    store_heals: AtomicU64,
+    store: Mutex<StoreCheck>,
     last_error: Mutex<String>,
 }
 
@@ -75,6 +78,121 @@ impl Stats {
     fn error(&self, message: String) {
         eprintln!("live pipeline: {message}");
         *self.last_error.lock().unwrap() = message;
+    }
+}
+
+/// Whether bars sent over line protocol are actually landing in QuestDB.
+/// A TCP write succeeding proves nothing: on 8 Oct 2026 a host crash left
+/// `bars_1m` unreadable and QuestDB silently discarded every line for six
+/// days while the writer counted them as sent.
+#[derive(Default)]
+struct StoreCheck {
+    /// "unchecked", "ok", "stale" (lines sent, nothing committed) or "unreadable".
+    state: &'static str,
+    detail: String,
+    last_write_us: Option<i64>,
+    lines_seen: u64,
+    /// Consecutive checks where lines were sent but the table did not advance.
+    stuck_checks: u32,
+    checked_at_ms: i64,
+}
+
+const STORE_CHECK_EVERY: Duration = Duration::from_secs(60);
+/// Lines flowing for this many checks with no new commit marks the store stale.
+const STORE_STUCK_CHECKS: u32 = 5;
+
+/// One check's verdict from the table's last data timestamp and the lines
+/// sent since the previous check.
+fn store_verdict(check: &mut StoreCheck, last_write_us: Option<i64>, lines: u64, readable: Result<(), String>) {
+    let sent = lines > check.lines_seen;
+    let advanced = last_write_us.is_some() && last_write_us > check.last_write_us;
+    if advanced {
+        check.stuck_checks = 0;
+    } else if sent {
+        check.stuck_checks += 1;
+    }
+    check.last_write_us = last_write_us.or(check.last_write_us);
+    check.lines_seen = lines;
+    (check.state, check.detail) = match readable {
+        Err(error) => ("unreadable", error),
+        Ok(()) if check.stuck_checks >= STORE_STUCK_CHECKS => (
+            "stale",
+            format!("{} checks with lines sent and no new bars committed", check.stuck_checks),
+        ),
+        Ok(()) => ("ok", String::new()),
+    };
+}
+
+async fn questdb_value(http: &str, sql: &str) -> Result<Option<i64>, String> {
+    let path = format!("/exec?query={}", minihttp::encode(sql, false));
+    match minihttp::get(http, &path, &[], Duration::from_secs(20)).await {
+        Ok((200, body)) => {
+            let value: serde_json::Value = serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+            Ok(value["dataset"].get(0).and_then(|row| row.get(0)).and_then(serde_json::Value::as_i64))
+        }
+        Ok((status, body)) => Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&body).chars().take(200).collect::<String>())),
+        Err(error) => Err(error),
+    }
+}
+
+/// Consecutive unreadable checks (one a minute) before the bars table is dropped and rebuilt.
+const HEAL_AFTER_UNREADABLE_CHECKS: u32 = 3;
+
+/// Drop a damaged bars_1m and create it again with its retention and dedup keys. A host crash left it
+/// unreadable on 8 and 15 Oct 2026; RENAME fails on a damaged table, DROP does not. The minute bars are
+/// also in the engine's SQLite store, so nothing unique is lost, and writes resume within a minute.
+async fn heal_bars_table(http: &str, stats: &Stats) {
+    let path = format!("/exec?query={}", minihttp::encode("DROP TABLE IF EXISTS bars_1m", false));
+    match minihttp::get(http, &path, &[], Duration::from_secs(60)).await {
+        Ok((200, _)) => {
+            let ready = create_tables(http, stats, 3).await;
+            stats.questdb_tables_ready.store(ready, Relaxed);
+            stats.error(format!("questdb bars_1m was unreadable; dropped and recreated (tables ready: {ready})"));
+            stats.store_heals.fetch_add(1, Relaxed);
+        }
+        Ok((status, body)) => stats.error(format!("questdb bars_1m heal: HTTP {status}: {}",
+                                                  String::from_utf8_lossy(&body).chars().take(200).collect::<String>())),
+        Err(error) => stats.error(format!("questdb bars_1m heal: {error}")),
+    }
+}
+
+async fn store_watch(http: String, stats: Arc<Stats>) {
+    let mut interval = tokio::time::interval(STORE_CHECK_EVERY);
+    let mut unreadable_checks = 0u32;
+    loop {
+        interval.tick().await;
+        let last_write = questdb_value(
+            &http,
+            "SELECT cast(table_last_write_timestamp AS LONG) FROM tables() WHERE table_name = 'bars_1m'",
+        )
+        .await;
+        // The catalogue can list a table whose files no longer open; read one row to be sure. After the
+        // 15 Oct 2026 crash the table still answered count() while every timestamp read as 0, so a
+        // zero designated timestamp on the last row is damage too.
+        let readable = match questdb_value(&http, "SELECT cast(ts AS LONG) FROM bars_1m LIMIT -1").await {
+            Ok(Some(ts)) if ts <= 0 => Err("last row's timestamp reads as 0 (damaged column files)".to_string()),
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+        let lines = stats.questdb_lines.load(Relaxed);
+        // The lock lives in this block only: it must not be held across the heal below, which awaits.
+        let (state, message) = {
+            let mut check = stats.store.lock().unwrap();
+            let before = check.state;
+            store_verdict(&mut check, last_write.clone().ok().flatten(), lines, readable.and(last_write.map(|_| ())));
+            check.checked_at_ms = now_ms();
+            let message = (check.state != before && check.state != "ok")
+                .then(|| format!("questdb bars_1m {}: {}", check.state, check.detail));
+            (check.state, message)
+        };
+        if let Some(message) = message {
+            stats.error(message);
+        }
+        unreadable_checks = if state == "unreadable" { unreadable_checks + 1 } else { 0 };
+        if unreadable_checks >= HEAL_AFTER_UNREADABLE_CHECKS {
+            unreadable_checks = 0;
+            heal_bars_table(&http, &stats).await;
+        }
     }
 }
 
@@ -119,6 +237,9 @@ impl Pipeline {
         }
         if let Some(address) = config.questdb_ilp.clone() {
             tokio::spawn(questdb_writer(questdb_rx, address, config.questdb_http.clone(), stats.clone()));
+            if let Some(http) = config.questdb_http.clone() {
+                tokio::spawn(store_watch(http, stats.clone()));
+            }
         }
         if let Some(engine) = config.engine.clone() {
             tokio::spawn(seeder(seed_rx, senders.clone(), engine.clone(), config.token.clone(), stats.clone()));
@@ -196,9 +317,30 @@ impl Pipeline {
                 "tables_ready": s.questdb_tables_ready.load(Relaxed),
                 "lines": s.questdb_lines.load(Relaxed),
                 "dropped": s.questdb_dropped.load(Relaxed),
+                "store": self.store_json(),
             },
             "last_error": s.last_error.lock().unwrap().clone(),
         })
+    }
+
+    fn store_json(&self) -> serde_json::Value {
+        let check = self.stats.store.lock().unwrap();
+        json!({
+            "state": if check.state.is_empty() { "unchecked" } else { check.state },
+            "detail": check.detail,
+            "last_write_us": check.last_write_us,
+            "checked_at_ms": check.checked_at_ms,
+            "last_line_ms": self.stats.questdb_last_line_ms.load(Relaxed),
+            "heals": self.stats.store_heals.load(Relaxed),
+        })
+    }
+
+    /// False when the bus is down or bars are not reaching QuestDB.
+    pub fn health(&self) -> (bool, serde_json::Value) {
+        let store = self.store_json();
+        let bus = self.stats.bus_connected.load(Relaxed);
+        let ok = bus && matches!(store["state"].as_str(), Some("ok" | "unchecked"));
+        (ok, json!({ "bus_connected": bus, "questdb": store }))
     }
 }
 
@@ -422,8 +564,8 @@ pub const QUESTDB_TABLES: [&str; 2] = [
      TIMESTAMP(ts) PARTITION BY DAY TTL 90 DAYS WAL DEDUP UPSERT KEYS(ts, symbol)",
 ];
 
-async fn create_tables(http: &str, stats: &Stats) -> bool {
-    for attempt in 0..60 {
+async fn create_tables(http: &str, stats: &Stats, attempts: u32) -> bool {
+    for attempt in 0..attempts {
         let mut ok = true;
         for ddl in QUESTDB_TABLES {
             let path = format!("/exec?query={}", minihttp::encode(ddl, false));
@@ -449,12 +591,62 @@ async fn create_tables(http: &str, stats: &Stats) -> bool {
     false
 }
 
+/// Bars are sent once a minute, at this many seconds past it, sorted by timestamp. A bar closes on its
+/// symbol's next tick (or the sweeper's grace), so a minute's ~1,500 bars used to trickle in across the
+/// whole next minute: QuestDB committed every ~3 s, each commit was out of order against the last, and
+/// every one rewrote the day's partition (4,160 rewrites of a 241 MB partition by 12:53 on 15 Oct 2026,
+/// ~137 GB of disk writes in 2.5 hours). By :15 the previous minute is complete, so a batch is an append.
+const BATCH_SECOND_MS: i64 = 15_000;
+/// A batch is sent early if it grows past this (a backlog after a reconnect), bounding memory.
+const MAX_PENDING_LINES: usize = 200_000;
+
+fn next_batch_delay(now_ms: i64) -> Duration {
+    let into_minute = now_ms.rem_euclid(60_000);
+    let wait = if into_minute < BATCH_SECOND_MS { BATCH_SECOND_MS - into_minute } else { 60_000 - into_minute + BATCH_SECOND_MS };
+    Duration::from_millis(wait as u64)
+}
+
+/// The designated timestamp is a line-protocol row's last field.
+fn line_timestamp(line: &str) -> i64 {
+    line.trim_end().rsplit(' ').next().and_then(|stamp| stamp.parse().ok()).unwrap_or(i64::MAX)
+}
+
+/// Write the pending lines in timestamp order and flush. False when the connection failed; the lines not
+/// yet written are counted as dropped.
+async fn send_batch(writer: &mut BufWriter<TcpStream>, pending: &mut Vec<String>, stats: &Stats) -> bool {
+    if pending.is_empty() {
+        return true;
+    }
+    pending.sort_by_key(|line| line_timestamp(line));
+    let total = pending.len();
+    for (index, line) in pending.iter().enumerate() {
+        if writer.write_all(line.as_bytes()).await.is_err() {
+            stats.questdb_dropped.fetch_add((total - index) as u64, Relaxed);
+            pending.clear();
+            return false;
+        }
+        stats.questdb_lines.fetch_add(1, Relaxed);
+    }
+    pending.clear();
+    stats.questdb_last_line_ms.store(now_ms(), Relaxed);
+    writer.flush().await.is_ok()
+}
+
 async fn questdb_writer(mut rx: mpsc::Receiver<String>, address: String, http: Option<String>, stats: Arc<Stats>) {
-    if let Some(http) = http {
-        let ready = create_tables(&http, &stats).await;
+    if let Some(http) = &http {
+        let ready = create_tables(http, &stats, 60).await;
         stats.questdb_tables_ready.store(ready, Relaxed);
     }
+    let mut reconnect = false;
+    let mut pending: Vec<String> = Vec::new();
     loop {
+        // A table dropped or lost while the service runs would otherwise be
+        // re-created by line protocol without its retention and dedup keys.
+        if let (true, Some(http)) = (reconnect, &http) {
+            let ready = create_tables(http, &stats, 1).await;
+            stats.questdb_tables_ready.store(ready, Relaxed);
+        }
+        reconnect = true;
         let stream = match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(&address)).await {
             Ok(Ok(stream)) => stream,
             _ => {
@@ -466,26 +658,108 @@ async fn questdb_writer(mut rx: mpsc::Receiver<String>, address: String, http: O
         stream.set_nodelay(true).ok();
         stats.questdb_connected.store(true, Relaxed);
         let mut writer = BufWriter::with_capacity(256 << 10, stream);
-        let mut flush = tokio::time::interval(Duration::from_millis(200));
+        let batch = tokio::time::sleep(next_batch_delay(now_ms()));
+        tokio::pin!(batch);
         loop {
             tokio::select! {
                 line = rx.recv() => {
                     let Some(line) = line else { return };
-                    if writer.write_all(line.as_bytes()).await.is_err() {
-                        stats.questdb_dropped.fetch_add(1, Relaxed);
-                        break;
+                    pending.push(line);
+                    if pending.len() >= MAX_PENDING_LINES {
+                        batch.as_mut().reset(tokio::time::Instant::now());
                     }
-                    stats.questdb_lines.fetch_add(1, Relaxed);
                 }
-                _ = flush.tick() => {
-                    if writer.flush().await.is_err() {
+                _ = &mut batch => {
+                    if !send_batch(&mut writer, &mut pending, &stats).await {
                         break;
                     }
+                    batch.as_mut().reset(tokio::time::Instant::now() + next_batch_delay(now_ms()));
                 }
             }
         }
         stats.questdb_connected.store(false, Relaxed);
         stats.error(format!("questdb {address}: connection lost; reconnecting"));
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_is_ok_while_commits_keep_up_with_lines() {
+        let mut check = StoreCheck::default();
+        for minute in 0..10 {
+            store_verdict(&mut check, Some(1_000 + minute), 100 * (minute as u64 + 1), Ok(()));
+        }
+        assert_eq!(check.state, "ok");
+        assert_eq!(check.stuck_checks, 0);
+    }
+
+    #[test]
+    fn lines_sent_without_commits_turn_the_store_stale() {
+        let mut check = StoreCheck::default();
+        store_verdict(&mut check, Some(1_000), 10, Ok(()));
+        for n in 1..STORE_STUCK_CHECKS {
+            store_verdict(&mut check, Some(1_000), 10 + n as u64, Ok(()));
+            assert_eq!(check.state, "ok");
+        }
+        store_verdict(&mut check, Some(1_000), 99, Ok(()));
+        assert_eq!(check.state, "stale");
+        // A commit clears it.
+        store_verdict(&mut check, Some(2_000), 120, Ok(()));
+        assert_eq!(check.state, "ok");
+    }
+
+    #[test]
+    fn a_quiet_market_is_not_stale() {
+        let mut check = StoreCheck::default();
+        for _ in 0..20 {
+            store_verdict(&mut check, Some(1_000), 10, Ok(()));
+        }
+        assert_eq!(check.state, "ok");
+    }
+
+    #[test]
+    fn an_empty_table_receiving_lines_turns_stale() {
+        let mut check = StoreCheck::default();
+        for n in 0..STORE_STUCK_CHECKS {
+            store_verdict(&mut check, None, 10 * (n as u64 + 1), Ok(()));
+        }
+        assert_eq!(check.state, "stale");
+    }
+
+    #[test]
+    fn an_unreadable_table_is_reported() {
+        let mut check = StoreCheck::default();
+        store_verdict(&mut check, Some(1_000), 10, Err("HTTP 500".into()));
+        assert_eq!(check.state, "unreadable");
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn batches_go_out_fifteen_seconds_past_each_minute() {
+        assert_eq!(next_batch_delay(0), Duration::from_millis(15_000));
+        assert_eq!(next_batch_delay(14_000), Duration::from_millis(1_000));
+        assert_eq!(next_batch_delay(15_000), Duration::from_millis(60_000));
+        assert_eq!(next_batch_delay(59_000 + 120_000), Duration::from_millis(16_000));
+    }
+
+    #[test]
+    fn lines_sort_by_their_designated_timestamp() {
+        let mut lines = vec![
+            "bars_1m,symbol=B open=1 2000\n".to_string(),
+            "bars_1m,symbol=A open=1 1000\n".to_string(),
+            "garbage".to_string(),
+        ];
+        lines.sort_by_key(|line| line_timestamp(line));
+        assert_eq!(line_timestamp(&lines[0]), 1000);
+        assert_eq!(line_timestamp(&lines[1]), 2000);
+        assert_eq!(line_timestamp(&lines[2]), i64::MAX);
     }
 }

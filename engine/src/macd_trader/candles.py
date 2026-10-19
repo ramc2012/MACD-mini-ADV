@@ -14,20 +14,24 @@ from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .models import Candle, Tick
+from .sessions import session_close
 
 IST = ZoneInfo("Asia/Kolkata")
 SESSION_OPEN = time(9, 15)
 SESSION_CLOSE = time(15, 30)
 
 
-def session_bucket(epoch: int, timeframe_seconds: int) -> int | None:
+def session_bucket(epoch: int, timeframe_seconds: int, symbol: str | None = None) -> int | None:
     """Session-anchored bucket start, or None for a tick outside the session.
 
     Returning None (rather than a bucket) is what keeps pre-open re-broadcasts
-    of yesterday's close out of today's first bar.
+    of yesterday's close out of today's first bar. With ``symbol`` the close is
+    that instrument's own (sessions.session_close): F&O to 15:40, cash to its
+    15:15 closing-auction cut-off; without it, the 15:30 cash close.
     """
     moment = datetime.fromtimestamp(epoch, UTC).astimezone(IST)
-    if not (SESSION_OPEN <= moment.timetz().replace(tzinfo=None) < SESSION_CLOSE):
+    close = session_close(symbol, moment.date()) if symbol else SESSION_CLOSE
+    if not (SESSION_OPEN <= moment.timetz().replace(tzinfo=None) < close):
         return None
     open_at = datetime.combine(moment.date(), SESSION_OPEN, IST)
     elapsed = int((moment - open_at).total_seconds())
@@ -44,7 +48,7 @@ class CandleAggregator:
     def on_tick(self, tick: Tick) -> tuple[Candle | None, Candle | None]:
         """(forming candle, just-closed candle). Either may be None."""
         epoch = int(tick.timestamp.timestamp())
-        bucket = session_bucket(epoch, self.timeframe_seconds)
+        bucket = session_bucket(epoch, self.timeframe_seconds, tick.symbol)
         if bucket is None:
             self.rejected_off_session += 1
             return None, None

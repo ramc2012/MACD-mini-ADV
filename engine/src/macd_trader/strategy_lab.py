@@ -638,6 +638,47 @@ def ceiling_report(options_by_day: dict, days: list[str], max_concurrent: int) -
     }
 
 
+def select_training_configurations(results: list[dict], top: int = 12) -> dict:
+    """Choose configurations on training net only; carry test losses unchanged.
+
+    Historical reports already used their test block to choose winners. A
+    corrected selector does not make those previously inspected dates a new
+    independent final holdout.
+    """
+    ordered = sorted(results, key=lambda row: row["in_sample"]["net"], reverse=True)
+    positive = [row for row in ordered if row["in_sample"]["net"] > 0]
+    by_rule = {}
+    for rule in ENTRY_RULES:
+        rows = [row for row in ordered if row["entry_rule"] == rule]
+        if not rows:
+            continue
+        best = rows[0]
+        by_rule[rule] = {
+            "best_config": best["config"],
+            "train_net": best["in_sample"]["net"],
+            "oos_net": best["out_of_sample"]["net"],
+            "oos_trades": best["out_of_sample"]["trades"],
+            "oos_win_rate": best["out_of_sample"]["win_rate"],
+            "oos_profit_factor": best["out_of_sample"]["profit_factor"],
+            "capture_out_pct": best["capture_out"],
+        }
+    return {
+        "ranked": (positive or ordered)[:top],
+        "worst": ordered[-5:],
+        "by_rule": by_rule,
+        "selection": {
+            "ranking": "training net P&L only",
+            "per_rule_choice": "highest training net P&L",
+            "holdout_used_for_selection": False,
+            "positive_training_candidates": len(positive),
+            "fallback": "training-ranked diagnostic results when no training net is positive",
+            "holdout_independence_verified": False,
+            "evidence_status": "exploratory; require fresh independent dates after prior test inspection",
+            "validated_for_deployment": False,
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="August option strategy laboratory")
     parser.add_argument("--database", default="runtime/historical.sqlite3")
@@ -694,13 +735,7 @@ def main() -> None:
         if index % 50 == 0:
             print(f"  {index}/{len(configs)}…", flush=True)
 
-    # Rank by out-of-sample net, requiring the in-sample side to be positive too
-    # so a lucky test block cannot crown a broken rule.
-    ranked = sorted(
-        [row for row in results if row["in_sample"]["net"] > 0],
-        key=lambda row: row["out_of_sample"]["net"], reverse=True,
-    )
-    fallback = sorted(results, key=lambda row: row["out_of_sample"]["net"], reverse=True)
+    selected = select_training_configurations(results, args.top)
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "expiry": args.expiry,
@@ -715,22 +750,8 @@ def main() -> None:
         "ceiling_train": ceiling_train,
         "ceiling_test": ceiling_test,
         "configurations_tested": len(results),
-        "ranked": (ranked or fallback)[:args.top],
-        "worst": fallback[-5:],
-        "by_rule": {},
+        **selected,
     }
-    for rule in ENTRY_RULES:
-        rows = [row for row in results if row["entry_rule"] == rule]
-        if rows:
-            best = max(rows, key=lambda row: row["out_of_sample"]["net"])
-            report["by_rule"][rule] = {
-                "best_config": best["config"],
-                "oos_net": best["out_of_sample"]["net"],
-                "oos_trades": best["out_of_sample"]["trades"],
-                "oos_win_rate": best["out_of_sample"]["win_rate"],
-                "oos_profit_factor": best["out_of_sample"]["profit_factor"],
-                "capture_out_pct": best["capture_out"],
-            }
     Path(args.out).write_text(json.dumps(report, indent=2))
     print(f"\nwrote {args.out}")
     print(f"\n{'rule':26s} {'src':11s} {'tf':>4s} {'OOS net':>12s} {'trades':>7s} {'win%':>6s} {'PF':>6s} {'capture%':>9s}")
