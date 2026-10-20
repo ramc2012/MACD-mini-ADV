@@ -193,7 +193,7 @@ class BrainError(RuntimeError):
 class GrokClient:
     """One structured chat-completions call per cycle. Async, no retries beyond one schema fallback."""
 
-    def __init__(self, key: str, model: str, base_url: str = DEFAULT_BASE_URL, timeout: float = 120.0,
+    def __init__(self, key: str, model: str, base_url: str = DEFAULT_BASE_URL, timeout: float = 240.0,
                  transport: httpx.AsyncBaseTransport | None = None, reasoning_effort: str | None = None):
         self._key = key
         self.model = model

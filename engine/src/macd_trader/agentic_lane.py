@@ -52,6 +52,7 @@ INDEX_TRIGGER = 0.004
 MIN_TRIGGER_GAP_SECONDS = 300          # event cycles (level breaks, fills, triggers) at most every 5 minutes
 INTRADAY_FLATTEN_AT = time(15, 15)
 LEVEL_INDICES = ("NIFTY", "BANKNIFTY")
+DEFAULT_EFFORT = "medium"           # grok-4.7 at its default (high) took ~200 s a decision; medium ~110 s
 MAX_ENTRY_DRIFT = 0.08             # skip an entry whose premium ran this far while the model was thinking
 UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only
 CYCLE_CHOICES = (15, 30, 60, 120)
@@ -326,7 +327,7 @@ class AgenticLane:
         except ValueError:
             base = brain.DEFAULT_BASE_URL
         return brain.GrokClient(key, config.get("model") or self.settings.agentic_model, base,
-                                reasoning_effort=config.get("reasoning_effort") or None)
+                                reasoning_effort=config.get("reasoning_effort") or DEFAULT_EFFORT)
 
     @property
     def universe(self) -> str:

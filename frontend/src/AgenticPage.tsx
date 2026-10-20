@@ -104,7 +104,7 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
         <label>Model<input list="agentic-models" value={model} placeholder={status?.default_model} onChange={(event) => setModel(event.target.value)} />
           <datalist id="agentic-models">{(test?.models || []).map((m) => <option key={m} value={m} />)}</datalist></label>
         <label>Reasoning effort<select value={effort} onChange={(event) => setEffort(event.target.value)}>
-          <option value="">Model default</option>{(status?.efforts || []).map((e) => <option key={e} value={e}>{e}</option>)}</select></label>
+          <option value="">Default (medium)</option>{(status?.efforts || []).map((e) => <option key={e} value={e}>{e}</option>)}</select></label>
         <label>API base<input value={base} onChange={(event) => setBase(event.target.value)} /></label>
         <label>Universe<select value={universe} onChange={(event) => setUniverse(event.target.value)}>
           <option value="index">Index options only (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY)</option>
