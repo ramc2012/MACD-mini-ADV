@@ -31,6 +31,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from . import agentic_brain as brain
+from . import agentic_features as feat
 from . import market_calendar
 from .blast_engine import LaneEvents, OrderOnlyBroker
 from .config import RUNTIME_DIR
@@ -274,6 +275,9 @@ class AgenticLane:
         self._cycle_lock = asyncio.Lock()
         self._cycles_today: tuple[str, int] = ("", 0)
         self._stats_cache: tuple[str, dict] = ("", {})
+        self._atr_cache: tuple[str, dict] = ("", {})
+        self._index_lots: dict[str, int] = {}
+        self._index_ctx: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
         self._last_equity = 0.0
         self._last_equity_value = float("nan")
@@ -405,12 +409,24 @@ class AgenticLane:
 
     def set_tradable_contracts(self, lot_sizes: dict[str, int]) -> None:
         held = {s: p.lot_size for s, p in self.portfolio.positions.items() if p.quantity > 0 and p.lot_size > 1}
-        self.execution.set_tradable_contracts({**held, **lot_sizes})
+        self._base_lots = dict(lot_sizes)
+        self.execution.set_tradable_contracts({**held, **lot_sizes, **self._index_lots})
 
     def set_contract_context(self, contracts: dict[str, dict]) -> None:
         held = {s: row for s, row in self._contracts.items() if s in self.portfolio.positions}
-        self._contracts = {**held, **contracts}
+        self._contracts = {**held, **contracts, **self._index_ctx}
         self.execution.set_contract_expiries({s: row.get("expiry") for s, row in self._contracts.items()})
+
+    def set_index_universe(self, contracts: dict[str, dict]) -> None:
+        """Every selected index contract -- ATM, ITM, OTM, this and the next expiry -- is tradable here.
+
+        The engine trades only the ATM legs elsewhere and keeps the rest on the feed for analysis; this lane
+        may roll to the next expiry or choose a strike, so it takes them all (paper fills, live ticks)."""
+        self._index_ctx = {s: row for s, row in contracts.items() if int(row.get("lot_size") or 0) > 0}
+        self._index_lots = {s: int(row["lot_size"]) for s, row in self._index_ctx.items()}
+        self.set_tradable_contracts(getattr(self, "_base_lots", {}))
+        self._contracts.update(self._index_ctx)
+        self.execution.set_contract_expiries({s: row.get("expiry") for s, row in self._index_ctx.items()})
 
     def set_resolvers(self, **_) -> None:
         return None
@@ -474,6 +490,22 @@ class AgenticLane:
         sectors = [s for s in SECTOR_NAMES if self._tick(s) is not None]
         stats = self._stats([NIFTY, *INDEX_SPOTS.values(), *sectors, *stocks])
         ohl = intraday_ohl(self.settings.research_database_path, list(INDEX_SPOTS.values()), now.date())
+        features: dict[str, dict] = {}
+        try:
+            with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=30) as fdb:
+                def safe(fn, *args):
+                    try:
+                        return fn(*args)
+                    except sqlite3.Error:      # a missing table (no chain capture for this index) costs one field
+                        return None
+
+                if self._atr_cache[0] != today:
+                    self._atr_cache = (today, {spot: safe(feat.daily_atr, fdb, spot, now.date()) for spot in INDEX_SPOTS.values()})
+                for root, spot in INDEX_SPOTS.items():
+                    features[root] = {"session": safe(feat.session_shape, fdb, root, spot, now, self._price(spot)),
+                                      "positioning": safe(feat.positioning, fdb, root, now)}
+        except sqlite3.Error as exc:
+            features = {"_error": {"session": {"error": str(exc)[:120]}}}
 
         def change(symbol):
             tick = self._tick(symbol)
@@ -489,7 +521,12 @@ class AgenticLane:
                             "from_open_pct": _r((price / day["open"] - 1) * 100) if price and day.get("open") else None,
                             "pos_in_day_range_pct": rng, "ret5d": _r(st.get("ret5")), "ret20d": _r(st.get("ret20")),
                             "vs_ma20_pct": _r((price / st["ma20"] - 1) * 100) if price and st.get("ma20") else None,
-                            "vs_ma50_pct": _r((price / st["ma50"] - 1) * 100) if price and st.get("ma50") else None})
+                            "vs_ma50_pct": _r((price / st["ma50"] - 1) * 100) if price and st.get("ma50") else None,
+                            "realised_vol20_pct": _r(st.get("vol20"), 1),
+                            "daily_atr": self._atr_cache[1].get(spot) or None,
+                            "session": features.get(root, {}).get("session") or None,
+                            **({"options_positioning": features[root]["positioning"]}
+                               if features.get(root, {}).get("positioning") else {})})
         vix_symbol = getattr(self.settings, "vix_symbol", "NSE:INDIAVIX-INDEX")
         stock_moves = {s: change(s) for s in stocks}
         moved = [v for v in stock_moves.values() if v is not None]
@@ -524,7 +561,8 @@ class AgenticLane:
         candidates, cand_rows = {}, []
         for (spot, side), rows in sorted(by_spot.items()):
             spot_price = self._price(spot)
-            keep = rows if spot in INDEX_SPOTS.values() else sorted(
+            keep = sorted(rows, key=lambda item: (str(item[1].get("expiry") or ""), float(item[1].get("strike") or 0))) \
+                if spot in INDEX_SPOTS.values() else sorted(
                 rows, key=lambda item: abs(float(item[1].get("strike") or 0) - (spot_price or 0)))[:1]
             for symbol, row in keep:
                 ltp = self._price(symbol)
@@ -540,11 +578,50 @@ class AgenticLane:
                     spread = _r((tick.ask - tick.bid) / ((tick.ask + tick.bid) / 2) * 100)
                 st = stats.get(spot, {})
                 candidates[cid] = {"symbol": symbol, "ltp": ltp, "lot_size": lot, "expiry": expiry}
+                is_index = spot in INDEX_SPOTS.values()
+                risk = feat.contract_risk(ltp, spot_price or 0.0, float(row.get("strike") or 0), expiry, side == "CE", lot, now)
                 cand_rows.append({"id": cid, "underlying": _underlying_of(spot), "type": side, "strike": row.get("strike"),
+                                  "moneyness": str(row.get("moneyness") or "ATM").replace("NEXT-", "next-expiry "),
                                   "expiry": expiry, "sessions_to_expiry": dte, "premium": _r(ltp), "lot": lot,
-                                  "lot_value": round(ltp * lot), "spread_pct": spread, "spot": _r(spot_price),
-                                  "spot_today_pct": change(spot), "rs60": _r(st.get("rs60"), 1), "vol20": _r(st.get("vol20"), 0),
+                                  "lot_value": round(ltp * lot), "spread_pct": spread, **risk,
+                                  **({} if is_index else {"spot": _r(spot_price), "spot_today_pct": change(spot),
+                                                          "rs60": _r(st.get("rs60"), 1), "vol20": _r(st.get("vol20"), 0)}),
                                   "held": symbol in held})
+
+        # Moneyness from the live index price (the selection's labels are from the morning and go stale on a
+        # trending day): the strike nearest spot is ATM per index, expiry and side; later expiries are "next-expiry".
+        spot_now = {entry["index"]: entry.get("ltp") for entry in indices}
+        groups: dict[tuple, list[dict]] = {}
+        for c in cand_rows:
+            if c["underlying"] in spot_now and spot_now[c["underlying"]]:
+                groups.setdefault((c["underlying"], c["expiry"], c["type"]), []).append(c)
+        first_expiry = {}
+        for (root, expiry, _side) in groups:
+            first_expiry[root] = min(first_expiry.get(root, expiry), expiry)
+        for (root, expiry, side), rows in groups.items():
+            spot = spot_now[root]
+            atm = min(rows, key=lambda c: abs(float(c["strike"] or 0) - spot))
+            for c in rows:
+                strike = float(c["strike"] or 0)
+                near = c is atm and abs(strike / spot - 1) <= 0.005
+                label = "ATM" if near else ("ITM" if (strike < spot) == (side == "CE") else "OTM")
+                c["moneyness"] = label if expiry == first_expiry[root] else f"next-expiry {label}"
+                c["strike_vs_spot_pct"] = _r((strike / spot - 1) * 100)
+
+        # what the option market prices to the nearest expiry, against the index's own daily range and realised vol
+        for entry in indices:
+            rows = [c for c in cand_rows if c["underlying"] == entry["index"]]
+            move = feat.implied_move(rows, entry.get("ltp"))
+            if move:
+                atr = (entry.get("daily_atr") or {}).get("atr_pct")
+                sessions = next((c["sessions_to_expiry"] for c in rows if c["expiry"] == move["expiry"]), None)
+                if atr and sessions:
+                    move["atr_move_to_expiry_pct"] = _r(atr * max(1, sessions) ** 0.5)
+                ivs = [c.get("iv_pct") for c in rows if c["expiry"] == move["expiry"] and c.get("strike") == move["strike"] and c.get("iv_pct")]
+                if ivs and entry.get("realised_vol20_pct"):
+                    move["atm_iv_pct"] = _r(sum(ivs) / len(ivs), 1)
+                    move["iv_to_realised"] = _r(move["atm_iv_pct"] / entry["realised_vol20_pct"])
+                entry["implied_move"] = move
 
         positions, pos_rows = {}, []
         deployed = 0.0
@@ -595,11 +672,30 @@ class AgenticLane:
             "open_positions": pos_rows,
             "candidates": cand_rows,
             "your_recent_notes": [{"at": c["at"][11:16], "view": c["market_view"], "note": c["notes"]} for c in recent],
-            "daily_data_as_of": stats.get(NIFTY, {}).get("as_of"),
+            "your_track_record": feat.track_record(self.repository.closed_positions(lane=self.name, limit=80)),
+            "data_quality": self._data_quality(now, stats, features, signals),
         }
         validation = {"candidates": candidates, "positions": positions, "book": book,
                       "clock": now.strftime("%H:%M"), "today": today, "market_open": in_session(now)}
         return json.dumps(prompt, separators=(",", ":"), default=str), validation
+
+    def _data_quality(self, now: datetime, stats: dict, features: dict, signals: dict) -> dict:
+        """Freshness flags so the model can discount stale inputs."""
+        expected = feat.previous_session(now.date()).isoformat()
+        as_of = stats.get(NIFTY, {}).get("as_of")
+        ages = {}
+        for root, spot in INDEX_SPOTS.items():
+            tick = self._tick(spot)
+            stamp = getattr(tick, "timestamp", None) if tick is not None else None
+            age = (now - stamp).total_seconds() if stamp is not None else None
+            ages[root] = round(age) if age is not None and age >= 0 else None
+        out = {"daily_closes_as_of": as_of, "daily_closes_stale": bool(as_of is None or as_of < expected),
+               "index_tick_age_seconds": ages, "scorecard_day": signals.get("scorecard_day"),
+               "chain_snapshot_age_min": {root: f["positioning"]["snapshot_age_min"] for root, f in features.items()
+                                          if isinstance(f, dict) and f.get("positioning")}}
+        if "_error" in features:
+            out["feature_error"] = features["_error"]["session"]["error"]
+        return out
 
     def _day_pnl(self, snap: dict) -> float:
         start = self._day_start_equity()

@@ -861,6 +861,13 @@ class TradingEngine(DeskMixin):
                 lane.set_tradable_contracts(tradable)
                 lane.set_contract_context(lane_context)
                 lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point)
+            if getattr(self, "agentic", None) is not None:
+                # The agentic lane may pick any selected index strike or roll to the next expiry.
+                self.agentic.set_index_universe({
+                    row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
+                                 "expiry": row.expiry, "volume": row.volume, "oi": row.oi, "lot_size": row.lot_size,
+                                 "moneyness": row.moneyness}
+                    for row in contracts if row.underlying in ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")})
             self.configure_desk(tradable)
             await self._refresh_position_marks()
 

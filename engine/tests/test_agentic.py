@@ -280,6 +280,26 @@ def test_index_universe_offers_only_index_contracts_and_cycles_hourly(tmp_path):
     assert lane.brain_status()["universe"] == "index" and lane.health()["cycle_minutes"] == 60
 
 
+def test_index_universe_extras_are_tradable_and_carry_risk_fields(tmp_path):
+    lane = build(tmp_path)
+    nxt = "NSE:NIFTY26NOV23500PE"
+    lane.set_index_universe({nxt: {"spot_symbol": "NSE:NIFTY50-INDEX", "option_type": "PE", "strike": 23500,
+                                   "expiry": "2100-01-26", "lot_size": 75, "moneyness": "NEXT-OTM", "volume": 0, "oi": 0}})
+    lane.engine.latest_ticks[nxt] = Tick(nxt, 150.0)
+    lane.set_tradable_contracts({CE: 750, PE: 75})             # the engine's next refresh must not drop it
+    lane.update_brain(universe="index")
+    prompt, validation = lane.build_context(NOW)
+    rows = {r["symbol"] for r in validation["candidates"].values()}
+    assert rows == {PE, nxt} and lane.execution.lot_sizes[nxt] == 75
+    data = json.loads(prompt)
+    # labels come from the live spot (23,000), not the selection's stale tag: a 23,500 put is in the money
+    labels = {c["strike"]: c["moneyness"] for c in data["candidates"]}
+    assert labels == {23000: "ATM", 23500: "next-expiry ITM"}
+    extra = next(c for c in data["candidates"] if c["moneyness"] == "next-expiry ITM")
+    assert {"breakeven", "move_needed_pct", "delta", "theta_rs_per_lot_day", "iv_pct"} <= set(extra)
+    assert "data_quality" in data and "your_track_record" in data and "spot" not in extra
+
+
 def test_the_key_is_only_ever_sent_to_x_ai(tmp_path):
     lane = build(tmp_path)
     lane.runtime_dir = str(tmp_path / "runtime")

@@ -59,6 +59,19 @@ What the backtests on this market found (Oct 2026 studies, 2019-2026 daily data,
   remain, and never hold a long option into the last 30 minutes of its expiry day.
 - After holidays and big overnight gaps, wait for the first 15-30 minutes to settle before adding risk.
 
+Reading the inputs:
+- indices[].session: today's hourly closes, opening gap, first-hour range (price above/inside/below it), yesterday's
+  high/low/close and the futures VWAP distance -- the shape of the day, not just the last price.
+- indices[].daily_atr and implied_move: the index's normal daily range versus the move the ATM straddle prices to
+  expiry. Options are expensive when the implied move (or iv_to_realised) is well above what the index usually moves.
+- indices[].options_positioning: put/call OI ratio, the largest call and put OI strikes (often act as resistance and
+  support), today's OI change.
+- candidates carry moneyness (ATM/ITM/OTM, next-expiry), iv_pct, delta, theta_rs_per_lot_day (what one lot loses per
+  day if nothing moves), breakeven and move_needed_pct (the index move needed by expiry to break even). Prefer
+  contracts whose needed move is realistic against daily_atr and the time left.
+- your_track_record: your own recent closed trades; learn from repeated mistakes within the week.
+- data_quality: freshness flags. If inputs are stale, lower your confidence and size.
+
 Hard limits (enforced in code; orders that break them are trimmed or rejected): maximum open positions, maximum value
 per position, maximum total deployed, a daily loss stop that blocks new risk, whole lots only, and only the
 contract_ids listed in this message. Use position_id values exactly as given to manage positions.
