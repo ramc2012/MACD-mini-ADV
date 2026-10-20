@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
 from . import market_calendar, nightly, whale
@@ -39,6 +39,10 @@ IST = ZoneInfo("Asia/Kolkata")
 QUOTES_BACKOFF_SECONDS = 300.0
 QUOTES_BACKOFF_MAX_SECONDS = 1800.0
 NIGHTLY_MAX_ATTEMPTS = 60
+# Minute coverage of thin names (PAGEIND, BOSCHLTD ...) is never complete: a minute bar exists only when the
+# contract trades. Waiting for "complete" kept 19 Oct's nightly waiting for good. After this time the nightly runs
+# on what it has and records the coverage as partial.
+NIGHTLY_DEADLINE = (21, 30)
 # Raw ticks are condensed outside market hours; check periodically.
 TICK_MAINTENANCE_INTERVAL_SECONDS = 900
 # The option agent summarises the earlier sessions at 14:30 (they do not change
@@ -87,6 +91,7 @@ class DeskMixin:
         self.nightly_report: dict | None = None
         self._nightly_done: str | None = None
         self._nightly_attempts = 0
+        self._nightly_caught_up: set[str] = set()
         self.chain_status: dict = {"day": None, "snapshots": 0, "last_at": None, "error": None,
                                    "whale_error": None, "windows": 0, "alerts_today": 0,
                                    "history_days": 0, "composite": {}}
@@ -298,27 +303,64 @@ class DeskMixin:
     def whale_symbols(self) -> list[str]:
         return [s for s in self.mp_spot_symbols() if is_futures_symbol(s)]
 
+    def _missed_nightly_day(self, now: datetime) -> str | None:
+        """The previous session when its nightly never ran (a stuck wait, a crash, a restart): no session profiles."""
+        import sqlite3
+        previous = market_calendar.previous_trading_day(now.date()).isoformat()
+        caught = self.__dict__.setdefault("_nightly_caught_up", set())
+        if previous in caught:
+            return None
+        try:
+            with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=30) as db:
+                done = db.execute("SELECT 1 FROM session_profiles WHERE day = ? LIMIT 1", (previous,)).fetchone()
+        except sqlite3.Error:
+            return None
+        if done:
+            caught.add(previous)
+            return None
+        return previous
+
+    async def _run_nightly(self, day: str, coverage: dict) -> dict:
+        report = await asyncio.to_thread(
+            nightly.run, self.settings.tick_database_path, self.settings.research_database_path, day,
+            self.nightly_symbols(), self.whale_symbols(), dict(self.mp.lot_sizes))
+        return {**report, "coverage_complete": bool(coverage.get("complete")),
+                "partial": not coverage.get("complete"), "missing_symbols": len(coverage.get("missing") or {})}
+
     async def _nightly_loop(self) -> None:
-        """Once per session, after the 15:40 close, turn the day into memory."""
+        """Once per session, after the 15:40 close, turn the day into memory; catch up a session that was missed.
+
+        Never during market hours. A session whose minute coverage is still incomplete at NIGHTLY_DEADLINE runs
+        anyway and is recorded as partial; a missed previous session is caught up at once (its data will not
+        improve by waiting).
+        """
         while True:
             await asyncio.sleep(60)
             now = datetime.now(IST)
             today = now.date().isoformat()
-            if not market_calendar.is_trading_day(now.date()) or self._nightly_done == today:
+            trading_today = market_calendar.is_trading_day(now.date())
+            if trading_today and (9, 0) <= (now.hour, now.minute) < (15, 50):
                 continue
-            if (now.hour, now.minute) < (15, 50):
+            missed = await asyncio.to_thread(self._missed_nightly_day, now)
+            if missed:
+                self.__dict__.setdefault("_nightly_caught_up", set()).add(missed)
+                try:
+                    coverage = await asyncio.to_thread(session_history_coverage, self.settings.research_database_path,
+                                                       date.fromisoformat(missed), self.nightly_symbols())
+                    self.nightly_report = {**await self._run_nightly(missed, coverage), "caught_up": True}
+                except Exception as exc:  # noqa: BLE001 — memory must not kill the feed
+                    self.nightly_report = {"day": missed, "error": str(exc), "caught_up": True}
+                continue
+            if not trading_today or self._nightly_done == today or (now.hour, now.minute) < (15, 50):
                 continue
             coverage = await asyncio.to_thread(session_history_coverage,
                 self.settings.research_database_path, now.date(), self.nightly_symbols())
-            if not coverage["complete"]:
+            if not coverage["complete"] and (now.hour, now.minute) < NIGHTLY_DEADLINE:
                 self.nightly_report = {"day": today, "waiting": "session minute history incomplete",
-                                       "quality": coverage, "partial": True}
+                                       "runs_anyway_at": "%02d:%02d" % NIGHTLY_DEADLINE, "quality": coverage, "partial": True}
                 continue
             try:
-                self.nightly_report = await asyncio.to_thread(
-                    nightly.run, self.settings.tick_database_path,
-                    self.settings.research_database_path, today,
-                    self.nightly_symbols(), self.whale_symbols(), dict(self.mp.lot_sizes))
+                self.nightly_report = await self._run_nightly(today, coverage)
                 self._nightly_done = today
                 self._nightly_attempts = 0
             except Exception as exc:  # noqa: BLE001 — memory must not kill the feed

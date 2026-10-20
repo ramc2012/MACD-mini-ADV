@@ -130,7 +130,7 @@ def test_nightly_retries_a_locked_database_instead_of_writing_the_day_off(monkey
 
     assert calls["n"] == 2
     assert engine._nightly_done == "2026-09-02"
-    assert engine.nightly_report == {"day": "2026-09-02", "sessions": 1}
+    assert {k: engine.nightly_report[k] for k in ("day", "sessions", "partial")} == {"day": "2026-09-02", "sessions": 1, "partial": False}
 
 
 def test_a_quotes_rate_limit_stands_the_futures_oi_call_down(monkeypatch):

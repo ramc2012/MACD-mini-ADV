@@ -295,6 +295,7 @@ class AgenticLane:
         self._index_lots: dict[str, int] = {}
         self._index_ctx: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
+        self._closes_checked = -1e9
         self._last_equity = 0.0
         self._last_equity_value = float("nan")
         self._last_equity_write = -1e9
@@ -1112,11 +1113,37 @@ class AgenticLane:
             return why
         return None
 
+    def _daily_closes_day(self) -> str | None:
+        try:
+            with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=30) as db:
+                row = db.execute("SELECT MAX(day) FROM daily_closes WHERE symbol = ?", (NIFTY,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return row[0] if row else None
+
+    async def keep_daily_closes_fresh(self, now: datetime) -> None:
+        """Every 10 minutes from 08:30: if the daily closes stop before the last session, start the engine's refresh
+        (it needs the broker logged in, so it is simply retried) and drop the lane's cached statistics."""
+        loop_now = asyncio.get_running_loop().time()
+        if loop_now - self._closes_checked < 600 or self.engine is None or not hasattr(self.engine, "sector_wheel"):
+            return
+        if not market_calendar.is_trading_day(now.date()) or now.time() < time(8, 30):
+            return
+        self._closes_checked = loop_now
+        have = await asyncio.to_thread(self._daily_closes_day)
+        if have is None or have < feat.previous_session(now.date()).isoformat():
+            try:
+                await self.engine.sector_wheel()
+            except Exception:  # noqa: BLE001 -- best effort; retried in 10 minutes
+                pass
+            self._stats_cache = ("", {})
+
     async def run(self) -> None:
         while True:
             await asyncio.sleep(5.0)
             try:
                 now = _now()
+                await self.keep_daily_closes_fresh(now)
                 await self.refresh_levels(now)
                 await self.check_triggers(now)
                 await self.flatten_intraday(now)
