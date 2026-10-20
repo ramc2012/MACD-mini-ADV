@@ -472,6 +472,43 @@ async def agentic_brain_test():
     return await _agentic().test_brain()
 
 
+class AgenticTelegramInput(BaseModel):
+    bot_token: str | None = Field(default=None, max_length=200)
+    clear_token: bool = False
+    unpair: bool = False
+
+
+def _telegram():
+    bridge = getattr(_agentic(), "telegram", None)
+    if bridge is None:
+        raise HTTPException(404, "Telegram is not available for the agentic lane")
+    return bridge
+
+
+@app.get("/api/agentic/telegram", dependencies=[Depends(authorize)])
+async def agentic_telegram_status():
+    """Bot status and, while unpaired, the code to send as /pair <code>. The token is never returned."""
+    return _telegram().status()
+
+
+@app.put("/api/agentic/telegram", dependencies=[Depends(authorize)])
+async def agentic_telegram_update(payload: AgenticTelegramInput):
+    try:
+        return await asyncio.to_thread(_telegram().update, bot_token=payload.bot_token,
+                                       clear_token=payload.clear_token, unpair=payload.unpair)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/agentic/telegram/test", dependencies=[Depends(authorize)])
+async def agentic_telegram_test():
+    bridge = _telegram()
+    if not bridge.status()["paired"]:
+        raise HTTPException(409, "pair the bot first: send /pair <code> to it from your Telegram")
+    ok = await bridge.send("Agentic lane: test message. Commands: /help")
+    return {**bridge.status(), "sent": ok}
+
+
 class AgenticThinkInput(BaseModel):
     note: str | None = Field(default=None, max_length=1000)
 

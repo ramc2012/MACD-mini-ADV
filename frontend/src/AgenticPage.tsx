@@ -126,6 +126,75 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
   </div>;
 }
 
+type TelegramStatus = { configured: boolean; token_hint: string | null; token_source: string; paired: boolean;
+  chat_name: string | null; pairing_code: string | null; polling: boolean; last_error: string | null; last_sent_at: string | null };
+
+/** Telegram: bot token (write-only), pairing by code, test message. Decisions go to the paired chat. */
+function TelegramPanel() {
+  const [status, setStatus] = useState<TelegramStatus | null>(null);
+  const [open, setOpen] = useState(false);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState("");
+  const [message, setMessage] = useState("");
+
+  const refresh = useCallback(() => requestJson<TelegramStatus>(`${API_URL}/api/agentic/telegram`, { headers: headers() })
+    .then((s) => { setStatus(s); return s; }).catch(() => null), []);
+  useEffect(() => { void refresh().then((s) => { if (s && !s.paired) setOpen(true); }); }, [refresh]);
+  useEffect(() => {                       // while waiting for /pair, watch for the pairing to land
+    if (!open || !status?.configured || status.paired) return;
+    const timer = setInterval(() => void refresh(), 4000);
+    return () => clearInterval(timer);
+  }, [open, status?.configured, status?.paired, refresh]);
+
+  const call = async (label: string, method: "PUT" | "POST", path: string, body?: unknown) => {
+    setBusy(label); setMessage("");
+    try {
+      const response = await fetch(`${API_URL}${path}`, { method, headers: headers(true), body: body ? JSON.stringify(body) : undefined });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+      setStatus(payload as TelegramStatus);
+      return payload;
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : "Request failed");
+      return null;
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return <div className="panel agentic-section agentic-brain">
+    <button className="agentic-brain-head" onClick={() => setOpen(!open)}>
+      <span>Telegram</span>
+      <span className={status?.paired ? "agentic-up" : "agentic-down"}>
+        {!status ? "…" : !status.configured ? "no bot token" : status.paired ? `paired with ${status.chat_name || "your chat"}${status.last_error ? " · last send failed" : ""}` : "waiting for /pair"}</span>
+      <span>{open ? "▾" : "▸"}</span>
+    </button>
+    {open && <div className="agentic-brain-body">
+      <p className="agentic-hint">Create a bot with <b>@BotFather</b> in Telegram (send <code>/newbot</code>, pick a name), paste its token here and Save.
+        Then send the pairing code below to your bot. Only that chat can command the lane; decisions, exits and a day-end summary are sent there.
+        Commands: /status /positions /journal /think [note] /pause /resume /close P01.</p>
+      <div className="agentic-form">
+        <label>Bot token<input type="password" autoComplete="off" value={token} onChange={(event) => setToken(event.target.value)}
+          placeholder={status?.configured ? `saved ${status.token_hint} — leave blank to keep` : "123456789:AA…"} /></label>
+      </div>
+      <div className="agentic-controls">
+        <button className="agentic-btn primary" disabled={!!busy || !token}
+          onClick={() => { void call("save", "PUT", "/api/agentic/telegram", { bot_token: token }).then((s) => { if (s) setToken(""); }); }}>
+          {busy === "save" ? "Saving…" : "Save"}</button>
+        <button className="agentic-btn" disabled={!!busy || !status?.paired} onClick={() => void call("test", "POST", "/api/agentic/telegram/test")}>
+          {busy === "test" ? "Sending…" : "Send test message"}</button>
+        {status?.paired && <button className="agentic-btn" disabled={!!busy} onClick={() => void call("unpair", "PUT", "/api/agentic/telegram", { unpair: true })}>Unpair</button>}
+        {status?.token_source === "panel" && <button className="agentic-btn" disabled={!!busy}
+          onClick={() => { if (window.confirm("Remove the bot token?")) void call("clear", "PUT", "/api/agentic/telegram", { clear_token: true }); }}>Remove token</button>}
+        {message && <span className="agentic-meta">{message}</span>}
+      </div>
+      {status?.configured && !status.paired && status.pairing_code && <div className="agentic-test ok">
+        Send this to your bot in Telegram: <b className="agentic-code">/pair {status.pairing_code}</b> — this panel updates when it is paired.</div>}
+      {status?.last_error && <div className="agentic-test bad">Telegram: {status.last_error}</div>}
+    </div>}
+  </div>;
+}
+
 export function AgenticPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [cycles, setCycles] = useState<Cycle[]>([]);
@@ -201,6 +270,7 @@ export function AgenticPage() {
     {error && <div className="panel chart-empty error">{error}</div>}
     {h?.error && <div className="panel chart-empty error">Lane error: {h.error}</div>}
     <BrainPanel onChanged={() => void load()} />
+    <TelegramPanel />
 
     <div className="agentic-cards">
       <div className="panel agentic-card"><small>Equity</small><b>{rupees(p?.equity)}</b><svg viewBox="0 0 300 40" preserveAspectRatio="none"><polyline points={spark} fill="none" stroke="#4da3ff" strokeWidth="1.5" /></svg></div>

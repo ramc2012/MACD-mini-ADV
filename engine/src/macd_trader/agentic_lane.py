@@ -265,6 +265,7 @@ class AgenticLane:
         self.last_test: dict | None = None
         self.client = self._make_client()
         self.paused = False
+        self.telegram = None          # agentic_telegram.TelegramBridge, attached by the engine
         self.error: str | None = None
         self.last_cycle: dict | None = None
         self.next_cycle_at: datetime | None = None
@@ -456,10 +457,14 @@ class AgenticLane:
 
     def note_operator_close(self, symbol: str) -> None:
         self._log_action(None, "close", symbol, None, self._price(symbol), "filled", "operator closed the position", None, None)
+        if self.telegram is not None:
+            self.telegram.on_exit(symbol, "OPERATOR_CLOSE", self._price(symbol))
         self._drop_meta(symbol)
         self.request_cycle(f"operator closed {symbol}")
 
     def note_guard_exit(self, symbol: str, reason: str, price: float) -> None:
+        if self.telegram is not None:
+            self.telegram.on_exit(symbol, reason, price)
         self._log_action(None, "close", symbol, None, price, "filled", f"guard: {reason}", None, None)
         self._drop_meta(symbol)
         self.request_cycle(f"{symbol} closed by {reason}")
@@ -759,6 +764,10 @@ class AgenticLane:
             await asyncio.to_thread(self._save_cycle, cycle)
             self.last_cycle = {k: cycle[k] for k in ("cycle_id", "at", "trigger", "mode", "market_view", "regime", "error")}
             self.events.publish("cycle", self.last_cycle)
+            if self.telegram is not None:
+                snap = self.portfolio.snapshot()
+                self.telegram.on_cycle(cycle, {"equity": snap["equity"], "day_pnl": self._day_pnl(snap),
+                                               "open_positions": len(self.held_symbols())})
             return cycle
 
     async def _execute(self, cycle_id: str, action: dict, now: datetime) -> dict:

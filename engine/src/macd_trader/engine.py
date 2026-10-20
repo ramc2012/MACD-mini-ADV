@@ -33,6 +33,7 @@ from . import market_calendar
 from .blast_engine import BlastEngine
 from .smart_lane import SmartLanes
 from .agentic_lane import AgenticLane
+from .agentic_telegram import TelegramBridge
 from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
 from .option_greeks import book_greeks
 from .entry_context import EntryFlow, is_underlying
@@ -357,6 +358,8 @@ class TradingEngine(DeskMixin):
         self.agentic = (AgenticLane(settings, self.broker, self.events,
                                     str(Path(settings.database_path).parent / "agentic_trader.sqlite3"), engine=self)
                         if settings.agentic_enabled else None)
+        if self.agentic is not None:
+            self.agentic.telegram = TelegramBridge(self.agentic, settings, close_position=self.close_smart_paper_position)
         self.extreme_booker = ExtremeBooker(settings.research_database_path)
         # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
         # priced them, and the blast journal reads the spread and IV inputs at each candidate.
@@ -409,6 +412,7 @@ class TradingEngine(DeskMixin):
         self.smart_lanes.start()
         if self.agentic is not None:
             self.agentic.start()
+            self.agentic.telegram.start()
         self._entry_gate_task = asyncio.create_task(self.entry_gate.run(
             lambda: self.execution, lambda: self.portfolio, self._queued_macd_entry_rejection,
         ))
@@ -1535,6 +1539,8 @@ class TradingEngine(DeskMixin):
             await self.smart_lanes.stop()
         if getattr(self, "agentic", None) is not None:
             await self.agentic.stop()
+            if self.agentic.telegram is not None:
+                await self.agentic.telegram.stop()
         if self.bus is not None:
             await self.bus.stop()
         with suppress(Exception):
