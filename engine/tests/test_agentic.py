@@ -201,6 +201,21 @@ def test_guards_close_at_the_agents_stop_without_waiting_for_a_cycle(tmp_path):
     assert lane.actions()[0]["reason"] == "guard: AGENT_STOP" and lane._triggers
 
 
+def test_an_entry_is_skipped_when_the_premium_ran_away_while_the_model_was_thinking(tmp_path):
+    lane = build(tmp_path)
+    cid = candidate_id(lane, PE)
+
+    class SlowClient(FakeClient):
+        async def decide(self, system, user, max_tokens=2500):
+            lane.engine.latest_ticks[PE] = Tick(PE, 112.0)        # a newer tick lands during the call
+            return await super().decide(system, user, max_tokens)
+
+    lane.client = SlowClient(decision(act("open", cid, lots=1, reason="index put")))
+    cycle = asyncio.run(lane.think("test", None, NOW))
+    assert not lane.held_symbols()
+    assert cycle["executed"][0]["status"] == "failed" and "premium moved from 100.00 to 112.00" in cycle["executed"][0]["error"]
+
+
 def test_no_key_means_rules_only_and_nothing_new(tmp_path):
     lane = build(tmp_path)
     lane.client = brain.GrokClient("", "grok-4")

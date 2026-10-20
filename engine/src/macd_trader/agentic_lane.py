@@ -49,6 +49,7 @@ HARD_FLOOR = 0.55
 POSITION_TRIGGER = 0.25
 INDEX_TRIGGER = 0.004
 MIN_TRIGGER_GAP_SECONDS = 900
+MAX_ENTRY_DRIFT = 0.08             # skip an entry whose premium ran this far while the model was thinking
 UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only
 CYCLE_CHOICES = (15, 30, 60, 120)
 DEFAULT_UNIVERSE = "index"
@@ -669,10 +670,13 @@ class AgenticLane:
         reason, note = str(action.get("reason") or "")[:1500], action.get("note")
         result = {"action": kind, "symbol": symbol, "lots": action.get("lots"), "status": "done", "price": None}
         try:
+            self._refresh_quote(symbol)
             if kind in ("open", "add"):
-                tick = self._tick(symbol)
-                if tick is not None and tick.ltp and symbol not in self.execution.last_prices:
-                    self.execution.set_quote(symbol, float(tick.ltp), tick.timestamp)
+                # The model can take a minute to answer: never chase a premium that ran away meanwhile.
+                decided, current = brain._num(action.get("ltp")), self._price(symbol)
+                if decided and current and current > decided * (1 + MAX_ENTRY_DRIFT):
+                    raise ValueError(f"premium moved from {decided:.2f} to {current:.2f} (>{MAX_ENTRY_DRIFT:.0%}) "
+                                     "while the model was deciding; entry skipped")
                 order = await self.execution.submit(symbol, "BUY", lots=int(action["lots"]))
                 result.update(status=order.status.lower(), price=getattr(order, "fill_price", None) or self._price(symbol),
                               order_id=order.order_id)
@@ -719,6 +723,16 @@ class AgenticLane:
         self._log_action(cycle_id, kind, symbol, action.get("lots"), result.get("price"), result["status"], reason, note,
                          result.get("order_id"))
         return result
+
+    def _refresh_quote(self, symbol: str) -> None:
+        """Take the engine's latest tick for this contract when it is newer than the book's quote."""
+        tick = self._tick(symbol)
+        if tick is None or not tick.ltp:
+            return
+        stamp = self.execution.last_price_at.get(symbol)
+        when = getattr(tick, "timestamp", None)
+        if stamp is None or (when is not None and when > stamp):
+            self.execution.set_quote(symbol, float(tick.ltp), when)
 
     # ---------------------------------------------------------------- persistence
 
