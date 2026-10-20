@@ -1,7 +1,7 @@
 """Agentic lane: the model proposes, code validates and executes in a paper book, guards act without waiting."""
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -38,6 +38,8 @@ class FakeClient:
         self.base_url = ""
 
     configured = True
+    key_hint = "…test"
+    reasoning_effort = None
 
     async def decide(self, system, user, max_tokens=2500):
         self.prompts.append(user)
@@ -58,6 +60,8 @@ def build(tmp_path: Path, *decisions) -> AgenticLane:
         PE: {"spot_symbol": "NSE:NIFTY50-INDEX", "option_type": "PE", "strike": 23000, "expiry": "2099-12-30", "volume": 1, "oi": 1}})
     lane.execution.set_quote(CE, 20.0)
     lane.execution.set_quote(PE, 100.0)
+    lane.runtime_dir = str(tmp_path / "runtime")
+    lane.update_brain(universe="all")                 # these tests trade a stock option too
     lane.client = FakeClient(*decisions)
     return lane
 
@@ -245,6 +249,20 @@ def test_panel_key_wins_over_the_environment_and_is_never_returned(tmp_path, mon
     assert status["key_source"] == "environment" and status["key_hint"] == "…2222"
     monkeypatch.delenv("XAI_API_KEY")
     assert lane.update_brain(model="")["configured"] is False and lane.client.model == lane.settings.agentic_model
+
+
+def test_index_universe_offers_only_index_contracts_and_cycles_hourly(tmp_path):
+    lane = build(tmp_path)
+    lane.update_brain(universe="index", cycle_minutes=60)
+    prompt, validation = lane.build_context(NOW)
+    assert [row["symbol"] for row in validation["candidates"].values()] == [PE]
+    assert "INDEX OPTIONS ONLY" in prompt and "option_agent_picks" not in prompt
+    lane.client = FakeClient(decision(act("hold", reason="nothing yet")) | {"next_check_minutes": 5})
+    asyncio.run(lane.think("test", None, NOW))
+    assert lane.next_cycle_at == NOW + timedelta(minutes=60)      # the model may not shorten the hour
+    with pytest.raises(ValueError):
+        lane.update_brain(cycle_minutes=7)
+    assert lane.brain_status()["universe"] == "index" and lane.health()["cycle_minutes"] == 60
 
 
 def test_the_key_is_only_ever_sent_to_x_ai(tmp_path):

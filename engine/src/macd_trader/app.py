@@ -445,6 +445,8 @@ class AgenticBrainInput(BaseModel):
     model: str | None = Field(default=None, max_length=80)
     api_base: str | None = Field(default=None, max_length=200)
     reasoning_effort: str | None = Field(default=None, max_length=10)
+    universe: str | None = Field(default=None, max_length=10)
+    cycle_minutes: int | None = None
 
 
 @app.get("/api/agentic/brain", dependencies=[Depends(authorize)])
@@ -458,7 +460,8 @@ async def agentic_brain_update(payload: AgenticBrainInput):
     try:
         return await asyncio.to_thread(_agentic().update_brain, api_key=payload.api_key, clear_key=payload.clear_key,
                                        model=payload.model, api_base=payload.api_base,
-                                       reasoning_effort=payload.reasoning_effort)
+                                       reasoning_effort=payload.reasoning_effort, universe=payload.universe,
+                                       cycle_minutes=payload.cycle_minutes)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

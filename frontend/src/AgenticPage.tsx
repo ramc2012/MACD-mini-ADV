@@ -36,7 +36,8 @@ const ACTION_LABEL: Record<string, string> = { open: "OPEN", add: "ADD", reduce:
 type BrainTest = { ok: boolean; models: string[]; model: string; model_listed: boolean | null; reply: string | null;
   latency_ms: number | null; error: string | null; at: string | null };
 type BrainStatus = { configured: boolean; key_source: "panel" | "environment" | "none"; key_hint: string | null; model: string;
-  api_base: string; reasoning_effort: string; efforts: string[]; default_model: string; last_test: BrainTest | null };
+  api_base: string; reasoning_effort: string; efforts: string[]; default_model: string; last_test: BrainTest | null;
+  universe: string; universes: string[]; cycle_minutes: number; cycle_choices: number[] };
 
 /** Connection panel: the xAI key (write-only; only its last 4 characters ever come back), model, effort, endpoint. */
 function BrainPanel({ onChanged }: { onChanged: () => void }) {
@@ -46,10 +47,14 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
   const [model, setModel] = useState("");
   const [effort, setEffort] = useState("");
   const [base, setBase] = useState("");
+  const [universe, setUniverse] = useState("index");
+  const [cycle, setCycle] = useState(60);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
 
-  const apply = (s: BrainStatus) => { setStatus(s); setModel(s.model); setEffort(s.reasoning_effort); setBase(s.api_base); };
+  const apply = (s: BrainStatus) => {
+    setStatus(s); setModel(s.model); setEffort(s.reasoning_effort); setBase(s.api_base); setUniverse(s.universe); setCycle(s.cycle_minutes);
+  };
   useEffect(() => {
     void requestJson<BrainStatus>(`${API_URL}/api/agentic/brain`, { headers: headers() })
       .then((s) => { apply(s); if (!s.configured) setOpen(true); })
@@ -73,7 +78,7 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
     }
   };
   const save = async () => {
-    const saved = await call("save", "PUT", "/api/agentic/brain", { api_key: key || null, model, api_base: base, reasoning_effort: effort });
+    const saved = await call("save", "PUT", "/api/agentic/brain", { api_key: key || null, model, api_base: base, reasoning_effort: effort, universe, cycle_minutes: cycle });
     if (saved) { setKey(""); setMessage("Saved."); }
   };
   const test = status?.last_test;
@@ -82,7 +87,7 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
     <button className="agentic-brain-head" onClick={() => setOpen(!open)}>
       <span>Brain connection (xAI API)</span>
       <span className={status?.configured ? "agentic-up" : "agentic-down"}>
-        {status ? (status.configured ? `key ${status.key_hint} (${status.key_source}) · ${status.model}` : "no API key — rules-only") : "…"}
+        {status ? (status.configured ? `key ${status.key_hint} (${status.key_source}) · ${status.model} · ${status.universe === "index" ? "index options" : "index + stocks"} · every ${status.cycle_minutes} min` : "no API key — rules-only") : "…"}
         {test ? (test.ok ? " · test passed" : " · test failed") : ""}</span>
       <span>{open ? "▾" : "▸"}</span>
     </button>
@@ -97,6 +102,11 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
         <label>Reasoning effort<select value={effort} onChange={(event) => setEffort(event.target.value)}>
           <option value="">Model default</option>{(status?.efforts || []).map((e) => <option key={e} value={e}>{e}</option>)}</select></label>
         <label>API base<input value={base} onChange={(event) => setBase(event.target.value)} /></label>
+        <label>Universe<select value={universe} onChange={(event) => setUniverse(event.target.value)}>
+          <option value="index">Index options only (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY)</option>
+          <option value="all">Index + F&amp;O stock options</option></select></label>
+        <label>Cycle<select value={cycle} onChange={(event) => setCycle(Number(event.target.value))}>
+          {(status?.cycle_choices || [15, 30, 60, 120]).map((m) => <option key={m} value={m}>Every {m} min</option>)}</select></label>
       </div>
       <div className="agentic-controls">
         <button className="agentic-btn primary" disabled={!!busy} onClick={() => void save()}>{busy === "save" ? "Saving…" : "Save"}</button>

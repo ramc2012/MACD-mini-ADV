@@ -48,7 +48,10 @@ EXPIRY_FLATTEN_AT = time(15, 10)
 HARD_FLOOR = 0.55
 POSITION_TRIGGER = 0.25
 INDEX_TRIGGER = 0.004
-MIN_TRIGGER_GAP_SECONDS = 180
+MIN_TRIGGER_GAP_SECONDS = 900
+UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only
+CYCLE_CHOICES = (15, 30, 60, 120)
+DEFAULT_UNIVERSE = "index"
 MAX_CYCLES_PER_DAY = 60
 EQUITY_EVERY_SECONDS = 30.0
 NIFTY = "NSE:NIFTY50-INDEX"
@@ -295,6 +298,7 @@ class AgenticLane:
     def _make_client(self) -> brain.GrokClient:
         """Key, model, endpoint and reasoning effort saved from the panel; settings are the defaults."""
         config = brain.load_config(self.runtime_dir)
+        self._config = config
         key, _ = brain.resolve_key(self.runtime_dir)
         base = config.get("api_base") or self.settings.agentic_api_base
         try:
@@ -304,15 +308,28 @@ class AgenticLane:
         return brain.GrokClient(key, config.get("model") or self.settings.agentic_model, base,
                                 reasoning_effort=config.get("reasoning_effort") or None)
 
+    @property
+    def universe(self) -> str:
+        value = getattr(self, "_config", {}).get("universe")
+        return value if value in UNIVERSES else DEFAULT_UNIVERSE
+
+    @property
+    def cycle_minutes(self) -> int:
+        value = getattr(self, "_config", {}).get("cycle_minutes")
+        return int(value) if value in CYCLE_CHOICES else int(self.settings.agentic_cycle_minutes)
+
     def brain_status(self) -> dict:
         _, source = brain.resolve_key(self.runtime_dir)
         return {"configured": self.client.configured, "key_source": source, "key_hint": self.client.key_hint,
                 "model": self.client.model, "api_base": self.client.base_url,
                 "reasoning_effort": self.client.reasoning_effort or "", "efforts": list(brain.EFFORTS),
-                "default_model": self.settings.agentic_model, "last_test": self.last_test}
+                "default_model": self.settings.agentic_model, "last_test": self.last_test,
+                "universe": self.universe, "universes": list(UNIVERSES),
+                "cycle_minutes": self.cycle_minutes, "cycle_choices": list(CYCLE_CHOICES)}
 
     def update_brain(self, *, api_key: str | None = None, clear_key: bool = False, model: str | None = None,
-                     api_base: str | None = None, reasoning_effort: str | None = None) -> dict:
+                     api_base: str | None = None, reasoning_effort: str | None = None,
+                     universe: str | None = None, cycle_minutes: int | None = None) -> dict:
         store = brain.brain_store(self.runtime_dir)
         config = store.load()
         if clear_key:
@@ -334,6 +351,16 @@ class AgenticLane:
                 config["reasoning_effort"] = reasoning_effort
             else:
                 config.pop("reasoning_effort", None)
+        if universe is not None:
+            if universe not in UNIVERSES:
+                raise ValueError(f"universe must be one of {', '.join(UNIVERSES)}")
+            config["universe"] = universe
+        if cycle_minutes is not None:
+            if cycle_minutes not in CYCLE_CHOICES:
+                raise ValueError(f"cycle_minutes must be one of {', '.join(map(str, CYCLE_CHOICES))}")
+            config["cycle_minutes"] = cycle_minutes
+            if self.next_cycle_at is not None:
+                self.next_cycle_at = min(self.next_cycle_at, _now() + timedelta(minutes=cycle_minutes))
         store.save(config)
         self.client = self._make_client()
         self.last_test = None
@@ -486,7 +513,7 @@ class AgenticLane:
         laggards = [s for s in reversed(rs) if stats[s]["vol20"] >= vol_cut][:4]
         movers = sorted((s for s in stocks if stock_moves.get(s) is not None), key=lambda s: -stock_moves[s])
         picks = {f"NSE:{u}-EQ" for side in signals["agent_picks"].values() for u in side}
-        shortlist = list(dict.fromkeys([*held_underlyings - {None}, *leaders, *movers[:4], *movers[-4:], *laggards,
+        shortlist = [] if self.universe == "index" else list(dict.fromkeys([*held_underlyings - {None}, *leaders, *movers[:4], *movers[-4:], *laggards,
                                         *[s for s in stocks if s in picks]]))[:STOCK_SHORTLIST]
         wanted_spots = set(INDEX_SPOTS.values()) | set(shortlist)
         by_spot: dict[tuple[str, str], list[tuple[str, dict]]] = {}
@@ -546,6 +573,11 @@ class AgenticLane:
         limits = self.limits()
         recent = self.recent_cycles(limit=3)
         prompt = {
+            "universe": ("INDEX OPTIONS ONLY: NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY. Do not propose stock options; "
+                         "use breadth and sectors only as context for the index view." if self.universe == "index"
+                         else "index and F&O stock options"),
+            "cycle": f"you are consulted every {self.cycle_minutes} minutes (sooner only if an open position needs attention); "
+                     "plan positions and levels so they can run unattended until the next cycle",
             "time_ist": now.strftime("%Y-%m-%d %H:%M"), "weekday": now.strftime("%A"),
             "market_open": in_session(now),
             "indices": indices,
@@ -553,7 +585,7 @@ class AgenticLane:
             "breadth_fno_stocks": breadth,
             "sectors_today": sector_rows,
             "index_scorecard": {"day": signals["scorecard_day"], "rows": signals["scorecard"]},
-            "option_agent_picks": {"day": signals["picks_day"], **signals["agent_picks"]},
+            **({} if self.universe == "index" else {"option_agent_picks": {"day": signals["picks_day"], **signals["agent_picks"]}}),
             "book": book,
             "limits": {"max_positions": limits.max_positions, "max_position_rs": round(limits.max_position_pct * self.capital),
                        "max_deployed_rs": round(limits.max_deployed_pct * self.capital),
@@ -616,7 +648,7 @@ class AgenticLane:
             if nifty:
                 self._last_nifty = nifty
             minutes = decision.get("next_check_minutes") if isinstance(decision.get("next_check_minutes"), int) else None
-            minutes = max(5, min(int(self.settings.agentic_cycle_minutes) * 2, minutes or int(self.settings.agentic_cycle_minutes)))
+            minutes = max(self.cycle_minutes, min(self.cycle_minutes * 2, minutes or self.cycle_minutes))
             self.next_cycle_at = now + timedelta(minutes=minutes)
             cycle.update({"mode": mode, "model": meta.get("model") if mode == "grok" else None,
                           "market_view": str(decision.get("market_view") or "")[:2000],
@@ -733,7 +765,7 @@ class AgenticLane:
         if self.next_cycle_at is None or self.next_cycle_at.date() != now.date():
             return "session start" if self.last_cycle is None or self.last_cycle["at"][:10] != day else "scheduled"
         nifty = self._price(NIFTY)
-        if nifty and self._last_nifty and abs(nifty / self._last_nifty - 1) >= INDEX_TRIGGER:
+        if self.held_symbols() and nifty and self._last_nifty and abs(nifty / self._last_nifty - 1) >= INDEX_TRIGGER:
             self.request_cycle(f"NIFTY moved {(nifty / self._last_nifty - 1) * 100:+.2f}% since the last cycle")
         if self._triggers and (self._last_trigger_at is None or (now - self._last_trigger_at).total_seconds() >= MIN_TRIGGER_GAP_SECONDS):
             self._last_trigger_at = now
@@ -820,7 +852,7 @@ class AgenticLane:
     def health(self) -> dict:
         return {"lane": self.name, "enabled": bool(self.settings.agentic_enabled), "paused": self.paused,
                 "brain": "grok" if self.client.configured else "rules-only (no API key yet)",
-                "model": self.client.model, "cycle_minutes": self.settings.agentic_cycle_minutes,
+                "model": self.client.model, "cycle_minutes": self.cycle_minutes, "universe": self.universe,
                 "next_cycle_at": self.next_cycle_at.isoformat(timespec="seconds") if self.next_cycle_at else None,
                 "cycles_today": self._cycles_today[1] if self._cycles_today[0] == _now().date().isoformat() else 0,
                 "pending_triggers": list(self._triggers), "last_cycle": self.last_cycle, "error": self.error,
