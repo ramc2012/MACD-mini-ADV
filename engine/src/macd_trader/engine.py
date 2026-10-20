@@ -32,6 +32,7 @@ from .models import Candle, Tick, Trade
 from . import market_calendar
 from .blast_engine import BlastEngine
 from .smart_lane import SmartLanes
+from .agentic_lane import AgenticLane
 from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
 from .option_greeks import book_greeks
 from .entry_context import EntryFlow, is_underlying
@@ -206,7 +207,10 @@ def preopen_window(moment: datetime | None = None) -> bool:
 def _smart_lanes(engine) -> list:
     """The engine's smart lanes, or none -- tests drive engine methods on bare stand-ins."""
     lanes = getattr(engine, "smart_lanes", None)
-    return lanes.lanes if lanes is not None else []
+    agentic = getattr(engine, "agentic", None)
+    # The agentic lane (agentic_lane.py) wears the same surface, so ticks, subscriptions, settlement and sweeps
+    # reach it through every loop below; the /api/smart_lanes routes list smart_lanes.lanes only.
+    return [*(lanes.lanes if lanes is not None else []), *([agentic] if agentic is not None else [])]
 
 
 def _held_contract_lots(engine) -> dict[str, int]:
@@ -349,6 +353,10 @@ class TradingEngine(DeskMixin):
         # Fourth and fifth books: the smart lanes (smart_lane.py), the research's
         # best rules at two capitals. Fed MACD-lane signals and blast-screen passes.
         self.smart_lanes = SmartLanes(settings, self.broker, self.events)
+        # Sixth book: the agentic lane, a Grok-run paper options book with written reasoning.
+        self.agentic = (AgenticLane(settings, self.broker, self.events,
+                                    str(Path(settings.database_path).parent / "agentic_trader.sqlite3"), engine=self)
+                        if settings.agentic_enabled else None)
         self.extreme_booker = ExtremeBooker(settings.research_database_path)
         # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
         # priced them, and the blast journal reads the spread and IV inputs at each candidate.
@@ -399,6 +407,8 @@ class TradingEngine(DeskMixin):
         self._dispersion_task = asyncio.create_task(self._dispersion_loop())
         self._blast_task = asyncio.create_task(self._blast_maintenance_loop())
         self.smart_lanes.start()
+        if self.agentic is not None:
+            self.agentic.start()
         self._entry_gate_task = asyncio.create_task(self.entry_gate.run(
             lambda: self.execution, lambda: self.portfolio, self._queued_macd_entry_rejection,
         ))
@@ -1516,6 +1526,8 @@ class TradingEngine(DeskMixin):
         await self.blast.stop()
         if getattr(self, "smart_lanes", None) is not None:
             await self.smart_lanes.stop()
+        if getattr(self, "agentic", None) is not None:
+            await self.agentic.stop()
         if self.bus is not None:
             await self.bus.stop()
         with suppress(Exception):

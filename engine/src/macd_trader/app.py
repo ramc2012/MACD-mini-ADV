@@ -409,6 +409,107 @@ class BlastSettingsInput(BaseModel):
     trail_pct: float | None = Field(default=None, gt=0, lt=1)
 
 
+def _agentic():
+    lane = getattr(engine, "agentic", None)
+    if lane is None:
+        raise HTTPException(404, "the agentic lane is disabled (MACD_AGENTIC_ENABLED)")
+    return lane
+
+
+@app.get("/api/agentic", dependencies=[Depends(authorize)])
+async def agentic_snapshot():
+    """The agentic lane (agentic_lane.py): book, positions with their thesis and levels, brain status."""
+    return _agentic().snapshot()
+
+
+@app.get("/api/agentic/cycles", dependencies=[Depends(authorize)])
+async def agentic_cycles(day: str | None = None, limit: int = Query(default=40, ge=1, le=500)):
+    """Each cycle's market view, the model's decision, what was accepted, rejected and filled."""
+    return {"cycles": await asyncio.to_thread(_agentic().recent_cycles, day, limit),
+            "days": await asyncio.to_thread(_agentic().journal_days)}
+
+
+@app.get("/api/agentic/actions", dependencies=[Depends(authorize)])
+async def agentic_actions(limit: int = Query(default=300, ge=1, le=2000)):
+    return {"actions": await asyncio.to_thread(_agentic().actions, limit)}
+
+
+@app.get("/api/agentic/equity", dependencies=[Depends(authorize)])
+async def agentic_equity():
+    return {"equity": await asyncio.to_thread(_agentic().equity_curve), "capital": _agentic().capital}
+
+
+class AgenticBrainInput(BaseModel):
+    api_key: str | None = Field(default=None, max_length=400)
+    clear_key: bool = False
+    model: str | None = Field(default=None, max_length=80)
+    api_base: str | None = Field(default=None, max_length=200)
+    reasoning_effort: str | None = Field(default=None, max_length=10)
+
+
+@app.get("/api/agentic/brain", dependencies=[Depends(authorize)])
+async def agentic_brain_status():
+    """Connection settings for the lane's model. The key itself is never returned, only its last 4 characters."""
+    return _agentic().brain_status()
+
+
+@app.put("/api/agentic/brain", dependencies=[Depends(authorize)])
+async def agentic_brain_update(payload: AgenticBrainInput):
+    try:
+        return await asyncio.to_thread(_agentic().update_brain, api_key=payload.api_key, clear_key=payload.clear_key,
+                                       model=payload.model, api_base=payload.api_base,
+                                       reasoning_effort=payload.reasoning_effort)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/agentic/brain/test", dependencies=[Depends(authorize)])
+async def agentic_brain_test():
+    """List the account's models and make one tiny completion with the configured model."""
+    return await _agentic().test_brain()
+
+
+class AgenticThinkInput(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+@app.post("/api/agentic/think", dependencies=[Depends(authorize)])
+async def agentic_think(payload: AgenticThinkInput):
+    """Run a cycle now, optionally with an operator note the model weighs. Outside the session it only comments."""
+    lane = _agentic()
+    lane._manual_task = asyncio.create_task(lane.think("operator request", (payload.note or "").strip() or None))
+    return {"queued": True}
+
+
+@app.post("/api/agentic/pause", dependencies=[Depends(authorize)])
+async def agentic_pause():
+    _agentic().paused = True
+    return _agentic().health()
+
+
+@app.post("/api/agentic/resume", dependencies=[Depends(authorize)])
+async def agentic_resume():
+    _agentic().paused = False
+    return _agentic().health()
+
+
+class AgenticCloseInput(BaseModel):
+    symbol: str = Field(min_length=3, max_length=64)
+    expected_quantity: int = Field(gt=0)
+
+
+@app.post("/api/agentic/close-position", dependencies=[Depends(authorize)])
+async def agentic_close_position(payload: AgenticCloseInput):
+    """Operator close of one agentic position (paper), priced from a fresh quote."""
+    lane = _agentic()
+    try:
+        result = await engine.close_smart_paper_position(lane.name, payload.symbol, payload.expected_quantity)
+    except (ValueError, PermissionError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    lane.note_operator_close(payload.symbol)
+    return result
+
+
 def _smart_lane(name: str):
     lane = engine.smart_lanes.get(name)
     if lane is None:

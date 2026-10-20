@@ -1199,3 +1199,51 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .position-tabs .book-side-count.buy { color:#41d5a1; background:#14352d; }
 .position-tabs .book-side-count.sell { color:#f39bab; background:#38212a; }
 .position-tabs button { flex-wrap:wrap; }
+/* Agentic lane */
+.agentic-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.agentic-note { min-width: 320px; }
+.agentic-btn { padding: 6px 12px; border: 1px solid #365473; border-radius: 4px; background: #17283f; color: #dce5f1; cursor: pointer; font-size: 12px; }
+.agentic-btn.primary { background: #1d4f8f; border-color: #2e6bb8; }
+.agentic-btn.small { padding: 3px 8px; font-size: 11px; }
+.agentic-btn:disabled { opacity: .55; cursor: default; }
+.agentic-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 10px; }
+.agentic-card { padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+.agentic-card small, .agentic-card span { color: #8fa1b8; font-size: 11px; }
+.agentic-card b { font-size: 18px; color: #f2f6fb; }
+.agentic-card svg { width: 100%; height: 32px; }
+.agentic-up { color: #22c893 !important; }
+.agentic-down { color: #f15b6c !important; }
+.agentic-section { margin-bottom: 10px; padding-bottom: 6px; }
+.agentic-table td small { color: #8fa1b8; display: block; font-size: 10px; }
+.agentic-why { max-width: 520px; white-space: normal; font-size: 11.5px; color: #cfd9e7; }
+.agentic-journal-head { display: flex; justify-content: space-between; align-items: center; }
+.agentic-cycle { border-top: 1px solid #1d2838; padding: 10px 12px; }
+.agentic-cycle header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.agentic-meta { color: #7f90a6; font-size: 11px; }
+.agentic-chip { padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #22324a; color: #cfd9e7; }
+.agentic-chip.bullish { background: #22c89326; color: #22c893; }
+.agentic-chip.bearish { background: #f15b6c26; color: #f15b6c; }
+.agentic-chip.volatile { background: #e5c85a26; color: #e5c85a; }
+.agentic-view { margin: 6px 0; color: #e6edf6; font-size: 13px; line-height: 1.45; }
+.agentic-operator { margin: 6px 0 0; color: #e5c85a; font-size: 12px; }
+.agentic-actions { list-style: none; margin: 6px 0; padding: 0; display: grid; gap: 6px; }
+.agentic-actions li { background: #121c2a; border-radius: 6px; padding: 6px 8px; font-size: 12px; color: #dce5f1; }
+.agentic-act { display: inline-block; min-width: 54px; text-align: center; font-weight: 700; font-size: 10.5px; padding: 1px 6px; border-radius: 3px; margin-right: 6px; background: #22324a; }
+.agentic-act.open, .agentic-act.add { background: #1d4f8f; }
+.agentic-act.reduce, .agentic-act.close { background: #6b2a33; }
+.agentic-reason { color: #aebdd0; font-size: 11.5px; margin-top: 3px; line-height: 1.4; }
+.agentic-rejected { font-size: 11.5px; color: #9fb0c5; }
+.agentic-notes { color: #8fa1b8; font-size: 11.5px; font-style: italic; margin: 4px 0 0; }
+@media (max-width: 900px) { .agentic-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } .agentic-note { min-width: 0; width: 100%; } }
+.agentic-brain-head { width: 100%; display: flex; gap: 12px; justify-content: space-between; align-items: center; background: transparent; border: 0; color: #dce5f1; padding: 10px 12px; cursor: pointer; font-weight: 600; text-align: left; }
+.agentic-brain-head span:nth-child(2) { font-weight: 400; font-size: 12px; margin-left: auto; }
+.agentic-brain-body { padding: 0 12px 12px; display: grid; gap: 10px; }
+.agentic-hint { color: #9fb0c5; font-size: 12px; margin: 0; }
+.agentic-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.agentic-form label { display: grid; gap: 4px; font-size: 11px; color: #8fa1b8; }
+.agentic-form input, .agentic-form select { padding: 6px 8px; border: 1px solid #2b3a4e; border-radius: 4px; background: #0e1520; color: #dce5f1; font-size: 12px; }
+.agentic-test { font-size: 12px; padding: 8px 10px; border-radius: 4px; }
+.agentic-test.ok { background: #22c8931a; color: #bff0dc; }
+.agentic-test.bad { background: #f15b6c1a; color: #ffc9cf; }
+.agentic-models { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+@media (max-width: 900px) { .agentic-form { grid-template-columns: 1fr 1fr; } }

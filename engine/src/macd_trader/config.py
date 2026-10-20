@@ -265,6 +265,20 @@ class Settings(BaseSettings):
     smart_min_dispersion_size: float = Field(default=0.25, gt=0, le=1)
     smart_blast_source: bool = True
 
+    # Agentic lane (agentic_lane.py): a paper options book run by a Grok model that opens, adds, reduces,
+    # closes and re-levels positions every cycle with written reasoning. The API key comes from the
+    # XAI_API_KEY environment variable (never a setting); without it the lane only manages open positions.
+    agentic_enabled: bool = True
+    agentic_capital: float = Field(default=1_000_000.0, gt=0)
+    agentic_model: str = "grok-4.7"
+    agentic_api_base: str = "https://api.x.ai/v1"
+    agentic_cycle_minutes: int = Field(default=15, ge=5, le=120)
+    agentic_max_positions: int = Field(default=8, ge=1, le=40)
+    agentic_max_position_pct: float = Field(default=0.15, gt=0, le=1)
+    agentic_max_deployed_pct: float = Field(default=0.60, gt=0, le=1)
+    agentic_daily_loss_stop_pct: float = Field(default=0.03, gt=0, le=1)
+    agentic_max_lots_per_order: int = Field(default=20, ge=1, le=500)
+
     # Raw tick capture. Ticks cannot be backfilled -- Fyers' finest history is
     # 5-second OHLCV -- so the socket's output is the only copy that will ever
     # exist. Raw rows are kept this many days, then condensed to the flow and

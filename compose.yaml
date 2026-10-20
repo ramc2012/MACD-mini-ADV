@@ -38,6 +38,9 @@ services:
       MACD_FYERS_ACCESS_TOKEN: ${MACD_FYERS_ACCESS_TOKEN:-}
       MACD_ALLOWED_ORIGINS_CSV: ${MACD_ALLOWED_ORIGINS_CSV:-}
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      # The agentic lane's brain (xAI Grok). Put XAI_API_KEY=... in the git-ignored .env beside this file;
+      # empty leaves the lane in rules-only mode (it manages open positions and opens nothing).
+      XAI_API_KEY: ${XAI_API_KEY:-}
     volumes:
       - ./runtime:/app/runtime
       - engine_data:/app/data
