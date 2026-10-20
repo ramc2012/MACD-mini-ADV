@@ -819,7 +819,7 @@ class AgenticLane:
 
     def health(self) -> dict:
         return {"lane": self.name, "enabled": bool(self.settings.agentic_enabled), "paused": self.paused,
-                "brain": "grok" if self.client.configured else "rules-only (set XAI_API_KEY)",
+                "brain": "grok" if self.client.configured else "rules-only (no API key yet)",
                 "model": self.client.model, "cycle_minutes": self.settings.agentic_cycle_minutes,
                 "next_cycle_at": self.next_cycle_at.isoformat(timespec="seconds") if self.next_cycle_at else None,
                 "cycles_today": self._cycles_today[1] if self._cycles_today[0] == _now().date().isoformat() else 0,

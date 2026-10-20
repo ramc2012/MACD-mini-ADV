@@ -202,7 +202,7 @@ export function AgenticPage() {
 
     <div className="panel agentic-section">
       <div className="panel-title">Open positions ({p?.positions.filter((x) => x.quantity > 0).length ?? 0})</div>
-      {p && p.positions.filter((x) => x.quantity > 0).length === 0 && <div className="chart-empty">Flat.</div>}
+      {p && p.positions.filter((x) => x.quantity > 0).length === 0 && <div className="agentic-empty">Flat.</div>}
       {p && p.positions.some((x) => x.quantity > 0) && <table className="ledger-table agentic-table"><thead><tr>
         <th>Contract</th><th>Lots</th><th>Avg → now</th><th>P&amp;L</th><th>Best / worst</th><th>Stop / target</th><th>Thesis and latest comment</th><th></th></tr></thead>
         <tbody>{p.positions.filter((x) => x.quantity > 0).map((row) => <tr key={row.symbol}>
@@ -223,7 +223,7 @@ export function AgenticPage() {
         <select className="heatmap-search" value={day} onChange={(event) => setDay(event.target.value)}>
           <option value="">Latest</option>{days.map((d) => <option key={d} value={d}>{d}</option>)}</select>
       </div>
-      {cycles.length === 0 && <div className="chart-empty">No cycles yet. The first runs at 09:20 on a trading day, or press “Think now”.</div>}
+      {cycles.length === 0 && <div className="agentic-empty">No cycles yet. The first runs at 09:20 on a trading day, or press “Think now”.</div>}
       {cycles.map((c) => <article key={c.cycle_id} className="agentic-cycle">
         <header>
           <b>{hhmm(c.at)}</b>

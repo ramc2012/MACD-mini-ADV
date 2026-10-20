@@ -1247,3 +1247,4 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .agentic-test.bad { background: #f15b6c1a; color: #ffc9cf; }
 .agentic-models { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 @media (max-width: 900px) { .agentic-form { grid-template-columns: 1fr 1fr; } }
+.agentic-empty { padding: 14px 12px; color: #8fa1b8; font-size: 12px; }
