@@ -858,6 +858,7 @@ class AgenticLane:
                 self._save_meta(symbol)
         except (ValueError, RuntimeError, PermissionError) as exc:
             result.update(status="failed", error=str(exc)[:200])
+            note = f"failed: {str(exc)[:200]}"
         self._log_action(cycle_id, kind, symbol, action.get("lots"), result.get("price"), result["status"], reason, note,
                          result.get("order_id"))
         return result
@@ -966,12 +967,15 @@ class AgenticLane:
         accepted = checked.accepted[0]
         accepted.pop("ltp", None)              # the decision price is now: no drift check against the arming price
         result = await self._execute(None, accepted, now)
-        self._close_trigger(spec["id"], "fired", f"{result['status']} @ {result.get('price')}", now)
+        filled = result["status"] == "filled"
+        self._close_trigger(spec["id"], "fired" if filled else "failed",
+                            f"{result['status']} @ {result.get('price')}" if filled else str(result.get("error")), now)
+        short = symbol.split(":")[-1]
+        what = (f"bought {short} x{accepted['lots']} @ {result.get('price')}" if filled
+                else f"the order for {short} failed: {result.get('error')}")
         if self.telegram is not None:
-            self.telegram.notify(f"Agentic | trigger {spec['id']} fired: {self._trigger_condition(spec)} -> "
-                                 f"{accepted['action'].upper()} {symbol.split(':')[-1]} x{accepted['lots']} @ {result.get('price')} "
-                                 f"({result['status']})")
-        self.request_cycle(f"trigger {spec['id']} fired: bought {symbol.split(':')[-1]} x{accepted['lots']}")
+            self.telegram.notify(f"Agentic | trigger {spec['id']} fired ({self._trigger_condition(spec)}): {what}")
+        self.request_cycle(f"trigger {spec['id']} fired: {what}")
         return {"id": spec["id"], **result}
 
     # ---------------------------------------------------------------- intraday exits and level events
