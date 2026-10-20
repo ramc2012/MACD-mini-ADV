@@ -18,7 +18,10 @@ type Health = {
   last_cycle: { at: string; trigger: string; mode: string; market_view: string; regime: string; error: string | null } | null;
   limits: Record<string, number | string>;
 };
-type Snapshot = { capital: number; health: Health; portfolio: { cash: number; equity: number; realized_pnl: number; unrealized_pnl: number; positions: Position[] } };
+type Trigger = { id: string; contract: string; lots: number; when: string; valid_until: string; stop_premium: number | null;
+  target_premium: number | null; horizon: string | null; armed_at: string; why: string };
+type Snapshot = { capital: number; health: Health; triggers?: Trigger[];
+  portfolio: { cash: number; equity: number; realized_pnl: number; unrealized_pnl: number; positions: Position[] } };
 type Act = { action: string; symbol?: string; contract_id?: string | null; position_id?: string | null; lots?: number | null;
   reason?: string; note?: string | null; rejected?: string; stop_premium?: number | null; target_premium?: number | null };
 type Exec = { action: string; symbol: string; lots?: number | null; status: string; price?: number | null; error?: string };
@@ -31,7 +34,8 @@ const rupees = (v: number | null | undefined) => (v === null || v === undefined 
 const pct = (v: number | null | undefined, d = 1) => (v === null || v === undefined ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(d)}%`);
 const hhmm = (iso?: string | null) => (iso ? new Date(iso).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", hour12: false }) : "—");
 const tone = (v: number) => (v > 0 ? "agentic-up" : v < 0 ? "agentic-down" : "");
-const ACTION_LABEL: Record<string, string> = { open: "OPEN", add: "ADD", reduce: "REDUCE", close: "CLOSE", set_levels: "LEVELS", hold: "HOLD" };
+const ACTION_LABEL: Record<string, string> = { open: "OPEN", add: "ADD", reduce: "REDUCE", close: "CLOSE", set_levels: "LEVELS",
+  hold: "HOLD", arm: "ARM", disarm: "DISARM" };
 
 type BrainTest = { ok: boolean; models: string[]; model: string; model_listed: boolean | null; reply: string | null;
   latency_ms: number | null; error: string | null; at: string | null };
@@ -279,6 +283,16 @@ export function AgenticPage() {
       <div className="panel agentic-card"><small>Brain</small><b>{h?.paused ? "Paused" : h?.brain === "grok" ? "Live" : "Rules only"}</b>
         <span>{h?.cycles_today ?? 0} cycles today · next {hhmm(h?.next_cycle_at)}{h?.pending_triggers?.length ? ` · trigger: ${h.pending_triggers.join("; ")}` : ""}</span></div>
     </div>
+
+    {(snap?.triggers || []).length > 0 && <div className="panel agentic-section">
+      <div className="panel-title">Armed triggers ({snap!.triggers!.length}) — fire automatically between cycles</div>
+      <table className="ledger-table agentic-table"><thead><tr><th>Id</th><th>Buys</th><th>When</th><th>Until</th><th>Stop / target</th><th>Why</th></tr></thead>
+        <tbody>{snap!.triggers!.map((t) => <tr key={t.id}>
+          <td><b>{t.id}</b><small>armed {t.armed_at} · {t.horizon || "intraday"}</small></td>
+          <td>{t.contract.split(":")[1]} ×{t.lots}</td><td>{t.when}</td><td>{t.valid_until}</td>
+          <td>{t.stop_premium ?? "—"} / {t.target_premium ?? "—"}</td><td className="agentic-why">{t.why}</td>
+        </tr>)}</tbody></table>
+    </div>}
 
     <div className="panel agentic-section">
       <div className="panel-title">Open positions ({p?.positions.filter((x) => x.quantity > 0).length ?? 0})</div>

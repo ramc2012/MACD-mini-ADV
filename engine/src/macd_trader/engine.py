@@ -1890,7 +1890,8 @@ class TradingEngine(DeskMixin):
     async def _backfill_context_indices(self) -> None:
         """About 100 days of minute history for context indices that have less, so 1W/1M moves and a daily RRG exist at once."""
         from .self_heal import last_captured
-        for symbol in list(getattr(self, "context_indices", [])):
+        vix = [self.settings.vix_symbol] if self.settings.vix_symbol else []
+        for symbol in list(dict.fromkeys([*getattr(self, "context_indices", []), *vix])):
             try:
                 last = await asyncio.to_thread(last_captured, self.settings.research_database_path, symbol)
                 count = await asyncio.to_thread(self._stored_minutes, symbol)

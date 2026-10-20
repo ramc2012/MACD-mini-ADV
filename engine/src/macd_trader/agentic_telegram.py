@@ -72,6 +72,11 @@ def cycle_text(cycle: dict, book: dict) -> str:
         levels = ", ".join(x for x in levels if x)
         if levels:
             detail += f" ({levels})"
+        if action.get("action") == "arm" and action.get("trigger_index"):
+            detail += f" when {action['trigger_index']} {action.get('trigger_op')} {action.get('trigger_level')}"
+            if action.get("confirm_index"):
+                detail += f" and {action['confirm_index']} {action.get('confirm_op')} {action.get('confirm_level')}"
+            detail += f" until {action.get('valid_until')}"
         if done.get("status") == "failed":
             detail += f" - FAILED: {done.get('error', '')}"
         lines += ["", detail, f"Why: {str(action.get('reason') or '')[:600]}"]

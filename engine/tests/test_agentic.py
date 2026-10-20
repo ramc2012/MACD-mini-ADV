@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from macd_trader import agentic_brain as brain
+from macd_trader import agentic_lane as agentic_lane_module
 from macd_trader.agentic_lane import AgenticLane
 from macd_trader.config import Settings
 from macd_trader.events import EventHub
@@ -191,7 +192,8 @@ def test_cycle_opens_with_thesis_then_books_half_then_closes(tmp_path):
     assert [a["action"] for a in reversed(lane.actions())] == ["open", "reduce", "close"]
 
 
-def test_guards_close_at_the_agents_stop_without_waiting_for_a_cycle(tmp_path):
+def test_guards_close_at_the_agents_stop_without_waiting_for_a_cycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(agentic_lane_module, "INTRADAY_FLATTEN_AT", __import__("datetime").time(23, 59))   # wall clock may be past 15:15
     lane = build(tmp_path)
     lane.client = FakeClient(decision(act("open", candidate_id(lane, PE), lots=2, stop=80, reason="index put")))
     asyncio.run(lane.think("test", None, NOW))
@@ -298,6 +300,72 @@ def test_index_universe_extras_are_tradable_and_carry_risk_fields(tmp_path):
     extra = next(c for c in data["candidates"] if c["moneyness"] == "next-expiry ITM")
     assert {"breakeven", "move_needed_pct", "delta", "theta_rs_per_lot_day", "iv_pct"} <= set(extra)
     assert "data_quality" in data and "your_track_record" in data and "spot" not in extra
+
+
+def arm(cid, op, level, until="14:00", confirm=None, lots=1, horizon="intraday", stop=60.0, target=160.0):
+    action = act("arm", cid, lots=lots, stop=stop, target=target, reason="break of the first-hour low")
+    action.update({"horizon": horizon, "trigger_index": "NIFTY", "trigger_op": op, "trigger_level": level,
+                   "confirm_index": None, "confirm_op": None, "confirm_level": None, "valid_until": until})
+    if confirm:
+        action.update({"confirm_index": confirm[0], "confirm_op": confirm[1], "confirm_level": confirm[2]})
+    return action
+
+
+def test_a_trigger_is_armed_then_fires_between_cycles_when_the_index_breaks(tmp_path):
+    lane = build(tmp_path)
+    cid = candidate_id(lane, PE)
+    lane.client = FakeClient(decision(arm(cid, "below", 22950), arm(cid, "below", 23100), arm(cid, "below", 22900, until="16:00")))
+    cycle = asyncio.run(lane.think("test", None, NOW))
+    assert [a["action"] for a in cycle["accepted"]] == ["arm"] and cycle["executed"][0]["status"] == "armed"
+    reasons = sorted(r["rejected"] for r in cycle["rejected"])
+    assert "already below" in reasons[1] or "already below" in reasons[0]
+    assert any("valid_until" in r for r in reasons)
+    assert list(lane.armed) == ["T01"] and not lane.held_symbols()
+    asyncio.run(lane.check_triggers(NOW.replace(minute=5)))           # NIFTY 23000: nothing yet
+    assert not lane.held_symbols()
+    lane.engine.latest_ticks["NSE:NIFTY50-INDEX"] = Tick("NSE:NIFTY50-INDEX", 22940.0)
+    fired = asyncio.run(lane.check_triggers(NOW.replace(minute=10)))
+    assert fired[0]["status"] == "filled" and lane.portfolio.positions[PE].lots == 1 and not lane.armed
+    assert lane.meta[PE]["stop_premium"] == 60.0 and lane.meta[PE]["horizon"] == "intraday"
+    assert "trigger T01 fired (NIFTY below 22950" in lane.meta[PE]["thesis"]
+    assert any("trigger T01 fired" in t for t in lane._triggers)        # the model is asked to review the fill
+
+
+def test_triggers_need_their_confirmation_and_expire_unfired(tmp_path):
+    lane = build(tmp_path)
+    cid = candidate_id(lane, PE)
+    lane.engine.latest_ticks["NSE:NIFTYBANK-INDEX"] = Tick("NSE:NIFTYBANK-INDEX", 55000.0)
+    lane.client = FakeClient(decision(arm(cid, "below", 22950, until="11:30", confirm=("BANKNIFTY", "below", 54800))))
+    asyncio.run(lane.think("test", None, NOW))
+    lane.engine.latest_ticks["NSE:NIFTY50-INDEX"] = Tick("NSE:NIFTY50-INDEX", 22900.0)
+    asyncio.run(lane.check_triggers(NOW.replace(minute=20)))
+    assert not lane.held_symbols() and "T01" in lane.armed                # BANKNIFTY has not confirmed
+    asyncio.run(lane.check_triggers(NOW.replace(minute=31, hour=11)))
+    assert not lane.armed and lane.actions()[0]["status"] == "expired"
+
+
+def test_intraday_positions_are_flattened_at_1515(tmp_path):
+    lane = build(tmp_path)
+    lane.client = FakeClient(decision(act("open", candidate_id(lane, PE), lots=1, reason="trend day")))
+    asyncio.run(lane.think("test", None, NOW))
+    assert lane.meta[PE]["horizon"] == "intraday"
+    asyncio.run(lane.flatten_intraday(NOW.replace(hour=15, minute=10)))
+    assert lane.held_symbols()
+    asyncio.run(lane.flatten_intraday(NOW.replace(hour=15, minute=16)))
+    assert not lane.held_symbols() and lane.actions()[0]["reason"] == "guard: INTRADAY_FLATTEN"
+
+
+def test_a_level_break_asks_for_a_cycle_once(tmp_path):
+    lane = build(tmp_path)
+    lane._levels = {"day": NOW.date().isoformat(), "first_hour": True,
+                    "NIFTY": {"first_hour_low": 22950.0, "first_hour_high": 23100.0, "prev_low": 22800.0, "prev_high": 23200.0},
+                    "BANKNIFTY": {}}
+    lane._level_events()
+    assert not lane._triggers
+    lane.engine.latest_ticks["NSE:NIFTY50-INDEX"] = Tick("NSE:NIFTY50-INDEX", 22940.0)
+    lane._level_events()
+    lane._level_events()
+    assert lane._triggers == ["NIFTY broke below its first hour low 22950"]
 
 
 def test_the_key_is_only_ever_sent_to_x_ai(tmp_path):

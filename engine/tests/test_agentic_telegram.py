@@ -89,7 +89,10 @@ def test_commands_status_think_pause_and_close_with_confirmation(tmp_path):
     assert closed == [("agentic", PE, 150)] and not lane.held_symbols() and lane.paused is False
 
 
-def test_cycle_and_exits_are_pushed_to_the_paired_chat(tmp_path):
+def test_cycle_and_exits_are_pushed_to_the_paired_chat(tmp_path, monkeypatch):
+    from datetime import time as _t
+    from macd_trader import agentic_lane
+    monkeypatch.setattr(agentic_lane, "INTRADAY_FLATTEN_AT", _t(23, 59))   # the stop, not the 15:15 flatten, must close it
     lane, bridge, fake, _ = setup(tmp_path)
     bridge._pair(42, "owner")
     lane.client = FakeClient(decision(act("open", candidate_id(lane, PE), lots=1, stop=80, reason="breadth weak"),

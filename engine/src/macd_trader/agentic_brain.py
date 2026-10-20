@@ -26,84 +26,123 @@ from pathlib import Path
 import httpx
 
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
-ACTIONS = ("open", "add", "reduce", "close", "set_levels", "hold")
+ACTIONS = ("open", "add", "reduce", "close", "set_levels", "hold", "arm", "disarm")
 REGIMES = ("bullish", "bearish", "neutral", "volatile")
+BIASES = ("bullish", "bearish", "neutral")
+HORIZONS = ("intraday", "overnight")
+TRIGGER_OPS = ("above", "below")
+INDEX_ROOTS = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")
+BLOCKERS = ("none", "data_missing_or_stale", "no_signal", "price_location", "risk_reward", "time_decay", "trend_conflict",
+            "limits", "event_risk")
+MAX_ARMED = 4
+INTRADAY_FLATTEN = "15:15"
 
 PLAYBOOK = """You are the portfolio manager of a PAPER options book on Indian markets (NSE/BSE index and F&O stock
 options). You only BUY options (calls or puts); you never write options. You think like an experienced discretionary
-options trader who respects evidence and risk. Every cycle you receive the market state, the open book and a list of
-tradable contracts with live prices. You decide what to do now and explain why, briefly and concretely.
+options trader who respects evidence and risk, and who is paid to take good trades, not to watch. Every cycle you
+receive the market state, the open book, your armed triggers and a list of tradable contracts with live prices.
 
 How to think each cycle:
-1. Read the regime: index trend (vs 20/50-day averages), today's move and where it sits in the day's range, breadth,
-   sector leadership, India VIX, time of day, days to expiry. Say what changed since your last note.
-2. Review every open position against its thesis: is the reason for holding still true? Hold, add, reduce, move the
-   stop/target, or close. Do not let a winner turn into a loser; do not average down a losing option.
-3. Only then consider new positions, and only where there is a real edge. Doing nothing is a valid decision.
-4. Size so that being wrong is survivable: risk on any one idea should be a small part of capital.
+1. Separate the multi-week TREND (vs 20/50-day averages) from TODAY'S TRADABLE BIAS (gap, first-hour range, VWAP,
+   hourly closes, breadth, the leading index). A down-trending market can have a strong up day; trade the day you
+   are in. "day_bias" is today's bias for the next few hours; "regime" is the overall read.
+2. Review every open position against its thesis: hold, add, reduce, re-level or close. Do not let a winner turn
+   into a loser; never average down a losing option.
+3. Decide new risk. If the setup is ready now, OPEN. If it needs a level to break first, ARM a trigger: the code
+   watches the index every few seconds between your cycles and fires the entry the moment the condition holds
+   (index above/below a level, optionally a second index confirming, valid until a time). Prefer arming a precise
+   trigger over saying "I would buy if...". If a trigger you wrote earlier has fired or its level has broken by now,
+   act on it or state concretely what changed. Disarm triggers whose idea is no longer valid.
+4. Size so that being wrong is survivable; define stop and target premiums for every entry.
+5. Being flat is a decision with a cost. When the read is clear and a contract's risk/reward fits, take it with
+   defined risk instead of waiting for a perfect entry.
+
+Horizon of every entry:
+- "intraday": the code closes it at 15:15 the same day. Use for trades on today's structure. Intraday trades do not
+  need the index scorecard.
+- "overnight": may be held. The index scorecard (net +2 or -2) is the best-tested next-day signal; hold overnight
+  only with it, or with a clearly stronger reason you state.
 
 What the backtests on this market found (Oct 2026 studies, 2019-2026 daily data, one year of real option premiums):
-- Stock calls on 60-day relative-strength leaders were the most consistent stock-option edge, mainly when NIFTY is
-  above its 50-day average; below it they did poorly. "The move already happened" did NOT hurt: strength persists
-  for 2-4 weeks on daily bars.
-- Buying stock PUTS lost money under every selection rule tested (weak stocks bounce, put premium decays). Express a
-  bearish view through index puts, not stock puts, unless the evidence in front of you is unusually strong.
-- Rotation hooks (RRG Improving->Leading, Weakening->Lagging) did not predict the next big movers. Do not rely on them.
-- Volatile names predict the SIZE of a move, not its direction; their options already charge for it.
-- Month-start sector leaders out-ran laggards for about 13 sessions, then faded by month end.
-- Next-day index direction is hard to call. The index scorecard (needs net +2 or -2) is the best-tested next-day
-  signal; when it says no trade, have a better reason than a feeling before taking an overnight index position.
-- Exits decide results more than entries: past positions often gave back 30-70 points from their peak. Book part of
-  a big winner (for example half at +50% to +80%) and trail the rest; cut a loser at its stop.
+- Next-day index direction is hard to call; the scorecard above is the tested exception. It is an OVERNIGHT filter,
+  not a reason to skip a clear intraday trend day.
+- Stock calls on 60-day relative-strength leaders were the most consistent STOCK-option edge, mainly when NIFTY is
+  above its 50-day average. That 50-day finding is about stock calls; it is not a ban on index calls on an up day.
+- Buying stock PUTS lost money under every selection rule tested. Express bearish views through index puts.
+- Rotation hooks (RRG) did not predict the next big movers. Volatile names predict the SIZE of a move, not its
+  direction; their options already charge for it.
+- Exits decide results more than entries: past positions gave back 30-70 points from their peak. Book part of a
+  big winner (half at +50% to +80%) and trail the rest; cut a loser at its stop.
 - Time decay accelerates in the last two sessions before expiry: prefer the next expiry when fewer than 2 sessions
-  remain, and never hold a long option into the last 30 minutes of its expiry day.
-- After holidays and big overnight gaps, wait for the first 15-30 minutes to settle before adding risk.
+  remain, never hold into the last 30 minutes of expiry day. Same-day expiry contracts are for intraday only.
+- After holidays and big gaps, let the first 15-30 minutes settle before adding risk.
 
 Reading the inputs:
-- indices[].session: today's hourly closes, opening gap, first-hour range (price above/inside/below it), yesterday's
-  high/low/close and the futures VWAP distance -- the shape of the day, not just the last price.
-- indices[].daily_atr and implied_move: the index's normal daily range versus the move the ATM straddle prices to
-  expiry. Options are expensive when the implied move (or iv_to_realised) is well above what the index usually moves.
-- indices[].options_positioning: put/call OI ratio, the largest call and put OI strikes (often act as resistance and
-  support), today's OI change.
-- candidates carry moneyness (ATM/ITM/OTM, next-expiry), iv_pct, delta, theta_rs_per_lot_day (what one lot loses per
-  day if nothing moves), breakeven and move_needed_pct (the index move needed by expiry to break even). Prefer
-  contracts whose needed move is realistic against daily_atr and the time left.
-- your_track_record: your own recent closed trades; learn from repeated mistakes within the week.
-- data_quality: freshness flags. If inputs are stale, lower your confidence and size.
+- indices[].session: hourly closes, opening gap, first-hour range (price above/inside/below it), yesterday's
+  high/low/close, futures VWAP distance. indices[].daily_atr vs implied_move: options are expensive when the implied
+  move (or iv_to_realised) is well above the usual range. options_positioning: put/call OI, biggest OI strikes
+  (support/resistance), today's OI change.
+- candidates: moneyness, iv_pct, delta, theta_rs_per_lot_day, breakeven, move_needed_pct. Prefer contracts whose
+  needed move is realistic against daily_atr and the time left.
+- armed_triggers: your pending conditional entries. your_track_record: your recent closed trades.
+- data_quality: freshness flags. Missing VIX or a stale option chain lowers confidence; it is rarely a reason by
+  itself to skip a trade whose price structure is clear.
+
+Report honestly what is holding you back: "blockers" lists the main reasons you are not taking (more) risk now, by
+category; "data_wanted" names the one missing input that would most change this decision, or "none".
 
 Hard limits (enforced in code; orders that break them are trimmed or rejected): maximum open positions, maximum value
-per position, maximum total deployed, a daily loss stop that blocks new risk, whole lots only, and only the
-contract_ids listed in this message. Use position_id values exactly as given to manage positions.
+per position, maximum total deployed, a daily loss stop that blocks new risk, no new risk after 15:10, at most
+""" + str(MAX_ARMED) + """ armed triggers, whole lots only, and only the contract_ids listed in this message. Use
+position_id and trigger ids exactly as given.
 
-Answer ONLY with JSON matching the schema. In "reason" give the specific evidence (numbers) behind each action. Keep
-market_view to 2-4 sentences, a trader's read, not a summary of the input."""
+Action fields: open/add need contract_id (open) or position_id (add), lots, stop_premium, target_premium, horizon.
+arm needs contract_id, lots, stop/target, horizon, trigger_index (NIFTY/BANKNIFTY/SENSEX/MIDCPNIFTY), trigger_op
+(above/below), trigger_level, valid_until (HH:MM IST) and optionally confirm_index/confirm_op/confirm_level.
+disarm needs contract_id = the trigger id (T01...). Unused fields are null.
 
+Answer ONLY with JSON matching the schema. In "reason" give the specific evidence (numbers). Keep market_view to 2-4
+sentences, a trader's read."""
+
+_NULLABLE_STR = {"type": ["string", "null"]}
+_NULLABLE_NUM = {"type": ["number", "null"]}
 DECISION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["market_view", "regime", "confidence", "actions", "next_check_minutes", "notes_for_next_cycle"],
+    "required": ["market_view", "regime", "day_bias", "confidence", "actions", "blockers", "data_wanted",
+                 "next_check_minutes", "notes_for_next_cycle"],
     "properties": {
         "market_view": {"type": "string"},
         "regime": {"type": "string", "enum": list(REGIMES)},
+        "day_bias": {"type": "string", "enum": list(BIASES)},
         "confidence": {"type": "number"},
         "actions": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["action", "contract_id", "position_id", "lots", "stop_premium", "target_premium", "reason"],
+                "required": ["action", "contract_id", "position_id", "lots", "stop_premium", "target_premium", "horizon",
+                             "trigger_index", "trigger_op", "trigger_level", "confirm_index", "confirm_op", "confirm_level",
+                             "valid_until", "reason"],
                 "properties": {
                     "action": {"type": "string", "enum": list(ACTIONS)},
-                    "contract_id": {"type": ["string", "null"]},
-                    "position_id": {"type": ["string", "null"]},
+                    "contract_id": _NULLABLE_STR, "position_id": _NULLABLE_STR,
                     "lots": {"type": ["integer", "null"]},
-                    "stop_premium": {"type": ["number", "null"]},
-                    "target_premium": {"type": ["number", "null"]},
+                    "stop_premium": _NULLABLE_NUM, "target_premium": _NULLABLE_NUM,
+                    "horizon": _NULLABLE_STR,
+                    "trigger_index": _NULLABLE_STR, "trigger_op": _NULLABLE_STR, "trigger_level": _NULLABLE_NUM,
+                    "confirm_index": _NULLABLE_STR, "confirm_op": _NULLABLE_STR, "confirm_level": _NULLABLE_NUM,
+                    "valid_until": _NULLABLE_STR,
                     "reason": {"type": "string"},
                 },
             },
         },
+        "blockers": {
+            "type": "array",
+            "items": {"type": "object", "additionalProperties": False, "required": ["category", "detail"],
+                      "properties": {"category": {"type": "string", "enum": list(BLOCKERS)}, "detail": {"type": "string"}}},
+        },
+        "data_wanted": {"type": "string"},
         "next_check_minutes": {"type": "integer"},
         "notes_for_next_cycle": {"type": "string"},
     },
@@ -312,39 +351,57 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
     for raw in actions:
         if not isinstance(raw, dict):
             continue
-        action = {k: raw.get(k) for k in ("action", "contract_id", "position_id", "lots", "stop_premium", "target_premium", "reason")}
+        action = {k: raw.get(k) for k in ("action", "contract_id", "position_id", "lots", "stop_premium", "target_premium",
+                                          "horizon", "trigger_index", "trigger_op", "trigger_level", "confirm_index",
+                                          "confirm_op", "confirm_level", "valid_until", "reason")}
+        if action.get("horizon") not in HORIZONS:
+            action["horizon"] = "intraday"
         kind = action["action"]
         if kind not in ACTIONS:
             reject(action, "unknown action")
             continue
         key = f"{kind}:{action.get('contract_id') or action.get('position_id')}"
+        if kind == "arm":     # several triggers on one contract at different levels are different orders
+            key += f":{action.get('trigger_index')}:{action.get('trigger_op')}:{action.get('trigger_level')}"
         if key in seen:
             reject(action, "duplicate action")
             continue
         seen.add(key)
-        if kind in ("open", "add", "reduce", "close") and context.get("market_open") is False:
+        if kind == "disarm":
+            if str(action.get("contract_id")) in context.get("triggers", {}):
+                out.accepted.append({**action, "symbol": context["triggers"][str(action["contract_id"])]["symbol"],
+                                     "trigger_id": str(action["contract_id"]), "note": None})
+            else:
+                reject(action, "no armed trigger with that id")
+            continue
+        if kind == "arm":
+            problem = _check_trigger(action, context, limits)
+            if problem:
+                reject(action, problem)
+                continue
+        if kind in ("open", "add", "reduce", "close", "arm") and context.get("market_open") is False:
             reject(action, "market closed")
             continue
         stop, target = _num(action.get("stop_premium")), _num(action.get("target_premium"))
         lots = action.get("lots")
         lots = int(lots) if isinstance(lots, (int, float)) and not isinstance(lots, bool) and lots == lots else None
 
-        if kind in ("open", "add"):
+        if kind in ("open", "add", "arm"):
             if loss_stop_hit:
                 reject(action, f"daily loss stop ({limits.daily_loss_stop_pct:.0%} of capital) reached: no new risk today")
                 continue
             if now >= limits.no_new_after:
                 reject(action, f"no new risk after {limits.no_new_after}")
                 continue
-            if kind == "open":
+            if kind in ("open", "arm"):
                 row = candidates.get(str(action.get("contract_id")))
                 if not row:
                     reject(action, "contract_id is not in this cycle's candidate list")
                     continue
-                if any(p["symbol"] == row["symbol"] for p in positions.values()):
+                if kind == "open" and any(p["symbol"] == row["symbol"] for p in positions.values()):
                     reject(action, "already held: use add with its position_id")
                     continue
-                if open_count >= limits.max_positions:
+                if kind == "open" and open_count >= limits.max_positions:
                     reject(action, f"already at {limits.max_positions} open positions")
                     continue
                 held_value = 0.0
@@ -377,6 +434,8 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                         "stop_premium": stop if stop and stop < ltp else None,
                         "target_premium": target if target and target > ltp else None, "note": note}
             out.accepted.append(accepted)
+            if kind == "arm":           # reserved when it fires, not now
+                continue
             deployed += granted * per_lot
             cash -= granted * per_lot
             if kind == "open":
@@ -408,6 +467,30 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
     return out
 
 
+def _check_trigger(action: dict, context: dict, limits: Limits) -> str | None:
+    """A trigger must watch a known index, not be already satisfied, and expire inside today's risk window."""
+    prices = context.get("index_prices", {})
+    if context.get("armed_count", 0) >= MAX_ARMED:
+        return f"already {MAX_ARMED} armed triggers: disarm one first"
+    for prefix, required in (("trigger", True), ("confirm", False)):
+        index, op, level = action.get(f"{prefix}_index"), action.get(f"{prefix}_op"), _num(action.get(f"{prefix}_level"))
+        if not required and index is None and op is None and level is None:
+            continue
+        if index not in INDEX_ROOTS or op not in TRIGGER_OPS or level is None:
+            return f"{prefix} needs an index ({'/'.join(INDEX_ROOTS)}), op (above/below) and a level"
+        now_price = prices.get(index)
+        if not now_price:
+            return f"no live price for {index}"
+        if required and ((op == "above" and now_price > level) or (op == "below" and now_price < level)):
+            return f"{index} is already {op} {level:g} ({now_price:g}): use open, not arm"
+    until = str(action.get("valid_until") or "")
+    if len(until) != 5 or until[2] != ":" or not until.replace(":", "").isdigit():
+        return "valid_until must be HH:MM"
+    if until <= context["clock"] or until > limits.no_new_after:
+        return f"valid_until must be after now and no later than {limits.no_new_after}"
+    return None
+
+
 # ---------------------------------------------------------------------------------------------- fallback
 
 def rules_decision(context: dict, reason: str) -> dict:
@@ -428,5 +511,6 @@ def rules_decision(context: dict, reason: str) -> dict:
                             "lots": int(pos["lots"]) // 2, "stop_premium": None, "target_premium": None,
                             "reason": f"up {ret:.0f}%: book half, let the rest run"})
     return {"market_view": f"Rules-only cycle ({reason}). Managing open positions; no new positions without the model.",
-            "regime": "neutral", "confidence": 0.0, "actions": actions, "next_check_minutes": 15,
-            "notes_for_next_cycle": ""}
+            "regime": "neutral", "day_bias": "neutral", "confidence": 0.0, "actions": actions,
+            "blockers": [{"category": "limits", "detail": reason}], "data_wanted": "none",
+            "next_check_minutes": 15, "notes_for_next_cycle": ""}

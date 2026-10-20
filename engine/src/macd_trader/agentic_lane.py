@@ -49,7 +49,9 @@ EXPIRY_FLATTEN_AT = time(15, 10)
 HARD_FLOOR = 0.55
 POSITION_TRIGGER = 0.25
 INDEX_TRIGGER = 0.004
-MIN_TRIGGER_GAP_SECONDS = 900
+MIN_TRIGGER_GAP_SECONDS = 300          # event cycles (level breaks, fills, triggers) at most every 5 minutes
+INTRADAY_FLATTEN_AT = time(15, 15)
+LEVEL_INDICES = ("NIFTY", "BANKNIFTY")
 MAX_ENTRY_DRIFT = 0.08             # skip an entry whose premium ran this far while the model was thinking
 UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only
 CYCLE_CHOICES = (15, 30, 60, 120)
@@ -77,6 +79,9 @@ CREATE TABLE IF NOT EXISTS agentic_actions (
   action_id TEXT PRIMARY KEY, cycle_id TEXT, at TEXT NOT NULL, action TEXT, symbol TEXT, lots INTEGER,
   price REAL, status TEXT, reason TEXT, note TEXT, order_id TEXT);
 CREATE INDEX IF NOT EXISTS agentic_actions_at ON agentic_actions(at);
+CREATE TABLE IF NOT EXISTS agentic_triggers (
+  trigger_id TEXT NOT NULL, day TEXT NOT NULL, created_at TEXT, spec TEXT, status TEXT, closed_at TEXT, outcome TEXT,
+  PRIMARY KEY (day, trigger_id));
 CREATE TABLE IF NOT EXISTS agentic_positions (
   symbol TEXT PRIMARY KEY, position_id TEXT, opened_at TEXT, thesis TEXT, stop_premium REAL, target_premium REAL,
   review_price REAL, booked INTEGER DEFAULT 0, underlying TEXT, expiry TEXT, last_comment TEXT, updated_at TEXT);
@@ -213,6 +218,8 @@ class AgenticExecutionManager(ExecutionManager):
         expiry = meta.get("expiry") or self.contract_expiries.get(symbol)
         if expiry and (expiry < now.date().isoformat() or (expiry == now.date().isoformat() and now.time() >= EXPIRY_FLATTEN_AT)):
             reason = "EXPIRY_DAY_FLATTEN"
+        elif meta.get("horizon") == "intraday" and now.time() >= INTRADAY_FLATTEN_AT:
+            reason = "INTRADAY_FLATTEN"
         elif price <= position.average_price * (1 - HARD_FLOOR):
             reason = f"HARD_FLOOR_{round(HARD_FLOOR * 100)}_PCT"
         elif meta.get("stop_premium") and price <= float(meta["stop_premium"]):
@@ -254,6 +261,10 @@ class AgenticLane:
         self._db_lock = Lock()
         with self._db_lock, self._db:
             self._db.executescript(SCHEMA)
+            try:
+                self._db.execute("ALTER TABLE agentic_positions ADD COLUMN horizon TEXT")
+            except sqlite3.OperationalError:
+                pass                                          # already there
         self.portfolio = Portfolio(self.capital, lane=self.name)
         self.events = LaneEvents(events, prefix=f"{self.name}_")
         self.broker = OrderOnlyBroker(broker)
@@ -270,6 +281,9 @@ class AgenticLane:
         self.last_cycle: dict | None = None
         self.next_cycle_at: datetime | None = None
         self._triggers: list[str] = []
+        self.armed: dict[str, dict] = {}                      # today's conditional entries, id -> spec
+        self._levels: dict = {"day": None}
+        self._level_fired: set[tuple[str, str]] = set()
         self._operator_notes: list[str] = []
         self._last_trigger_at: datetime | None = None
         self._last_nifty: float | None = None
@@ -399,6 +413,11 @@ class AgenticLane:
             if row["symbol"] in held:
                 self.meta[row["symbol"]] = dict(row)
         self.execution.set_contract_expiries({s: m.get("expiry") for s, m in self.meta.items() if m.get("expiry")})
+        with self._db_lock:
+            for row in self._db.execute("SELECT spec FROM agentic_triggers WHERE day = ? AND status = 'armed'",
+                                        (_now().date().isoformat(),)):
+                spec = json.loads(row[0])
+                self.armed[spec["id"]] = spec
         excursions = self.repository.load_position_excursions()
         for position in self.portfolio.positions.values():
             row = excursions.get(position.position_id)
@@ -675,13 +694,16 @@ class AgenticLane:
                        "daily_loss_stop_rs": round(limits.daily_loss_stop_pct * self.capital),
                        "max_lots_per_order": limits.max_lots_per_order, "no_new_risk_after": limits.no_new_after},
             "open_positions": pos_rows,
+            "armed_triggers": [self._trigger_view(t) for t in self.armed.values()],
             "candidates": cand_rows,
             "your_recent_notes": [{"at": c["at"][11:16], "view": c["market_view"], "note": c["notes"]} for c in recent],
             "your_track_record": feat.track_record(self.repository.closed_positions(lane=self.name, limit=80)),
             "data_quality": self._data_quality(now, stats, features, signals),
         }
         validation = {"candidates": candidates, "positions": positions, "book": book,
-                      "clock": now.strftime("%H:%M"), "today": today, "market_open": in_session(now)}
+                      "clock": now.strftime("%H:%M"), "today": today, "market_open": in_session(now),
+                      "triggers": dict(self.armed), "armed_count": len(self.armed),
+                      "index_prices": {root: self._price(spot) for root, spot in INDEX_SPOTS.items()}}
         return json.dumps(prompt, separators=(",", ":"), default=str), validation
 
     def _data_quality(self, now: datetime, stats: dict, features: dict, signals: dict) -> dict:
@@ -755,6 +777,8 @@ class AgenticLane:
             cycle.update({"mode": mode, "model": meta.get("model") if mode == "grok" else None,
                           "market_view": str(decision.get("market_view") or "")[:2000],
                           "regime": decision.get("regime"), "confidence": brain._num(decision.get("confidence")),
+                          "day_bias": decision.get("day_bias"), "blockers": decision.get("blockers") or [],
+                          "data_wanted": decision.get("data_wanted"),
                           "notes": str(decision.get("notes_for_next_cycle") or "")[:1500],
                           "decision": decision, "accepted": checked.accepted, "rejected": checked.rejected,
                           "executed": executed, "latency_ms": meta.get("latency_ms"),
@@ -791,6 +815,7 @@ class AgenticLane:
                                                   "booked": 0}
                 if kind == "open":
                     meta["thesis"] = reason
+                    meta["horizon"] = action.get("horizon") or "intraday"
                 meta["last_comment"] = reason
                 for level in ("stop_premium", "target_premium"):
                     if action.get(level):
@@ -816,6 +841,13 @@ class AgenticLane:
                     self.meta[symbol]["booked"] = 1
                     self.meta[symbol]["last_comment"] = reason
                     self._save_meta(symbol)
+            elif kind == "arm":
+                spec = self._arm(action, now)
+                result.update(status="armed", trigger_id=spec["id"])
+                note = f"{spec['id']}: {self._trigger_condition(spec)} until {spec['valid_until']}"
+            elif kind == "disarm":
+                self._close_trigger(action["trigger_id"], "disarmed", reason, now)
+                result.update(status="disarmed")
             else:   # set_levels / hold
                 meta = self.meta.setdefault(symbol, {"symbol": symbol})
                 for level in ("stop_premium", "target_premium"):
@@ -839,6 +871,173 @@ class AgenticLane:
         if stamp is None or (when is not None and when > stamp):
             self.execution.set_quote(symbol, float(tick.ltp), when)
 
+    # ---------------------------------------------------------------- conditional entries
+
+    @staticmethod
+    def _trigger_condition(spec: dict) -> str:
+        text = f"{spec['trigger_index']} {spec['trigger_op']} {spec['trigger_level']:g}"
+        if spec.get("confirm_index"):
+            text += f" and {spec['confirm_index']} {spec['confirm_op']} {spec['confirm_level']:g}"
+        return text
+
+    def _trigger_view(self, spec: dict) -> dict:
+        return {"id": spec["id"], "contract": spec["symbol"], "lots": spec["lots"], "when": self._trigger_condition(spec),
+                "valid_until": spec["valid_until"], "stop_premium": spec.get("stop_premium"),
+                "target_premium": spec.get("target_premium"), "horizon": spec.get("horizon"), "armed_at": spec["armed_at"],
+                "why": spec["reason"][:300]}
+
+    def _arm(self, action: dict, now: datetime) -> dict:
+        day = now.date().isoformat()
+        with self._db_lock:
+            used = self._db.execute("SELECT COUNT(*) FROM agentic_triggers WHERE day = ?", (day,)).fetchone()[0]
+        spec = {"id": f"T{used + 1:02d}", "day": day, "symbol": action["symbol"], "lots": int(action["lots"]),
+                "stop_premium": action.get("stop_premium"), "target_premium": action.get("target_premium"),
+                "horizon": action.get("horizon") or "intraday", "trigger_index": action["trigger_index"],
+                "trigger_op": action["trigger_op"], "trigger_level": float(action["trigger_level"]),
+                "confirm_index": action.get("confirm_index"), "confirm_op": action.get("confirm_op"),
+                "confirm_level": float(action["confirm_level"]) if action.get("confirm_level") is not None else None,
+                "valid_until": action["valid_until"], "reason": str(action.get("reason") or ""),
+                "armed_at": now.strftime("%H:%M"), "premium_at_arm": action.get("ltp")}
+        self.armed[spec["id"]] = spec
+        with self._db_lock, self._db:
+            self._db.execute("INSERT OR REPLACE INTO agentic_triggers VALUES (?,?,?,?,?,?,?)",
+                             (spec["id"], day, now.isoformat(timespec="seconds"), json.dumps(spec), "armed", None, None))
+        return spec
+
+    def _close_trigger(self, trigger_id: str, status: str, outcome: str, now: datetime) -> None:
+        spec = self.armed.pop(trigger_id, None)
+        day = spec["day"] if spec else now.date().isoformat()
+        with self._db_lock, self._db:
+            self._db.execute("UPDATE agentic_triggers SET status = ?, closed_at = ?, outcome = ? WHERE day = ? AND trigger_id = ?",
+                             (status, now.isoformat(timespec="seconds"), outcome[:500], day, trigger_id))
+
+    def _condition_met(self, index: str | None, op: str | None, level: float | None) -> bool:
+        price = self._price(INDEX_SPOTS.get(index or "", ""))
+        if not price or level is None:
+            return False
+        return price > level if op == "above" else price < level
+
+    async def check_triggers(self, now: datetime | None = None) -> list[dict]:
+        """Fire, expire or keep each armed entry. Runs every few seconds; the model is not consulted to fire."""
+        now = (now or _now()).astimezone(IST)
+        fired = []
+        for spec in list(self.armed.values()):
+            if spec["day"] != now.date().isoformat() or now.strftime("%H:%M") > spec["valid_until"]:
+                self._close_trigger(spec["id"], "expired", "not triggered before valid_until", now)
+                self._log_action(None, "expire", spec["symbol"], spec["lots"], None, "expired",
+                                 f"{spec['id']} expired: {self._trigger_condition(spec)} never held", None, None)
+                continue
+            if not in_session(now) or not self._condition_met(spec["trigger_index"], spec["trigger_op"], spec["trigger_level"]):
+                continue
+            if spec.get("confirm_index") and not self._condition_met(spec["confirm_index"], spec["confirm_op"], spec["confirm_level"]):
+                continue
+            fired.append(await self._fire(spec, now))
+        return fired
+
+    async def _fire(self, spec: dict, now: datetime) -> dict:
+        symbol = spec["symbol"]
+        self._refresh_quote(symbol)
+        price = self._price(symbol)
+        held = self.portfolio.positions.get(symbol)
+        positions, deployed = {}, 0.0
+        for i, (s, p) in enumerate(((s, p) for s, p in self.portfolio.positions.items() if p.quantity > 0), 1):
+            ltp = self._price(s) or p.last_price
+            positions[f"P{i:02d}"] = {"symbol": s, "lots": p.lots, "lot_size": p.lot_size, "ltp": ltp, "value": ltp * p.quantity,
+                                      "expiry": str(self._contracts.get(s, {}).get("expiry") or "")[:10]}
+            deployed += p.average_price * p.quantity
+        snap = self.portfolio.snapshot()
+        context = {"candidates": {"C": {"symbol": symbol, "ltp": price, "lot_size": self.execution.lot_sizes.get(symbol, 0),
+                                        "expiry": str(self._contracts.get(symbol, {}).get("expiry") or "")[:10]}},
+                   "positions": positions, "book": {"cash": self.portfolio.cash, "deployed": deployed, "day_pnl": self._day_pnl(snap)},
+                   "clock": now.strftime("%H:%M"), "today": now.date().isoformat(), "market_open": in_session(now)}
+        pid = next((k for k, v in positions.items() if v["symbol"] == symbol), None)
+        action = {"action": "add" if held and held.quantity > 0 else "open", "contract_id": "C", "position_id": pid,
+                  "lots": spec["lots"], "stop_premium": spec.get("stop_premium"), "target_premium": spec.get("target_premium"),
+                  "horizon": spec.get("horizon"),
+                  "reason": f"trigger {spec['id']} fired ({self._trigger_condition(spec)}, armed {spec['armed_at']}): {spec['reason']}"}
+        checked = brain.validate({"actions": [action]}, context, self.limits())
+        if not checked.accepted:
+            why = checked.rejected[0]["rejected"] if checked.rejected else "rejected"
+            self._close_trigger(spec["id"], "blocked", why, now)
+            self._log_action(None, "trigger", symbol, spec["lots"], price, "blocked", f"{spec['id']} fired but blocked: {why}", None, None)
+            self.request_cycle(f"trigger {spec['id']} fired but was blocked: {why}")
+            return {"id": spec["id"], "status": "blocked", "why": why}
+        accepted = checked.accepted[0]
+        accepted.pop("ltp", None)              # the decision price is now: no drift check against the arming price
+        result = await self._execute(None, accepted, now)
+        self._close_trigger(spec["id"], "fired", f"{result['status']} @ {result.get('price')}", now)
+        if self.telegram is not None:
+            self.telegram.notify(f"Agentic | trigger {spec['id']} fired: {self._trigger_condition(spec)} -> "
+                                 f"{accepted['action'].upper()} {symbol.split(':')[-1]} x{accepted['lots']} @ {result.get('price')} "
+                                 f"({result['status']})")
+        self.request_cycle(f"trigger {spec['id']} fired: bought {symbol.split(':')[-1]} x{accepted['lots']}")
+        return {"id": spec["id"], **result}
+
+    # ---------------------------------------------------------------- intraday exits and level events
+
+    async def flatten_intraday(self, now: datetime | None = None) -> None:
+        """Positions opened as intraday are out at 15:15 even if no tick arrives to trigger the guard."""
+        now = (now or _now()).astimezone(IST)
+        if not in_session(now) or now.time() < INTRADAY_FLATTEN_AT:
+            return
+        for symbol in list(self.held_symbols()):
+            if self.meta.get(symbol, {}).get("horizon") != "intraday":
+                continue
+            position = self.portfolio.positions[symbol]
+            self._refresh_quote(symbol)
+            try:
+                self.execution.arm_exit(symbol, "INTRADAY_FLATTEN")
+                await self.execution.submit(symbol, "SELL", position.quantity)
+            except (ValueError, RuntimeError):
+                continue
+            self.note_guard_exit(symbol, "INTRADAY_FLATTEN", self._price(symbol))
+
+    def _compute_levels(self, now: datetime) -> dict:
+        out = {"day": now.date().isoformat(), "first_hour": now.time() >= time(10, 16)}
+        try:
+            with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=30) as db:
+                for root in LEVEL_INDICES:
+                    shape = feat.session_shape(db, root, INDEX_SPOTS[root], now, self._price(INDEX_SPOTS[root]))
+                    levels = {"prev_high": shape.get("prev_high"), "prev_low": shape.get("prev_low")}
+                    if out["first_hour"] and shape.get("first_hour"):
+                        levels["first_hour_high"] = shape["first_hour"]["high"]
+                        levels["first_hour_low"] = shape["first_hour"]["low"]
+                    out[root] = levels
+        except sqlite3.Error:
+            pass
+        return out
+
+    async def refresh_levels(self, now: datetime | None = None) -> None:
+        now = (now or _now()).astimezone(IST)
+        if not in_session(now):
+            return
+        stale = self._levels.get("day") != now.date().isoformat() or (
+            not self._levels.get("first_hour") and now.time() >= time(10, 16))
+        if not stale:
+            return
+        if self._levels.get("day") != now.date().isoformat():
+            self._level_fired = set()
+        self._levels = await asyncio.to_thread(self._compute_levels, now)
+        # a level already broken when it becomes known is not news
+        for root in LEVEL_INDICES:
+            for key, level in (self._levels.get(root) or {}).items():
+                if level and self._broken(root, key, level):
+                    self._level_fired.add((root, key))
+
+    def _broken(self, root: str, key: str, level: float) -> bool:
+        price = self._price(INDEX_SPOTS[root])
+        if not price:
+            return False
+        return price > level if key.endswith("high") else price < level
+
+    def _level_events(self) -> None:
+        for root in LEVEL_INDICES:
+            for key, level in (self._levels.get(root) or {}).items():
+                if level and (root, key) not in self._level_fired and self._broken(root, key, level):
+                    self._level_fired.add((root, key))
+                    side = "above" if key.endswith("high") else "below"
+                    self.request_cycle(f"{root} broke {side} its {key.replace('_', ' ')} {level:g}")
+
     # ---------------------------------------------------------------- persistence
 
     def _save_meta(self, symbol: str) -> None:
@@ -846,10 +1045,13 @@ class AgenticLane:
         if not meta:
             return
         with self._db_lock, self._db:
-            self._db.execute("""INSERT OR REPLACE INTO agentic_positions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            self._db.execute("""INSERT OR REPLACE INTO agentic_positions (symbol, position_id, opened_at, thesis, stop_premium,
+                                target_premium, review_price, booked, underlying, expiry, last_comment, updated_at, horizon)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                              (symbol, meta.get("position_id"), meta.get("opened_at"), meta.get("thesis"), meta.get("stop_premium"),
                               meta.get("target_premium"), meta.get("review_price"), int(meta.get("booked") or 0),
-                              meta.get("underlying"), meta.get("expiry"), meta.get("last_comment"), datetime.now(UTC).isoformat()))
+                              meta.get("underlying"), meta.get("expiry"), meta.get("last_comment"), datetime.now(UTC).isoformat(),
+                              meta.get("horizon")))
 
     def _drop_meta(self, symbol: str) -> None:
         self.meta.pop(symbol, None)
@@ -873,16 +1075,28 @@ class AgenticLane:
 
     # ---------------------------------------------------------------- loop
 
+    def can_cycle(self, now: datetime) -> bool:
+        if self.paused or not in_session(now) or not (FIRST_CYCLE_AT <= now.time() <= LAST_CYCLE_AT):
+            return False
+        day = now.date().isoformat()
+        return not (self._cycles_today[0] == day and self._cycles_today[1] >= MAX_CYCLES_PER_DAY)
+
     def _due(self, now: datetime) -> str | None:
-        if self.paused or not in_session(now):
-            return None
-        if not (FIRST_CYCLE_AT <= now.time() <= LAST_CYCLE_AT):
+        if not self.can_cycle(now):
             return None
         day = now.date().isoformat()
-        if self._cycles_today[0] == day and self._cycles_today[1] >= MAX_CYCLES_PER_DAY:
-            return None
         if self.next_cycle_at is None or self.next_cycle_at.date() != now.date():
             return "session start" if self.last_cycle is None or self.last_cycle["at"][:10] != day else "scheduled"
+        why = self.event_reason(now)
+        if why:
+            return why
+        if now >= self.next_cycle_at:
+            return "scheduled"
+        return None
+
+    def event_reason(self, now: datetime) -> str | None:
+        """A level break, a fired trigger, a stop/target, or a big move while holding: worth a cycle now."""
+        self._level_events()
         nifty = self._price(NIFTY)
         if self.held_symbols() and nifty and self._last_nifty and abs(nifty / self._last_nifty - 1) >= INDEX_TRIGGER:
             self.request_cycle(f"NIFTY moved {(nifty / self._last_nifty - 1) * 100:+.2f}% since the last cycle")
@@ -891,8 +1105,6 @@ class AgenticLane:
             why = "; ".join(self._triggers)
             self._triggers = []
             return why
-        if now >= self.next_cycle_at:
-            return "scheduled"
         return None
 
     async def run(self) -> None:
@@ -900,6 +1112,9 @@ class AgenticLane:
             await asyncio.sleep(5.0)
             try:
                 now = _now()
+                await self.refresh_levels(now)
+                await self.check_triggers(now)
+                await self.flatten_intraday(now)
                 why = self._due(now)
                 if why:
                     note = " | ".join(self._operator_notes) or None
@@ -963,9 +1178,10 @@ class AgenticLane:
         snap = self.execution.portfolio_snapshot()
         for row in snap["positions"]:
             meta = self.meta.get(row["symbol"], {})
-            for key in ("thesis", "last_comment", "stop_premium", "target_premium", "expiry", "booked", "opened_at"):
+            for key in ("thesis", "last_comment", "stop_premium", "target_premium", "expiry", "booked", "opened_at", "horizon"):
                 row[key] = meta.get(key)
         return {"lane": self.name, "capital": self.capital, "portfolio": snap, "health": self.health(),
+                "triggers": [self._trigger_view(t) for t in self.armed.values()],
                 "closed": self.execution.visible_closed_positions()[-100:]}
 
     def health(self) -> dict:
