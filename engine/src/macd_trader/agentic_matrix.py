@@ -36,6 +36,7 @@ SMALL_DAY_ATR, WIDE_DAY_ATR = 0.60, 1.80
 EXPENSIVE_RATIO = 1.30
 DEFAULT_STOP_FRACTION = 0.40                         # sizing stop when the model gives none
 MIN_STOP_FRACTION = 0.20                             # a tighter stop does not buy more lots
+STOP_SLIPPAGE = 0.15                                 # stops fill past the level in a fast market (22 Oct: 206 vs ~230)
 SIDES = {"CE": 1, "PE": -1}
 
 
@@ -148,6 +149,7 @@ def risk_budget(entry: dict, capital: float, risk_pct: float, *, overnight: bool
 
 
 def risk_per_lot(ltp: float, stop: float | None, lot_size: int) -> float:
-    """Premium at risk per lot to the stop; a missing stop is taken at 40% and a tighter one counts as 20%."""
+    """Premium at risk per lot to the stop, plus 15% for slippage; a missing stop is taken at 40% and a tighter
+    one counts as 20%."""
     stop_frac = DEFAULT_STOP_FRACTION if not stop or stop >= ltp else (ltp - stop) / ltp
-    return ltp * max(stop_frac, MIN_STOP_FRACTION) * lot_size
+    return ltp * max(stop_frac, MIN_STOP_FRACTION) * (1 + STOP_SLIPPAGE) * lot_size

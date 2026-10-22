@@ -75,8 +75,8 @@ def test_risk_budget_halves_for_each_aggravating_condition():
     worst, notes = mx.risk_budget(cell, 1_000_000, 0.015, overnight=True, scorecard_agrees=False, expiry_today=True,
                                   clock="14:40", day_pnl=-20_000)
     assert worst == 15_000 / 16 and len(notes) == 4
-    assert mx.risk_per_lot(100.0, None, 75) == 3000           # no stop -> 40%
-    assert mx.risk_per_lot(100.0, 95.0, 75) == 1500           # a 5% stop counts as 20%
+    assert round(mx.risk_per_lot(100.0, None, 75)) == 3450    # no stop -> 40%, +15% slippage
+    assert round(mx.risk_per_lot(100.0, 95.0, 75)) == 1725    # a 5% stop counts as 20%
 
 
 # ------------------------------------------------------------------------------------------- the validator
@@ -108,20 +108,20 @@ def test_grade_a_trims_lots_to_the_risk_budget_and_grade_d_blocks_the_side():
     out = brain.validate({"actions": [order("open", "C02", lots=10), order("open", "C01", lots=2)]},
                          ctx(matrix_of()), brain.Limits(capital=1_000_000))
     ce = out.accepted[0]
-    assert ce["grade"] == "A" and ce["lots"] == 5             # Rs 15,000 / (40 x 75 = Rs 3,000 per lot)
-    assert "grade A" in ce["note"] and "trimmed from 10 to 5" in ce["note"]
+    assert ce["grade"] == "A" and ce["lots"] == 4             # Rs 15,000 / (40 x 75 x 1.15 = Rs 3,450 per lot)
+    assert "grade A" in ce["note"] and "trimmed from 10 to 4" in ce["note"]
     assert "grade D" in out.rejected[0]["rejected"]
 
 
 def test_overnight_without_the_scorecard_halves_and_an_add_shares_the_budget():
     out = brain.validate({"actions": [order("open", "C02", lots=10, horizon="overnight")]}, ctx(matrix_of()),
                          brain.Limits(capital=1_000_000))
-    assert out.accepted[0]["lots"] == 2                       # Rs 7,500 / Rs 3,000
+    assert out.accepted[0]["lots"] == 2                       # Rs 7,500 / Rs 3,450
     held = {"P01": {"symbol": CE, "lots": 3, "lot_size": 75, "ltp": 100.0, "value": 22_500, "expiry": "2026-10-20",
                     "underlying": "NIFTY", "type": "CE", "stop_premium": 60.0}}
     out = brain.validate({"actions": [order("add", pid="P01", lots=10)]}, ctx(matrix_of(), positions=held),
                          brain.Limits(capital=1_000_000))
-    assert out.accepted[0]["lots"] == 2                       # Rs 15,000 - 3 x Rs 3,000 already at risk
+    assert out.accepted[0]["lots"] == 1                       # Rs 15,000 - 3 x Rs 3,450 already at risk
 
 
 def test_a_trigger_at_the_edge_is_sized_as_a_break_and_one_lot_too_many_is_explained():
@@ -129,7 +129,7 @@ def test_a_trigger_at_the_edge_is_sized_as_a_break_and_one_lot_too_many_is_expla
     arm = order("arm", "C02", lots=10, trigger_index="NIFTY", trigger_op="above", trigger_level=23100,
                 valid_until="14:00")
     out = brain.validate({"actions": [arm]}, ctx(inside), brain.Limits(capital=1_000_000))
-    assert out.accepted[0]["grade"] == "A" and out.accepted[0]["lots"] == 5
+    assert out.accepted[0]["grade"] == "A" and out.accepted[0]["lots"] == 4
     poor = {"NIFTY": {s: {**v, "size_multiplier": 0.3, "grade": "C", "if_break": None} for s, v in inside["NIFTY"].items()}}
     big = ctx(poor, candidates={"C02": {"symbol": CE, "ltp": 400.0, "lot_size": 75, "expiry": "2026-10-20",
                                         "underlying": "NIFTY", "type": "CE"}})

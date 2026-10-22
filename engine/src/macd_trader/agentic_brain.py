@@ -16,6 +16,7 @@ its last four characters), and it is only ever sent to an https host on x.ai.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -101,7 +102,11 @@ category; "data_wanted" names the one missing input that would most change this 
 
 Hard limits (enforced in code; orders that break them are trimmed or rejected): maximum open positions, maximum value
 per position, maximum total deployed, a daily loss stop that blocks new risk, no new risk after 15:10, at most
-""" + str(MAX_ARMED) + """ armed triggers, whole lots only, and only the contract_ids listed in this message. Use
+""" + str(MAX_ARMED) + """ armed triggers, whole lots only, and only the contract_ids listed in this message.
+Also enforced (lessons of 22 Oct 2026): no new position before 09:45 unless grade A (arm triggers instead; they
+fill from 09:45); at most one re-entry per index and side per day, and only at grade A; the code books half of a
+winner at +30% or when its index reaches half its first-hour range beyond the edge (a one-lot position is closed
+there), moves the rest to breakeven, and from +20% trails the stop at 88% of the best premium. Use
 position_id and trigger ids exactly as given.
 
 Action fields: open/add need contract_id (open) or position_id (add), lots, stop_premium, target_premium, horizon.
@@ -194,6 +199,26 @@ def check_base_url(url: str) -> str:
     return url.strip().rstrip("/")
 
 
+RETRY_PAUSE_S = 5.0
+
+
+def _error_text(response: httpx.Response) -> str:
+    """A short, readable reason: the API's JSON error message, or the page title of a gateway error page."""
+    text = response.text or ""
+    try:
+        err = response.json().get("error")
+        message = err.get("message") if isinstance(err, dict) else err
+        if message:
+            return str(message)[:200]
+    except (ValueError, AttributeError):
+        pass
+    import re
+    title = re.search(r"<title>(.*?)</title>", text, re.I | re.S)
+    if title:
+        return re.sub(r"\s+", " ", title.group(1)).strip()[:200]
+    return re.sub(r"\s+", " ", text).strip()[:200] or "(empty body)"
+
+
 class BrainError(RuntimeError):
     pass
 
@@ -270,6 +295,20 @@ class GrokClient:
             response.raise_for_status()
             return [row.get("id") for row in response.json().get("data", []) if row.get("id")]
 
+    async def _post_with_retry(self, client: httpx.AsyncClient, body: dict) -> httpx.Response:
+        """One retry after a short pause on a gateway error (5xx) or a dropped connection; never on 4xx."""
+        for attempt in (1, 2):
+            try:
+                response = await client.post(f"{self.base_url}/chat/completions", json=body)
+            except (httpx.TransportError,):
+                if attempt == 2:
+                    raise
+            else:
+                if response.status_code < 500 or attempt == 2:
+                    return response
+            await asyncio.sleep(RETRY_PAUSE_S)
+        raise AssertionError("unreachable")
+
     async def decide(self, system: str, user: str, max_tokens: int = 2500) -> tuple[dict, dict]:
         """Returns (decision, meta). Raises BrainError on transport or parse failure."""
         body = {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -284,7 +323,7 @@ class GrokClient:
         started = clock.monotonic()
         try:
             async with self._client() as client:
-                response = await client.post(f"{self.base_url}/chat/completions", json=body)
+                response = await self._post_with_retry(client, body)
                 if response.status_code == 400 and self.json_schema_supported and "response_format" in response.text:
                     # Older models: fall back to plain JSON mode once and remember it.
                     self.json_schema_supported = False
@@ -296,7 +335,7 @@ class GrokClient:
         latency = round((clock.monotonic() - started) * 1000)
         if response.status_code != 200:
             # The body can echo the request but never the key (it travels only in the header).
-            raise BrainError(f"HTTP {response.status_code}: {response.text[:300]}")
+            raise BrainError(f"HTTP {response.status_code}: {_error_text(response)}")
         payload = response.json()
         try:
             content = payload["choices"][0]["message"]["content"]
@@ -362,6 +401,8 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
         action = {k: raw.get(k) for k in ("action", "contract_id", "position_id", "lots", "stop_premium", "target_premium",
                                           "horizon", "trigger_index", "trigger_op", "trigger_level", "confirm_index",
                                           "confirm_op", "confirm_level", "valid_until", "reason")}
+        if context.get("matrix") is None:     # a trigger fill: the grade was set by the code when it was armed
+            action["grade"] = raw.get("grade")
         if action.get("horizon") not in HORIZONS:
             action["horizon"] = "intraday"
         kind = action["action"]
@@ -452,6 +493,11 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                     note = f"trimmed from {wanted} to {granted} lots: {why}"
                 else:
                     note = f"{note}; {why}" if note else why
+            grade = grade or action.get("grade")     # set above only on the matrix-free trigger-fill path
+            gate = _entry_gate(kind, row, context, grade, now)
+            if gate:
+                reject(action, gate)
+                continue
             accepted = {**action, "lots": granted, "symbol": row["symbol"], "ltp": ltp, "lot_size": lot_size,
                         "stop_premium": stop if stop and stop < ltp else None,
                         "target_premium": target if target and target > ltp else None, "note": note, "grade": grade}
@@ -487,6 +533,23 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                              "target_premium": target if target is not None and (not ltp or target > ltp) else None,
                              "note": None})
     return out
+
+
+def _entry_gate(kind: str, row: dict, context: dict, grade: str | None, now: str) -> str | None:
+    """22 Oct 2026 lessons, enforced: no new position before the open has settled unless the setup is grade A,
+    and at most one re-entry per index and side per day, only at grade A."""
+    if kind == "open" and context.get("settle_until") and now < context["settle_until"] and grade != "A":
+        return f"before {context['settle_until']} only a grade A setup may open (this is {grade or 'ungraded'}); arm a trigger instead"
+    entries = context.get("entries_today")
+    if entries is None or kind not in ("open", "arm"):
+        return None
+    key = f"{row.get('underlying')}:{row.get('type')}"
+    taken = int(entries.get(key, 0))
+    if taken >= 2:
+        return f"{key.replace(':', ' ')} already entered and re-entered today: no third entry"
+    if taken == 1 and grade != "A":
+        return f"re-entering {key.replace(':', ' ')} after a closed trade today needs grade A (this is {grade or 'ungraded'})"
+    return None
 
 
 def _matrix_size(kind: str, action: dict, row: dict, context: dict, limits: Limits, ltp: float, stop: float | None,

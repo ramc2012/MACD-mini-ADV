@@ -55,6 +55,11 @@ INTRADAY_FLATTEN_AT = time(15, 15)
 LEVEL_INDICES = ("NIFTY", "BANKNIFTY")
 DEFAULT_EFFORT = "medium"           # grok-4.7 at its default (high) took ~200 s a decision; medium ~110 s
 MAX_ENTRY_DRIFT = 0.08             # skip an entry whose premium ran this far while the model was thinking
+# Profit-taking in code (22 Oct 2026: winners at +28% and +37% were all given back to their stops).
+BOOK_AT = 0.30                      # book half (one lot: all) at +30%, or when the index reaches its first target
+TRAIL_FROM, TRAIL_KEEP = 0.20, 0.88  # from +20% the stop trails at 88% of the best premium ...
+TRAIL_FLOOR = 1.05                  # ... and never below entry +5%
+SETTLE_UNTIL = time(9, 45)          # no new risk (and no trigger fills) before the open type is known
 UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only
 CYCLE_CHOICES = (15, 30, 60, 120)
 DEFAULT_UNIVERSE = "index"
@@ -228,6 +233,10 @@ class AgenticExecutionManager(ExecutionManager):
             reason = "AGENT_STOP"
         elif meta.get("target_premium") and price >= float(meta["target_premium"]):
             reason = "AGENT_TARGET"
+        if not reason and price > position.average_price:
+            reason = await self._take_profit(symbol, position, meta, price)
+            if reason == "booked":
+                return
         if reason:
             self.arm_exit(symbol, reason)
             try:
@@ -239,6 +248,34 @@ class AgenticExecutionManager(ExecutionManager):
         review = meta.get("review_price")
         if review and abs(price / float(review) - 1) >= POSITION_TRIGGER:
             self.lane.request_cycle(f"{symbol} moved {((price / float(review)) - 1) * 100:+.0f}% since last review")
+
+    async def _take_profit(self, symbol: str, position, meta: dict, price: float) -> str | None:
+        """Bank part of a winner: half at +30% or the index's first target (one lot: all of it), then trail.
+
+        Returns a full-exit reason, "booked" after a partial sale, or None."""
+        gain = price / position.average_price - 1
+        target_hit = self.lane.index_target_hit(symbol)
+        if not meta.get("booked") and (gain >= BOOK_AT or (target_hit and gain >= 0.05)):
+            why = f"+{gain * 100:.0f}%" + (" and the index reached its first target" if target_hit else "")
+            if position.lots <= 1:
+                return "PROFIT_TAKE_ONE_LOT"
+            lots = position.lots // 2
+            self.arm_exit(symbol, "PROFIT_BOOK_HALF")
+            try:
+                await self.submit(symbol, "SELL", lots * position.lot_size)
+            except (ValueError, RuntimeError):
+                return None
+            meta["booked"] = 1
+            meta["stop_premium"] = max(float(meta.get("stop_premium") or 0.0), position.average_price)
+            self.lane.note_partial_exit(symbol, lots, price, f"booked half ({lots} lots) at {why}; rest stopped at breakeven")
+            return "booked"
+        best = max(float(position.peak_price or 0.0), float(getattr(position, "max_price", 0.0) or 0.0), price)
+        if best >= position.average_price * (1 + TRAIL_FROM):
+            trail = round(max(best * TRAIL_KEEP, position.average_price * TRAIL_FLOOR), 2)
+            if trail > float(meta.get("stop_premium") or 0.0):
+                meta["stop_premium"] = trail
+                self.lane.save_meta_quietly(symbol)
+        return None
 
     async def on_closed_bar(self, symbol: str, macd: float) -> bool:
         return False
@@ -485,6 +522,51 @@ class AgenticLane:
             self.telegram.on_exit(symbol, "OPERATOR_CLOSE", self._price(symbol))
         self._drop_meta(symbol)
         self.request_cycle(f"operator closed {symbol}")
+
+    def note_partial_exit(self, symbol: str, lots: int, price: float, why: str) -> None:
+        self._log_action(None, "reduce", symbol, lots, price, "filled", f"guard: {why}", None, None)
+        self._save_meta(symbol)
+        if self.telegram is not None:
+            self.telegram.notify(f"Agentic | {symbol.split(':')[-1]}: {why} @ {price:.2f}")
+        self.request_cycle(f"{symbol}: {why}")
+
+    def save_meta_quietly(self, symbol: str) -> None:
+        self._save_meta(symbol)
+
+    def index_target_hit(self, symbol: str) -> bool:
+        """The position's index has run half its first-hour range beyond the edge in the trade's direction."""
+        contract = self._contracts.get(symbol, {})
+        root, side = _underlying_of(contract.get("spot_symbol", "")), contract.get("option_type")
+        inputs = ((self.matrix or {}).get(root) or {}).get("inputs") or {}
+        high, low, price = inputs.get("ib_high"), inputs.get("ib_low"), self._price(INDEX_SPOTS.get(root, ""))
+        if not high or not low or not price or side not in ("CE", "PE"):
+            return False
+        half = 0.5 * (high - low)
+        return price >= high + half if side == "CE" else price <= low - half
+
+    def entries_today(self, day: str) -> dict[str, int]:
+        """New positions opened today per "ROOT:SIDE" (closed ones and open ones), for the re-entry rule."""
+        counts: dict[str, int] = {}
+        seen: set[str] = set()
+        rows = [(c.get("symbol"), str(c.get("entry_time") or c.get("opened_at") or "")) for c in
+                self.repository.closed_positions(lane=self.name, limit=400)]
+        rows += [(s, p.opened_at.astimezone(IST).isoformat() if hasattr(p.opened_at, "astimezone") else str(p.opened_at))
+                 for s, p in self.portfolio.positions.items() if p.quantity > 0]
+        for symbol, opened in rows:
+            if not symbol or (symbol, opened) in seen:
+                continue
+            seen.add((symbol, opened))
+            try:
+                when = datetime.fromisoformat(opened).astimezone(IST).date().isoformat()
+            except ValueError:
+                continue
+            if when != day:
+                continue
+            contract = self._contracts.get(symbol, {})
+            root = _underlying_of(contract.get("spot_symbol", "")) if contract else symbol.split(":")[-1]
+            side = contract.get("option_type") or symbol[-2:]
+            counts[f"{root}:{side}"] = counts.get(f"{root}:{side}", 0) + 1
+        return counts
 
     def note_guard_exit(self, symbol: str, reason: str, price: float) -> None:
         if self.telegram is not None:
@@ -742,6 +824,7 @@ class AgenticLane:
             "data_quality": self._data_quality(now, stats, features, signals),
         }
         validation = {"candidates": candidates, "positions": positions, "book": book, "matrix": matrix,
+                      "entries_today": self.entries_today(today), "settle_until": SETTLE_UNTIL.strftime("%H:%M"),
                       "risk_per_trade_pct": self.settings.agentic_risk_per_trade_pct,
                       "clock": now.strftime("%H:%M"), "today": today, "market_open": in_session(now),
                       "triggers": dict(self.armed), "armed_count": len(self.armed),
@@ -941,7 +1024,7 @@ class AgenticLane:
                 "confirm_index": action.get("confirm_index"), "confirm_op": action.get("confirm_op"),
                 "confirm_level": float(action["confirm_level"]) if action.get("confirm_level") is not None else None,
                 "valid_until": action["valid_until"], "reason": str(action.get("reason") or ""),
-                "armed_at": now.strftime("%H:%M"), "premium_at_arm": action.get("ltp")}
+                "armed_at": now.strftime("%H:%M"), "premium_at_arm": action.get("ltp"), "grade": action.get("grade")}
         self.armed[spec["id"]] = spec
         with self._db_lock, self._db:
             self._db.execute("INSERT OR REPLACE INTO agentic_triggers VALUES (?,?,?,?,?,?,?)",
@@ -971,7 +1054,9 @@ class AgenticLane:
                 self._log_action(None, "expire", spec["symbol"], spec["lots"], None, "expired",
                                  f"{spec['id']} expired: {self._trigger_condition(spec)} never held", None, None)
                 continue
-            if not in_session(now) or not self._condition_met(spec["trigger_index"], spec["trigger_op"], spec["trigger_level"]):
+            if not in_session(now) or now.time() < SETTLE_UNTIL:
+                continue              # armed early is fine; it fills only once the open has settled
+            if not self._condition_met(spec["trigger_index"], spec["trigger_op"], spec["trigger_level"]):
                 continue
             if spec.get("confirm_index") and not self._condition_met(spec["confirm_index"], spec["confirm_op"], spec["confirm_level"]):
                 continue
@@ -990,14 +1075,18 @@ class AgenticLane:
                                       "expiry": str(self._contracts.get(s, {}).get("expiry") or "")[:10]}
             deployed += p.average_price * p.quantity
         snap = self.portfolio.snapshot()
+        contract = self._contracts.get(symbol, {})
         context = {"candidates": {"C": {"symbol": symbol, "ltp": price, "lot_size": self.execution.lot_sizes.get(symbol, 0),
-                                        "expiry": str(self._contracts.get(symbol, {}).get("expiry") or "")[:10]}},
+                                        "expiry": str(contract.get("expiry") or "")[:10],
+                                        "underlying": _underlying_of(contract.get("spot_symbol", "")),
+                                        "type": contract.get("option_type")}},
+                   "entries_today": self.entries_today(now.date().isoformat()),
                    "positions": positions, "book": {"cash": self.portfolio.cash, "deployed": deployed, "day_pnl": self._day_pnl(snap)},
                    "clock": now.strftime("%H:%M"), "today": now.date().isoformat(), "market_open": in_session(now)}
         pid = next((k for k, v in positions.items() if v["symbol"] == symbol), None)
         action = {"action": "add" if held and held.quantity > 0 else "open", "contract_id": "C", "position_id": pid,
                   "lots": spec["lots"], "stop_premium": spec.get("stop_premium"), "target_premium": spec.get("target_premium"),
-                  "horizon": spec.get("horizon"),
+                  "horizon": spec.get("horizon"), "grade": spec.get("grade"),
                   "reason": f"trigger {spec['id']} fired ({self._trigger_condition(spec)}, armed {spec['armed_at']}): {spec['reason']}"}
         checked = brain.validate({"actions": [action]}, context, self.limits())
         if not checked.accepted:

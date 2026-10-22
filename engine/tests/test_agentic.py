@@ -133,7 +133,8 @@ def test_rules_fallback_cuts_losers_books_half_of_winners_and_leaves_expiry_day(
 
 # ----------------------------------------------------------------------------------- the Grok client
 
-def test_grok_client_sends_the_schema_and_never_echoes_the_key():
+def test_grok_client_sends_the_schema_and_never_echoes_the_key(monkeypatch):
+    monkeypatch.setattr(brain, "RETRY_PAUSE_S", 0)
     seen = {}
 
     def handler(request: httpx.Request):
