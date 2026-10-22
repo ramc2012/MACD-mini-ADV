@@ -229,8 +229,8 @@ def daily_ohlc(db: sqlite3.Connection, spot: str, today: date, sessions: int = 1
 
 
 def matrix_inputs(db: sqlite3.Connection, spot: str, now: datetime, daily: list[tuple] | None = None) -> dict:
-    """What the decision matrix needs for one index: ATR, the prior day's size and shape, today's open type and
-    first-hour range (each only once it is complete). ``daily`` = daily_ohlc(...) when cached by the caller."""
+    """What the decision matrix needs for one index: ATR, the prior day's size, shape and close location, the
+    10-session high/low, today's open type and first-hour range (each only once it is complete). ``daily`` = daily_ohlc(...) when cached by the caller."""
     from .agentic_matrix import open_type
     daily = daily if daily is not None else daily_ohlc(db, spot, now.date())
     if len(daily) < 8:
@@ -241,7 +241,9 @@ def matrix_inputs(db: sqlite3.Connection, spot: str, now: datetime, daily: list[
     _, po, ph, pl, pc = daily[-1]
     ranges = [d[2] - d[3] for d in daily[-7:]]
     out = {"atr_points": _r(atr, 1), "prev_range_atr": _r((ph - pl) / atr), "prev_colour": (pc > po) - (pc < po),
-           "prev_nr7": len(ranges) == 7 and (ph - pl) <= min(ranges), "prev_inside": ph < daily[-2][2] and pl > daily[-2][3]}
+           "prev_nr7": len(ranges) == 7 and (ph - pl) <= min(ranges), "prev_inside": ph < daily[-2][2] and pl > daily[-2][3],
+           "prev_clv": _r((pc - pl) / (ph - pl)) if ph > pl else None,
+           "hi10": _r(max(d[2] for d in daily[-10:])), "lo10": _r(min(d[3] for d in daily[-10:]))}
     bars = _minutes(db, spot, now.date(), int(now.timestamp()) + 1)
     lo, _ = _bounds(now.date())
     first30 = [(b[1], b[2], b[3], b[4]) for b in bars if b[0] < lo + 1800]

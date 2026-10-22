@@ -67,36 +67,48 @@ def test_an_armed_break_is_graded_as_if_it_had_broken():
     assert assumed["score"] == inside["score"] + 2
 
 
-def test_risk_budget_halves_for_each_aggravating_condition():
-    cell = {"size_multiplier": 1.0}
-    full, _ = mx.risk_budget(cell, 1_000_000, 0.015, overnight=False, scorecard_agrees=False, expiry_today=False,
-                             clock="11:00", day_pnl=0)
-    assert full == 15_000
-    worst, notes = mx.risk_budget(cell, 1_000_000, 0.015, overnight=True, scorecard_agrees=False, expiry_today=True,
-                                  clock="14:40", day_pnl=-20_000)
-    assert worst == 15_000 / 16 and len(notes) == 4
+def test_risk_per_lot_carries_slippage_and_a_minimum_stop():
     assert round(mx.risk_per_lot(100.0, None, 75)) == 3450    # no stop -> 40%, +15% slippage
     assert round(mx.risk_per_lot(100.0, 95.0, 75)) == 1725    # a 5% stop counts as 20%
+
+
+SWING_UP = {**BROKEN_UP, "prev_clv": 0.85, "hi10": 23120.0, "lo10": 22500.0, "prev_range_atr": 1.0}
+
+
+def test_swing_grade_reads_the_scorecard_trends_breakout_and_yesterdays_close():
+    up = mx.evaluate_swing(SWING_UP, "CE", 23130.0, trend20=1, trend50=1, scorecard_call="CE", intraday_grade="A")
+    # +2 scorecard, +1 20d, +1 50d, +1 10-session breakout, +1 closed near the high, +1 timing
+    assert (up["grade"], up["score"]) == ("A", 7)
+    down = mx.evaluate_swing(SWING_UP, "PE", 23130.0, trend20=1, trend50=1, scorecard_call="CE", intraday_grade="D")
+    assert down["grade"] == "D" and down["score"] == -1
+    pullback = mx.evaluate_swing({**SWING_UP, "hi10": 23500.0, "prev_clv": 0.5}, "CE", 23130.0, trend20=1, trend50=1,
+                                 ma20_gap_atr=0.3)
+    assert any("pullback" in why for _, why in pullback["factors"])
 
 
 # ------------------------------------------------------------------------------------------- the validator
 
 def ctx(matrix, **kw):
-    base = {"candidates": {"C01": {"symbol": PE, "ltp": 100.0, "lot_size": 75, "expiry": "2026-10-20",
-                                   "underlying": "NIFTY", "type": "PE"},
-                           "C02": {"symbol": CE, "ltp": 100.0, "lot_size": 75, "expiry": "2026-10-20",
-                                   "underlying": "NIFTY", "type": "CE"}},
+    base = {"candidates": {"C01": {"symbol": PE, "ltp": 100.0, "lot_size": 75, "expiry": "2026-10-27",
+                                   "underlying": "NIFTY", "type": "PE", "sessions_to_expiry": 9},
+                           "C02": {"symbol": CE, "ltp": 100.0, "lot_size": 75, "expiry": "2026-10-27",
+                                   "underlying": "NIFTY", "type": "CE", "sessions_to_expiry": 9}},
             "positions": {}, "book": {"cash": 1_000_000, "deployed": 0, "day_pnl": 0}, "clock": "11:00",
-            "today": "2026-10-13", "market_open": True, "matrix": matrix, "risk_per_trade_pct": 0.015,
+            "today": "2026-10-13", "market_open": True, "matrix": matrix,
             "index_prices": {"NIFTY": 23050.0}, "armed_count": 0}
     base.update(kw)
     return base
 
 
-def matrix_of(price=23130.0, clock="10:40"):
-    return {"NIFTY": {side: {**mx.evaluate(BROKEN_UP, side, clock, price, trend=1),
-                             "if_break": mx.evaluate(BROKEN_UP, side, clock, price, trend=1, assume_break=True),
-                             "scorecard_agrees": False} for side in mx.SIDES}}
+def matrix_of(price=23130.0, clock="10:40", scorecard=None):
+    out = {}
+    for side in mx.SIDES:
+        intraday = mx.evaluate(BROKEN_UP, side, clock, price, trend=1)
+        out[side] = {**intraday, "if_break": mx.evaluate(BROKEN_UP, side, clock, price, trend=1, assume_break=True),
+                     "swing": mx.evaluate_swing(SWING_UP, side, price, trend20=1, trend50=1, scorecard_call=scorecard,
+                                                intraday_grade=intraday["grade"]),
+                     "scorecard_agrees": scorecard == side}
+    return {"NIFTY": out}
 
 
 def order(action, cid=None, lots=10, stop=60.0, pid=None, horizon="intraday", **extra):
@@ -104,37 +116,51 @@ def order(action, cid=None, lots=10, stop=60.0, pid=None, horizon="intraday", **
             "target_premium": 200.0, "horizon": horizon, "reason": "test", **extra}
 
 
-def test_grade_a_trims_lots_to_the_risk_budget_and_grade_d_blocks_the_side():
-    out = brain.validate({"actions": [order("open", "C02", lots=10), order("open", "C01", lots=2)]},
+def test_lots_follow_the_grade_and_grade_d_still_trades_one_lot():
+    out = brain.validate({"actions": [order("open", "C02", lots=10), order("open", "C01", lots=5)]},
                          ctx(matrix_of()), brain.Limits(capital=1_000_000))
+    ce, pe = out.accepted
+    assert (ce["grade"], ce["lots"]) == ("A", 4) and "trimmed from 10 to 4" in ce["note"]
+    assert (pe["grade"], pe["lots"]) == ("D", 1)
+    small = brain.validate({"actions": [order("open", "C02", lots=2)]}, ctx(matrix_of()), brain.Limits(capital=1_000_000))
+    assert small.accepted[0]["lots"] == 2                     # fewer than the cap is the model's choice
+
+
+def test_a_swing_entry_uses_the_swing_grade_needs_time_to_expiry_and_keeps_a_sane_invalidation():
+    m = matrix_of(scorecard="PE")                            # the scorecard calls puts: the CE swing grade drops
+    out = brain.validate({"actions": [order("open", "C02", lots=10, horizon="swing", setup="multiday_breakout",
+                                            invalidation_level=22900)]}, ctx(m), brain.Limits(capital=1_000_000))
     ce = out.accepted[0]
-    assert ce["grade"] == "A" and ce["lots"] == 4             # Rs 15,000 / (40 x 75 x 1.15 = Rs 3,450 per lot)
-    assert "grade A" in ce["note"] and "trimmed from 10 to 4" in ce["note"]
-    assert "grade D" in out.rejected[0]["rejected"]
+    assert ce["horizon"] == "swing" and ce["setup"] == "multiday_breakout" and ce["invalidation_level"] == 22900
+    assert ce["grade"] == m["NIFTY"]["CE"]["swing"]["grade"] and ce["lots"] == mx.LOTS_BY_GRADE[ce["grade"]]
+    wrong_side = brain.validate({"actions": [order("open", "C02", lots=1, horizon="swing", invalidation_level=23200)]},
+                                ctx(m), brain.Limits(capital=1_000_000))
+    assert wrong_side.accepted[0]["invalidation_level"] is None and wrong_side.accepted[0]["setup"] == "other"
+    short = ctx(m)
+    short["candidates"]["C02"]["sessions_to_expiry"] = 1
+    out = brain.validate({"actions": [order("open", "C02", lots=1, horizon="overnight")]}, short, brain.Limits(capital=1_000_000))
+    assert "at least 3 sessions to expiry" in out.rejected[0]["rejected"]
 
 
-def test_overnight_without_the_scorecard_halves_and_an_add_shares_the_budget():
-    out = brain.validate({"actions": [order("open", "C02", lots=10, horizon="overnight")]}, ctx(matrix_of()),
-                         brain.Limits(capital=1_000_000))
-    assert out.accepted[0]["lots"] == 2                       # Rs 7,500 / Rs 3,450
-    held = {"P01": {"symbol": CE, "lots": 3, "lot_size": 75, "ltp": 100.0, "value": 22_500, "expiry": "2026-10-20",
-                    "underlying": "NIFTY", "type": "CE", "stop_premium": 60.0}}
+def test_an_add_counts_the_held_lots_against_the_cap():
+    held = {"P01": {"symbol": CE, "lots": 3, "lot_size": 75, "ltp": 100.0, "value": 22_500, "expiry": "2026-10-27",
+                    "underlying": "NIFTY", "type": "CE", "stop_premium": 60.0, "horizon": "intraday"}}
     out = brain.validate({"actions": [order("add", pid="P01", lots=10)]}, ctx(matrix_of(), positions=held),
                          brain.Limits(capital=1_000_000))
-    assert out.accepted[0]["lots"] == 1                       # Rs 15,000 - 3 x Rs 3,450 already at risk
+    assert out.accepted[0]["lots"] == 1                       # grade A: 4 lots, 3 held
+    held["P01"]["lots"] = 4
+    out = brain.validate({"actions": [order("add", pid="P01", lots=1)]}, ctx(matrix_of(), positions=held),
+                         brain.Limits(capital=1_000_000))
+    assert "no room to add" in out.rejected[0]["rejected"]
 
 
-def test_a_trigger_at_the_edge_is_sized_as_a_break_and_one_lot_too_many_is_explained():
+def test_a_trigger_at_the_edge_is_sized_as_a_break():
     inside = matrix_of(price=23050.0, clock="11:00")         # inside the first hour: CE grade B (score 3)
+    assert inside["NIFTY"]["CE"]["grade"] == "B"
     arm = order("arm", "C02", lots=10, trigger_index="NIFTY", trigger_op="above", trigger_level=23100,
                 valid_until="14:00")
     out = brain.validate({"actions": [arm]}, ctx(inside), brain.Limits(capital=1_000_000))
     assert out.accepted[0]["grade"] == "A" and out.accepted[0]["lots"] == 4
-    poor = {"NIFTY": {s: {**v, "size_multiplier": 0.3, "grade": "C", "if_break": None} for s, v in inside["NIFTY"].items()}}
-    big = ctx(poor, candidates={"C02": {"symbol": CE, "ltp": 400.0, "lot_size": 75, "expiry": "2026-10-20",
-                                        "underlying": "NIFTY", "type": "CE"}})
-    out = brain.validate({"actions": [order("open", "C02", lots=1, stop=None)]}, big, brain.Limits(capital=1_000_000))
-    assert "not even one lot fits" in out.rejected[0]["rejected"]
 
 
 def test_no_matrix_in_the_context_keeps_the_old_limits():

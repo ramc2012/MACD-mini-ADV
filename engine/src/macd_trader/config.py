@@ -273,14 +273,11 @@ class Settings(BaseSettings):
     agentic_model: str = "grok-4.7"
     agentic_api_base: str = "https://api.x.ai/v1"
     agentic_cycle_minutes: int = Field(default=15, ge=5, le=120)
-    agentic_max_positions: int = Field(default=8, ge=1, le=40)
+    agentic_max_positions: int = Field(default=10, ge=1, le=40)     # intraday and swing books together
     agentic_max_position_pct: float = Field(default=0.15, gt=0, le=1)
     agentic_max_deployed_pct: float = Field(default=0.60, gt=0, le=1)
     agentic_daily_loss_stop_pct: float = Field(default=0.03, gt=0, le=1)
     agentic_max_lots_per_order: int = Field(default=20, ge=1, le=500)
-    # Decision matrix (agentic_matrix.py): premium at risk to the stop per new trade, as a share of capital, for
-    # grade A (B 0.6x, C 0.3x, D none).
-    agentic_risk_per_trade_pct: float = Field(default=0.015, gt=0, le=0.1)
 
     # Raw tick capture. Ticks cannot be backfilled -- Fyers' finest history is
     # 5-second OHLCV -- so the socket's output is the only copy that will ever

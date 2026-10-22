@@ -30,7 +30,21 @@ DEFAULT_BASE_URL = "https://api.x.ai/v1"
 ACTIONS = ("open", "add", "reduce", "close", "set_levels", "hold", "arm", "disarm")
 REGIMES = ("bullish", "bearish", "neutral", "volatile")
 BIASES = ("bullish", "bearish", "neutral")
-HORIZONS = ("intraday", "overnight")
+HORIZONS = ("intraday", "swing")
+SETUPS = {
+    "ib_breakout": "first-hour range broken with the open type agreeing (intraday plan)",
+    "opening_drive": "trade the drive's direction once the open has settled",
+    "trend_pullback": "with the 20/50-day trend after a pullback to the 20-day average or prior support",
+    "multiday_breakout": "break of the 5-10 session high/low or the weekly value area, held for days",
+    "failed_breakout_reversal": "a break of a key level (prior day/week high or low) that fails back inside: trade the other way",
+    "gap_follow_through": "a close near the day's extreme held overnight for the gap",
+    "mean_reversion": "fade an extended multi-day move (far from the 20-day average) back toward value",
+    "scorecard_overnight": "the tested next-day index scorecard call",
+    "expiry_positioning": "expiry-week plays around open-interest walls and max pain",
+    "other": "anything else (explain it in the reason)",
+}
+SWING_MIN_SESSIONS_TO_EXPIRY = 3
+SWING_MAX_SESSIONS = 5
 TRIGGER_OPS = ("above", "below")
 INDEX_ROOTS = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")
 BLOCKERS = ("none", "data_missing_or_stale", "no_signal", "price_location", "risk_reward", "time_decay", "trend_conflict",
@@ -58,11 +72,22 @@ How to think each cycle:
 5. Being flat is a decision with a cost. When the read is clear and a contract's risk/reward fits, take it with
    defined risk instead of waiting for a perfect entry.
 
-Horizon of every entry:
-- "intraday": the code closes it at 15:15 the same day. Use for trades on today's structure. Intraday trades do not
-  need the index scorecard.
-- "overnight": may be held. The index scorecard (net +2 or -2) is the best-tested next-day signal; hold overnight
-  only with it, or with a clearly stronger reason you state.
+Horizon of every entry -- trade BOTH, the operator wants directional moves that span days, not only scalps:
+- "intraday": the code closes it at 15:15 the same day. Use for today's structure (opening drive, first-hour break).
+- "swing": a directional position held 1-5 sessions (the code closes it at 15:15 on the 5th session). Use the
+  multi-day structure: 20/50-day trend, 10-session high/low, the scorecard, where yesterday closed. Rules: a contract
+  with at least 3 sessions to expiry (prefer the next expiry), a stop premium wide enough for overnight noise, and an
+  "invalidation_level": the INDEX level that proves the idea wrong (below the index for a call, above for a put) --
+  the code exits when the index crosses it, so a swing is judged on the index, not on premium noise. The code books
+  half a swing winner at +50% and trails the rest from +40% at 75% of the best premium.
+
+Setups -- every open/arm names one in "setup" so the scoreboard learns which ideas work here:
+""" + "\n".join(f"- {k}: {v}" for k, v in SETUPS.items()) + """
+
+LEARNING PHASE: the operator wants varied, liberal trades to learn and firm up setups. Try different setups on both
+horizons when the evidence is reasonable, at the fixed lot sizes of the decision matrix; you do not need a perfect
+setup, you need a defined idea, a stop and an invalidation. Read setup_scoreboard: lean toward setups that are
+working, keep testing the ones with few trades, and drop ones that keep failing.
 
 What the backtests on this market found (Oct 2026 studies, 2019-2026 daily data, one year of real option premiums):
 - Next-day index direction is hard to call; the scorecard above is the tested exception. It is an OVERNIGHT filter,
@@ -90,12 +115,11 @@ Reading the inputs:
   itself to skip a trade whose price structure is clear.
 
 Decision matrix (computed by the code each cycle; it GOVERNS size): decision_matrix grades every index x side
-(CE / PE) A-D from the tested factors -- the open type (from 09:45), the first-hour range break and its width (from
-10:15), the 20-day trend, the prior day's size, option richness -- and lists each factor with its points. Your
-premium at risk to the stop on a new trade is capped by the grade (risk_rs_by_grade); larger orders are trimmed and
-grade D blocks new risk on that side. A tighter stop gives more lots only down to a 20% stop. Use the matrix: take
-A/B setups decisively, keep C small, and when a side is inside its first-hour range arm a trigger at the edge (an
-armed break is graded as if it had broken). Name the grade in each open/add/arm reason.
+(CE / PE) A-D twice: "intraday" (open type from 09:45, first-hour break and width from 10:15, 20-day trend, prior
+day's size, option richness) and "swing" (scorecard, 20/50-day trend, 10-session breakout, pullback to the 20-day
+average, where yesterday closed, prior day's size, today's timing). Each factor is listed with its points. The
+grade of the entry's horizon fixes the most lots it may carry: A 4, B 3, C 2, D 1 (an add counts what is held).
+An armed intraday break is graded as if it had broken. Name the grade and the setup in each open/add/arm reason.
 
 Report honestly what is holding you back: "blockers" lists the main reasons you are not taking (more) risk now, by
 category; "data_wanted" names the one missing input that would most change this decision, or "none".
@@ -104,12 +128,13 @@ Hard limits (enforced in code; orders that break them are trimmed or rejected): 
 per position, maximum total deployed, a daily loss stop that blocks new risk, no new risk after 15:10, at most
 """ + str(MAX_ARMED) + """ armed triggers, whole lots only, and only the contract_ids listed in this message.
 Also enforced (lessons of 22 Oct 2026): no new position before 09:45 unless grade A (arm triggers instead; they
-fill from 09:45); at most one re-entry per index and side per day, and only at grade A; the code books half of a
-winner at +30% or when its index reaches half its first-hour range beyond the edge (a one-lot position is closed
-there), moves the rest to breakeven, and from +20% trails the stop at 88% of the best premium. Use
+fill from 09:45); at most one re-entry per index and side per day, and only at grade A. Intraday winners: half is
+booked at +30% or when the index reaches half its first-hour range beyond the edge (one lot: all of it), the rest
+moves to breakeven, and from +20% the stop trails at 88% of the best premium. Swing winners: see Horizon above. Use
 position_id and trigger ids exactly as given.
 
-Action fields: open/add need contract_id (open) or position_id (add), lots, stop_premium, target_premium, horizon.
+Action fields: open/add need contract_id (open) or position_id (add), lots, stop_premium, target_premium, horizon,
+setup, and for swing an invalidation_level (set_levels may move it).
 arm needs contract_id, lots, stop/target, horizon, trigger_index (NIFTY/BANKNIFTY/SENSEX/MIDCPNIFTY), trigger_op
 (above/below), trigger_level, valid_until (HH:MM IST) and optionally confirm_index/confirm_op/confirm_level.
 disarm needs contract_id = the trigger id (T01...). Unused fields are null.
@@ -135,6 +160,7 @@ DECISION_SCHEMA = {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["action", "contract_id", "position_id", "lots", "stop_premium", "target_premium", "horizon",
+                             "setup", "invalidation_level",
                              "trigger_index", "trigger_op", "trigger_level", "confirm_index", "confirm_op", "confirm_level",
                              "valid_until", "reason"],
                 "properties": {
@@ -143,6 +169,8 @@ DECISION_SCHEMA = {
                     "lots": {"type": ["integer", "null"]},
                     "stop_premium": _NULLABLE_NUM, "target_premium": _NULLABLE_NUM,
                     "horizon": _NULLABLE_STR,
+                    "setup": {"type": ["string", "null"], "enum": [*SETUPS, None]},
+                    "invalidation_level": _NULLABLE_NUM,
                     "trigger_index": _NULLABLE_STR, "trigger_op": _NULLABLE_STR, "trigger_level": _NULLABLE_NUM,
                     "confirm_index": _NULLABLE_STR, "confirm_op": _NULLABLE_STR, "confirm_level": _NULLABLE_NUM,
                     "valid_until": _NULLABLE_STR,
@@ -352,7 +380,7 @@ class GrokClient:
 @dataclass
 class Limits:
     capital: float
-    max_positions: int = 8
+    max_positions: int = 10
     max_position_pct: float = 0.15
     max_deployed_pct: float = 0.60
     daily_loss_stop_pct: float = 0.03
@@ -399,8 +427,13 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
         if not isinstance(raw, dict):
             continue
         action = {k: raw.get(k) for k in ("action", "contract_id", "position_id", "lots", "stop_premium", "target_premium",
-                                          "horizon", "trigger_index", "trigger_op", "trigger_level", "confirm_index",
-                                          "confirm_op", "confirm_level", "valid_until", "reason")}
+                                          "horizon", "setup", "invalidation_level", "trigger_index", "trigger_op",
+                                          "trigger_level", "confirm_index", "confirm_op", "confirm_level", "valid_until",
+                                          "reason")}
+        if action.get("horizon") == "overnight":          # the older name for a multi-day hold
+            action["horizon"] = "swing"
+        if action.get("setup") not in SETUPS:
+            action["setup"] = "other"
         if context.get("matrix") is None:     # a trigger fill: the grade was set by the code when it was armed
             action["grade"] = raw.get("grade")
         if action.get("horizon") not in HORIZONS:
@@ -459,6 +492,8 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                 if not pos:
                     reject(action, "position_id not found")
                     continue
+                if pos.get("horizon") in HORIZONS:          # an add belongs to the position's own horizon
+                    action["horizon"] = pos["horizon"]
                 row = {"symbol": pos["symbol"], "ltp": pos["ltp"], "lot_size": pos["lot_size"], "expiry": pos.get("expiry"),
                        "underlying": pos.get("underlying"), "type": pos.get("type")}
                 held_value = float(pos.get("value", 0.0))
@@ -469,6 +504,13 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
             if row.get("expiry") == context["today"] and now >= limits.expiry_no_new_after:
                 reject(action, "contract expires today: no new risk this late")
                 continue
+            if kind in ("open", "arm") and action["horizon"] == "swing":
+                left = row.get("sessions_to_expiry")
+                if left is not None and left < SWING_MIN_SESSIONS_TO_EXPIRY:
+                    reject(action, f"a swing trade needs at least {SWING_MIN_SESSIONS_TO_EXPIRY} sessions to expiry "
+                                   f"(this has {left}): use the next expiry")
+                    continue
+            action["invalidation_level"] = _invalidation(action, row, context)
             per_lot = ltp * lot_size
             room = min(limits.max_position_pct * limits.capital - held_value,
                        limits.max_deployed_pct * limits.capital - deployed,
@@ -552,35 +594,40 @@ def _entry_gate(kind: str, row: dict, context: dict, grade: str | None, now: str
     return None
 
 
+def _invalidation(action: dict, row: dict, context: dict) -> float | None:
+    """An index level that ends the idea: below the index for a call, above it for a put; otherwise dropped."""
+    level = _num(action.get("invalidation_level"))
+    price = (context.get("index_prices") or {}).get(row.get("underlying"))
+    if level is None or not price:
+        return level if level is not None and not price else None
+    if (row.get("type") == "CE" and level < price) or (row.get("type") == "PE" and level > price):
+        return level
+    return None
+
+
 def _matrix_size(kind: str, action: dict, row: dict, context: dict, limits: Limits, ltp: float, stop: float | None,
                  lot_size: int, pos: dict | None) -> tuple[int, str, str] | str:
-    """Lots the decision matrix allows for this entry, or the reason it allows none (agentic_matrix.py)."""
+    """Lots the decision matrix allows: a fixed number per grade (learning phase), on the horizon's own grade."""
     from . import agentic_matrix as mx
     root, side = row.get("underlying"), row.get("type")
     if side not in mx.SIDES:
         return "decision matrix: unknown option side"
     cell = (context["matrix"].get(root) or {}).get(side)
-    if cell is None:     # no inputs for this index (no history yet): the smallest grade, never more
-        cell = {"grade": "C", "score": None, "size_multiplier": 0.3, "scorecard_agrees": False}
-    if kind == "arm" and action.get("trigger_op") == ("above" if side == "CE" else "below") and cell.get("if_break"):
-        cell = {**cell, **{k: cell["if_break"][k] for k in ("grade", "score", "size_multiplier")}}
+    if cell is None:     # no inputs for this index (no history yet): the smallest graded size
+        cell = {"grade": "C", "score": None}
+    swing = action.get("horizon") == "swing"
+    if swing and cell.get("swing"):
+        cell = cell["swing"]
+    elif kind == "arm" and action.get("trigger_op") == ("above" if side == "CE" else "below") and cell.get("if_break"):
+        cell = cell["if_break"]
     grade = cell["grade"]
-    if grade == "D":
-        return (f"decision matrix grade D for {root} {side} (score {cell.get('score')}): no new risk on that side now")
-    budget, mods = mx.risk_budget(cell, limits.capital, float(context.get("risk_per_trade_pct") or 0.015),
-                                  overnight=action.get("horizon") == "overnight",
-                                  scorecard_agrees=bool(cell.get("scorecard_agrees")),
-                                  expiry_today=row.get("expiry") == context["today"], clock=context["clock"],
-                                  day_pnl=float(context["book"].get("day_pnl", 0.0)))
-    if pos is not None:      # an add shares the position's budget with what is already held
-        budget -= int(pos.get("lots") or 0) * mx.risk_per_lot(_num(pos.get("ltp")) or ltp, _num(pos.get("stop_premium")),
-                                                              int(pos.get("lot_size") or lot_size))
-    per_lot = mx.risk_per_lot(ltp, stop, lot_size)
-    lots = int(max(budget, 0) // per_lot)
-    why = (f"grade {grade} (score {cell.get('score')}) risk budget Rs {max(budget, 0):,.0f}"
-           + (f" ({', '.join(mods)})" if mods else "") + f", Rs {per_lot:,.0f} at risk per lot")
+    cap = mx.LOTS_BY_GRADE[grade]
+    held = int(pos.get("lots") or 0) if pos is not None else 0
+    lots = cap - held
+    why = (f"{'swing' if swing else 'intraday'} grade {grade} (score {cell.get('score')}): up to {cap} lots"
+           + (f", {held} held" if held else "") + f"; Rs {mx.risk_per_lot(ltp, stop, lot_size):,.0f} at risk per lot")
     if lots < 1:
-        return f"decision matrix: {why}; not even one lot fits (tighten the stop, pick a cheaper strike, or wait for a better grade)"
+        return f"decision matrix: {why} -- no room to add"
     return lots, grade, why
 
 

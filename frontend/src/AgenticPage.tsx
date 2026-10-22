@@ -11,7 +11,9 @@ type Position = {
   unrealized_pnl: number; return_pct: number; max_return_pct: number; min_return_pct: number;
   thesis?: string | null; last_comment?: string | null; stop_premium?: number | null; target_premium?: number | null;
   expiry?: string | null; booked?: number | null; opened_at?: string | null;
+  horizon?: string | null; setup?: string | null; grade?: string | null; invalidation_level?: number | null;
 };
+type SetupRow = { setup: string; horizon: string; trades: number; wins: number; net_pnl_rs: number; avg_return_pct: number | null };
 type Health = {
   enabled: boolean; paused: boolean; brain: string; model: string; cycle_minutes: number; next_cycle_at: string | null;
   cycles_today: number; pending_triggers: string[]; error: string | null; open_positions: number;
@@ -20,7 +22,7 @@ type Health = {
 };
 type Trigger = { id: string; contract: string; lots: number; when: string; valid_until: string; stop_premium: number | null;
   target_premium: number | null; horizon: string | null; armed_at: string; why: string };
-type Snapshot = { capital: number; health: Health; triggers?: Trigger[];
+type Snapshot = { capital: number; health: Health; triggers?: Trigger[]; setups?: SetupRow[];
   portfolio: { cash: number; equity: number; realized_pnl: number; unrealized_pnl: number; positions: Position[] } };
 type Act = { action: string; symbol?: string; contract_id?: string | null; position_id?: string | null; lots?: number | null;
   reason?: string; note?: string | null; rejected?: string; stop_premium?: number | null; target_premium?: number | null };
@@ -199,11 +201,12 @@ function TelegramPanel() {
   </div>;
 }
 
-type MatrixCell = { grade: string; score: number; factors: [number, string][]; scorecard_agrees: boolean };
+type Graded = { grade: string; score: number; factors: [number, string][] };
+type MatrixCell = Graded & { scorecard_agrees: boolean; swing?: Graded };
 type MatrixRow = { index: string; CE: MatrixCell; PE: MatrixCell;
   inputs: { open_type?: string; open_dir?: number; ib_high?: number; ib_low?: number; ib_atr?: number; prev_range_atr?: number;
     prev_nr7?: boolean; prev_inside?: boolean; atr_points?: number } | null };
-type Matrix = { at: string | null; risk_per_trade_pct: number; risk_rs_by_grade: Record<string, number>; indices: MatrixRow[] };
+type Matrix = { at: string | null; lots_by_grade: Record<string, number>; indices: MatrixRow[] };
 
 // The decision matrix (agentic_matrix.py): code grades every index x side from the tested factors and the grade caps
 // the premium a new trade may put at risk. Refreshed every minute without a model call.
@@ -217,13 +220,14 @@ function MatrixPanel() {
     return () => clearInterval(timer);
   }, []);
   if (!m) return null;
-  const cell = (c: MatrixCell) => <td><b className={`agentic-grade grade-${c.grade}`}>{c.grade}</b> <small>score {c.score}{c.scorecard_agrees ? " · scorecard agrees" : ""}</small>
-    {open && <ul className="agentic-factors">{c.factors.map(([pts, why], i) => <li key={i}>{pts > 0 ? `+${pts}` : pts} {why}</li>)}</ul>}</td>;
+  const graded = (label: string, c: Graded) => <div><small>{label}</small> <b className={`agentic-grade grade-${c.grade}`}>{c.grade}</b> <small>score {c.score}</small>
+    {open && <ul className="agentic-factors">{c.factors.map(([pts, why], i) => <li key={i}>{pts > 0 ? `+${pts}` : pts} {why}</li>)}</ul>}</div>;
+  const cell = (c: MatrixCell) => <td>{graded("intraday", c)}{c.swing && graded("swing", c.swing)}{c.scorecard_agrees && <small>scorecard agrees</small>}</td>;
   return <div className="panel agentic-section">
     <div className="panel-title agentic-journal-head">Decision matrix — governs size{m.at ? ` · as of ${m.at}` : ""}
       <button className="agentic-btn small" onClick={() => setOpen(!open)}>{open ? "Hide factors" : "Show factors"}</button></div>
-    <div className="agentic-empty">Risk to the stop per new trade: {Object.entries(m.risk_rs_by_grade).map(([g, rs]) => `${g} ₹${rs.toLocaleString("en-IN")}`).join(" · ")} · D = no new risk on that side.
-      Halved for overnight without the scorecard, same-day expiry, after 14:30, or the book down 1.5% today.</div>
+    <div className="agentic-empty">Most lots per position by the grade of its horizon (learning phase): {Object.entries(m.lots_by_grade || {}).map(([g, n]) => `${g} ${n}`).join(" · ")}.
+      Intraday positions close at 15:15; swing positions run up to 5 sessions with an index invalidation level.</div>
     <table className="ledger-table agentic-table"><thead><tr><th>Index</th><th>Calls (CE)</th><th>Puts (PE)</th><th>Inputs</th></tr></thead>
       <tbody>{m.indices.map((r) => <tr key={r.index}><td><b>{r.index}</b></td>{cell(r.CE)}{cell(r.PE)}
         <td><small>{r.inputs?.open_type ? `open ${r.inputs.open_type}${r.inputs.open_dir ? (r.inputs.open_dir > 0 ? " up" : " down") : ""}` : "open type at 09:45"}
@@ -335,7 +339,8 @@ export function AgenticPage() {
       {p && p.positions.some((x) => x.quantity > 0) && <table className="ledger-table agentic-table"><thead><tr>
         <th>Contract</th><th>Lots</th><th>Avg → now</th><th>P&amp;L</th><th>Best / worst</th><th>Stop / target</th><th>Thesis and latest comment</th><th></th></tr></thead>
         <tbody>{p.positions.filter((x) => x.quantity > 0).map((row) => <tr key={row.symbol}>
-          <td><b>{row.symbol.split(":")[1]}</b><small>{row.expiry ? ` exp ${row.expiry.slice(5)}` : ""}{row.booked ? " · half booked" : ""}</small></td>
+          <td><b>{row.symbol.split(":")[1]}</b><small>{row.expiry ? ` exp ${row.expiry.slice(5)}` : ""}{row.booked ? " · half booked" : ""}</small>
+            <small>{row.horizon || "intraday"}{row.setup ? ` · ${row.setup.replace(/_/g, " ")}` : ""}{row.grade ? ` · grade ${row.grade}` : ""}{row.invalidation_level ? ` · wrong past ${row.invalidation_level}` : ""}</small></td>
           <td>{row.lots}</td>
           <td>{row.average_price.toFixed(2)} → {row.last_price.toFixed(2)}</td>
           <td className={tone(row.unrealized_pnl)}>{rupees(row.unrealized_pnl)}<small> {pct(row.return_pct)}</small></td>
@@ -346,6 +351,14 @@ export function AgenticPage() {
             onClick={() => { if (window.confirm(`Close ${row.symbol} (${row.lots} lots) at market? (paper)`)) void post("/api/agentic/close-position", { symbol: row.symbol, expected_quantity: row.quantity }, row.symbol); }}>Close</button></td>
         </tr>)}</tbody></table>}
     </div>
+
+    {(snap?.setups || []).length > 0 && <div className="panel agentic-section">
+      <div className="panel-title">Setup scoreboard — what the lane is learning</div>
+      <table className="ledger-table agentic-table"><thead><tr><th>Setup</th><th>Horizon</th><th>Trades</th><th>Wins</th><th>Avg return</th><th>Net P&amp;L</th></tr></thead>
+        <tbody>{snap!.setups!.map((r) => <tr key={`${r.setup}-${r.horizon}`}><td>{r.setup.replace(/_/g, " ")}</td><td>{r.horizon}</td>
+          <td>{r.trades}</td><td>{r.wins}</td><td>{r.avg_return_pct == null ? "—" : pct(r.avg_return_pct)}</td>
+          <td className={tone(r.net_pnl_rs)}>{rupees(r.net_pnl_rs)}</td></tr>)}</tbody></table>
+    </div>}
 
     <div className="panel agentic-section">
       <div className="panel-title agentic-journal-head">Decision journal

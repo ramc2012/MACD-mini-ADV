@@ -8,7 +8,7 @@ import httpx
 
 from macd_trader import agentic_brain as brain
 from macd_trader import agentic_lane as lane_module
-from test_agentic import CE, NOW, PE, FakeClient, act, build, candidate_id, decision
+from test_agentic import CE, NOW, PE, FakeClient, act, build, candidate_id, decision, generous_lots  # noqa: F401
 
 
 def held(lane, symbol, lots, stop=None):
@@ -110,3 +110,65 @@ def test_a_gateway_error_is_retried_once_and_reported_by_its_title(monkeypatch):
         assert str(exc) == "HTTP 520: api.x.ai | 520: Web server is returning an unknown error"
     else:
         raise AssertionError("expected a BrainError")
+
+
+# ------------------------------------------------------------------------------------------- swing positions
+
+def swing(lane, symbol, lots, stop=None, invalidation=None, setup="multiday_breakout"):
+    lane.client = FakeClient(decision({**act("open", candidate_id(lane, symbol), lots=lots, stop=stop, reason="swing idea"),
+                                       "horizon": "swing", "setup": setup, "invalidation_level": invalidation}))
+    cycle = asyncio.run(lane.think("test", None, NOW))
+    assert lane.portfolio.positions[symbol].lots == lots, cycle["rejected"]
+    return lane.portfolio.positions[symbol]
+
+
+def fresh_at_any_time(lane, monkeypatch):
+    """Ticks below carry the test session's clock, not the wall clock: accept them as fresh."""
+    monkeypatch.setattr(lane.execution, "_fresh_price", lambda symbol: lane.execution.last_prices.get(symbol))
+
+
+def test_a_swing_position_survives_1515_and_books_at_50_not_30_percent(tmp_path, monkeypatch):
+    lane = build(tmp_path)
+    fresh_at_any_time(lane, monkeypatch)
+    swing(lane, PE, 4, stop=60)
+    assert lane.meta[PE]["horizon"] == "swing" and lane.meta[PE]["setup"] == "multiday_breakout"
+    asyncio.run(lane.flatten_intraday(NOW.replace(hour=15, minute=16)))
+    assert lane.held_symbols()
+    asyncio.run(lane.execution.on_tick(PE, 131.0, NOW.replace(hour=11, minute=30)))   # +31%: intraday would book
+    assert lane.portfolio.positions[PE].lots == 4
+    asyncio.run(lane.execution.on_tick(PE, 151.0, NOW.replace(hour=11, minute=31)))
+    assert lane.portfolio.positions[PE].lots == 2 and lane.meta[PE]["booked"] == 1
+
+
+def test_a_swing_position_is_closed_on_its_fifth_session_and_on_index_invalidation(tmp_path, monkeypatch):
+    lane = build(tmp_path)
+    fresh_at_any_time(lane, monkeypatch)
+    swing(lane, PE, 1, stop=40, invalidation=23100)                  # a put: wrong if NIFTY goes above 23,100
+    assert lane.meta[PE]["invalidation_level"] == 23100
+    lane.engine.latest_ticks["NSE:NIFTY50-INDEX"].ltp = 23080.0
+    asyncio.run(lane.check_invalidations(NOW))
+    assert lane.held_symbols()
+    lane.engine.latest_ticks["NSE:NIFTY50-INDEX"].ltp = 23120.0
+    asyncio.run(lane.check_invalidations(NOW))
+    assert not lane.held_symbols() and "INDEX_INVALIDATION" in lane.actions()[0]["reason"]
+
+    swing(lane, CE, 1, stop=10)
+    lane.meta[CE]["opened_at"] = "2026-09-28T10:00:00+05:30"         # Mon 28 Sep: 5 sessions by Mon 5 Oct (2 Oct holiday)
+    assert lane_module.sessions_held(lane.meta[CE]["opened_at"], NOW) == 5
+    asyncio.run(lane.execution.on_tick(CE, 20.5, NOW.replace(hour=15, minute=10)))
+    assert CE in lane.held_symbols()
+    asyncio.run(lane.execution.on_tick(CE, 20.5, NOW.replace(hour=15, minute=16)))
+    assert CE not in lane.held_symbols() and lane.actions()[0]["reason"] == "guard: SWING_HOLD_LIMIT_5_SESSIONS"
+
+
+def test_the_setup_scoreboard_counts_closed_trades_per_setup_and_horizon(tmp_path, monkeypatch):
+    monkeypatch.setattr(lane_module, "INTRADAY_FLATTEN_AT", time(23, 59))
+    lane = build(tmp_path)
+    swing(lane, PE, 2, stop=60, setup="trend_pullback")
+    lane.client = FakeClient(decision(act("close", position_id="P01", reason="done")))
+    lane.execution.set_quote(PE, 120.0)
+    asyncio.run(lane.think("test", None, NOW))
+    board = lane.setup_scoreboard()
+    assert board == [{"setup": "trend_pullback", "horizon": "swing", "trades": 1, "wins": 1,
+                      "net_pnl_rs": board[0]["net_pnl_rs"], "avg_return_pct": board[0]["avg_return_pct"]}]
+    assert board[0]["net_pnl_rs"] > 0 and '"setup_scoreboard"' in lane.build_context(NOW)[0]
