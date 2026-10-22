@@ -313,12 +313,18 @@ class DeskMixin:
         try:
             with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=30) as db:
                 done = db.execute("SELECT 1 FROM session_profiles WHERE day = ? LIMIT 1", (previous,)).fetchone()
+                # A session lost to an outage has no minutes until the engine's outage repair downloads them (it
+                # needs the broker login): wait for them rather than writing the day off with nothing in it.
+                opened = int(datetime.fromisoformat(f"{previous}T09:15:00").replace(tzinfo=IST).timestamp())
+                minutes = db.execute("""SELECT COUNT(*) FROM historical_candles WHERE symbol = 'NSE:NIFTY50-INDEX'
+                                        AND timeframe_seconds = 60 AND timestamp >= ? AND timestamp < ?""",
+                                     (opened, opened + 22_500)).fetchone()[0]
         except sqlite3.Error:
             return None
         if done:
             caught.add(previous)
             return None
-        return previous
+        return previous if minutes >= 300 else None
 
     async def _run_nightly(self, day: str, coverage: dict) -> dict:
         report = await asyncio.to_thread(
