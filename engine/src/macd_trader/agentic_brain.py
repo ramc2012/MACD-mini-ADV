@@ -88,6 +88,14 @@ Reading the inputs:
 - data_quality: freshness flags. Missing VIX or a stale option chain lowers confidence; it is rarely a reason by
   itself to skip a trade whose price structure is clear.
 
+Decision matrix (computed by the code each cycle; it GOVERNS size): decision_matrix grades every index x side
+(CE / PE) A-D from the tested factors -- the open type (from 09:45), the first-hour range break and its width (from
+10:15), the 20-day trend, the prior day's size, option richness -- and lists each factor with its points. Your
+premium at risk to the stop on a new trade is capped by the grade (risk_rs_by_grade); larger orders are trimmed and
+grade D blocks new risk on that side. A tighter stop gives more lots only down to a 20% stop. Use the matrix: take
+A/B setups decisively, keep C small, and when a side is inside its first-hour range arm a trigger at the edge (an
+armed break is graded as if it had broken). Name the grade in each open/add/arm reason.
+
 Report honestly what is holding you back: "blockers" lists the main reasons you are not taking (more) risk now, by
 category; "data_wanted" names the one missing input that would most change this decision, or "none".
 
@@ -410,7 +418,8 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                 if not pos:
                     reject(action, "position_id not found")
                     continue
-                row = {"symbol": pos["symbol"], "ltp": pos["ltp"], "lot_size": pos["lot_size"], "expiry": pos.get("expiry")}
+                row = {"symbol": pos["symbol"], "ltp": pos["ltp"], "lot_size": pos["lot_size"], "expiry": pos.get("expiry"),
+                       "underlying": pos.get("underlying"), "type": pos.get("type")}
                 held_value = float(pos.get("value", 0.0))
             ltp, lot_size = _num(row.get("ltp")), int(row.get("lot_size") or 0)
             if not ltp or ltp <= 0 or lot_size < 1:
@@ -430,9 +439,22 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                 reject(action, f"no room: one lot is Rs {per_lot:,.0f}, room Rs {max(room, 0):,.0f}")
                 continue
             note = f"trimmed from {wanted} to {granted} lots to fit limits" if granted < wanted else None
+            grade = None
+            if context.get("matrix") is not None:
+                sized = _matrix_size(kind, action, row, context, limits, ltp, stop if stop and stop < ltp else None, lot_size,
+                                     pos if kind == "add" else None)
+                if isinstance(sized, str):
+                    reject(action, sized)
+                    continue
+                budget_lots, grade, why = sized
+                if budget_lots < granted:
+                    granted = budget_lots
+                    note = f"trimmed from {wanted} to {granted} lots: {why}"
+                else:
+                    note = f"{note}; {why}" if note else why
             accepted = {**action, "lots": granted, "symbol": row["symbol"], "ltp": ltp, "lot_size": lot_size,
                         "stop_premium": stop if stop and stop < ltp else None,
-                        "target_premium": target if target and target > ltp else None, "note": note}
+                        "target_premium": target if target and target > ltp else None, "note": note, "grade": grade}
             out.accepted.append(accepted)
             if kind == "arm":           # reserved when it fires, not now
                 continue
@@ -465,6 +487,38 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                              "target_premium": target if target is not None and (not ltp or target > ltp) else None,
                              "note": None})
     return out
+
+
+def _matrix_size(kind: str, action: dict, row: dict, context: dict, limits: Limits, ltp: float, stop: float | None,
+                 lot_size: int, pos: dict | None) -> tuple[int, str, str] | str:
+    """Lots the decision matrix allows for this entry, or the reason it allows none (agentic_matrix.py)."""
+    from . import agentic_matrix as mx
+    root, side = row.get("underlying"), row.get("type")
+    if side not in mx.SIDES:
+        return "decision matrix: unknown option side"
+    cell = (context["matrix"].get(root) or {}).get(side)
+    if cell is None:     # no inputs for this index (no history yet): the smallest grade, never more
+        cell = {"grade": "C", "score": None, "size_multiplier": 0.3, "scorecard_agrees": False}
+    if kind == "arm" and action.get("trigger_op") == ("above" if side == "CE" else "below") and cell.get("if_break"):
+        cell = {**cell, **{k: cell["if_break"][k] for k in ("grade", "score", "size_multiplier")}}
+    grade = cell["grade"]
+    if grade == "D":
+        return (f"decision matrix grade D for {root} {side} (score {cell.get('score')}): no new risk on that side now")
+    budget, mods = mx.risk_budget(cell, limits.capital, float(context.get("risk_per_trade_pct") or 0.015),
+                                  overnight=action.get("horizon") == "overnight",
+                                  scorecard_agrees=bool(cell.get("scorecard_agrees")),
+                                  expiry_today=row.get("expiry") == context["today"], clock=context["clock"],
+                                  day_pnl=float(context["book"].get("day_pnl", 0.0)))
+    if pos is not None:      # an add shares the position's budget with what is already held
+        budget -= int(pos.get("lots") or 0) * mx.risk_per_lot(_num(pos.get("ltp")) or ltp, _num(pos.get("stop_premium")),
+                                                              int(pos.get("lot_size") or lot_size))
+    per_lot = mx.risk_per_lot(ltp, stop, lot_size)
+    lots = int(max(budget, 0) // per_lot)
+    why = (f"grade {grade} (score {cell.get('score')}) risk budget Rs {max(budget, 0):,.0f}"
+           + (f" ({', '.join(mods)})" if mods else "") + f", Rs {per_lot:,.0f} at risk per lot")
+    if lots < 1:
+        return f"decision matrix: {why}; not even one lot fits (tighten the stop, pick a cheaper strike, or wait for a better grade)"
+    return lots, grade, why
 
 
 def _check_trigger(action: dict, context: dict, limits: Limits) -> str | None:

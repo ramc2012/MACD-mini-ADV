@@ -205,3 +205,50 @@ def track_record(closed: list[dict], limit: int = 6) -> dict:
     wins = [r for r in rows if r["pnl_rs"] > 0]
     return {"closed_positions": len(rows), "wins": len(wins), "net_pnl_rs": round(sum(r["pnl_rs"] for r in rows)),
             "recent": rows[:limit]}
+
+
+def daily_ohlc(db: sqlite3.Connection, spot: str, today: date, sessions: int = 16) -> list[tuple]:
+    """Completed sessions before ``today`` as [(day, open, high, low, close), ...], oldest first, from minute bars."""
+    days, day = [], previous_session(today)
+    while len(days) < sessions:
+        days.append(day)
+        day = previous_session(day)
+    lo, _ = _bounds(days[-1])
+    _, hi = _bounds(days[0])
+    rows = db.execute("""SELECT timestamp, open, high, low, close FROM historical_candles WHERE symbol=? AND timeframe_seconds=60
+                         AND timestamp>=? AND timestamp<? ORDER BY timestamp""", (spot, lo, hi)).fetchall()
+    per_day: dict[date, list] = {}
+    for ts, o, h, l, c in rows:
+        d = datetime.fromtimestamp(ts, IST).date()
+        agg = per_day.get(d)
+        if agg is None:
+            per_day[d] = [o, h, l, c]
+        else:
+            agg[1], agg[2], agg[3] = max(agg[1], h), min(agg[2], l), c
+    return [(d, *per_day[d]) for d in sorted(per_day)]
+
+
+def matrix_inputs(db: sqlite3.Connection, spot: str, now: datetime, daily: list[tuple] | None = None) -> dict:
+    """What the decision matrix needs for one index: ATR, the prior day's size and shape, today's open type and
+    first-hour range (each only once it is complete). ``daily`` = daily_ohlc(...) when cached by the caller."""
+    from .agentic_matrix import open_type
+    daily = daily if daily is not None else daily_ohlc(db, spot, now.date())
+    if len(daily) < 8:
+        return {}
+    trs = [max(daily[i][2] - daily[i][3], abs(daily[i][2] - daily[i - 1][4]), abs(daily[i][3] - daily[i - 1][4]))
+           for i in range(1, len(daily))]
+    atr = sum(trs[-14:]) / len(trs[-14:])
+    _, po, ph, pl, pc = daily[-1]
+    ranges = [d[2] - d[3] for d in daily[-7:]]
+    out = {"atr_points": _r(atr, 1), "prev_range_atr": _r((ph - pl) / atr), "prev_colour": (pc > po) - (pc < po),
+           "prev_nr7": len(ranges) == 7 and (ph - pl) <= min(ranges), "prev_inside": ph < daily[-2][2] and pl > daily[-2][3]}
+    bars = _minutes(db, spot, now.date(), int(now.timestamp()) + 1)
+    lo, _ = _bounds(now.date())
+    first30 = [(b[1], b[2], b[3], b[4]) for b in bars if b[0] < lo + 1800]
+    if now.time() >= time(9, 45) and len(first30) >= 25:
+        out["open_type"], out["open_dir"] = open_type(first30, atr)
+    first_hour = [b for b in bars if b[0] < lo + 3600]
+    if now.time() >= time(10, 15) and len(first_hour) >= 50:
+        out["ib_high"], out["ib_low"] = _r(max(b[2] for b in first_hour)), _r(min(b[3] for b in first_hour))
+        out["ib_atr"] = _r((out["ib_high"] - out["ib_low"]) / atr)
+    return out

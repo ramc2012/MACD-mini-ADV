@@ -422,6 +422,12 @@ async def agentic_snapshot():
     return _agentic().snapshot()
 
 
+@app.get("/api/agentic/matrix", dependencies=[Depends(authorize)])
+async def agentic_matrix():
+    """The decision matrix now: grade, score and factors per index x side, and the risk budget per grade."""
+    return await _agentic().refresh_matrix()
+
+
 @app.get("/api/agentic/cycles", dependencies=[Depends(authorize)])
 async def agentic_cycles(day: str | None = None, limit: int = Query(default=40, ge=1, le=500)):
     """Each cycle's market view, the model's decision, what was accepted, rejected and filled."""

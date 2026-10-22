@@ -278,6 +278,9 @@ class Settings(BaseSettings):
     agentic_max_deployed_pct: float = Field(default=0.60, gt=0, le=1)
     agentic_daily_loss_stop_pct: float = Field(default=0.03, gt=0, le=1)
     agentic_max_lots_per_order: int = Field(default=20, ge=1, le=500)
+    # Decision matrix (agentic_matrix.py): premium at risk to the stop per new trade, as a share of capital, for
+    # grade A (B 0.6x, C 0.3x, D none).
+    agentic_risk_per_trade_pct: float = Field(default=0.015, gt=0, le=0.1)
 
     # Raw tick capture. Ticks cannot be backfilled -- Fyers' finest history is
     # 5-second OHLCV -- so the socket's output is the only copy that will ever

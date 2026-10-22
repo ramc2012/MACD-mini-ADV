@@ -199,6 +199,39 @@ function TelegramPanel() {
   </div>;
 }
 
+type MatrixCell = { grade: string; score: number; factors: [number, string][]; scorecard_agrees: boolean };
+type MatrixRow = { index: string; CE: MatrixCell; PE: MatrixCell;
+  inputs: { open_type?: string; open_dir?: number; ib_high?: number; ib_low?: number; ib_atr?: number; prev_range_atr?: number;
+    prev_nr7?: boolean; prev_inside?: boolean; atr_points?: number } | null };
+type Matrix = { at: string | null; risk_per_trade_pct: number; risk_rs_by_grade: Record<string, number>; indices: MatrixRow[] };
+
+// The decision matrix (agentic_matrix.py): code grades every index x side from the tested factors and the grade caps
+// the premium a new trade may put at risk. Refreshed every minute without a model call.
+function MatrixPanel() {
+  const [m, setM] = useState<Matrix | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const load = () => requestJson<Matrix>(`${API_URL}/api/agentic/matrix`, { headers: headers() }).then(setM).catch(() => undefined);
+    void load();
+    const timer = setInterval(load, 60_000);
+    return () => clearInterval(timer);
+  }, []);
+  if (!m) return null;
+  const cell = (c: MatrixCell) => <td><b className={`agentic-grade grade-${c.grade}`}>{c.grade}</b> <small>score {c.score}{c.scorecard_agrees ? " · scorecard agrees" : ""}</small>
+    {open && <ul className="agentic-factors">{c.factors.map(([pts, why], i) => <li key={i}>{pts > 0 ? `+${pts}` : pts} {why}</li>)}</ul>}</td>;
+  return <div className="panel agentic-section">
+    <div className="panel-title agentic-journal-head">Decision matrix — governs size{m.at ? ` · as of ${m.at}` : ""}
+      <button className="agentic-btn small" onClick={() => setOpen(!open)}>{open ? "Hide factors" : "Show factors"}</button></div>
+    <div className="agentic-empty">Risk to the stop per new trade: {Object.entries(m.risk_rs_by_grade).map(([g, rs]) => `${g} ₹${rs.toLocaleString("en-IN")}`).join(" · ")} · D = no new risk on that side.
+      Halved for overnight without the scorecard, same-day expiry, after 14:30, or the book down 1.5% today.</div>
+    <table className="ledger-table agentic-table"><thead><tr><th>Index</th><th>Calls (CE)</th><th>Puts (PE)</th><th>Inputs</th></tr></thead>
+      <tbody>{m.indices.map((r) => <tr key={r.index}><td><b>{r.index}</b></td>{cell(r.CE)}{cell(r.PE)}
+        <td><small>{r.inputs?.open_type ? `open ${r.inputs.open_type}${r.inputs.open_dir ? (r.inputs.open_dir > 0 ? " up" : " down") : ""}` : "open type at 09:45"}
+          {r.inputs?.ib_high ? ` · IB ${r.inputs.ib_low}–${r.inputs.ib_high} (${r.inputs.ib_atr} ATR)` : " · IB at 10:15"}
+          {r.inputs?.prev_range_atr != null ? ` · prior day ${r.inputs.prev_range_atr} ATR${r.inputs.prev_nr7 ? " NR7" : ""}${r.inputs.prev_inside ? " inside" : ""}` : ""}</small></td></tr>)}</tbody></table>
+  </div>;
+}
+
 export function AgenticPage() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [cycles, setCycles] = useState<Cycle[]>([]);
@@ -283,6 +316,8 @@ export function AgenticPage() {
       <div className="panel agentic-card"><small>Brain</small><b>{h?.paused ? "Paused" : h?.brain === "grok" ? "Live" : "Rules only"}</b>
         <span>{h?.cycles_today ?? 0} cycles today · next {hhmm(h?.next_cycle_at)}{h?.pending_triggers?.length ? ` · trigger: ${h.pending_triggers.join("; ")}` : ""}</span></div>
     </div>
+
+    <MatrixPanel />
 
     {(snap?.triggers || []).length > 0 && <div className="panel agentic-section">
       <div className="panel-title">Armed triggers ({snap!.triggers!.length}) — fire automatically between cycles</div>

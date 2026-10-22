@@ -1249,3 +1249,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @media (max-width: 900px) { .agentic-form { grid-template-columns: 1fr 1fr; } }
 .agentic-empty { padding: 14px 12px; color: #8fa1b8; font-size: 12px; }
 .agentic-code { font-family: ui-monospace, Menlo, monospace; font-size: 14px; background: #0e1520; padding: 2px 6px; border-radius: 3px; }
+
+.agentic-grade { display: inline-block; min-width: 18px; text-align: center; border-radius: 3px; padding: 0 4px; font-size: 12px; }
+.agentic-grade.grade-A { background: #1f6f43; color: #eafff2; }
+.agentic-grade.grade-B { background: #2d5a8a; color: #eaf3ff; }
+.agentic-grade.grade-C { background: #6b5a1f; color: #fff6dd; }
+.agentic-grade.grade-D { background: #6e2a2a; color: #ffe9e9; }
+.agentic-factors { margin: 4px 0 0; padding-left: 14px; font-size: 11px; color: #cfd9e7; }

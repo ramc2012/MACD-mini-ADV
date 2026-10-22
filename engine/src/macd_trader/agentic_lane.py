@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 from . import agentic_brain as brain
 from . import agentic_features as feat
+from . import agentic_matrix as mx
 from . import market_calendar
 from .blast_engine import LaneEvents, OrderOnlyBroker
 from .config import RUNTIME_DIR
@@ -292,6 +293,8 @@ class AgenticLane:
         self._cycles_today: tuple[str, int] = ("", 0)
         self._stats_cache: tuple[str, dict] = ("", {})
         self._atr_cache: tuple[str, dict] = ("", {})
+        self._ohlc_cache: tuple[str, dict] = ("", {})
+        self.matrix: dict = {}              # the last cycle's decision matrix, {root: {"CE": {...}, "PE": {...}}}
         self._index_lots: dict[str, int] = {}
         self._index_ctx: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
@@ -527,9 +530,12 @@ class AgenticLane:
 
                 if self._atr_cache[0] != today:
                     self._atr_cache = (today, {spot: safe(feat.daily_atr, fdb, spot, now.date()) for spot in INDEX_SPOTS.values()})
+                if self._ohlc_cache[0] != today:
+                    self._ohlc_cache = (today, {spot: safe(feat.daily_ohlc, fdb, spot, now.date()) for spot in INDEX_SPOTS.values()})
                 for root, spot in INDEX_SPOTS.items():
                     features[root] = {"session": safe(feat.session_shape, fdb, root, spot, now, self._price(spot)),
-                                      "positioning": safe(feat.positioning, fdb, root, now)}
+                                      "positioning": safe(feat.positioning, fdb, root, now),
+                                      "matrix_inputs": safe(feat.matrix_inputs, fdb, spot, now, self._ohlc_cache[1].get(spot)) or {}}
         except sqlite3.Error as exc:
             features = {"_error": {"session": {"error": str(exc)[:120]}}}
 
@@ -603,7 +609,8 @@ class AgenticLane:
                 if tick is not None and getattr(tick, "bid", None) and getattr(tick, "ask", None) and tick.ask >= tick.bid > 0:
                     spread = _r((tick.ask - tick.bid) / ((tick.ask + tick.bid) / 2) * 100)
                 st = stats.get(spot, {})
-                candidates[cid] = {"symbol": symbol, "ltp": ltp, "lot_size": lot, "expiry": expiry}
+                candidates[cid] = {"symbol": symbol, "ltp": ltp, "lot_size": lot, "expiry": expiry,
+                                   "underlying": _underlying_of(spot), "type": side}
                 is_index = spot in INDEX_SPOTS.values()
                 risk = feat.contract_risk(ltp, spot_price or 0.0, float(row.get("strike") or 0), expiry, side == "CE", lot, now)
                 cand_rows.append({"id": cid, "underlying": _underlying_of(spot), "type": side, "strike": row.get("strike"),
@@ -649,6 +656,26 @@ class AgenticLane:
                     move["iv_to_realised"] = _r(move["atm_iv_pct"] / entry["realised_vol20_pct"])
                 entry["implied_move"] = move
 
+        # The decision matrix: grade per index x side, which sets each new trade's risk budget (agentic_matrix.py).
+        matrix = {}
+        for entry in indices:
+            root = entry["index"]
+            inputs = features.get(root, {}).get("matrix_inputs") or {}
+            if not inputs:
+                continue
+            trend = 0 if entry.get("vs_ma20_pct") is None else (1 if entry["vs_ma20_pct"] > 0 else -1)
+            iv_ratio = (entry.get("implied_move") or {}).get("iv_to_realised")
+            calls = {row.get("index"): row.get("call") for row in signals["scorecard"]}
+            clock = now.strftime("%H:%M")
+            matrix[root] = {side: {**mx.evaluate(inputs, side, clock, entry.get("ltp"), trend=trend, iv_ratio=iv_ratio),
+                                   "if_break": mx.evaluate(inputs, side, clock, entry.get("ltp"), trend=trend, iv_ratio=iv_ratio,
+                                                           assume_break=True),
+                                   "scorecard_agrees": calls.get(root) == side}
+                            for side in mx.SIDES}
+            matrix[root]["inputs"] = {k: inputs.get(k) for k in ("open_type", "open_dir", "ib_high", "ib_low", "ib_atr",
+                                                                  "prev_range_atr", "prev_nr7", "prev_inside", "atr_points")}
+        self.matrix = {"at": now.strftime("%H:%M"), "risk_per_trade_pct": self.settings.agentic_risk_per_trade_pct, **matrix}
+
         positions, pos_rows = {}, []
         deployed = 0.0
         for symbol, p in self.portfolio.positions.items():
@@ -661,7 +688,10 @@ class AgenticLane:
             ret = (ltp / p.average_price - 1) * 100 if p.average_price else 0.0
             pid = f"P{len(positions) + 1:02d}"
             expiry = meta.get("expiry") or self._contracts.get(symbol, {}).get("expiry")
+            contract = self._contracts.get(symbol, {})
             positions[pid] = {"symbol": symbol, "lots": p.lots, "lot_size": p.lot_size, "ltp": ltp, "value": value,
+                              "underlying": _underlying_of(contract.get("spot_symbol", "")), "type": contract.get("option_type"),
+                              "stop_premium": meta.get("stop_premium"),
                               "return_pct": ret, "expiry": str(expiry or "")[:10], "booked": bool(meta.get("booked"))}
             pos_rows.append({"position_id": pid, "contract": symbol, "lots": p.lots, "avg_premium": _r(p.average_price),
                              "premium_now": _r(ltp), "return_pct": _r(ret, 1), "best_pct": _r(p.max_return_pct, 1),
@@ -695,6 +725,15 @@ class AgenticLane:
                        "max_deployed_rs": round(limits.max_deployed_pct * self.capital),
                        "daily_loss_stop_rs": round(limits.daily_loss_stop_pct * self.capital),
                        "max_lots_per_order": limits.max_lots_per_order, "no_new_risk_after": limits.no_new_after},
+            "decision_matrix": {
+                "rule": (f"ENFORCED: each new position's premium at risk to its stop is capped at "
+                         f"{self.settings.agentic_risk_per_trade_pct:.1%} of capital x the grade (A 1.0, B 0.6, C 0.3; D = no new "
+                         "risk on that side), halved for overnight without the scorecard, same-day expiry, after 14:30, or "
+                         "the book down 1.5% today. Lots above the budget are trimmed; state the grade in your reason."),
+                "risk_rs_by_grade": {g: round(self.capital * self.settings.agentic_risk_per_trade_pct * m) for _, g, m in mx.GRADES},
+                **{root: {side: {"grade": v[side]["grade"], "score": v[side]["score"],
+                                 "factors": [f"{p:+d} {why}" for p, why in v[side]["factors"]]} for side in mx.SIDES}
+                   for root, v in matrix.items()}},
             "open_positions": pos_rows,
             "armed_triggers": [self._trigger_view(t) for t in self.armed.values()],
             "candidates": cand_rows,
@@ -702,7 +741,8 @@ class AgenticLane:
             "your_track_record": feat.track_record(self.repository.closed_positions(lane=self.name, limit=80)),
             "data_quality": self._data_quality(now, stats, features, signals),
         }
-        validation = {"candidates": candidates, "positions": positions, "book": book,
+        validation = {"candidates": candidates, "positions": positions, "book": book, "matrix": matrix,
+                      "risk_per_trade_pct": self.settings.agentic_risk_per_trade_pct,
                       "clock": now.strftime("%H:%M"), "today": today, "market_open": in_session(now),
                       "triggers": dict(self.armed), "armed_count": len(self.armed),
                       "index_prices": {root: self._price(spot) for root, spot in INDEX_SPOTS.items()}}
@@ -818,6 +858,7 @@ class AgenticLane:
                 if kind == "open":
                     meta["thesis"] = reason
                     meta["horizon"] = action.get("horizon") or "intraday"
+                    meta["grade"] = action.get("grade")
                 meta["last_comment"] = reason
                 for level in ("stop_premium", "target_premium"):
                     if action.get(level):
@@ -1210,11 +1251,31 @@ class AgenticLane:
         snap = self.execution.portfolio_snapshot()
         for row in snap["positions"]:
             meta = self.meta.get(row["symbol"], {})
-            for key in ("thesis", "last_comment", "stop_premium", "target_premium", "expiry", "booked", "opened_at", "horizon"):
+            for key in ("thesis", "last_comment", "stop_premium", "target_premium", "expiry", "booked", "opened_at", "horizon",
+                        "grade"):
                 row[key] = meta.get(key)
         return {"lane": self.name, "capital": self.capital, "portfolio": snap, "health": self.health(),
                 "triggers": [self._trigger_view(t) for t in self.armed.values()],
+                "matrix": self.matrix_view(),
                 "closed": self.execution.visible_closed_positions()[-100:]}
+
+    async def refresh_matrix(self) -> dict:
+        """Rebuild the context (no model call) so the matrix is current, then return it."""
+        await asyncio.to_thread(self.build_context)
+        return self.matrix_view()
+
+    def matrix_view(self) -> dict:
+        """The decision matrix as of the last context build (a cycle, or /api/agentic/matrix)."""
+        out = {"at": (self.matrix or {}).get("at"), "risk_per_trade_pct": self.settings.agentic_risk_per_trade_pct,
+               "risk_rs_by_grade": {g: round(self.capital * self.settings.agentic_risk_per_trade_pct * m) for _, g, m in mx.GRADES},
+               "indices": []}
+        for root, cell in (self.matrix or {}).items():
+            if not isinstance(cell, dict) or "CE" not in cell:
+                continue
+            out["indices"].append({"index": root, "inputs": cell.get("inputs"),
+                                   **{side: {k: cell[side][k] for k in ("grade", "score", "factors", "scorecard_agrees")}
+                                      for side in mx.SIDES}})
+        return out
 
     def health(self) -> dict:
         return {"lane": self.name, "enabled": bool(self.settings.agentic_enabled), "paused": self.paused,

@@ -47,9 +47,12 @@ class FakeClient:
         return self.decisions.pop(0), {"latency_ms": 5, "model": "grok-test", "prompt_tokens": 100, "completion_tokens": 50}
 
 
-def build(tmp_path: Path, *decisions) -> AgenticLane:
+def build(tmp_path: Path, *decisions, risk_pct: float = 0.1) -> AgenticLane:
+    # risk_pct 10%: these tests exercise the book mechanics; the decision matrix's own sizing is tested in
+    # test_agentic_matrix.py with the default 1.5%.
     settings = Settings(execution_mode="paper", slippage_bps=0, database_path=str(tmp_path / "macd.sqlite3"),
-                        research_database_path=str(tmp_path / "hist.sqlite3"), agentic_capital=1_000_000)
+                        research_database_path=str(tmp_path / "hist.sqlite3"), agentic_capital=1_000_000,
+                        agentic_risk_per_trade_pct=risk_pct)
     engine = SimpleNamespace(latest_ticks={
         "NSE:NIFTY50-INDEX": Tick("NSE:NIFTY50-INDEX", 23000.0, change_pct=-0.5),
         "NSE:SBIN-EQ": Tick("NSE:SBIN-EQ", 805.0, change_pct=1.2),
