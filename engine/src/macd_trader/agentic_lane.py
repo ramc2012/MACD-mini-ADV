@@ -59,7 +59,7 @@ MAX_ENTRY_DRIFT = 0.08             # skip an entry whose premium ran this far wh
 BOOK_AT = 0.30                      # book half (one lot: all) at +30%, or when the index reaches its first target
 TRAIL_FROM, TRAIL_KEEP = 0.20, 0.88  # from +20% the stop trails at 88% of the best premium ...
 TRAIL_FLOOR = 1.05                  # ... and never below entry +5%
-SETTLE_UNTIL = time(9, 45)          # no new risk (and no trigger fills) before the open type is known
+SETTLE_UNTIL = time(9, 30)          # first 15 minutes: only A/B opens, no trigger fills (relaxed from 09:45)
 # Swing positions (1-5 sessions): looser profit-taking, an index invalidation level, a session limit.
 SWING_BOOK_AT, SWING_TRAIL_FROM, SWING_TRAIL_KEEP = 0.50, 0.40, 0.75
 UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only

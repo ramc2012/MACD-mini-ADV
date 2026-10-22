@@ -127,8 +127,9 @@ category; "data_wanted" names the one missing input that would most change this 
 Hard limits (enforced in code; orders that break them are trimmed or rejected): maximum open positions, maximum value
 per position, maximum total deployed, a daily loss stop that blocks new risk, no new risk after 15:10, at most
 """ + str(MAX_ARMED) + """ armed triggers, whole lots only, and only the contract_ids listed in this message.
-Also enforced (lessons of 22 Oct 2026): no new position before 09:45 unless grade A (arm triggers instead; they
-fill from 09:45); at most one re-entry per index and side per day, and only at grade A. Intraday winners: half is
+Also enforced (lessons of 22 Oct 2026, relaxed for learning): no new position before 09:30 unless grade A/B (arm
+triggers instead; they fill from 09:30); a re-entry on an index and side already traded today needs grade A or B,
+at most two re-entries per index and side per day. Intraday winners: half is
 booked at +30% or when the index reaches half its first-hour range beyond the edge (one lot: all of it), the rest
 moves to breakeven, and from +20% the stop trails at 88% of the best premium. Swing winners: see Horizon above. Use
 position_id and trigger ids exactly as given.
@@ -577,20 +578,27 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
     return out
 
 
+MAX_ENTRIES_PER_SIDE = 3          # per index and side per day: the first entry and two re-entries
+REENTRY_GRADES = ("A", "B")
+EARLY_GRADES = ("A", "B")
+
+
 def _entry_gate(kind: str, row: dict, context: dict, grade: str | None, now: str) -> str | None:
-    """22 Oct 2026 lessons, enforced: no new position before the open has settled unless the setup is grade A,
-    and at most one re-entry per index and side per day, only at grade A."""
-    if kind == "open" and context.get("settle_until") and now < context["settle_until"] and grade != "A":
-        return f"before {context['settle_until']} only a grade A setup may open (this is {grade or 'ungraded'}); arm a trigger instead"
+    """22 Oct 2026 lessons, relaxed for the learning phase: before the open has settled only an A/B setup opens
+    (the intraday grade is capped at C until 09:45, so in practice a swing); a re-entry on an index and side that
+    already traded today needs grade A or B, and there are at most two re-entries."""
+    if kind == "open" and context.get("settle_until") and now < context["settle_until"] and grade not in EARLY_GRADES:
+        return (f"before {context['settle_until']} only a grade A/B setup may open (this is {grade or 'ungraded'}); "
+                "arm a trigger instead")
     entries = context.get("entries_today")
     if entries is None or kind not in ("open", "arm"):
         return None
     key = f"{row.get('underlying')}:{row.get('type')}"
     taken = int(entries.get(key, 0))
-    if taken >= 2:
-        return f"{key.replace(':', ' ')} already entered and re-entered today: no third entry"
-    if taken == 1 and grade != "A":
-        return f"re-entering {key.replace(':', ' ')} after a closed trade today needs grade A (this is {grade or 'ungraded'})"
+    if taken >= MAX_ENTRIES_PER_SIDE:
+        return f"{key.replace(':', ' ')} already traded {taken} times today: no more entries on that side"
+    if taken >= 1 and grade not in REENTRY_GRADES:
+        return f"re-entering {key.replace(':', ' ')} after a closed trade today needs grade A or B (this is {grade or 'ungraded'})"
     return None
 
 

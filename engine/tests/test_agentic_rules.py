@@ -52,35 +52,37 @@ def test_the_index_first_target_books_before_30_percent(tmp_path, monkeypatch):
     assert lane.portfolio.positions[PE].lots == 1 and lane.meta[PE]["booked"] == 1
 
 
-def test_no_new_position_before_0945_unless_grade_a_and_triggers_wait(tmp_path):
+def test_no_new_position_before_0930_unless_grade_a_or_b_and_triggers_wait(tmp_path):
     early = {"candidates": {"C01": {"symbol": PE, "ltp": 100.0, "lot_size": 75, "expiry": "2099-12-30",
                                     "underlying": "NIFTY", "type": "PE"}},
-             "positions": {}, "book": {"cash": 1_000_000, "deployed": 0, "day_pnl": 0}, "clock": "09:30",
-             "today": "2026-10-05", "market_open": True, "settle_until": "09:45", "entries_today": {}}
-    out = brain.validate({"actions": [act("open", "C01", lots=1)]}, early, brain.Limits(capital=1_000_000))
-    assert "before 09:45 only a grade A" in out.rejected[0]["rejected"]
-    out = brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "A"}]}, early, brain.Limits(capital=1_000_000))
+             "positions": {}, "book": {"cash": 1_000_000, "deployed": 0, "day_pnl": 0}, "clock": "09:20",
+             "today": "2026-10-05", "market_open": True, "settle_until": "09:30", "entries_today": {}}
+    out = brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "C"}]}, early, brain.Limits(capital=1_000_000))
+    assert "before 09:30 only a grade A/B" in out.rejected[0]["rejected"]
+    out = brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "B"}]}, early, brain.Limits(capital=1_000_000))
     assert out.accepted
     lane = build(tmp_path)
     lane.client = FakeClient(decision({**act("arm", candidate_id(lane, PE), lots=1, stop=60), "trigger_index": "NIFTY",
                                        "trigger_op": "below", "trigger_level": 22950, "valid_until": "14:00", "horizon": "intraday"}))
     asyncio.run(lane.think("test", None, NOW))
     lane.engine.latest_ticks["NSE:NIFTY50-INDEX"].ltp = 22900.0
-    assert asyncio.run(lane.check_triggers(NOW.replace(hour=9, minute=40))) == [] and "T01" in lane.armed
-    assert asyncio.run(lane.check_triggers(NOW.replace(hour=9, minute=46)))[0]["status"] == "filled"
+    assert asyncio.run(lane.check_triggers(NOW.replace(hour=9, minute=25))) == [] and "T01" in lane.armed
+    assert asyncio.run(lane.check_triggers(NOW.replace(hour=9, minute=31)))[0]["status"] == "filled"
 
 
-def test_one_re_entry_per_index_side_and_only_at_grade_a():
+def test_re_entries_need_grade_a_or_b_and_stop_after_two():
     def ctx(taken):
         return {"candidates": {"C01": {"symbol": CE, "ltp": 20.0, "lot_size": 750, "expiry": "2099-12-30",
                                        "underlying": "NIFTY", "type": "CE"}},
                 "positions": {}, "book": {"cash": 1_000_000, "deployed": 0, "day_pnl": 0}, "clock": "11:00",
                 "today": "2026-10-05", "market_open": True, "entries_today": {"NIFTY:CE": taken}}
     limits = brain.Limits(capital=1_000_000)
-    assert "needs grade A" in brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "B"}]}, ctx(1), limits).rejected[0]["rejected"]
-    assert brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "A"}]}, ctx(1), limits).accepted
-    assert "no third entry" in brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "A"}]}, ctx(2), limits).rejected[0]["rejected"]
-    assert brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": "C"}]}, ctx(0), limits).accepted
+    def run(grade, taken):
+        return brain.validate({"actions": [{**act("open", "C01", lots=1), "grade": grade}]}, ctx(taken), limits)
+    assert "needs grade A or B" in run("C", 1).rejected[0]["rejected"]
+    assert run("B", 1).accepted and run("A", 2).accepted
+    assert "no more entries" in run("A", 3).rejected[0]["rejected"]
+    assert run("D", 0).accepted                               # a first entry at any grade
 
 
 def test_the_lane_counts_todays_entries_per_index_and_side(tmp_path):
