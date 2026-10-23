@@ -32,6 +32,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 from .directional import Bias, SessionTape, TapeBook, evaluate as evaluate_directional
 from .footprint import FootprintBook, confidence_grade
@@ -279,6 +280,10 @@ class MPEngine:
         self.last_error: str | None = None
         self.last_error_at: str | None = None
         self.history_database_path = history_database_path
+        # The decision matrix's grades at each new entry (entry_grade.py): measured, never read by a rule.
+        from .entry_grade import EntryGrader
+        self.entry_grader = EntryGrader(history_database_path)
+        self.lane_label = Path(database_path).stem          # mp_trader / mp_index_shadow
         # underlying -> (monotonic stamp, auction_views.context payload).
         self._context_cache: dict[str, tuple[float, dict | None]] = {}
         self.vix_symbol = DEFAULT_VIX_SYMBOL
@@ -1144,6 +1149,8 @@ class MPEngine:
                 }
             self.repository.save_order(order)
             self.repository.save_trade(trade)
+            if side == "BUY" and held_before == 0 and position:
+                self._record_entry_grade(order, symbol, note)
             snapshot = self._portfolio_view()
             self.repository.save_equity_point(snapshot)
             self._publish("mp_order", _as_dict(order))
@@ -1369,6 +1376,19 @@ class MPEngine:
                 "error": self.state_save_error,
             },
         }
+
+    def _record_entry_grade(self, order, symbol: str, setup: str | None) -> None:
+        """Log the decision matrix's grades at a new position's entry (the engine's lanes do it in execution.py)."""
+        try:
+            grade = self.entry_grader.grade(symbol)
+            if grade is not None:
+                self.repository.save_entry_context(
+                    order.order_id, datetime.now(UTC).isoformat(), symbol,
+                    {"lane": self.lane_label,
+                     "setup": setup, "underlying": self.underlying_of.get(symbol), "fill_price": order.fill_price,
+                     "matrix": grade})
+        except Exception:  # noqa: BLE001 -- measurement only
+            pass
 
     def carry_decision(self, symbol: str) -> tuple[bool, str]:
         """Allow overnight risk only when auction location and flow agree.

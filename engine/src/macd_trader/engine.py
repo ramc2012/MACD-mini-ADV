@@ -37,6 +37,7 @@ from .agentic_telegram import TelegramBridge
 from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
 from .option_greeks import book_greeks
 from .entry_context import EntryFlow, is_underlying
+from .entry_grade import EntryGrader
 from . import self_heal
 from .desk import (  # noqa: F401 - re-exported; tests and callers read them here
     NIGHTLY_MAX_ATTEMPTS, QUOTES_BACKOFF_MAX_SECONDS, QUOTES_BACKOFF_SECONDS,
@@ -369,10 +370,11 @@ class TradingEngine(DeskMixin):
         self.expired_settlements: list[dict] = []
         self._self_heal_task: asyncio.Task | None = None
         self.entry_flow = EntryFlow()
+        self.entry_grader = EntryGrader(settings.research_database_path)
         quote = lambda symbol: self.latest_ticks.get(symbol)  # noqa: E731
         for execution in (self.execution, self.blast.execution, *[lane.execution for lane in _smart_lanes(self)]):
             execution.quote_source = quote
-            execution.entry_context = self.entry_flow.context
+            execution.entry_context = self._entry_context
         self.blast.quote_source = quote
         self.blast.history_path = settings.research_database_path
         self.blast.candidate_listeners.append(self._offer_blast_candidate)
@@ -1822,6 +1824,14 @@ class TradingEngine(DeskMixin):
             if not self.strategy._confirmations_pass(kama_ok, rsi_ok, roc_ok):
                 return "CONFIRMATION_FADED"
         return None
+
+    def _entry_context(self, symbol: str) -> dict | None:
+        """What every lane logs at a new entry: the underlying's session order flow and the decision matrix's grades."""
+        flow = self.entry_flow.context(symbol)
+        grade = self.entry_grader.grade(symbol)
+        if flow is None and grade is None:
+            return None
+        return {**(flow or {}), "matrix": grade}
 
     def _smart_macd_confirm(self, symbol: str, bucket: int | None, price: float) -> bool | None:
         """Is the cross still standing? The committed bar once the signal bar has closed, else the intrabar preview."""
