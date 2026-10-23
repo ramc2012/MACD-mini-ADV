@@ -158,16 +158,26 @@ class ExtremeBooker:
         if symbol in execution._armed_exits or any(
                 o.symbol == symbol and o.side == "SELL" and o.status == "OPEN" for o in execution.orders.values()):
             return None                                    # another exit is already in flight
+        # A lane may book less than everything (the agentic lane books HALF of a multi-day swing position, at
+        # least one lot, once a day) -- "an extreme move warrants booking at least half". Default: all of it.
+        sizer = getattr(execution, "extreme_book_quantity", None)
+        quantity = sizer(symbol, position, now) if sizer else position.quantity
+        if quantity <= 0:
+            self.pending.pop(key, None)
+            return None
         execution.arm_exit(symbol, reason)
         try:
-            await execution.submit(symbol, "SELL", position.quantity)
+            await execution.submit(symbol, "SELL", quantity)
         except (ValueError, RuntimeError, PermissionError) as exc:
             execution._armed_exits.discard(symbol)
             self.error = f"{execution.portfolio.lane} {symbol}: {exc}"[:200]
             return None
         self.pending.pop(key, None)
+        after = getattr(execution, "on_extreme_booked", None)
+        if after:
+            after(symbol, quantity, mark, reason)
         record = {"at": now.isoformat(timespec="seconds"), "lane": execution.portfolio.lane, "symbol": symbol,
-                  "reason": reason, "index_dev_atr": round(dev, 2), "exit_mark": mark,
+                  "reason": reason, "index_dev_atr": round(dev, 2), "exit_mark": mark, "quantity": quantity,
                   "entry": round(position.average_price, 2)}
         self.booked.insert(0, record)
         del self.booked[50:]

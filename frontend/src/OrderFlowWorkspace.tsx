@@ -267,6 +267,15 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
       {data?.setup?.setup && <span className="mp-tag setup" title={data.setup.reason}>{data.setup.setup.replace(/_/g, " ")}</span>}
       {flow?.absorption?.detected && <span className={`mp-tag ${flow.absorption.side === "sellers_absorbed" ? "good" : "bad"}`}>
         {String(flow.absorption.side).replace(/_/g, " ")}</span>}
+      {flow?.burst?.detected && <span className="mp-tag bad"
+        title={`One-sided burst ${flow.burst.minutes_ago} min ago at ${flow.burst.volume_x}x volume (${Math.round((flow.burst.share ?? 0) * 100)}% one-sided). Across 211 stocks and the index futures, bursts reversed over the next 30 minutes: do not chase.`}>
+        {flow.burst.side === "buy_burst" ? "buy burst" : "sell burst"} · fade risk</span>}
+      {flow?.minute_divergence?.classic && <span className={`mp-tag ${flow.minute_divergence.classic === "bullish" ? "good" : "bad"}`}
+        title="Over the last hour of minutes: price made a new extreme that cumulative delta did not confirm.">
+        {flow.minute_divergence.classic} divergence (1h)</span>}
+      {flow?.minute_divergence?.hidden && <span className="mp-tag"
+        title="Price held its extreme while cumulative delta made a new one: the other side is being absorbed. Shown for reading; not a tested signal on its own.">
+        {flow.minute_divergence.hidden === "bullish" ? "sellers absorbed" : "buyers absorbed"} (1h)</span>}
     </div>
 
     {replay && <div className="of-scrub">

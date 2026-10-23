@@ -174,3 +174,33 @@ def test_the_setup_scoreboard_counts_closed_trades_per_setup_and_horizon(tmp_pat
     assert board == [{"setup": "trend_pullback", "horizon": "swing", "trades": 1, "wins": 1,
                       "net_pnl_rs": board[0]["net_pnl_rs"], "avg_return_pct": board[0]["avg_return_pct"]}]
     assert board[0]["net_pnl_rs"] > 0 and '"setup_scoreboard"' in lane.build_context(NOW)[0]
+
+
+# ------------------------------------------------------------------------------------------- 23 Oct fixes
+
+def test_an_extreme_index_move_books_half_of_a_swing_and_all_of_an_intraday_position(tmp_path, monkeypatch):
+    from macd_trader.extreme_booking import ExtremeBooker
+    lane = build(tmp_path)
+    fresh_at_any_time(lane, monkeypatch)
+    swing(lane, PE, 4, stop=60)
+    booker = ExtremeBooker(str(tmp_path / "none.sqlite3"))
+    booker.pending[(lane.execution.portfolio.lane, PE)] = ("EXTREME_BOOK_PUT_INDEX_1ATR_DOWN", -1.2, NOW.date().isoformat())
+    lane.execution.set_quote(PE, 120.0)
+    assert asyncio.run(booker._try(lane.execution, PE, NOW))["quantity"] == 2 * 75
+    assert lane.portfolio.positions[PE].lots == 2 and lane.meta[PE]["stop_premium"] >= 100.0
+    booker.pending[(lane.execution.portfolio.lane, PE)] = ("EXTREME_BOOK_PUT_INDEX_1ATR_DOWN", -1.3, NOW.date().isoformat())
+    assert asyncio.run(booker._try(lane.execution, PE, NOW)) is None          # once a day for the swing
+    assert lane.portfolio.positions[PE].lots == 2
+
+
+def test_contracts_that_are_not_streaming_are_left_out_of_the_prompt(tmp_path):
+    from datetime import timedelta
+    lane = build(tmp_path)
+    _, validation = lane.build_context(NOW)
+    assert any(r["symbol"] == PE for r in validation["candidates"].values())
+    old = NOW - timedelta(minutes=10)
+    lane.execution.last_price_at[PE] = old
+    lane.engine.latest_ticks[PE].timestamp = old
+    prompt, validation = lane.build_context(NOW)
+    assert not any(r["symbol"] == PE for r in validation["candidates"].values())
+    assert '"contracts_left_out_no_live_price":1' in prompt

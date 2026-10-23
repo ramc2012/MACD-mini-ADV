@@ -192,6 +192,10 @@ export type FootprintFlow = {
   normalised?: FootprintNormalised | null;
   absorption: { detected: boolean; side: string | null };
   divergence: { detected: boolean; kind: string | null };
+  // Minute-scale reads (research/orderflow_detectors_20261023): a one-sided burst on heavy volume in the
+  // last 3 minutes (they reverse: do not chase), and the hour's price/CVD divergence.
+  burst?: { detected: boolean; side?: string; minutes_ago?: number; volume_x?: number; share?: number } | null;
+  minute_divergence?: { detected: boolean; classic: string | null; hidden: string | null } | null;
   // Each print weighted by how much the three classification votes agreed.
   // Where this parts company with cumulative_delta the tape was batched or
   // contested — exactly where the raw figure deserves least trust.

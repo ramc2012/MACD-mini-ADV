@@ -51,6 +51,9 @@ from .repository import TradeRepository
 from .universe import desk_underlying
 
 FORCED_EXIT_MINUTE = 15 * 60 + 20
+# Breakout-type setups that a same-direction delta burst in the last minutes vetoes (orderflow.burst).
+BURST_VETOED_SETUPS = frozenset({"ib_range_extension", "value_area_breakout", "opening_range_breakout",
+                                 "donchian_breakout", "vwap_reclaim"})
 # Entries wait for the initial balance (the first HOUR, brackets A and B) to
 # complete: from 10:15. On the 691 signals of 29 Sep - 9 Oct the 09:xx ones
 # averaged -5.7% (lane exits) and, the 12-a-day budget being first-come, they
@@ -452,6 +455,7 @@ class MPEngine:
                 "speed_samples": list(state.speed_samples)[-60:],
                 "volume_at_price": {str(p): list(v) for p, v in levels},
                 "cvd_curve": list(state.cvd_curve)[-240:],
+                "minutes": list(state.minutes)[-90:],
                 "recent": [[p.timestamp, p.price, p.size, p.side, p.method, p.confidence]
                            for p in list(state.recent)[-60:]],
             }
@@ -561,6 +565,7 @@ class MPEngine:
             state.speed_samples.extend(tuple(sample) for sample in (row.get("speed_samples") or []))
             state.volume_at_price = {float(p): list(v) for p, v in (row.get("volume_at_price") or {}).items()}
             state.cvd_curve.extend(tuple(v) for v in (row.get("cvd_curve") or []))
+            state.minutes.extend(list(v) for v in (row.get("minutes") or []))
             state.recent.extend(Print(*v) for v in (row.get("recent") or []))
             self.flow.states[symbol] = state
         for symbol, row in (payload.get("tapes") or {}).items():
@@ -877,13 +882,25 @@ class MPEngine:
                 probe.pop(side, None)
                 probe.pop(f"{side}_extreme", None)
 
+        # Divergence at MINUTE scale once an hour of minutes exists (the print-scale read spans seconds and
+        # carried no measured edge); research/orderflow_detectors_20261023.
+        minute_div = self.flow.minute_divergence(symbol)
+        divergence = minute_div if len(getattr(state, "minutes", ())) >= 61 else self.flow.divergence(symbol)
         bias = evaluate_directional(
             price=price, marks=marks, tape=tape, profile=profile, flow_state=state,
-            absorption=self.flow.absorption(symbol), divergence=self.flow.divergence(symbol),
+            absorption=self.flow.absorption(symbol), divergence=divergence,
             min_imbalance=self.settings.min_imbalance, probe_window_open=probe,
         )
         if bias is None:
             return None, "no setup"
+        # Do not chase a delta burst: one-sided bursts on heavy volume reverse over the next 30 minutes
+        # (net of drift -0.056 sigma on stocks, t -5.3; -0.13 on index futures). Breakout-type setups only.
+        if bias.setup in BURST_VETOED_SETUPS:
+            burst = self.flow.burst(symbol)
+            wanted = 1 if bias.direction == "bullish" else -1
+            if burst.get("detected") and burst.get("direction") == wanted:
+                return None, (f"{bias.setup} {bias.direction} vetoed: chasing a {burst['side'].replace('_', ' ')} "
+                              f"{burst['minutes_ago']} min ago ({burst['volume_x']}x volume, {burst['share']:+.0%} one-sided)")
         marks["last_signal_at"] = now
         return bias, bias.reason
 

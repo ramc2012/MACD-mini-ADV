@@ -25,6 +25,10 @@ MID_TOLERANCE = 0.25
 # A divergence must move price and delta by this share of their own range
 # before it counts, otherwise tick noise reads as a signal.
 MIN_DIVERGENCE_FRACTION = 0.25
+# Minute-scale detectors (research/orderflow_detectors_20261023).
+MINUTE_BARS = 150
+BURST_SHARE, BURST_VOLUME_X, BURST_WITHIN_MINUTES = 0.5, 2.0, 3
+MIN_MINUTE_DIVERGENCE_EDGE = 0.10
 # Deepest consumer is the 240-point UI curve; divergence looks back 120. 512
 # leaves headroom without retaining more than twice the data any consumer can
 # use for every symbol in the 600+ contract universe.
@@ -97,6 +101,9 @@ class FlowState:
     # price -> [buy_volume, sell_volume] for footprint / absorption work.
     volume_at_price: dict[float, list[float]] = field(default_factory=dict)
     recent: deque = field(default_factory=lambda: deque(maxlen=400))
+    # One row per minute: [minute_ts, close, volume, buy_volume, sell_volume, cvd_at_close]. The minute-scale
+    # detectors (burst, minute_divergence) read it; research/orderflow_detectors_20261023.
+    minutes: deque = field(default_factory=lambda: deque(maxlen=MINUTE_BARS))
     # How each print was classified. If "quote" stays at zero the broker is
     # not delivering depth and the flow is a tick-rule approximation — the
     # difference matters enough to measure rather than assume. "mid" no longer
@@ -329,6 +336,17 @@ class OrderFlowTracker:
         state.print_stamps.append((stamp, size))
         state.bucket_qty += size
         state.cvd_curve.append((stamp, state.cumulative_delta, tick.ltp, state.weighted_delta))
+        minute = int(stamp // 60 * 60)
+        if not state.minutes or state.minutes[-1][0] != minute:
+            state.minutes.append([minute, tick.ltp, 0.0, 0.0, 0.0, state.cumulative_delta])
+        bar = state.minutes[-1]
+        bar[1] = tick.ltp
+        bar[2] += size
+        if side > 0:
+            bar[3] += size
+        elif side < 0:
+            bar[4] += size
+        bar[5] = state.cumulative_delta
         print_row = Print(stamp, tick.ltp, size, side, method, confidence)
         state.recent.append(print_row)
         return print_row
@@ -423,6 +441,63 @@ class OrderFlowTracker:
             "span_ticks": round(span_ticks, 1),
             "volume": volume,
         }
+
+    def burst(self, symbol: str, within_minutes: int = BURST_WITHIN_MINUTES, now: float | None = None) -> dict:
+        """A one-minute burst of one-sided aggression: >= BURST_SHARE of the minute's volume on one side at
+        >= BURST_VOLUME_X the session's median minute volume, in the last ``within_minutes`` minutes.
+
+        research/orderflow_detectors_20261023: across 211 stocks and the index futures (12 sessions), the next 30
+        minutes went AGAINST the burst (-0.056 sigma net of the market, t -5.3; futures -0.13, t -3.2), for buy and
+        sell bursts alike. A burst is a reason not to chase, not a signal to follow."""
+        state = self.states.get(symbol)
+        if not state or len(state.minutes) < 20:
+            return {"detected": False}
+        bars = list(state.minutes)
+        volumes = sorted(bar[2] for bar in bars[:-1] if bar[2] > 0)
+        if not volumes:
+            return {"detected": False}
+        median = volumes[len(volumes) // 2]
+        latest = bars[-1][0] if now is None else int(now // 60 * 60)
+        for bar in reversed(bars):
+            ago = (latest - bar[0]) // 60
+            if ago > within_minutes:
+                break
+            volume = bar[2]
+            if volume <= 0 or volume < BURST_VOLUME_X * median:
+                continue
+            share = (bar[3] - bar[4]) / volume
+            if abs(share) >= BURST_SHARE:
+                return {"detected": True, "direction": 1 if share > 0 else -1,
+                        "side": "buy_burst" if share > 0 else "sell_burst", "minutes_ago": int(ago),
+                        "volume_x": round(volume / median, 1), "share": round(share, 2)}
+        return {"detected": False}
+
+    def minute_divergence(self, symbol: str, lookback: int = 60, recent: int = 15) -> dict:
+        """Price vs CVD over the last hour of MINUTES (the prints-based divergence() spans seconds).
+
+        classic: price makes a lower low while CVD makes a higher low (bullish), or the mirror (bearish) --
+                 net of drift weakly right (+0.03..+0.04 sigma over 30 minutes, t ~2.1-2.6).
+        hidden:  price holds a higher low while CVD makes a lower low (sellers absorbed), or the mirror --
+                 shown for reading only; it did not survive both drift baselines.
+        The edge is MIN_MINUTE_DIVERGENCE_EDGE of the hour's CVD range."""
+        state = self.states.get(symbol)
+        if not state or len(state.minutes) < lookback + 1:
+            return {"detected": False, "classic": None, "hidden": None}
+        bars = list(state.minutes)[-(lookback + 1):]
+        prior, last = bars[:-recent], bars[-recent:]
+        cvds = [bar[5] for bar in bars]
+        edge = MIN_MINUTE_DIVERGENCE_EDGE * (max(cvds) - min(cvds))
+        if edge <= 0:
+            return {"detected": False, "classic": None, "hidden": None}
+        p_lo, p_hi = min(b[1] for b in prior), max(b[1] for b in prior)
+        r_lo, r_hi = min(b[1] for b in last), max(b[1] for b in last)
+        q_lo, q_hi = min(b[5] for b in prior), max(b[5] for b in prior)
+        s_lo, s_hi = min(b[5] for b in last), max(b[5] for b in last)
+        classic = ("bullish" if r_lo < p_lo and s_lo > q_lo + edge else
+                   "bearish" if r_hi > p_hi and s_hi < q_hi - edge else None)
+        hidden = ("bullish" if r_lo > p_lo and s_lo < q_lo - edge else
+                  "bearish" if r_hi < p_hi and s_hi > q_hi + edge else None)
+        return {"detected": classic is not None, "kind": classic, "classic": classic, "hidden": hidden}
 
     def divergence(self, symbol: str, lookback: int = 120) -> dict:
         """Price/CVD divergence — price makes a new extreme, delta does not."""
@@ -523,6 +598,10 @@ class OrderFlowTracker:
             "normalised": normalised,
             "absorption": self.absorption(symbol),
             "divergence": self.divergence(symbol),
+            # Minute-scale reads (research/orderflow_detectors_20261023): a recent burst (do not chase it) and
+            # the hour's price/CVD divergence, classic and hidden.
+            "burst": self.burst(symbol),
+            "minute_divergence": self.minute_divergence(symbol),
             "footprint": [
                 {"price": price, "buy": buy, "sell": sell, "delta": buy - sell}
                 for price, buy, sell in sorted(levels, key=lambda row: -row[0])

@@ -54,6 +54,7 @@ MIN_TRIGGER_GAP_SECONDS = 300          # event cycles (level breaks, fills, trig
 INTRADAY_FLATTEN_AT = time(15, 15)
 LEVEL_INDICES = ("NIFTY", "BANKNIFTY")
 DEFAULT_EFFORT = "medium"           # grok-4.7 at its default (high) took ~200 s a decision; medium ~110 s
+STALE_CANDIDATE_SECONDS = 120       # a contract silent this long is left out of the model's candidates
 MAX_ENTRY_DRIFT = 0.08             # skip an entry whose premium ran this far while the model was thinking
 # Profit-taking in code (22 Oct 2026: winners at +28% and +37% were all given back to their stops).
 BOOK_AT = 0.30                      # book half (one lot: all) at +30%, or when the index reaches its first target
@@ -298,6 +299,29 @@ class AgenticExecutionManager(ExecutionManager):
                 meta["stop_premium"] = trail
                 self.lane.save_meta_quietly(symbol)
         return None
+
+    def extreme_book_quantity(self, symbol: str, position, now: datetime) -> int:
+        """Extreme index move (extreme_booking.py): book half of a swing position (at least one lot, once a day)
+        and keep the rest on a breakeven stop; intraday positions are booked whole."""
+        meta = self.lane.meta.get(symbol, {})
+        if meta.get("horizon") != "swing":
+            return position.quantity
+        today = now.astimezone(IST).date().isoformat()
+        if meta.get("extreme_booked") == today:
+            return 0
+        if position.lots <= 1:
+            return position.quantity
+        meta["extreme_booked"] = today
+        meta["booked"] = 1
+        meta["stop_premium"] = max(float(meta.get("stop_premium") or 0.0), position.average_price)
+        return (position.lots // 2) * position.lot_size
+
+    def on_extreme_booked(self, symbol: str, quantity: int, price: float, reason: str) -> None:
+        if symbol in self.lane.held_symbols():
+            lots = quantity // max(1, self.portfolio.positions[symbol].lot_size)
+            self.lane.note_partial_exit(symbol, lots, price, f"{reason}: booked half ({lots} lots) of the swing, rest at breakeven")
+        else:
+            self.lane.note_guard_exit(symbol, reason, price)
 
     async def on_closed_bar(self, symbol: str, macd: float) -> bool:
         return False
@@ -654,6 +678,14 @@ class AgenticLane:
     def _tick(self, symbol: str):
         return getattr(self.engine, "latest_ticks", {}).get(symbol) if self.engine is not None else None
 
+    def _tick_age(self, symbol: str, now: datetime) -> float | None:
+        """Seconds since this contract last printed (the book's quote or the engine's tick, whichever is newer)."""
+        stamps = [self.execution.last_price_at.get(symbol)]
+        tick = self._tick(symbol)
+        stamps.append(getattr(tick, "timestamp", None) if tick is not None else None)
+        stamps = [s for s in stamps if s is not None]
+        return (now - max(stamps)).total_seconds() if stamps else None
+
     def _price(self, symbol: str) -> float | None:
         price = self.execution.last_prices.get(symbol)
         if price:
@@ -747,6 +779,7 @@ class AgenticLane:
             if row.get("spot_symbol") in wanted_spots and self.execution.lot_sizes.get(symbol, 0) > 0:
                 by_spot.setdefault((row["spot_symbol"], row.get("option_type", "")), []).append((symbol, row))
         candidates, cand_rows = {}, []
+        stale_skipped = 0
         for (spot, side), rows in sorted(by_spot.items()):
             spot_price = self._price(spot)
             keep = sorted(rows, key=lambda item: (str(item[1].get("expiry") or ""), float(item[1].get("strike") or 0))) \
@@ -755,6 +788,10 @@ class AgenticLane:
             for symbol, row in keep:
                 ltp = self._price(symbol)
                 if not ltp:
+                    continue
+                age = self._tick_age(symbol, now)
+                if in_session(now) and (age is None or age > STALE_CANDIDATE_SECONDS):
+                    stale_skipped += 1          # not streaming: an order on it fails "live price is stale"
                     continue
                 cid = f"C{len(candidates) + 1:02d}"
                 lot = int(self.execution.lot_sizes.get(symbol, 0))
@@ -910,7 +947,8 @@ class AgenticLane:
             "candidates": cand_rows,
             "your_recent_notes": [{"at": c["at"][11:16], "view": c["market_view"], "note": c["notes"]} for c in recent],
             "your_track_record": feat.track_record(self.repository.closed_positions(lane=self.name, limit=80)),
-            "data_quality": self._data_quality(now, stats, features, signals),
+            "data_quality": {**self._data_quality(now, stats, features, signals),
+                             "contracts_left_out_no_live_price": stale_skipped},
         }
         validation = {"candidates": candidates, "positions": positions, "book": book, "matrix": matrix,
                       "entries_today": self.entries_today(today), "settle_until": SETTLE_UNTIL.strftime("%H:%M"),

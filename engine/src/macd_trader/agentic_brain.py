@@ -338,7 +338,7 @@ class GrokClient:
             await asyncio.sleep(RETRY_PAUSE_S)
         raise AssertionError("unreachable")
 
-    async def decide(self, system: str, user: str, max_tokens: int = 2500) -> tuple[dict, dict]:
+    async def decide(self, system: str, user: str, max_tokens: int = 4000) -> tuple[dict, dict]:
         """Returns (decision, meta). Raises BrainError on transport or parse failure."""
         body = {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_completion_tokens": max_tokens}
