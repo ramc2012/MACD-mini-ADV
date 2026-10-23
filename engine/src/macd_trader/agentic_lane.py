@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 from . import agentic_brain as brain
 from . import agentic_features as feat
 from . import agentic_matrix as mx
+from . import mp_annotations
 from . import market_calendar
 from .blast_engine import LaneEvents, OrderOnlyBroker
 from .config import RUNTIME_DIR
@@ -379,6 +380,7 @@ class AgenticLane:
         self._atr_cache: tuple[str, dict] = ("", {})
         self._ohlc_cache: tuple[str, dict] = ("", {})
         self.matrix: dict = {}              # the last cycle's decision matrix, {root: {"CE": {...}, "PE": {...}}}
+        self._annotation_cache: dict = {}   # mp_annotations daily parts, per futures symbol and day
         self._index_lots: dict[str, int] = {}
         self._index_ctx: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
@@ -678,6 +680,24 @@ class AgenticLane:
     def _tick(self, symbol: str):
         return getattr(self.engine, "latest_ticks", {}).get(symbol) if self.engine is not None else None
 
+    def _front_future(self, root: str, now: datetime) -> str | None:
+        """The index's most-traded futures symbol today (the one the desk reads order flow on)."""
+        pattern = feat.FUTURES_GLOB.get(root)
+        if not pattern:
+            return None
+        lo, _ = feat._bounds(now.date())
+        try:
+            with sqlite3.connect(f"file:{self.settings.research_database_path}?mode=ro", uri=True, timeout=10) as db:
+                row = None
+                for since in (lo, lo - 86400 * 4):      # today's busiest series; before the open, the last sessions'
+                    row = db.execute("""SELECT symbol FROM historical_candles WHERE symbol GLOB ? AND timeframe_seconds=60
+                                        AND timestamp>=? GROUP BY symbol ORDER BY SUM(volume) DESC LIMIT 1""", (pattern, since)).fetchone()
+                    if row:
+                        break
+        except sqlite3.Error:
+            return None
+        return row[0] if row else None
+
     def _tick_age(self, symbol: str, now: datetime) -> float | None:
         """Seconds since this contract last printed (the book's quote or the engine's tick, whichever is newer)."""
         stamps = [self.execution.last_price_at.get(symbol)]
@@ -848,6 +868,19 @@ class AgenticLane:
                     move["atm_iv_pct"] = _r(sum(ivs) / len(ivs), 1)
                     move["iv_to_realised"] = _r(move["atm_iv_pct"] / entry["realised_vol20_pct"])
                 entry["implied_move"] = move
+
+        # Market Profile notes and the current 30-minute period vs its baseline, read on each index's front futures
+        # (mp_annotations.py; every note carries the base rate it was measured with).
+        for entry in indices:
+            fut = self._front_future(entry["index"], now)
+            if not fut:
+                continue
+            tracker = getattr(getattr(self.engine, "entry_flow", None), "tracker", None)
+            state = tracker.states.get(fut) if tracker is not None else None
+            flow_minutes = [list(m) for m in getattr(state, "minutes", [])] if state is not None else None
+            notes = mp_annotations.annotate(self.settings.research_database_path, fut, now, flow_minutes, self._annotation_cache)
+            if notes.get("notes"):
+                entry["profile_and_period"] = {"read_on": fut.split(":")[-1], "notes": notes["notes"]}
 
         # The decision matrix: grade per index x side, which sets each new trade's risk budget (agentic_matrix.py).
         matrix = {}

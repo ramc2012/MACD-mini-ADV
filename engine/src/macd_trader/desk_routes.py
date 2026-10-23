@@ -417,6 +417,19 @@ async def mp_snapshot(symbol: str | None = Query(default=None)):
         result["profile"] = await _profile_snapshot(focus, profile, 90)
     return result
 
+_annotation_cache: dict = {}
+
+
+@router.get("/api/mp/annotations/{symbol:path}", dependencies=[Depends(authorize)])
+async def mp_annotations_view(symbol: str):
+    """Evidence-labelled profile notes and the current period vs its baseline (mp_annotations.py)."""
+    from . import mp_annotations
+    state = engine.mp.flow.states.get(symbol)
+    flow_minutes = [list(m) for m in getattr(state, "minutes", [])] if state is not None else None
+    return await asyncio.to_thread(mp_annotations.annotate, engine.mp.history_database_path, symbol, None,
+                                   flow_minutes, _annotation_cache)
+
+
 @router.get("/api/mp/profile/{symbol:path}", dependencies=[Depends(authorize)])
 async def mp_profile(symbol: str, full: bool = Query(default=False),
                      profile_only: bool = Query(default=False)):

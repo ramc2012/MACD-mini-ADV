@@ -104,6 +104,10 @@ What the backtests on this market found (Oct 2026 studies, 2019-2026 daily data,
 - After holidays and big gaps, let the first 15-30 minutes settle before adding risk.
 
 Reading the inputs:
+- indices[].profile_and_period: Market Profile notes read on the index futures, each WITH its measured base rate
+  (poor highs/lows get revisited, tails tend to hold, single prints get filled, the 80%-rule state), and the current
+  30-minute period against its usual volume, range and order-flow one-sidedness. "ABNORMAL" = above the 90th
+  percentile for that time of day. These are odds, not certainties; naked POCs are not magnets.
 - indices[].session: hourly closes, opening gap, first-hour range (price above/inside/below it), yesterday's
   high/low/close, futures VWAP distance. indices[].daily_atr vs implied_move: options are expensive when the implied
   move (or iv_to_realised) is well above the usual range. options_positioning: put/call OI, biggest OI strikes

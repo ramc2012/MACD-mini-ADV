@@ -48,6 +48,47 @@ function useEndpoint<T>(path: string | null, deps: unknown[]) {
   return { data, error, loading };
 }
 
+type PeriodReading = {
+  period?: string; starts?: string; rvol?: number | null; rvol_p90?: number; volume_abnormal?: boolean;
+  range_atr?: number; range_usual?: number; range_p90?: number; range_abnormal?: boolean;
+  delta_share?: number; delta_p90?: number | null; delta_abnormal?: boolean; day_high_share?: number; day_low_share?: number;
+};
+type Annotations = { symbol: string; at: string; notes: string[]; period: PeriodReading; error?: string;
+  eighty_rule?: { state: string; rule_active?: boolean } };
+
+// Profile notes with the base rate each was measured with (research/mp_advanced_20261024), and the current
+// 30-minute period against what is normal for that time of day. Refreshed every minute.
+function ProfileNotes({ symbol }: { symbol: string }) {
+  const [data, setData] = useState<Annotations>();
+  useEffect(() => {
+    if (!symbol) return;
+    let alive = true;
+    const load = () => void fetch(`${API_URL}/api/mp/annotations/${encodeURIComponent(symbol)}`, { headers: headers() })
+      .then((r) => (r.ok ? r.json() : undefined)).then((v) => { if (alive && v) setData(v as Annotations); }).catch(() => undefined);
+    load();
+    const timer = setInterval(load, 60_000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [symbol]);
+  if (!data || data.error) return null;
+  const p = data.period || {};
+  const flag = (bad?: boolean) => (bad ? "negative" : "");
+  return <section className="panel auction-notes">
+    <div className="panel-title"><span>Period vs normal, and profile odds</span><span className="auction-flow-controls">{data.at}</span></div>
+    {p.period && <div className="auction-stat-row">
+      <div><span>Period</span><b>{p.period} · {p.starts}</b></div>
+      <div><span>Volume vs usual</span><b className={flag(p.volume_abnormal)}>{p.rvol != null ? `${p.rvol.toFixed(1)}x` : "—"}</b>
+        {p.rvol_p90 && <small>p90 {p.rvol_p90.toFixed(1)}x</small>}</div>
+      <div><span>Range (ATR)</span><b className={flag(p.range_abnormal)}>{p.range_atr != null ? p.range_atr.toFixed(2) : "—"}</b>
+        {p.range_usual != null && <small>usual {p.range_usual.toFixed(2)} · p90 {p.range_p90?.toFixed(2)}</small>}</div>
+      <div><span>Flow one-sided</span><b className={flag(p.delta_abnormal)}>{p.delta_share != null ? `${(p.delta_share * 100).toFixed(0)}%` : "—"}</b>
+        {p.delta_p90 != null && <small>p90 {(p.delta_p90 * 100).toFixed(0)}%</small>}</div>
+      <div><span>Day high / low made here</span><b>{p.day_high_share != null ? `${(p.day_high_share * 100).toFixed(0)}% / ${((p.day_low_share || 0) * 100).toFixed(0)}%` : "—"}</b></div>
+    </div>}
+    <ul className="auction-note-list">{(data.notes || []).slice(1).map((n, i) => <li key={i}>{n}</li>)}</ul>
+    <small className="auction-note-foot">Odds from 5,250 index sessions 2021-26. Naked POCs are shown as levels only: they were hit no more often than any price at the same distance.</small>
+  </section>;
+}
+
 export function AuctionPage() {
   const { data: symbols } = useEndpoint<string[]>("/api/auction/symbols", []);
   const [symbol, setSymbol] = useState("");
@@ -109,6 +150,7 @@ export function AuctionPage() {
     </section>}
 
     {reference && <div className="auction-grid">
+      <ProfileNotes symbol={symbol} />
       <LocationPanel reference={reference} />
       <LevelsPanel reference={reference} />
       <TodayPanel rates={rates.data} />
