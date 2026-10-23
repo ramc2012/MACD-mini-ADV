@@ -15,6 +15,8 @@ from macd_trader.smart_lane import (
     BLAST_SOURCE, MACD_SOURCE, SmartLane, SmartLanes, dispersion_size, lane_label, score,
 )
 
+pytestmark = pytest.mark.usefixtures("no_stock_t2")   # these test the expiry-DAY rules
+
 SYMBOL = "NSE:SBIN26OCT800CE"
 T0 = datetime(2026, 10, 5, 4, 30, tzinfo=UTC)          # 10:00 IST
 

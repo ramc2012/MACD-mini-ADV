@@ -54,21 +54,82 @@ def days_to_expiry(expiry: str | None, today: date | None = None) -> int | None:
     return (parsed - (today or datetime.now(IST).date())).days
 
 
-def is_tradable(expiry: str | None, min_days: int = 1, today: date | None = None) -> bool:
+def is_tradable(expiry: str | None, min_days: int = 1, today: date | None = None, stock: bool = False) -> bool:
     """Is this contract far enough from expiry to open a new position in?
 
     ``min_days=1`` — the default — rejects a contract expiring today and keeps
     everything else, so the only behaviour that changes is the expiry day
-    itself. ``min_days=0`` restores the old "not yet expired" rule.
+    itself. ``min_days=0`` restores the old "not yet expired" rule. A STOCK
+    option series additionally stops being tradable on its last day, T-2
+    (see :func:`stock_last_day`).
     """
     remaining = days_to_expiry(expiry, today)
-    return remaining is not None and remaining >= min_days
+    if remaining is None or remaining < min_days:
+        return False
+    if stock and STOCK_EXIT_SESSIONS > 0:
+        return (today or datetime.now(IST).date()) < stock_last_day(expiry)
+    return True
 
 
-def first_tradable(expiries: list[Expiry], min_days: int = 1, today: date | None = None) -> Expiry | None:
+def first_tradable(expiries: list[Expiry], min_days: int = 1, today: date | None = None,
+                   stock: bool = False) -> Expiry | None:
     """The nearest listed expiry that is still far enough out."""
     ordered = sorted((row for row in expiries if to_date(row.date)), key=lambda row: to_date(row.date))
-    return next((row for row in ordered if is_tradable(row.date, min_days, today)), None)
+    return next((row for row in ordered if is_tradable(row.date, min_days, today, stock)), None)
+
+
+# --- Stock options: out by T-2 ---------------------------------------------
+# NSE stock options are physically settled and brokers raise margins in the
+# expiry week, so the operator's rule (23 Oct 2026) is that T-2 -- two trading
+# sessions before the Tuesday expiry -- is the LAST day in a series: from T-2
+# new positions go to the next series, and what is still held is closed by the
+# expiry-flatten time (15:10) on T-2, at once if T-2 has already passed. Index
+# options are cash-settled and keep the expiry-day rules. 0 disables.
+STOCK_EXIT_SESSIONS = 2
+_INDEX_OPTION = re.compile(r"^(?:NSE|BSE):(?:NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|NIFTYNXT50|SENSEX|BANKEX)\d{2}")
+
+
+def set_stock_exit_sessions(sessions: int) -> None:
+    global STOCK_EXIT_SESSIONS
+    STOCK_EXIT_SESSIONS = max(0, int(sessions))
+
+
+def is_stock_option(symbol: str) -> bool:
+    return symbol.endswith(("CE", "PE")) and not _INDEX_OPTION.match(symbol)
+
+
+def is_stock_spot(spot_symbol: str) -> bool:
+    return spot_symbol.endswith("-EQ")
+
+
+def stock_last_day(expiry: str | date | None) -> date | None:
+    """The last trading day of a stock option series: ``STOCK_EXIT_SESSIONS`` sessions before its expiry."""
+    from . import market_calendar
+    day = expiry if isinstance(expiry, date) else to_date(expiry)
+    if day is None:
+        return None
+    for _ in range(STOCK_EXIT_SESSIONS):
+        day = market_calendar.previous_trading_day(day)
+    return day
+
+
+def stock_entry_closed(symbol: str, expiry: str | None, today: date | None = None) -> bool:
+    """No new risk (entries or adds) in a stock option from its series' last day on."""
+    if STOCK_EXIT_SESSIONS <= 0 or not is_stock_option(symbol):
+        return False
+    last = stock_last_day(expiry)
+    return last is not None and (today or datetime.now(IST).date()) >= last
+
+
+def stock_exit_due(symbol: str, expiry: str | None, now: datetime | None = None, cutoff: tuple[int, int] = (15, 10)) -> bool:
+    """A held stock option must be closed: after its last day, or on it from the cutoff time."""
+    if STOCK_EXIT_SESSIONS <= 0 or not is_stock_option(symbol):
+        return False
+    last = stock_last_day(expiry)
+    if last is None:
+        return False
+    now = (now or datetime.now(IST)).astimezone(IST)
+    return now.date() > last or (now.date() == last and (now.hour, now.minute) >= cutoff)
 
 
 def futures_root(symbol: str) -> tuple[str, str] | None:

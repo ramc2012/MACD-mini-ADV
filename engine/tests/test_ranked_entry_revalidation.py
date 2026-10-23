@@ -14,6 +14,8 @@ from macd_trader.engine import TradingEngine
 from macd_trader.indicators import IncrementalKAMA
 from macd_trader.models import Candle, IndicatorPoint, Signal, Tick
 
+pytestmark = pytest.mark.usefixtures("no_stock_t2")   # these test the expiry-DAY rules
+
 
 SYMBOL = "NSE:TEST26OCT100CE"
 START = datetime(2026, 9, 28, 5, 30, tzinfo=UTC)  # Monday 11:00 IST

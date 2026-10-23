@@ -321,6 +321,10 @@ class Settings(BaseSettings):
     # from settlement. 0 restores the previous "anything unexpired" rule.
     # Applies to the ATM option lane and to the desk's futures series alike.
     min_days_to_expiry: int = 1
+    # Stock options leave a series on its last day: this many trading sessions before expiry (T-2 for a
+    # Tuesday expiry is the Friday). From that day new risk goes to the next series and anything still held
+    # is closed by expiry_flatten_ist (at once if the day has passed). Index options are unaffected. 0 = off.
+    stock_option_exit_sessions: int = Field(default=2, ge=0, le=5)
     # IST time at which any position still held in a contract expiring TODAY
     # is flattened. Nothing else closes them: an expired option simply stops
     # ticking, so the paper book would carry its last mark forever. Blank

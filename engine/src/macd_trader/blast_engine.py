@@ -86,6 +86,7 @@ from .execution import ExecutionManager
 from .indicators import IncrementalMACD
 from .models import Candle, IndicatorPoint, Signal, Trade
 from .option_greeks import greeks, years_to_expiry
+from .rollover import stock_exit_due
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
 
@@ -1071,8 +1072,9 @@ class BlastEngine:
                 marked += 1
         return marked
 
-    def expiring_positions(self, today: date) -> list[str]:
-        """Held symbols whose OWN recorded expiry is today or already past."""
+    def expiring_positions(self, today: date, now: datetime | None = None) -> list[str]:
+        """Held symbols whose OWN recorded expiry is today or already past, and stock options at or past their
+        series' last day (T-2, rollover.stock_exit_due) once ``now`` reaches the flatten time."""
         expiring = []
         for symbol, position in self.portfolio.positions.items():
             if position.quantity <= 0:
@@ -1082,7 +1084,7 @@ class BlastEngine:
                 expiry = date.fromisoformat(str(raw)[:10])
             except ValueError:
                 continue
-            if expiry <= today:
+            if expiry <= today or (now is not None and stock_exit_due(symbol, expiry.isoformat(), now)):
                 expiring.append(symbol)
         return expiring
 

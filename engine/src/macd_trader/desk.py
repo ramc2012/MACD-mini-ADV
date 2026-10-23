@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from . import market_calendar, nightly, whale
 from .self_heal import session_history_coverage
-from .rollover import days_to_expiry, is_futures_symbol
+from .rollover import days_to_expiry, is_futures_symbol, stock_entry_closed
 from .universe import INDEX_SPOTS, desk_underlying
 
 # Index instruments (futures, options, spots) by symbol prefix; no F&O stock begins with these.
@@ -131,7 +131,8 @@ class DeskMixin:
         self.mp.set_position_underlyings(self.desk_position_underlyings())
         self.mp.set_expiring_symbols({
             symbol for symbol, contract in self.contract_selector.contracts.items()
-            if days_to_expiry(contract.expiry) is not None and days_to_expiry(contract.expiry) <= 0
+            if (days_to_expiry(contract.expiry) is not None and days_to_expiry(contract.expiry) <= 0)
+            or stock_entry_closed(symbol, contract.expiry)      # a stock option on/after its T-2 last day
         })
         self.mp.set_directional_scope(self.mp_spot_symbols())
         self.mp.set_universe(self.mp_universe())

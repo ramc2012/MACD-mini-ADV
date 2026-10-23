@@ -39,6 +39,7 @@ from threading import Lock
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .rollover import stock_exit_due
 from . import market_calendar
 from .blast_engine import LaneEvents, OrderOnlyBroker
 from .execution import ExecutionManager
@@ -193,6 +194,8 @@ class SmartExecutionManager(ExecutionManager):
         today = now.date().isoformat()
         if expiry and (expiry < today or (expiry == today and now.time() >= FLATTEN_AT)):
             reason = "EXPIRY_DAY_FLATTEN"
+        elif expiry and stock_exit_due(symbol, expiry, now, (FLATTEN_AT.hour, FLATTEN_AT.minute)):
+            reason = "STOCK_SERIES_LAST_DAY_EXIT"     # T-2 for stock options (rollover.py)
         elif price <= position.hard_stop:
             reason = f"HARD_STOP_{round(rules['hard'] * 100)}_PCT"
         elif position.trailing_stop and price <= position.trailing_stop:

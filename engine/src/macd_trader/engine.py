@@ -13,13 +13,14 @@ from pathlib import Path
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from .rollover import set_stock_exit_sessions
 from .brokers import Broker, create_broker
 from .candle_store import (
     LiveCandleWriter, prior_session_candle_count, prune_history, resolve_expiry, store_historical_candles,
 )
 from .tick_store import TickStore
 from .regimes import regime_for
-from .rollover import days_to_expiry, first_tradable, is_futures_symbol, Expiry
+from .rollover import days_to_expiry, first_tradable, is_futures_symbol, Expiry, is_stock_option, stock_exit_due, stock_last_day
 from .sessions import in_session, market_close, market_open
 from .candles import CandleAggregator
 from .chart_history import aggregate_session_candles, load_chart_history
@@ -228,6 +229,7 @@ def _held_contract_lots(engine) -> dict[str, int]:
 
 class TradingEngine(DeskMixin):
     def __init__(self, settings: Settings):
+        set_stock_exit_sessions(settings.stock_option_exit_sessions)   # T-2 for stock options (rollover.py)
         self.settings = settings
         self.calendar_rejected = market_calendar.configure(settings.market_holidays_csv)
         self.events = EventHub()
@@ -2219,14 +2221,16 @@ class TradingEngine(DeskMixin):
             if not market_calendar.is_trading_day(now.date()):
                 continue
             if (now.hour, now.minute) < cutoff:
-                continue
+                # A stock option past its T-2 last day (the app was down that afternoon) is closed at once.
+                if not (market_open(now) and self._overdue_stock_positions(now)):
+                    continue
             await self._flatten_expiring_positions(now)
 
     async def _flatten_expiring_positions(self, now: datetime) -> None:
         """Retry each still-held expiry until its paper exit actually fills."""
-        macd_symbols = self.expiring_positions()
+        macd_symbols = self.expiring_positions(now)
         mp_symbols = self.expiring_desk_positions()
-        blast_symbols = self.blast.expiring_positions(now.date())
+        blast_symbols = self.blast.expiring_positions(now.date(), now)
         if not (macd_symbols or mp_symbols or blast_symbols):
             self._flattened_expiry_day = now.date().isoformat()
             return
@@ -2263,21 +2267,42 @@ class TradingEngine(DeskMixin):
             else:
                 self.rollover_errors.pop(key, None)
 
-        pending = (self.expiring_positions()
+        pending = (self.expiring_positions(now)
                    or any(symbol in self.mp.portfolio.positions for symbol in mp_symbols)
-                   or self.blast.expiring_positions(now.date()))
+                   or self.blast.expiring_positions(now.date(), now))
         self._flattened_expiry_day = None if pending else now.date().isoformat()
         self.events.publish("snapshot_required", {"reason": "expiry_day_flatten"})
 
-    def expiring_positions(self) -> list[str]:
-        """Open positions whose contract expires today or has already died."""
+    def expiring_positions(self, now: datetime | None = None) -> list[str]:
+        """Open positions whose contract expires today or has already died, and stock options at or past their
+        series' last day (T-2, rollover.stock_exit_due) once the flatten time has come."""
+        cutoff = self._expiry_flatten_time() or (15, 10)
         expiring = []
         for symbol in self.portfolio.positions:
-            contract = self.contract_selector.contracts.get(symbol)
-            remaining = days_to_expiry(getattr(contract, "expiry", None)) if contract else None
-            if remaining is not None and remaining <= 0:
+            expiry = self._expiry_of(symbol)
+            remaining = days_to_expiry(expiry)
+            if (remaining is not None and remaining <= 0) or stock_exit_due(symbol, expiry, now, cutoff):
                 expiring.append(symbol)
         return expiring
+
+    def _expiry_of(self, symbol: str) -> str | None:
+        contract = self.contract_selector.contracts.get(symbol)
+        return getattr(contract, "expiry", None) if contract else self.execution.contract_expiries.get(symbol)
+
+    def _overdue_stock_positions(self, now: datetime) -> bool:
+        """Any book still holding a stock option whose T-2 last day is already over."""
+        held = [*self.portfolio.positions, *self.blast.portfolio.positions, *self.desk_holdings()]
+        expiries = {**self.execution.contract_expiries, **self.blast.execution.contract_expiries}
+        for smart in _smart_lanes(self):
+            held += smart.held_symbols()
+            expiries.update(smart.execution.contract_expiries)
+        for symbol in held:
+            if not is_stock_option(symbol):
+                continue
+            last = stock_last_day(self._expiry_of(symbol) or expiries.get(symbol))
+            if last is not None and now.date() > last:
+                return True
+        return False
 
     async def _rollover_loop(self) -> None:
         """Refresh the daily ATM universe without rolling an open position into another contract."""

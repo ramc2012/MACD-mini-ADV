@@ -1,11 +1,15 @@
 """Expiry sweeps keep trying every held book until its exit fills."""
 
 import asyncio
+
+import pytest
 from datetime import UTC, datetime
 from types import MethodType, SimpleNamespace
 
 from macd_trader.desk import DeskMixin
 from macd_trader.engine import IST, TradingEngine, regular_session_open
+
+pytestmark = pytest.mark.usefixtures("no_stock_t2")   # these test the expiry-DAY rules
 
 
 def test_expiry_exit_retries_each_failed_book_on_the_next_sweep():
@@ -53,7 +57,7 @@ def test_expiry_exit_retries_each_failed_book_on_the_next_sweep():
     )
     blast = SimpleNamespace(
         portfolio=SimpleNamespace(positions=blast_positions),
-        expiring_positions=lambda day: list(blast_positions),
+        expiring_positions=lambda day, *now: list(blast_positions),
         flatten=blast_flatten, error="temporary mark failure",
     )
     engine = SimpleNamespace(
@@ -61,7 +65,7 @@ def test_expiry_exit_retries_each_failed_book_on_the_next_sweep():
         portfolio=SimpleNamespace(positions=positions), execution=execution,
         mp=mp, blast=blast, position_mark_errors={}, rollover_errors={},
         _flattened_expiry_day=None,
-        expiring_positions=lambda: list(positions),
+        expiring_positions=lambda *now: list(positions),
         events=SimpleNamespace(publish=lambda topic, payload: published.append((topic, payload))),
     )
     # The desk's share of the sweep lives on DeskMixin, which TradingEngine inherits.

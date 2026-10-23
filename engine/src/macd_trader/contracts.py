@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .brokers import Broker, OptionChainEntry
-from .rollover import Expiry, first_tradable, is_tradable
+from .rollover import Expiry, first_tradable, is_stock_spot, is_tradable
 from .universe import DISPLAY_BY_SPOT, INDEX_SPOTS, STOCK_SPOTS
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -204,9 +204,10 @@ class ContractSelector:
         the nearest expiry that clears the threshold instead. The extra call
         happens only on the days it is needed.
         """
-        if is_tradable(chain.expiry, self.min_days_to_expiry):
+        stock = is_stock_spot(spot_symbol)          # stock options leave a series on its T-2 (rollover.py)
+        if is_tradable(chain.expiry, self.min_days_to_expiry, stock=stock):
             return chain
-        target = first_tradable(list(chain.expiries or []), self.min_days_to_expiry)
+        target = first_tradable(list(chain.expiries or []), self.min_days_to_expiry, stock=stock)
         if target is None or not target.token:
             return chain
         rolled = await self.broker.option_chain(spot_symbol, target.token)
@@ -228,7 +229,7 @@ class ContractSelector:
             contract_from_row(row)
             for row in saved_contracts
             if row.get("spot_symbol") in spot_symbols
-            and is_tradable(row.get("expiry"), self.min_days_to_expiry)
+            and is_tradable(row.get("expiry"), self.min_days_to_expiry, stock=is_stock_spot(str(row.get("spot_symbol") or "")))
         ]
         previously_selected = {row.symbol for row in selected}
         ladder_roles = {
@@ -278,7 +279,7 @@ class ContractSelector:
                             raise
                         await asyncio.sleep(2 * (attempt + 1))
                 assert chain is not None
-                if not is_tradable(chain.expiry, self.min_days_to_expiry):
+                if not is_tradable(chain.expiry, self.min_days_to_expiry, stock=is_stock_spot(spot_symbol)):
                     raise RuntimeError(
                         f"no expiry at least {self.min_days_to_expiry} day(s) out "
                         f"(nearest listed: {chain.expiry or 'unknown'})"
@@ -384,7 +385,8 @@ class ContractSelector:
                 self.master_errors[spot_symbol] = "no reference price"
                 continue
             expiries = sorted(listed_series)
-            chosen = first_tradable([Expiry(day) for day in expiries], self.min_days_to_expiry)
+            chosen = first_tradable([Expiry(day) for day in expiries], self.min_days_to_expiry,
+                                    stock=is_stock_spot(spot_symbol))
             if chosen is None:
                 self.master_errors[spot_symbol] = f"no expiry at least {self.min_days_to_expiry} day(s) out"
                 continue

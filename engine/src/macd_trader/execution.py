@@ -21,6 +21,8 @@ def _session_day(moment: datetime) -> date:
     return (moment if moment.tzinfo else moment.replace(tzinfo=UTC)).astimezone(IST).date()
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
+from . import rollover
+from .rollover import stock_entry_closed
 
 
 class ExecutionManager:
@@ -118,6 +120,9 @@ class ExecutionManager:
             raise ValueError(f"Contract expiry is unavailable for {symbol}; BUY blocked") from None
         if expiry < datetime.now(IST).date():
             raise ValueError(f"Expired contract {symbol} ({expiry.isoformat()}); BUY blocked")
+        if stock_entry_closed(symbol, expiry.isoformat(), datetime.now(IST).date()):
+            raise ValueError(f"{symbol}: stock option series from its last day (T-{rollover.STOCK_EXIT_SESSIONS}) on: "
+                             "new risk goes to the next series; BUY blocked")
 
     def expire_previous_session_orders(self, today: date | None = None) -> None:
         """Resting paper tickets are day orders, as on the exchange.

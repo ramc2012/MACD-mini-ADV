@@ -27,3 +27,12 @@ def fixed_auction_session_clock(monkeypatch, request):
     monkeypatch.setattr(mp_engine, "datetime", _TradingSessionDateTime)
     monkeypatch.setattr(models, "datetime", _TradingSessionDateTime)
     monkeypatch.setattr(request.module, "datetime", _TradingSessionDateTime)
+
+
+@pytest.fixture
+def no_stock_t2(monkeypatch):
+    """Switch off the T-2 stock-option rule (rollover.py) for tests of the expiry-DAY mechanics on stock fixtures."""
+    from macd_trader import desk_app, engine, rollover
+    monkeypatch.setattr(rollover, "STOCK_EXIT_SESSIONS", 0)
+    for module in (engine, desk_app):
+        monkeypatch.setattr(module, "set_stock_exit_sessions", lambda sessions: None)

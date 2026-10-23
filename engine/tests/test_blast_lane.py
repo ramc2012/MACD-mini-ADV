@@ -37,6 +37,8 @@ from macd_trader.config import Settings
 from macd_trader.events import EventHub
 from macd_trader.models import Candle, IndicatorPoint
 
+pytestmark = pytest.mark.usefixtures("no_stock_t2")   # these test the expiry-DAY rules
+
 SYMBOL = "NSE:SBIN26SEP800CE"
 SPOT = "NSE:SBIN-EQ"
 
