@@ -35,6 +35,7 @@ from __future__ import annotations
 
 GRADES = ((4, "A", 1.0), (2, "B", 0.6), (0, "C", 0.3))
 LOTS_BY_GRADE = {"A": 4, "B": 3, "C": 2, "D": 1}     # learning phase: every grade trades, sized by lots
+HEAVY_IB_RVOL, LIGHT_IB_RVOL = 1.3, 0.85              # first-hour futures volume vs its 20-session average
 NARROW_IB_ATR, WIDEST_IB_ATR = 0.44, 0.68          # quintile cuts of IB / ATR, index sessions 2021-2026
 SMALL_DAY_ATR, WIDE_DAY_ATR = 0.60, 1.80
 EXPENSIVE_RATIO = 1.30
@@ -114,6 +115,14 @@ def evaluate(inputs: dict, side: str, clock: str, price: float | None, *, trend:
                 add(1, f"narrow first hour ({ib_atr:.2f} ATR)")
             elif ib_atr > WIDEST_IB_ATR:
                 add(-1, f"widest first hour ({ib_atr:.2f} ATR): little room left")
+        rvol = inputs.get("ib_rvol")
+        if rvol is not None:
+            # Zero points on purpose: a size read. On indices it did not call trend vs balance (oi_flow_20261024 s4).
+            if rvol >= HEAVY_IB_RVOL:
+                add(0, f"first-hour volume {rvol:.1f}x usual: expect a wider rest of day (0.80 vs 0.71 ATR, "
+                       f"0.96 with a wide first hour); size, not direction")
+            elif rvol < LIGHT_IB_RVOL:
+                add(0, f"first-hour volume {rvol:.1f}x usual: light; rest of day usually narrower (0.71 ATR)")
     if trend == s:
         add(1, "with the 20-day trend")
     prev_rng = inputs.get("prev_range_atr")

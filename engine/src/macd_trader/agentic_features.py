@@ -138,9 +138,34 @@ def positioning(db: sqlite3.Connection, root: str, now: datetime) -> dict | None
     if not ce_oi:
         return None
     top = lambda rows: [[_r(k, 0), int(oi)] for k, oi, _d in sorted(rows, key=lambda x: -x[1])[:3]]  # noqa: E731
-    return {"expiry": expiry, "snapshot_age_min": _r((now.timestamp() - ts) / 60, 0), "pcr_oi": _r(pe_oi / ce_oi),
-            "top_call_oi_strikes": top(ce), "top_put_oi_strikes": top(pe),
-            "today_oi_change_calls": int(sum(x[2] for x in ce)), "today_oi_change_puts": int(sum(x[2] for x in pe))}
+    out = {"expiry": expiry, "snapshot_age_min": _r((now.timestamp() - ts) / 60, 0), "pcr_oi": _r(pe_oi / ce_oi),
+           "top_call_oi_strikes": top(ce), "top_put_oi_strikes": top(pe),
+           "today_oi_change_calls": int(sum(x[2] for x in ce)), "today_oi_change_puts": int(sum(x[2] for x in pe))}
+    dislocation = near_money_oi_vs_hour(db, root, ts, expiry, lo)
+    if dislocation is not None:
+        out["near_money_oi_vs_60min_avg_pct"] = dislocation
+        if abs(dislocation) >= OI_DISLOCATION_PCT:
+            out["near_money_oi_read"] = (f"near-money OI {dislocation:+.1f}% off its hour average: the next hour moved "
+                                         f"0.19-0.21 vs 0.15 ATR at the average (size, not direction)")
+    return out
+
+
+OI_DISLOCATION_PCT = 3.0     # research/oi_flow_20261024 s2: |60-min move| 0.207 / 0.185 ATR beyond it, 0.152 at the average
+
+
+def near_money_oi_vs_hour(db: sqlite3.Connection, root: str, ts: int, expiry: str, session_start: int) -> float | None:
+    """Total OI of the strikes within 2% of spot (nearest expiry) now, against its average over the last 60 minutes
+    of snapshots (at least 30 of them, today only), in %."""
+    rows = db.execute("""SELECT ts, strike, oi, spot FROM chain_snapshots WHERE underlying=? AND expiry=? AND ts>? AND ts<=?""",
+                      (root, expiry, max(session_start - 1, ts - 3600), ts)).fetchall()
+    totals: dict[int, float] = {}
+    for stamp, strike, oi, spot in rows:
+        if spot and abs(strike / spot - 1) <= 0.02:
+            totals[stamp] = totals.get(stamp, 0.0) + (oi or 0)
+    if len(totals) < 30 or not totals.get(ts):
+        return None
+    average = sum(totals.values()) / len(totals)
+    return _r((totals[ts] / average - 1) * 100, 1) if average else None
 
 
 def contract_risk(premium: float, spot: float, strike: float, expiry: str, call: bool, lot: int, now: datetime) -> dict:
@@ -228,6 +253,50 @@ def daily_ohlc(db: sqlite3.Connection, spot: str, today: date, sessions: int = 1
     return [(d, *per_day[d]) for d in sorted(per_day)]
 
 
+SPOT_ROOTS = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANKNIFTY", "BSE:SENSEX-INDEX": "SENSEX",
+              "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY"}
+_FIRST_HOUR_BASE: dict[tuple[str, date], float | None] = {}
+
+
+def _first_hour_volume(db: sqlite3.Connection, root: str, day: date) -> float | None:
+    """09:15-10:15 volume of the index's busiest futures series that day (the index itself has no volume)."""
+    lo, _ = _bounds(day)
+    row = db.execute("""SELECT SUM(volume) AS v FROM historical_candles WHERE symbol GLOB ? AND timeframe_seconds=60
+                        AND timestamp>=? AND timestamp<? GROUP BY symbol ORDER BY v DESC LIMIT 1""",
+                     (FUTURES_GLOB[root], lo, lo + 3600)).fetchone()
+    return float(row[0]) if row and row[0] else None
+
+
+def first_hour_rvol(db: sqlite3.Connection, spot: str, day: date, sessions: int = 20) -> float | None:
+    """Today's first-hour futures volume against its average over the prior ``sessions`` sessions.
+
+    A SIZE read, not a direction or day-type call: on 858 index-days (Mar 2025 - Mar 2026,
+    research/oi_flow_20261024 s4) heavy first-hour activity meant a wider rest of day (0.80 vs 0.71 ATR; 0.96 with a
+    wide first hour) while the stocks' "narrow first hour + heavy volume = trend day" did NOT carry over to indices.
+    """
+    root = SPOT_ROOTS.get(spot)
+    if root is None:
+        return None
+    today = _first_hour_volume(db, root, day)
+    if not today:
+        return None
+    key = (root, day)
+    if key not in _FIRST_HOUR_BASE:
+        volumes, cursor = [], day
+        for _ in range(sessions + 10):
+            if len(volumes) >= sessions:
+                break
+            cursor = previous_session(cursor)
+            volume = _first_hour_volume(db, root, cursor)
+            if volume:
+                volumes.append(volume)
+        _FIRST_HOUR_BASE[key] = sum(volumes) / len(volumes) if len(volumes) >= 10 else None
+        for stale in [k for k in _FIRST_HOUR_BASE if k[1] < day]:
+            _FIRST_HOUR_BASE.pop(stale, None)
+    base = _FIRST_HOUR_BASE[key]
+    return _r(today / base) if base else None
+
+
 def matrix_inputs(db: sqlite3.Connection, spot: str, now: datetime, daily: list[tuple] | None = None) -> dict:
     """What the decision matrix needs for one index: ATR, the prior day's size, shape and close location, the
     10-session high/low, today's open type and first-hour range (each only once it is complete). ``daily`` = daily_ohlc(...) when cached by the caller."""
@@ -253,4 +322,5 @@ def matrix_inputs(db: sqlite3.Connection, spot: str, now: datetime, daily: list[
     if now.time() >= time(10, 15) and len(first_hour) >= 50:
         out["ib_high"], out["ib_low"] = _r(max(b[2] for b in first_hour)), _r(min(b[3] for b in first_hour))
         out["ib_atr"] = _r((out["ib_high"] - out["ib_low"]) / atr)
+        out["ib_rvol"] = first_hour_rvol(db, spot, now.date())
     return out

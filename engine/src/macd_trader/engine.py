@@ -268,6 +268,7 @@ class TradingEngine(DeskMixin):
         self._dispersion_task: asyncio.Task | None = None
         self._nightly_task: asyncio.Task | None = None
         self._chain_task: asyncio.Task | None = None
+        self._stock_chain_task: asyncio.Task | None = None
         self._nightly_done: str | None = None
         self._nightly_attempts = 0
         self.nightly_report: dict | None = None
@@ -423,6 +424,7 @@ class TradingEngine(DeskMixin):
         if self.desk_local:
             self._nightly_task = asyncio.create_task(self._nightly_loop())
             self._chain_task = asyncio.create_task(self._chain_loop())
+            self._stock_chain_task = asyncio.create_task(self._stock_chain_loop())
             if self.settings.tick_capture_enabled:
                 self._tick_maintenance_task = asyncio.create_task(self._tick_maintenance_loop())
         self._history_prune_task = asyncio.create_task(self._history_prune_loop())
@@ -1517,7 +1519,7 @@ class TradingEngine(DeskMixin):
             with suppress(asyncio.CancelledError):
                 await self._session_close_task
             self._session_close_task = None
-        for name in ("_nightly_task", "_chain_task"):
+        for name in ("_nightly_task", "_chain_task", "_stock_chain_task"):
             task = getattr(self, name)
             if task:
                 task.cancel()

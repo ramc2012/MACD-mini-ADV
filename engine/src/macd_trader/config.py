@@ -283,6 +283,10 @@ class Settings(BaseSettings):
     # 5-second OHLCV -- so the socket's output is the only copy that will ever
     # exist. Raw rows are kept this many days, then condensed to the flow and
     # volume-profile facts a candle cannot reproduce.
+    # Live OI (oi_capture.py): the minute chain snapshots cover these index roots beside NIFTY/BANKNIFTY, and
+    # every F&O stock's chain is swept once per window (0 turns the stock sweep off).
+    chain_extra_roots: list[str] = ["SENSEX", "MIDCPNIFTY"]
+    stock_chain_sweep_minutes: int = Field(default=15, ge=0, le=120)
     tick_capture_enabled: bool = True
     tick_retention_days: int = 5
     # Derived flow is ~300x smaller per session than the ticks it comes from,

@@ -111,7 +111,9 @@ Reading the inputs:
 - indices[].session: hourly closes, opening gap, first-hour range (price above/inside/below it), yesterday's
   high/low/close, futures VWAP distance. indices[].daily_atr vs implied_move: options are expensive when the implied
   move (or iv_to_realised) is well above the usual range. options_positioning: put/call OI, biggest OI strikes
-  (support/resistance), today's OI change.
+  (support/resistance), today's OI change, and near_money_oi_vs_60min_avg_pct (OI 3%+ off its hour average was
+  followed by a bigger next hour; it tells SIZE, never direction: OI and VWAP reads were right 49-53% on direction).
+  The matrix's first-hour-volume factor is the same kind of read: heavy first hour = wider rest of day.
 - candidates: moneyness, iv_pct, delta, theta_rs_per_lot_day, breakeven, move_needed_pct. Prefer contracts whose
   needed move is realistic against daily_atr and the time left.
 - armed_triggers: your pending conditional entries. your_track_record: your recent closed trades.

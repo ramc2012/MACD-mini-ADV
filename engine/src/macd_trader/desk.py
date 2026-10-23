@@ -18,12 +18,14 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from zoneinfo import ZoneInfo
 
-from . import market_calendar, nightly, whale
+from . import market_calendar, nightly, oi_capture, whale
 from .self_heal import session_history_coverage
 from .rollover import days_to_expiry, is_futures_symbol, stock_entry_closed
+from .models import Tick
 from .universe import INDEX_SPOTS, desk_underlying
 
 # Index instruments (futures, options, spots) by symbol prefix; no F&O stock begins with these.
@@ -488,7 +490,10 @@ class DeskMixin:
         if self.chain_status["day"] != day:
             self.chain_status.update({"day": day, "snapshots": 0, "windows": 0, "alerts_today": 0})
         roots = self._whale_roots()
-        for root in roots:
+        # The extra roots are snapshot for their OI record only; the whale tracker scores NIFTY/BANKNIFTY.
+        chain_roots = [*roots, *(root for root in getattr(self.settings, "chain_extra_roots", ())
+                                 if root in INDEX_SPOTS and root not in roots)]
+        for root in chain_roots:
             try:
                 # The chain is keyed to the INDEX. The desk watches the
                 # future, and the future's own symbol is not a chain root.
@@ -500,6 +505,7 @@ class DeskMixin:
             except Exception as exc:  # noqa: BLE001
                 self.chain_status["error"] = str(exc)
         futures = {root: symbol for root, symbol in roots.items() if symbol}
+        open_interest = await self._futures_open_interest(stamp)
         if not futures:
             return
         now = time.monotonic()
@@ -521,6 +527,13 @@ class DeskMixin:
             else:
                 quotes_error = None
                 self._quotes_backoff = QUOTES_BACKOFF_SECONDS
+        for symbol in futures.values():
+            # /quotes has no OI; the depth read supplies the futures leg's.
+            row = open_interest.get(symbol)
+            if row:
+                quote = quotes.get(symbol)
+                quotes[symbol] = (Tick(symbol, row.get("ltp") or 0.0, row.get("volume") or 0, open_interest=row["oi"])
+                                  if quote is None else replace(quote, open_interest=row["oi"]))
         flow_states = {symbol: self.mp.flow.states.get(symbol) for symbol in futures.values()}
         try:
             payload, problem = await asyncio.to_thread(
@@ -529,6 +542,88 @@ class DeskMixin:
             self.chain_status["whale_error"] = problem or quotes_error
         except Exception as exc:  # noqa: BLE001
             self.chain_status["whale_error"] = str(exc)
+
+    def _oi_futures(self) -> list[str]:
+        """Every index future the desk watches, for the minute OI record."""
+        return [symbol for symbol in self.mp_spot_symbols()
+                if is_futures_symbol(symbol) and desk_underlying(symbol) in INDEX_SPOTS]
+
+    async def _futures_open_interest(self, stamp: int) -> dict[str, dict]:
+        """One depth read per index future (Fyers takes one symbol per depth call), stored in oi_minutes."""
+        rows: dict[str, dict] = {}
+        if time.monotonic() < self._quotes_blocked_until:
+            return rows
+        for symbol in self._oi_futures():
+            try:
+                row = await self.broker.open_interest(symbol)
+            except Exception as exc:  # noqa: BLE001 — a missed minute of OI must not cost the chain
+                self.chain_status["oi_error"] = str(exc)[:200]
+                if "429" in str(exc):
+                    break
+                continue
+            if row:
+                rows[symbol] = row
+        if rows:
+            try:
+                await asyncio.to_thread(self._store_oi, stamp, rows)
+                self.chain_status.update({"oi_symbols": len(rows), "oi_error": None})
+            except Exception as exc:  # noqa: BLE001
+                self.chain_status["oi_error"] = str(exc)[:200]
+        return rows
+
+    def _store_oi(self, stamp: int, rows: dict[str, dict]) -> None:
+        import sqlite3
+        connection = sqlite3.connect(self.settings.research_database_path, timeout=30)
+        try:
+            oi_capture.save_oi(connection, stamp, rows)
+        finally:
+            connection.close()
+
+    async def _stock_chain_loop(self) -> None:
+        """Every F&O stock's chain, a few strikes around the money, once per sweep window.
+
+        The calls are spaced out rather than burst: the engine process makes every Fyers call for both
+        processes, and a 200-call burst would collide with its own quotes and history traffic.
+        """
+        from .universe import STOCK_SPOTS
+        while True:
+            minutes = self.settings.stock_chain_sweep_minutes
+            if minutes <= 0 or not _engine().fo_session_open():
+                await asyncio.sleep(60)
+                continue
+            started = time.monotonic()
+            stored = failed = 0
+            for name, spot in STOCK_SPOTS.items():
+                if not _engine().fo_session_open():
+                    break
+                if time.monotonic() < self._quotes_blocked_until:
+                    await asyncio.sleep(oi_capture.STOCK_CALL_GAP_SECONDS)
+                    continue
+                try:
+                    stored += await self._stock_chain(name, spot)
+                except Exception as exc:  # noqa: BLE001 — one stock must not stop the sweep
+                    failed += 1
+                    self.chain_status["stock_chain_error"] = f"{name}: {exc}"[:200]
+                    if "429" in str(exc):
+                        self._quotes_blocked_until = time.monotonic() + self._quotes_backoff
+                await asyncio.sleep(oi_capture.STOCK_CALL_GAP_SECONDS)
+            self.chain_status.update({"stock_chain_rows": stored, "stock_chain_failed": failed,
+                                      "stock_chain_at": datetime.now(UTC).isoformat()})
+            await asyncio.sleep(max(1.0, minutes * 60 - (time.monotonic() - started)))
+
+    async def _stock_chain(self, name: str, spot: str) -> int:
+        stamp = whale.snapshot_stamp()
+        chain = await self.broker.option_chain(spot, strikecount=oi_capture.STOCK_STRIKES)
+        chains = [chain]
+        token = oi_capture.next_expiry_token(chain, chain.expiry, oi_capture.NEXT_SERIES_WITHIN_DAYS,
+                                             datetime.now(IST).date())
+        if token:
+            await asyncio.sleep(oi_capture.STOCK_CALL_GAP_SECONDS)
+            chains.append(await self.broker.option_chain(spot, expiry_token=token,
+                                                         strikecount=oi_capture.STOCK_STRIKES))
+        for one in chains:
+            await asyncio.to_thread(self._store_chain, stamp, name, one)
+        return sum(len(one.entries) for one in chains)
 
     def _whale_roots(self) -> dict[str, str | None]:
         """Chain root -> the desk future for it, for the roots the tracker covers."""

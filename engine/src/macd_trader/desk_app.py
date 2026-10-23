@@ -76,8 +76,11 @@ class StrategyClient:
         return response.json()
 
     # The two broker calls the desk's collectors make, same shapes as a Broker.
-    async def option_chain(self, symbol: str) -> OptionChain:
-        raw = await self._broker("GET", f"/api/internal/option-chain/{symbol}")
+    async def option_chain(self, symbol: str, expiry_token: str | None = None,
+                           strikecount: int | None = None) -> OptionChain:
+        params = {**({"strikecount": strikecount} if strikecount else {}),
+                  **({"expiry": expiry_token} if expiry_token else {})}
+        raw = await self._broker("GET", f"/api/internal/option-chain/{symbol}", params=params)
         return OptionChain(
             expiry=raw["expiry"], spot_price=raw["spot_price"],
             entries=[OptionChainEntry(**row) for row in raw.get("entries", [])],
@@ -92,6 +95,9 @@ class StrategyClient:
         if response.status_code >= 400:
             raise RuntimeError(response.json().get("detail", response.text)[:500])
         return response.json()
+
+    async def open_interest(self, symbol: str) -> dict | None:
+        return (await self._broker("GET", f"/api/internal/open-interest/{symbol}")).get("open_interest")
 
     async def quotes(self, symbols: list[str]) -> dict[str, Tick]:
         raw = await self._broker("POST", "/api/internal/quotes", json={"symbols": symbols})
@@ -213,7 +219,7 @@ class DeskEngine(DeskMixin):
         self.active = active
         if active:
             loops = [self._holdings_loop(), self._expiry_flatten_loop(), self._session_close_loop(),
-                     self._nightly_loop(), self._chain_loop(), self._agent_loop()]
+                     self._nightly_loop(), self._chain_loop(), self._stock_chain_loop(), self._agent_loop()]
             if self.settings.tick_capture_enabled:
                 loops.append(self._tick_maintenance_loop())
             self._lane_tasks = [asyncio.create_task(loop) for loop in loops]

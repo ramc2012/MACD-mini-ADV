@@ -171,6 +171,10 @@ class Broker(ABC):
         rows = await asyncio.gather(*(self.quote(symbol) for symbol in symbols))
         return {row.symbol: row for row in rows}
 
+    async def open_interest(self, symbol: str) -> dict | None:
+        """Open interest for one derivative: {"oi", "prev_oi", "ltp", "volume"}, or None when the broker has none."""
+        return None
+
     async def validate_session(self) -> bool:
         """Confirm that the broker session is still authenticated.
 
@@ -517,9 +521,8 @@ class FyersBroker(Broker):
         value = row.get("v", {})
         ltp = float(value.get("lp", 0) or 0)
         change = float(value.get("ch", 0) or 0)
-        # The socket never delivers OI on this account (ticks.oi is NULL on
-        # every recorded row), so the quotes REST is the only source of
-        # futures open interest the desk has.
+        # Fyers' /quotes carries no OI field (checked 23 Oct 2026, futures
+        # included): this stays None from Fyers and open_interest() reads it.
         oi = value.get("oi")
         return Tick(
             str(row.get("n") or fallback_symbol), ltp, int(value.get("volume", 0) or 0),
@@ -563,8 +566,26 @@ class FyersBroker(Broker):
             raise RuntimeError(f"No quote for {symbol}")
         return rows[symbol]
 
-    async def option_chain(self, symbol: str, expiry_token: str | None = None) -> OptionChain:
-        params = {"symbol": symbol, "strikecount": "12"}
+    async def open_interest(self, symbol: str) -> dict | None:
+        """OI from the depth REST, the only Fyers call that carries it for a single contract: the socket never
+        sends OI on this account and /quotes has no OI field at all (checked 23 Oct 2026, futures included).
+        Depth takes exactly one symbol per call."""
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(f"{self.data_url}/depth", params={"symbol": symbol, "ohlcv_flag": "1"},
+                                        headers={"Authorization": self.authorization})
+            response.raise_for_status()
+            payload = response.json()
+        if payload.get("s") == "error":
+            raise RuntimeError(payload.get("message", f"Fyers depth failed for {symbol}"))
+        row = (payload.get("d") or {}).get(symbol)
+        if not row or row.get("oi") in (None, ""):
+            return None
+        return {"oi": int(row["oi"]), "prev_oi": int(row["pdoi"]) if row.get("pdoi") not in (None, "") else None,
+                "ltp": float(row.get("ltp") or 0), "volume": int(row.get("v") or 0)}
+
+    async def option_chain(self, symbol: str, expiry_token: str | None = None,
+                           strikecount: int = 12) -> OptionChain:
+        params = {"symbol": symbol, "strikecount": str(strikecount)}
         if expiry_token:
             # Fyers keys a specific expiry by the epoch it reports in
             # expiryData; without it the response is always the front expiry.

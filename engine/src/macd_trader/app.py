@@ -1209,12 +1209,23 @@ async def internal_desk_holdings(payload: DeskHoldingsInput):
 
 
 @app.get("/api/internal/option-chain/{symbol:path}", dependencies=[Depends(authorize)])
-async def internal_option_chain(symbol: str):
+async def internal_option_chain(symbol: str, strikecount: int | None = Query(None, ge=1, le=50),
+                                expiry: str | None = Query(None, max_length=20)):
+    # Only the overrides the caller sent: the default call is the one every broker implements.
+    extra = {**({"strikecount": strikecount} if strikecount else {}), **({"expiry_token": expiry} if expiry else {})}
     try:
-        chain = await engine.broker.option_chain(symbol)
+        chain = await engine.broker.option_chain(symbol, **extra)
     except Exception as exc:  # noqa: BLE001 - relayed: the desk backs off on a 429 in the text
         raise HTTPException(502, f"broker option chain failed: {exc}") from exc
     return fast_json(chain)
+
+
+@app.get("/api/internal/open-interest/{symbol:path}", dependencies=[Depends(authorize)])
+async def internal_open_interest(symbol: str):
+    try:
+        return {"symbol": symbol, "open_interest": await engine.broker.open_interest(symbol)}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"broker open interest failed: {exc}") from exc
 
 
 @app.post("/api/internal/quotes", dependencies=[Depends(authorize)])

@@ -590,7 +590,7 @@ def _engine(tmp_path):
         _quotes_blocked_until=0.0, _quotes_backoff=engine_module.QUOTES_BACKOFF_SECONDS)
     engine.events = SimpleNamespace(publish=lambda kind, data: engine.published.append((kind, data)))
     for name in ("_chain_minute", "_whale_roots", "_store_chain", "_whale_minute", "_option_flow_signs",
-                 "mp_spot_symbols", "mp_configured_symbols"):
+                 "mp_spot_symbols", "mp_configured_symbols", "_futures_open_interest", "_oi_futures", "_store_oi"):
         setattr(engine, name, getattr(TradingEngine, name).__get__(engine))
     return engine
 
@@ -851,3 +851,32 @@ def test_chain_days_is_a_ledger_and_old_sessions_keep_only_their_close(tmp_path)
         _ts(15, 32, day=old_day), _ts(10, 0)]
     # The ledger is the history count, and condensation does not erase a day.
     assert connection.execute("SELECT COUNT(DISTINCT day) FROM chain_days").fetchone()[0] == 2
+
+
+def test_chain_minute_snapshots_the_extra_roots_and_takes_futures_oi_from_depth(tmp_path):
+    """/quotes carries no OI on Fyers; the depth read does, and the extra roots get a chain for their OI record."""
+    engine = _engine(tmp_path)
+    engine.settings.chain_extra_roots = ["SENSEX", "MIDCPNIFTY", "NOT_A_ROOT"]
+    engine.broker.quotes = lambda symbols: _no_oi_quotes(symbols)
+    depth_calls = []
+
+    async def open_interest(symbol):
+        depth_calls.append(symbol)
+        return {"oi": 777_000, "prev_oi": 700_000, "ltp": 24011.0, "volume": 5}
+
+    engine.broker.open_interest = open_interest
+    asyncio.run(engine._chain_minute(_ts(10, 5)))
+
+    assert engine.broker.chain_calls == ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX", "NSE:MIDCPNIFTY-INDEX"]
+    # Every index future the desk watches gets a depth read, SENSEX's too.
+    assert depth_calls == [FUT, "BSE:SENSEX26SEPFUT"]
+    connection = sqlite3.connect(engine.settings.research_database_path)
+    assert connection.execute("SELECT oi FROM whale_flow_minutes").fetchone() == (777_000,)
+    assert sorted(connection.execute("SELECT symbol, oi, prev_oi FROM oi_minutes")) == [
+        ("BSE:SENSEX26SEPFUT", 777_000, 700_000), (FUT, 777_000, 700_000)]
+    # (The fake chain reuses one contract symbol, so chain_days is where every root shows.)
+    assert {row[0] for row in connection.execute("SELECT underlying FROM chain_days")} == {"NIFTY", "SENSEX", "MIDCPNIFTY"}
+
+
+async def _no_oi_quotes(symbols):
+    return {symbol: Tick(symbol, 24010.0) for symbol in symbols}
