@@ -290,9 +290,15 @@ class TickStore:
     # -- condensation --------------------------------------------------------
 
     def days_pending_condensation(self, now: datetime | None = None) -> list[str]:
-        """IST days whose raw ticks are older than the retention window."""
+        """Finished IST days (before today) whose raw ticks have not been condensed yet.
+
+        Condensing no longer waits for the raw retention window: since 24 Oct 2026 a day is rolled into minute
+        flow and the ladder the night after its session, and its raw ticks stay (and are archived) until
+        ``purge_raw`` finds the archive holds them. Every reader prefers the condensed rows, so this only makes
+        fresh sessions cheaper to read.
+        """
         moment = (now or datetime.now(IST)).astimezone(IST)
-        cutoff = (moment - timedelta(days=self.retention_days)).date()
+        cutoff = moment.date() - timedelta(days=1)
         connection = _connect(self._path)
         try:
             done = {r[0] for r in connection.execute("SELECT day FROM tick_condensed_days")}
@@ -308,7 +314,8 @@ class TickStore:
             connection.close()
 
     def condense_day(self, day: str) -> dict:
-        """Roll one IST day of raw ticks into flow rows, then delete the raw."""
+        """Roll one IST day of raw ticks into flow rows. The raw ticks stay; ``purge_raw`` removes them once the
+        archive holds them."""
         start = int(datetime.fromisoformat(f"{day}T00:00:00").replace(tzinfo=IST).timestamp() * 1000)
         end = start + 86_400_000
         connection = _connect(self._path)
@@ -354,7 +361,6 @@ class TickStore:
                    (symbol_id, day, price, buy_volume, sell_volume) VALUES (?,?,?,?,?)""",
                 ladder_rows,
             )
-            connection.execute("DELETE FROM ticks WHERE ts_ms >= ? AND ts_ms < ?", (start, end))
             connection.execute(
                 """INSERT OR REPLACE INTO tick_condensed_days
                    (day, condensed_at, raw_ticks, minute_rows, ladder_rows) VALUES (?,?,?,?,?)""",
@@ -368,58 +374,78 @@ class TickStore:
         finally:
             connection.close()
 
-    def prune_flow(self, now: datetime | None = None) -> dict:
-        """Drop derived flow past its own, much longer, retention window.
+    def prune_flow(self, now: datetime | None = None, archive=None) -> dict:
+        """Drop derived flow past its own, much longer, hot window -- only days the archive holds.
 
         Raw ticks and flow age out on different clocks on purpose: the raw tier
         is bulk, the derived tier is the research record. Session and period
         profiles are never pruned here — they are the positional lane's memory.
+        Without an archive nothing is deleted: the flow is kept forever.
         """
         moment = (now or datetime.now(IST)).astimezone(IST)
         cutoff = (moment - timedelta(days=self.flow_retention_days)).date().isoformat()
+        minutes = ladders = held = 0
         connection = _connect(self._path)
         try:
-            minute_cutoff = int(datetime.fromisoformat(f"{cutoff}T00:00:00").replace(tzinfo=IST).timestamp())
-            minutes = connection.execute(
-                "DELETE FROM tick_minute_flow WHERE minute_ts < ?", (minute_cutoff,)).rowcount
-            ladders = connection.execute(
-                "DELETE FROM tick_session_ladder WHERE day < ?", (cutoff,)).rowcount
+            days = [d for (d,) in connection.execute(
+                "SELECT DISTINCT day FROM tick_session_ladder WHERE day < ? ORDER BY day", (cutoff,))]
+            days += [d for (d,) in connection.execute(
+                """SELECT DISTINCT date(minute_ts,'unixepoch','+5 hours','+30 minutes') FROM tick_minute_flow
+                   WHERE minute_ts < ?""",
+                (int(datetime.fromisoformat(f"{cutoff}T00:00:00").replace(tzinfo=IST).timestamp()),)) if d]
+            for day in sorted(set(days)):
+                start = int(datetime.fromisoformat(f"{day}T00:00:00").replace(tzinfo=IST).timestamp())
+                flow_rows = connection.execute("SELECT COUNT(*) FROM tick_minute_flow WHERE minute_ts >= ? AND "
+                                               "minute_ts < ?", (start, start + 86_400)).fetchone()[0]
+                ladder_rows = connection.execute("SELECT COUNT(*) FROM tick_session_ladder WHERE day = ?",
+                                                 (day,)).fetchone()[0]
+                if archive is None or not (archive.covers("flow_1m", day, flow_rows)
+                                           and archive.covers("ladders", day, ladder_rows)):
+                    held += 1
+                    continue
+                minutes += connection.execute("DELETE FROM tick_minute_flow WHERE minute_ts >= ? AND minute_ts < ?",
+                                              (start, start + 86_400)).rowcount
+                ladders += connection.execute("DELETE FROM tick_session_ladder WHERE day = ?", (day,)).rowcount
             connection.commit()
-            self.last_prune = {"cutoff": cutoff, "minute_rows": minutes, "ladder_rows": ladders}
+            self.last_prune = {"cutoff": cutoff, "minute_rows": minutes, "ladder_rows": ladders, "days_held": held}
             return self.last_prune
         finally:
             connection.close()
 
-    def condense_pending(self, now: datetime | None = None) -> list[dict]:
+    def condense_pending(self, now: datetime | None = None, archive=None) -> list[dict]:
         results = [self.condense_day(day) for day in self.days_pending_condensation(now)]
-        self.purge_stranded_raw(now)
+        self.purge_raw(now, archive)
         return results
 
-    def purge_stranded_raw(self, now: datetime | None = None) -> int:
-        """Delete raw ticks that no condensation will ever reach.
+    def purge_raw(self, now: datetime | None = None, archive=None) -> int:
+        """Delete raw ticks of days past the hot window (``retention_days``) that the archive holds in full.
 
-        A symbol with no trade yet today streams its LAST trade's exchange
-        time: an option idle since 25 Sep arrives stamped 25 Sep, one that has
-        never traded at the feed's zero time (1980-01-01). Those rows land on
-        days already condensed -- or that were never sessions -- and
-        ``days_pending_condensation`` skips both, so they stayed in the raw
-        table for good: on 1 Oct 2026 it held rows for 1980-01-01, 7-9 Sep
-        and 25 Sep, all long condensed.
+        Rows stamped before 2000 (an untraded contract's zero exchange time) are feed artefacts, not a session,
+        and always go. Any real day the archive does not cover -- no archive mounted, the day not sealed yet,
+        or rows that arrived after it was sealed -- is kept and counted in ``last_purge["days_held"]``; the
+        next archive pass re-seals it and the purge after that removes it. Raw ticks are never lost to a rule.
         """
         moment = (now or datetime.now(IST)).astimezone(IST)
-        cutoff = (moment - timedelta(days=self.retention_days)).date() + timedelta(days=1)
-        cutoff_ms = int(datetime.combine(cutoff, datetime.min.time(), IST).timestamp() * 1000)
+        cutoff = (moment - timedelta(days=self.retention_days)).date().isoformat()
+        deleted, held = 0, []
         connection = _connect(self._path)
         try:
-            deleted = connection.execute(
-                """DELETE FROM ticks WHERE ts_ms < ? AND (
-                     ts_ms < ? OR date(ts_ms / 1000, 'unixepoch', '+5 hours', '+30 minutes')
-                                  IN (SELECT day FROM tick_condensed_days))""",
-                (cutoff_ms, EARLIEST_SESSION_MS)).rowcount
+            deleted += connection.execute("DELETE FROM ticks WHERE ts_ms < ?", (EARLIEST_SESSION_MS,)).rowcount
+            days = [d for (d,) in connection.execute(
+                "SELECT DISTINCT date(ts_ms / 1000, 'unixepoch', '+5 hours', '+30 minutes') FROM ticks") if d]
+            for day in sorted(d for d in days if d <= cutoff):
+                start = int(datetime.fromisoformat(f"{day}T00:00:00").replace(tzinfo=IST).timestamp() * 1000)
+                rows = connection.execute("SELECT COUNT(*) FROM ticks WHERE ts_ms >= ? AND ts_ms < ?",
+                                          (start, start + 86_400_000)).fetchone()[0]
+                if archive is None or not archive.covers("ticks", day, rows):
+                    held.append(day)
+                    continue
+                deleted += connection.execute("DELETE FROM ticks WHERE ts_ms >= ? AND ts_ms < ?",
+                                              (start, start + 86_400_000)).rowcount
             connection.commit()
         finally:
             connection.close()
-        self.last_purge = {"at": moment.isoformat(timespec="seconds"), "raw_ticks": deleted}
+        self.last_purge = {"at": moment.isoformat(timespec="seconds"), "raw_ticks": deleted, "days_held": held}
         return deleted
 
     def vacuum(self) -> None:

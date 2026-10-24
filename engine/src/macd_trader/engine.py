@@ -1269,6 +1269,12 @@ class TradingEngine(DeskMixin):
         finally:
             self.events.publish("broker", self.broker_status())
 
+    def _archive(self):
+        """The market-data archive, when its folder is mounted; None means the hot stores keep everything."""
+        from .archive import Archive
+        archive = Archive(self.settings.archive_dir or "/nonexistent")
+        return archive if archive.available() else None
+
     async def _history_prune_loop(self) -> None:
         """Bound historical.sqlite3 once a day, after the close.
 
@@ -1291,6 +1297,7 @@ class TradingEngine(DeskMixin):
                     now=now,
                     keep_days=self.settings.history_retention_days,
                     expired_keep_days=self.settings.expired_contract_retention_days,
+                    archive=self._archive(),
                 )
                 self.history_prune["error"] = None
             except Exception as exc:  # noqa: BLE001 - retry tomorrow; never stop the feed
@@ -2672,6 +2679,7 @@ class TradingEngine(DeskMixin):
             "loop_lag_ms": self.loop_lag_ms(),
             "candle_writer": self.candle_writer.status(),
             "history_prune": self.history_prune,
+            "archive": getattr(self, "archive_report", None) if self.desk_local else self.desk_status.get("archive"),
             "tick_store": (self.tick_store.status(include_database_counts=False)
                            if self.settings.tick_capture_enabled else None)
             if self.desk_local else self.desk_status.get("tick_store"),

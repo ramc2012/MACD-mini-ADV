@@ -44,6 +44,9 @@ services:
     volumes:
       - ./runtime:/app/runtime
       - engine_data:/app/data
+      # The permanent market-data archive (engine/src/macd_trader/archive.py): a host folder, outside Docker's
+      # disk image, so a Docker reset cannot take it. The engine only reads it, to know what it may prune.
+      - ./archive:/app/archive:ro
     depends_on:
       - nats
     healthcheck:
@@ -75,6 +78,8 @@ services:
       # Read-only: the engine owns settings.json and the credentials.
       - ./runtime:/app/runtime:ro
       - engine_data:/app/data
+      # The desk writes the archive (nightly seal of ticks, bars, chains, OI, flow).
+      - ./archive:/app/archive
     depends_on:
       engine:
         condition: service_healthy
@@ -88,16 +93,10 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  questdb:
-    image: questdb/questdb:10.0.1
-    ports:
-      - "127.0.0.1:9002:9000"
-    volumes:
-      - questdb_fyers_data:/var/lib/questdb
-    restart: unless-stopped
-
-  # Tick bus. Core NATS, no persistence: the engine's SQLite capture and
-  # QuestDB are the durable records; the bus only fans ticks out.
+  # Tick bus. Core NATS, no persistence: the engine's SQLite capture and the
+  # archive are the durable records; the bus only fans ticks out. (QuestDB was
+  # retired 24 Oct 2026: nothing in trading read it, and it cost ~315 MB and
+  # ~9% CPU even idle. Analytics keeps its in-memory live state without it.)
   nats:
     image: nats:2.10-alpine
     command: ["--http_port", "8222"]
@@ -108,18 +107,12 @@ services:
       context: ./analytics
     environment:
       PORT: "8081"
-      QUESTDB_ADDR: questdb:9009
-      QUESTDB_HTTP_URL: http://questdb:9000
-      # Raw ticks in QuestDB expire after 5 days; "off" keeps only 1-minute bars.
-      QUESTDB_STORE_TICKS: ${QUESTDB_STORE_TICKS:-on}
       NATS_ADDR: nats:4222
       ENGINE_URL: http://engine:8100
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       # Worker shards for live analytics; defaults to the CPU count, 2 to 8.
       LIVE_WORKERS: ${LIVE_WORKERS:-}
     depends_on:
-      questdb:
-        condition: service_started
       nats:
         condition: service_started
       engine:
@@ -193,5 +186,4 @@ services:
 
 volumes:
   engine_data:
-  questdb_fyers_data:
   us_paper_data:

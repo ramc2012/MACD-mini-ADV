@@ -89,7 +89,7 @@ export function QuantAnalyticsPage({ symbols, selected, timeframe, onSelect }: {
         <EdgeCard />
       </div>
       <details className="panel quant-pipeline">
-        <summary>Pipeline health — gateway fan-out, tick bus, Rust shards, QuestDB</summary>
+        <summary>Pipeline health — gateway fan-out, tick bus, Rust shards</summary>
         <LivePipeline symbol={symbol} onSelect={onSelect} />
       </details>
     </div>

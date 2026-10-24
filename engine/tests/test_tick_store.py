@@ -107,14 +107,14 @@ class TestCondensation:
             store.add(_tick("NSE:X", ltp, when, volume=cum, bid=bid, ask=ask))
         store.flush_sync()
 
-    def test_nothing_is_condensed_inside_the_retention_window(self):
+    def test_a_day_is_condensed_the_night_after_not_on_the_day(self):
         with tempfile.TemporaryDirectory() as folder:
             store = _store(folder, retention_days=2)
             self._day_of_ticks(store, day=20)
-            # Same day: far inside the window.
+            # Same day: the session may still be writing.
             assert store.days_pending_condensation(now=_ist(20, 16, 0)) == []
-            # One day later: still inside a 2-day window.
-            assert store.days_pending_condensation(now=_ist(21, 16, 0)) == []
+            # The next day: condensed, whatever the raw window (raw ticks stay until archived).
+            assert store.days_pending_condensation(now=_ist(21, 16, 0)) == ["2026-08-20"]
 
     def test_a_day_past_the_window_becomes_pending(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -122,7 +122,7 @@ class TestCondensation:
             self._day_of_ticks(store, day=20)
             assert store.days_pending_condensation(now=_ist(22, 16, 0)) == ["2026-08-20"]
 
-    def test_condensing_replaces_raw_rows_with_flow(self):
+    def test_condensing_writes_flow_and_keeps_the_raw(self):
         with tempfile.TemporaryDirectory() as folder:
             store = _store(folder, retention_days=2)
             self._day_of_ticks(store, day=20)
@@ -131,7 +131,7 @@ class TestCondensation:
             result = store.condense_day("2026-08-20")
             assert result["raw_ticks"] == 4
             assert result["minute_rows"] == 2          # 09:20 and 09:21
-            assert store.status()["raw_ticks"] == 0    # raw is gone
+            assert store.status()["raw_ticks"] == 4    # raw stays until the archive holds it
             assert store.status()["minute_rows"] == 2
 
     def test_aggressor_split_survives_the_condensation(self):
@@ -166,8 +166,9 @@ class TestCondensation:
             self._day_of_ticks(store, day=20)
             store.condense_day("2026-08-20")
             assert store.days_pending_condensation(now=_ist(22, 16, 0)) == []
-            again = store.condense_day("2026-08-20")   # no raw rows left
-            assert again["raw_ticks"] == 0
+            again = store.condense_day("2026-08-20")   # the same rows again: same flow, no duplicates
+            assert (again["raw_ticks"], again["minute_rows"]) == (4, 2)
+            assert store.status()["minute_rows"] == 2
             assert store.status()["condensed_days"] == 1
 
     def test_only_the_targeted_day_is_consumed(self):
@@ -176,7 +177,8 @@ class TestCondensation:
             self._day_of_ticks(store, day=20)
             self._day_of_ticks(store, day=21)
             store.condense_day("2026-08-20")
-            assert store.status()["raw_ticks"] == 4    # the 21st is untouched
+            assert store.status()["minute_rows"] == 2  # the 21st is untouched
+            assert store.status()["condensed_days"] == 1
 
     def test_vacuum_runs_clean(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -187,26 +189,27 @@ class TestCondensation:
             assert store.status()["minute_rows"] == 2
 
 
-def test_stale_stamped_ticks_on_condensed_days_are_purged_not_stranded():
-    """An idle contract streams its last trade's time; 1980 is the feed's "never traded"."""
-    import sqlite3
+def test_raw_ticks_go_only_once_the_archive_holds_them():
+    """Condensed the night after; raw kept past the hot window until the archive covers the day.
+    1980 stamps (the feed's "never traded") are artefacts and always go."""
+    from macd_trader import archive as arc
     with tempfile.TemporaryDirectory() as folder:
         store = _store(folder, retention_days=2)
         store.add(_tick("NSE:X", 100.0, _ist(20, 9, 20), volume=100))
         store.flush_sync()
-        assert [r["day"] for r in store.condense_pending(now=_ist(22, 16, 0))] == ["2026-08-20"]
-        # After the day was condensed, the feed re-sends stale stamps for it,
-        # plus a zero-time snapshot and a live tick from today.
-        store.add(_tick("NSE:IDLE", 5.0, _ist(20, 15, 29), volume=7))
+        assert [r["day"] for r in store.condense_pending(now=_ist(21, 16, 0))] == ["2026-08-20"]
+        store.add(_tick("NSE:IDLE", 5.0, _ist(20, 15, 29), volume=7))         # a stale stamp, after condensing
         store.add(_tick("NSE:NEVER", 1.0, datetime(1980, 1, 1, 5, 30, tzinfo=IST)))
-        store.add(_tick("NSE:X", 101.0, _ist(22, 9, 20), volume=200))
+        store.add(_tick("NSE:X", 101.0, _ist(24, 9, 20), volume=200))
         store.flush_sync()
 
-        assert store.days_pending_condensation(now=_ist(24, 16, 0)) == ["2026-08-22"]
-        store.condense_pending(now=_ist(24, 16, 0))
+        store.condense_pending(now=_ist(24, 16, 0))                           # no archive: nothing real goes
+        assert store.last_purge["days_held"] == ["2026-08-20"]
+        assert store.status()["raw_ticks"] == 3                               # 1980 went
 
-        days = [r[0] for r in sqlite3.connect(os.path.join(folder, "ticks.sqlite3")).execute(
-            "SELECT day FROM tick_condensed_days ORDER BY day")]
-        assert days == ["2026-08-20", "2026-08-22"]
-        assert store.status()["raw_ticks"] == 0
-        assert store.last_purge["raw_ticks"] == 2
+        archive = arc.Archive(os.path.join(folder, "archive"))
+        report = arc.seal_pending(archive, history_path="", ticks_path=os.path.join(folder, "ticks.sqlite3"),
+                                  today=datetime(2026, 8, 24).date(), tick_retention_days=0)
+        assert report["errors"] == [] and archive.rows("ticks", "2026-08-20") == 2
+        store.condense_pending(now=_ist(24, 16, 0), archive=archive)
+        assert store.last_purge["days_held"] == [] and store.status()["raw_ticks"] == 1   # only the 24th is left

@@ -665,26 +665,37 @@ CHAIN_RETENTION_DAYS = 90
 
 
 def condense_chain_snapshots(connection: sqlite3.Connection, before_day: str,
-                             keep_days: int = CHAIN_RETENTION_DAYS) -> int:
-    """Beyond ``keep_days``, keep only each day's closing snapshot per root.
+                             keep_days: int = CHAIN_RETENTION_DAYS, archive=None) -> int:
+    """Beyond ``keep_days``, keep only each day's closing snapshot per root -- for days the archive holds.
 
     Nothing else reads an old intraday chain: the windows are stored in
     whale_strike_windows, alert outcomes are same-day, and Layer D needs the
     prior close and nothing before it. Keeping the whole minute series is
-    ~77,000 rows a session for a table that had no retention rule at all.
+    ~77,000 rows a session in the hot store; the archive (archive.py) keeps
+    every minute for good, so a day is thinned only once ``archive.covers`` it.
+    Without an archive nothing is thinned.
     """
+    if archive is None:
+        return 0
     ensure_schema(connection)
     cutoff = (date.fromisoformat(before_day) - timedelta(days=keep_days)).isoformat()
-    closes = [row[0] for row in connection.execute(
-        f"""SELECT MAX(ts) FROM chain_snapshots WHERE {IST_DAY_SQL} < ?
-            GROUP BY {IST_DAY_SQL}, underlying""", (cutoff,))]
-    if not closes:
-        return 0
-    with connection:
-        cursor = connection.execute(
-            f"""DELETE FROM chain_snapshots WHERE {IST_DAY_SQL} < ?
-                AND ts NOT IN ({", ".join("?" * len(closes))})""", (cutoff, *closes))
-    return cursor.rowcount
+    removed = 0
+    days = [row[0] for row in connection.execute(
+        f"SELECT DISTINCT {IST_DAY_SQL} FROM chain_snapshots WHERE {IST_DAY_SQL} < ?", (cutoff,))]
+    from .archive import day_bounds
+    for day in days:
+        start, end = day_bounds(day)                       # the whole IST calendar day, as the archive seals it
+        rows = connection.execute("SELECT COUNT(*) FROM chain_snapshots WHERE ts >= ? AND ts < ?",
+                                  (start, end)).fetchone()[0]
+        if not archive.covers("chains", day, rows):
+            continue
+        closes = [row[0] for row in connection.execute(
+            "SELECT MAX(ts) FROM chain_snapshots WHERE ts >= ? AND ts < ? GROUP BY underlying", (start, end))]
+        with connection:
+            removed += connection.execute(
+                f"""DELETE FROM chain_snapshots WHERE ts >= ? AND ts < ?
+                    AND ts NOT IN ({", ".join("?" * len(closes))})""", (start, end, *closes)).rowcount
+    return removed
 
 
 def snapshot_times(connection: sqlite3.Connection, underlying: str, day: str) -> list[int]:

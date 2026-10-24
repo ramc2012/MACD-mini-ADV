@@ -44,3 +44,6 @@ compose.override.yaml
 !/research/**/*.ipynb
 !/research/**/.gitignore
 **/.deps/
+
+# market-data archive (Parquet, outside git)
+/archive/

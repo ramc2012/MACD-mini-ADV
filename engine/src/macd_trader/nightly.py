@@ -67,7 +67,7 @@ def rebuild_candle_days(ticks_path: str, history_path: str, day: str, underlying
 
 
 def run(ticks_path: str, history_path: str, day: str, symbols: list[str],
-        whale_symbols: list[str] | None = None, lots: dict[str, int] | None = None) -> dict:
+        whale_symbols: list[str] | None = None, lots: dict[str, int] | None = None, archive=None) -> dict:
     underlyings = sorted({s for s in symbols if not is_option(s)})
     report: dict = {"day": day, "symbols": len(underlyings)}
     if not underlyings:
@@ -151,7 +151,7 @@ def run(ticks_path: str, history_path: str, day: str, symbols: list[str],
         # The chain table is the one research table with no retention rule:
         # ~77,000 rows a session, and nothing reads an old intraday chain once
         # its windows are stored. Beyond the horizon, keep each day's close.
-        report["chain_condensed"] = whale.condense_chain_snapshots(out, day)
+        report["chain_condensed"] = whale.condense_chain_snapshots(out, day, archive=archive)
     finally:
         for connection in (ticks, history_ro, out):
             connection.close()

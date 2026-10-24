@@ -287,6 +287,11 @@ class Settings(BaseSettings):
     # every F&O stock's chain is swept once per window (0 turns the stock sweep off).
     chain_extra_roots: list[str] = ["SENSEX", "MIDCPNIFTY"]
     stock_chain_sweep_minutes: int = Field(default=15, ge=0, le=120)
+    # The permanent market-data archive (archive.py): a host folder mounted into the containers, so a Docker
+    # reset cannot take it. Raw ticks are kept there tick_archive_retention_days; every other dataset forever.
+    # The SQLite stores below are the hot window: nothing leaves them until the archive holds it.
+    archive_dir: str = "/app/archive"
+    tick_archive_retention_days: int = Field(default=120, ge=0, le=3650)
     tick_capture_enabled: bool = True
     tick_retention_days: int = 5
     # Derived flow is ~300x smaller per session than the ticks it comes from,

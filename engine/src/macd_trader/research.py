@@ -45,16 +45,9 @@ class HistoricalStore:
           symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
           open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
           volume INTEGER NOT NULL, asset_type TEXT NOT NULL, expiry TEXT,
-          downloaded_at TEXT NOT NULL,
           PRIMARY KEY(symbol, timeframe_seconds, timestamp)
-        );
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_historical_asset_time ON historical_candles(asset_type, timestamp);
-        CREATE TABLE IF NOT EXISTS historical_indicators (
-          symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
-          macd REAL NOT NULL, signal REAL NOT NULL, histogram REAL NOT NULL,
-          bb_middle REAL, bb_upper REAL, bb_lower REAL, bb_width REAL, kama REAL,
-          PRIMARY KEY(symbol, timeframe_seconds,timestamp)
-        );
         CREATE TABLE IF NOT EXISTS download_log (
           symbol TEXT NOT NULL, asset_type TEXT NOT NULL, range_from TEXT NOT NULL, range_to TEXT NOT NULL,
           rows_saved INTEGER NOT NULL, status TEXT NOT NULL, detail TEXT, completed_at TEXT NOT NULL,
@@ -80,14 +73,10 @@ class HistoricalStore:
         self.db.commit()
 
     def save_candles(self, rows: list[Candle], asset_type: str, expiry: str | None = None) -> int:
-        now = datetime.now(UTC).isoformat()
+        from .candle_store import insert_candles
         with self.db:
-            self.db.executemany(
-                """INSERT OR REPLACE INTO historical_candles
-                (symbol,timeframe_seconds,timestamp,open,high,low,close,volume,asset_type,expiry,downloaded_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                [(r.symbol, 60, r.timestamp, r.open, r.high, r.low, r.close, r.volume, asset_type, expiry, now) for r in rows],
-            )
+            insert_candles(self.db, [(r.symbol, 60, r.timestamp, r.open, r.high, r.low, r.close, r.volume, asset_type,
+                                      expiry) for r in rows])
         return len(rows)
 
     def log_download(self, symbol: str, asset_type: str, start: date, end: date, count: int, status: str, detail: str = "") -> None:

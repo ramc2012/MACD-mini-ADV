@@ -72,34 +72,52 @@ def _history(path, rows):
     connection.close()
 
 
-def test_history_prune_drops_expired_contracts_and_old_bars_only(tmp_path):
+def test_history_prune_deletes_only_what_the_archive_holds(tmp_path):
+    from zoneinfo import ZoneInfo
+    from macd_trader import archive as arc
+    ist = ZoneInfo("Asia/Kolkata")
     path = str(tmp_path / "historical.sqlite3")
     now = datetime(2026, 9, 28, 17, 0, tzinfo=UTC)
-    recent = int((now - timedelta(days=2)).timestamp())
-    ancient = int((now - timedelta(days=200)).timestamp())
+    recent = int(datetime(2026, 9, 24, 10, 0, tzinfo=ist).timestamp())
+    ancient = int(datetime(2026, 3, 12, 10, 0, tzinfo=ist).timestamp())
     _history(path, [
         ("NSE:LONGEXPIRED26AUG", recent, "2026-08-20"),   # 39 days past expiry
         ("NSE:JUSTEXPIRED26SEP", recent, "2026-09-10"),   # 18 days past expiry: kept
         ("NSE:LIVE26OCT", recent, "2026-10-27"),
         ("NSE:SBIN-EQ", recent, None),
-        ("NSE:SBIN-EQ", ancient, None),                   # older than retention
+        ("NSE:SBIN-EQ", ancient, None),                   # older than the hot window
     ])
-    result = prune_history(path, now=now, keep_days=120, expired_keep_days=30)
-    assert result == {"candles": 2, "indicators": 2, "vacuumed": 0}
+    # No archive: nothing is deleted at all.
+    assert prune_history(path, now=now, keep_days=120, expired_keep_days=30)["candles"] == 0
+    archive = arc.Archive(tmp_path / "archive")
+    # Sealed, but the expired contract later grew a row the archive does not have: it is held.
+    arc.seal_pending(archive, history_path=path, ticks_path="", today=now.date(), bars_lookback_days=400)
+    connection = sqlite3.connect(path)
+    connection.execute("INSERT INTO historical_candles VALUES ('NSE:LONGEXPIRED26AUG',60,?,1,1,1,1,0,'option',"
+                       "'2026-08-20','x')", (recent + 60,))
+    connection.commit()
+    connection.close()
+    held = prune_history(path, now=now, keep_days=120, expired_keep_days=30, archive=archive)
+    assert (held["candles"], held["held_symbols"]) == (1, 1)            # only SBIN's ancient bar went
+    arc.seal_pending(archive, history_path=path, ticks_path="", today=now.date(), bars_lookback_days=400)
+    result = prune_history(path, now=now, keep_days=120, expired_keep_days=30, archive=archive)
+    assert (result["candles"], result["indicators"], result["held_symbols"]) == (2, 1, 0)   # its 2 bars, 1 cached row
     connection = sqlite3.connect(path)
     kept = sorted(connection.execute("SELECT symbol, timestamp FROM historical_candles").fetchall())
-    indicators = sorted(connection.execute("SELECT symbol, timestamp FROM historical_indicators").fetchall())
     connection.close()
-    assert kept == indicators == sorted([
-        ("NSE:JUSTEXPIRED26SEP", recent), ("NSE:LIVE26OCT", recent), ("NSE:SBIN-EQ", recent)])
+    assert kept == sorted([("NSE:JUSTEXPIRED26SEP", recent), ("NSE:LIVE26OCT", recent), ("NSE:SBIN-EQ", recent)])
+    assert archive.symbol_totals("bars_1m")["NSE:LONGEXPIRED26AUG"] == 2   # the archive kept both
 
 
 def test_history_prune_can_be_disabled_and_tolerates_a_missing_file(tmp_path):
+    from macd_trader import archive as arc
     path = str(tmp_path / "historical.sqlite3")
     now = datetime(2026, 9, 28, tzinfo=UTC)
     _history(path, [("NSE:OLD", int((now - timedelta(days=999)).timestamp()), "2024-01-01")])
-    assert prune_history(path, now=now, keep_days=0, expired_keep_days=0)["candles"] == 0
-    assert prune_history(str(tmp_path / "absent.sqlite3"), now=now, keep_days=1, expired_keep_days=1)["candles"] == 0
+    archive = arc.Archive(tmp_path / "archive")
+    assert prune_history(path, now=now, keep_days=0, expired_keep_days=0, archive=archive)["candles"] == 0
+    assert prune_history(str(tmp_path / "absent.sqlite3"), now=now, keep_days=1, expired_keep_days=1,
+                         archive=archive)["candles"] == 0
 
 
 def _engine(tmp_path):

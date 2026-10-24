@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import RLock
 
@@ -21,6 +21,34 @@ from .models import Candle
 
 FLUSH_INTERVAL_SECONDS = 10.0
 MAX_BUFFER_ROWS = 50_000
+
+
+# The minute-bar table. Clustered on its key (WITHOUT ROWID), so the key is stored once: the rowid layout kept a
+# 2.25 GB copy of (symbol, timeframe, timestamp) beside 6.5 GB of rows (Oct 2026). ``downloaded_at`` was dropped
+# the same day: written on every row (~32 bytes each), read by nothing. Stores built before then may still carry
+# it; ``insert_candles`` fills it there.
+CANDLES_DDL = """
+    CREATE TABLE IF NOT EXISTS historical_candles (
+      symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
+      open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
+      volume INTEGER NOT NULL, asset_type TEXT NOT NULL, expiry TEXT,
+      PRIMARY KEY(symbol, timeframe_seconds, timestamp)
+    ) WITHOUT ROWID
+"""
+_COLUMNS = "symbol, timeframe_seconds, timestamp, open, high, low, close, volume, asset_type, expiry"
+
+
+def insert_candles(connection: sqlite3.Connection, rows: list[tuple]) -> None:
+    """INSERT OR REPLACE rows in _COLUMNS order, into either table layout."""
+    connection.execute(CANDLES_DDL)
+    legacy = any(row[1] == "downloaded_at" for row in connection.execute("PRAGMA table_info(historical_candles)"))
+    if legacy:
+        stamp = datetime.now(UTC).isoformat()
+        connection.executemany(f"INSERT OR REPLACE INTO historical_candles ({_COLUMNS}, downloaded_at) "
+                               "VALUES (?,?,?,?,?,?,?,?,?,?,?)", [(*row, stamp) for row in rows])
+    else:
+        connection.executemany(f"INSERT OR REPLACE INTO historical_candles ({_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               rows)
 
 
 def _asset_type(symbol: str) -> str:
@@ -56,7 +84,6 @@ class LiveCandleWriter:
                 candle.symbol, 60, candle.timestamp,
                 candle.open, candle.high, candle.low, candle.close,
                 int(bar_volume), _asset_type(candle.symbol), expiry,
-                datetime.now(UTC).isoformat(),
             ))
 
     def start(self) -> None:
@@ -87,21 +114,7 @@ class LiveCandleWriter:
                 # WAL on a local filesystem, the rollback journal on a bind
                 # mount (see sqlite_journal: WAL corrupted a trade book there).
                 sqlite_journal.configure(connection, self._path)
-                connection.execute("""
-                    CREATE TABLE IF NOT EXISTS historical_candles (
-                      symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
-                      open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
-                      volume INTEGER NOT NULL, asset_type TEXT NOT NULL, expiry TEXT,
-                      downloaded_at TEXT NOT NULL,
-                      PRIMARY KEY(symbol, timeframe_seconds, timestamp)
-                    )
-                """)
-                connection.executemany(
-                    """INSERT OR REPLACE INTO historical_candles
-                       (symbol, timeframe_seconds, timestamp, open, high, low, close, volume, asset_type, expiry, downloaded_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    rows,
-                )
+                insert_candles(connection, rows)
                 connection.commit()
             finally:
                 connection.close()
@@ -167,29 +180,11 @@ def store_historical_candles(
     connection = sqlite3.connect(database_path, timeout=30)
     try:
         sqlite_journal.configure(connection, database_path)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS historical_candles (
-              symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
-              open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
-              volume INTEGER NOT NULL, asset_type TEXT NOT NULL, expiry TEXT,
-              downloaded_at TEXT NOT NULL,
-              PRIMARY KEY(symbol, timeframe_seconds, timestamp)
-            )
-        """)
-        downloaded_at = datetime.now(UTC).isoformat()
-        connection.executemany(
-            """INSERT OR REPLACE INTO historical_candles
-               (symbol, timeframe_seconds, timestamp, open, high, low, close, volume, asset_type, expiry, downloaded_at)
-               VALUES (?, 60, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    row.symbol, row.timestamp, row.open, row.high, row.low, row.close,
-                    int(row.volume), _asset_type(row.symbol),
-                    (expiry_by_symbol or {}).get(row.symbol, expiry), downloaded_at,
-                )
-                for row in rows
-            ],
-        )
+        insert_candles(connection, [
+            (row.symbol, 60, row.timestamp, row.open, row.high, row.low, row.close,
+             int(row.volume), _asset_type(row.symbol), (expiry_by_symbol or {}).get(row.symbol, expiry))
+            for row in rows
+        ])
         connection.commit()
         return len(rows)
     finally:
@@ -202,48 +197,66 @@ PRUNE_VACUUM_MIN_ROWS = 200_000
 
 
 def prune_history(
-    database_path: str, *, now: datetime, keep_days: int, expired_keep_days: int,
+    database_path: str, *, now: datetime, keep_days: int, expired_keep_days: int, archive=None,
 ) -> dict[str, int]:
-    """Bound the minute-bar cache, which otherwise grows ~190 MB a trading day.
+    """Bound the minute-bar cache (the hot window), which otherwise grows ~190 MB a trading day.
 
     Two rules, both measured in days:
     - an option contract's bars go ``expired_keep_days`` after its expiry;
     - any bar older than ``keep_days`` goes, contract or spot.
-    Cached indicators follow their bars. A value of 0 disables that rule.
-    Run outside market hours: the delete and any VACUUM hold the write lock.
+    A value of 0 disables that rule. Since 24 Oct 2026 a bar is deleted only when the archive (archive.py)
+    holds it: an expired contract when its archived total covers every hot row, an old day symbol by symbol
+    when that day's sidecar covers the symbol. Without an archive nothing is deleted. Only 1-minute rows are
+    touched (the timeframe the archive keeps). Cached indicators are no longer written; any left go with
+    their bars. Run outside market hours: the delete and any VACUUM hold the write lock.
     """
-    if not Path(database_path).exists():
-        return {"candles": 0, "indicators": 0, "vacuumed": 0}
+    deleted = {"candles": 0, "indicators": 0, "vacuumed": 0, "held_symbols": 0, "held_days": 0}
+    if not Path(database_path).exists() or archive is None:
+        return deleted
     connection = sqlite3.connect(database_path, timeout=60)
-    deleted = {"candles": 0, "indicators": 0, "vacuumed": 0}
     try:
         sqlite_journal.configure(connection, database_path)
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "historical_candles" not in tables:
             return deleted
         has_indicators = "historical_indicators" in tables
-        with connection:
-            if expired_keep_days > 0:
-                expired_before = (now.date().toordinal() - expired_keep_days)
-                cutoff = datetime.fromordinal(expired_before).date().isoformat()
-                symbols = [row[0] for row in connection.execute(
-                    "SELECT DISTINCT symbol FROM historical_candles WHERE expiry IS NOT NULL AND expiry < ?",
-                    (cutoff,))]
-                for offset in range(0, len(symbols), 500):
-                    chunk = symbols[offset:offset + 500]
-                    marks = ",".join("?" * len(chunk))
+        if expired_keep_days > 0:
+            expired_before = (now.date().toordinal() - expired_keep_days)
+            cutoff = datetime.fromordinal(expired_before).date().isoformat()
+            symbols = [row[0] for row in connection.execute(
+                "SELECT DISTINCT symbol FROM historical_candles WHERE expiry IS NOT NULL AND expiry < ?",
+                (cutoff,))]
+            totals = archive.symbol_totals("bars_1m")
+            for symbol in symbols:
+                hot = connection.execute("SELECT COUNT(*) FROM historical_candles WHERE symbol = ? AND "
+                                         "timeframe_seconds = 60", (symbol,)).fetchone()[0]
+                if hot > totals.get(symbol, 0):
+                    deleted["held_symbols"] += 1
+                    continue
+                with connection:
                     deleted["candles"] += connection.execute(
-                        f"DELETE FROM historical_candles WHERE symbol IN ({marks})", chunk).rowcount
+                        "DELETE FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60",
+                        (symbol,)).rowcount
                     if has_indicators:
                         deleted["indicators"] += connection.execute(
-                            f"DELETE FROM historical_indicators WHERE symbol IN ({marks})", chunk).rowcount
-            if keep_days > 0:
-                oldest = int(now.timestamp()) - keep_days * 86_400
-                deleted["candles"] += connection.execute(
-                    "DELETE FROM historical_candles WHERE timestamp < ?", (oldest,)).rowcount
-                if has_indicators:
-                    deleted["indicators"] += connection.execute(
-                        "DELETE FROM historical_indicators WHERE timestamp < ?", (oldest,)).rowcount
+                            "DELETE FROM historical_indicators WHERE symbol = ?", (symbol,)).rowcount
+        if keep_days > 0:
+            from .archive import bar_counts, day_bounds
+            oldest = (now - timedelta(days=keep_days)).date().isoformat()
+            old_days = [day for day in archive.days("bars_1m") if day < oldest]
+            symbols = [row[0] for row in connection.execute("SELECT DISTINCT symbol FROM historical_candles")] \
+                if old_days else []
+            for day in old_days:
+                start, end = day_bounds(day)
+                sealed = archive.symbol_rows("bars_1m", day)
+                for symbol, hot in bar_counts(connection, day, symbols).items():
+                    if hot > sealed.get(symbol, 0):
+                        deleted["held_days"] += 1
+                        continue
+                    with connection:
+                        deleted["candles"] += connection.execute(
+                            """DELETE FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60
+                               AND timestamp >= ? AND timestamp < ?""", (symbol, start, end)).rowcount
         if deleted["candles"] + deleted["indicators"] >= PRUNE_VACUUM_MIN_ROWS:
             connection.execute("VACUUM")
             deleted["vacuumed"] = 1

@@ -844,7 +844,14 @@ def test_chain_days_is_a_ledger_and_old_sessions_keep_only_their_close(tmp_path)
 
     assert connection.execute("SELECT COUNT(DISTINCT day) FROM chain_days").fetchone()[0] == 2
 
-    removed = whale.condense_chain_snapshots(connection, DAY, keep_days=30)
+    assert whale.condense_chain_snapshots(connection, DAY, keep_days=30) == 0     # nothing thinned unarchived
+    connection.commit()
+    from datetime import date
+    from macd_trader import archive as arc
+    archive = arc.Archive(tmp_path / "archive")
+    arc.seal_pending(archive, history_path=str(tmp_path / "h.sqlite3"), ticks_path="",
+                     today=date.fromisoformat(DAY), bars_lookback_days=0)
+    removed = whale.condense_chain_snapshots(connection, DAY, keep_days=30, archive=archive)
 
     assert removed == 2
     assert [row[0] for row in connection.execute("SELECT ts FROM chain_snapshots ORDER BY ts")] == [

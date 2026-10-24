@@ -34,19 +34,8 @@ def load_chart_history(
     connection = sqlite3.connect(database_path, timeout=30)
     connection.row_factory = sqlite3.Row
     try:
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS historical_indicators (
-              symbol TEXT NOT NULL, timeframe_seconds INTEGER NOT NULL, timestamp INTEGER NOT NULL,
-              macd REAL NOT NULL, signal REAL NOT NULL, histogram REAL NOT NULL,
-              bb_middle REAL, bb_upper REAL, bb_lower REAL, bb_width REAL, kama REAL,
-              kama_rsi REAL, kama_roc REAL,
-              PRIMARY KEY(symbol, timeframe_seconds,timestamp)
-            )
-        """)
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(historical_indicators)")}
-        for name in ("kama_rsi", "kama_roc"):
-            if name not in columns:
-                connection.execute(f"ALTER TABLE historical_indicators ADD COLUMN {name} REAL")
+        # Indicators are computed per request and returned, never stored: the historical_indicators table they
+        # were once written to (3.3 GB by Oct 2026) had no reader, and every chart load rewrote thousands of rows.
         try:
             if source_row_limit is None:
                 rows = connection.execute(
@@ -100,17 +89,6 @@ def load_chart_history(
                 symbol, candle.timestamp, macd_value.macd, macd_value.signal, macd_value.histogram,
                 bb.middle, bb.upper, bb.lower, bb.width, kama_value, rsi_value, roc_value,
             ))
-        connection.executemany(
-            """INSERT OR REPLACE INTO historical_indicators
-               (symbol,timeframe_seconds,timestamp,macd,signal,histogram,bb_middle,bb_upper,bb_lower,bb_width,kama,kama_rsi,kama_roc)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [
-                (point.symbol, timeframe_seconds, point.timestamp, point.macd, point.signal, point.histogram,
-                 point.bb_middle, point.bb_upper, point.bb_lower, point.bb_width, point.kama, point.kama_rsi, point.kama_roc)
-                for point in indicators
-            ],
-        )
-        connection.commit()
         return {"symbol": symbol, "timeframe_seconds": timeframe_seconds, "candles": candles, "indicators": indicators}
     finally:
         connection.close()

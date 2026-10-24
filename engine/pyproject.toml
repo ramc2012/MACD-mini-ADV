@@ -16,6 +16,8 @@ dependencies = [
   # The tick bus between the strategy and desk processes.
   "nats-py>=2.7",
   "pydantic-settings>=2.2",
+  # The market-data archive (archive.py): Parquet + zstd, imported only by the archive pass.
+  "pyarrow==21.0.0",
   "uvicorn[standard]>=0.29",
 ]
 

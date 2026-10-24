@@ -98,6 +98,7 @@ class DeskMixin:
                                    "whale_error": None, "windows": 0, "alerts_today": 0,
                                    "history_days": 0, "composite": {}}
         self.whale_alert_queue: list[dict] = []
+        self.archive_report: dict | None = None
         self._quotes_blocked_until = 0.0
         self._quotes_backoff = QUOTES_BACKOFF_SECONDS
         self.agent_status: dict = {"emitted_day": None, "emit": None, "learned_day": None, "learn": None,
@@ -279,25 +280,47 @@ class DeskMixin:
                 mapping[symbol] = source
         return mapping
 
-    async def _tick_maintenance_loop(self) -> None:
-        """Condense raw ticks past the retention window, outside market hours.
+    def archive(self):
+        """The market-data archive (archive.py), or None when its folder is not mounted -- then nothing is
+        deleted from the hot stores, which is the safe failure."""
+        from .archive import Archive
+        archive = Archive(getattr(self.settings, "archive_dir", "") or "/nonexistent")
+        return archive if archive.available() else None
 
-        Condensing a full day means streaming several million rows, so it is
-        never allowed to run during the session — the loop simply waits. The
-        VACUUM afterwards is what actually returns the deleted rows' pages to
-        the filesystem; without it the file only ever grows.
+    def _archive_pass(self) -> dict:
+        """Seal finished days into the archive (worker thread; outside market hours)."""
+        from . import archive as arc
+        archive = self.archive()
+        if archive is None:
+            return {"error": f"archive folder {getattr(self.settings, 'archive_dir', '')} is not mounted; "
+                             "the hot stores keep everything"}
+        return arc.seal_pending(archive, history_path=self.settings.research_database_path,
+                                ticks_path=self.settings.tick_database_path if self.settings.tick_capture_enabled else "",
+                                today=datetime.now(IST).date(),
+                                tick_retention_days=getattr(self.settings, "tick_archive_retention_days", 120))
+
+    async def _tick_maintenance_loop(self) -> None:
+        """Outside market hours: condense finished days, seal them into the archive, then trim the hot stores.
+
+        Order matters. Condensing writes the minute flow and ladder (the raw ticks stay); the archive pass seals
+        ticks, flow, ladders, bars, chains and OI; only then may ``purge_raw`` / ``prune_flow`` delete, and only
+        what the archive covers. Condensing a full day streams millions of rows, so none of this runs during
+        the session. The VACUUM afterwards returns the deleted rows' pages to the filesystem.
         """
         while True:
             await asyncio.sleep(TICK_MAINTENANCE_INTERVAL_SECONDS)
             if _engine().regular_session_open() or _engine().preopen_window():
                 continue
             try:
-                done = await asyncio.to_thread(self.tick_store.condense_pending)
-                pruned = await asyncio.to_thread(self.tick_store.prune_flow)
-                if done or pruned["minute_rows"] or pruned["ladder_rows"]:
+                await asyncio.to_thread(self.tick_store.condense_pending)        # condense only; no archive yet
+                self.archive_report = await asyncio.to_thread(self._archive_pass)
+                archive = self.archive()
+                await asyncio.to_thread(self.tick_store.purge_raw, None, archive)
+                pruned = await asyncio.to_thread(self.tick_store.prune_flow, None, archive)
+                if (self.tick_store.last_purge or {}).get("raw_ticks") or pruned["minute_rows"] or pruned["ladder_rows"]:
                     await asyncio.to_thread(self.tick_store.vacuum)
             except Exception as exc:  # noqa: BLE001 — maintenance must not die
-                self.tick_store.last_error = f"condense failed: {exc}"
+                self.tick_store.last_error = f"tick maintenance failed: {exc}"
 
     def nightly_symbols(self) -> list[str]:
         """Underlyings only: spots, indices, the desk's futures."""
@@ -332,7 +355,7 @@ class DeskMixin:
     async def _run_nightly(self, day: str, coverage: dict) -> dict:
         report = await asyncio.to_thread(
             nightly.run, self.settings.tick_database_path, self.settings.research_database_path, day,
-            self.nightly_symbols(), self.whale_symbols(), dict(self.mp.lot_sizes))
+            self.nightly_symbols(), self.whale_symbols(), dict(self.mp.lot_sizes), self.archive())
         return {**report, "coverage_complete": bool(coverage.get("complete")),
                 "partial": not coverage.get("complete"), "missing_symbols": len(coverage.get("missing") or {})}
 

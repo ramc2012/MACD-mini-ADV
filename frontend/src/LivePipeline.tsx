@@ -128,11 +128,8 @@ export function LivePipeline({ symbol, onSelect }: { symbol: string; onSelect: (
             stats ? stats.shards.map((shard) => count.format(shard.symbols)).join(" / ") + " symbols per shard" : "—",
             `seeded ${count.format(stats?.seeds.by_state.seeded || 0)} · pending ${count.format(stats?.seeds.by_state.pending || 0)} · failed ${count.format(stats?.seeds.by_state.failed || 0)}`,
           ]} />
-        <Stage title="QuestDB" loaded={loaded} ok={!!stats?.questdb.connected && !!stats.questdb.tables_ready}
-          lines={[
-            `${count.format(stats?.questdb.lines || 0)} lines written`,
-            `${count.format(stats?.questdb.dropped || 0)} dropped · tables ${stats?.questdb.tables_ready ? "ready" : "not ready"}`,
-          ]} />
+        <Stage title="Market-data archive" loaded={loaded} ok
+          lines={["QuestDB retired 24 Oct 2026", "ticks, bars, chains, OI and flow are sealed nightly to Parquet"]} />
       </div>
       {stats?.last_error && <p className="quant-note">Last pipeline error: {stats.last_error}</p>}
 

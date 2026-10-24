@@ -310,6 +310,7 @@ class DeskEngine(DeskMixin):
             "mp_index_shadow": self.mp_index_shadow_view(),
             "chain": self.chain_status,
             "nightly": self.nightly_report,
+            "archive": self.archive_report,
             "tick_store": self.tick_store.status(include_database_counts=False)
             if self.settings.tick_capture_enabled else None,
             "bus": self.bus.status(),
