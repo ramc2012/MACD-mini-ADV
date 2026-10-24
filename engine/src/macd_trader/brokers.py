@@ -402,6 +402,25 @@ class FyersBroker(Broker):
     def authorization(self) -> str:
         return f"{self.settings.fyers_client_id}:{self.settings.fyers_access_token}"
 
+    async def _data_get(self, client: httpx.AsyncClient, endpoint: str, params: dict, *, priority: str,
+                        ttl_ms: int | None = None) -> httpx.Response:
+        """GET a Fyers data endpoint, directly or through the market-intelligence hub.
+
+        With ``market_hub_url`` set, the call goes to the hub's /v1/request: one budget shared with every other
+        caller of the same Fyers account, a short cache shared with Nomad Curie, and the hub's 429 back-off. The
+        hub answers with Fyers' own status and body, so every parser below is unchanged. Empty (the default):
+        straight to Fyers, as before.
+        """
+        hub = (getattr(self.settings, "market_hub_url", "") or "").rstrip("/")
+        if not hub:
+            return await client.get(f"{self.data_url}/{endpoint}", params=params,
+                                    headers={"Authorization": self.authorization})
+        body = {"broker": "fyers", "endpoint": endpoint, "query": {k: str(v) for k, v in params.items()},
+                "priority": priority, "caller": "macd-mini-adv"}
+        if ttl_ms is not None:
+            body["ttl_ms"] = ttl_ms
+        return await client.post(f"{hub}/v1/request", json=body)
+
     @staticmethod
     def exchange_timestamp(payload: dict) -> datetime:
         """Return Fyers exchange time, never the browser/server wall clock when supplied."""
@@ -490,7 +509,7 @@ class FyersBroker(Broker):
             "cont_flag": "1",
         }
         async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(f"{self.data_url}/history", params=params, headers={"Authorization": self.authorization})
+            response = await self._data_get(client, "history", params, priority="normal")
             response.raise_for_status()
             payload = response.json()
         if payload.get("s") == "error":
@@ -509,7 +528,7 @@ class FyersBroker(Broker):
             "cont_flag": "1",
         }
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(f"{self.data_url}/history", params=params, headers={"Authorization": self.authorization})
+            response = await self._data_get(client, "history", params, priority="bulk")
             response.raise_for_status()
             payload = response.json()
         if payload.get("s") == "error":
@@ -541,11 +560,9 @@ class FyersBroker(Broker):
                 chunk = requested[offset: offset + 40]
                 response = None
                 for attempt in range(4):
-                    response = await client.get(
-                        f"{self.data_url}/quotes",
-                        params={"symbols": ",".join(chunk)},
-                        headers={"Authorization": self.authorization},
-                    )
+                    # Marks: the hub's highest class, coalesced but never served from cache.
+                    response = await self._data_get(client, "quotes", {"symbols": ",".join(chunk)},
+                                                    priority="critical", ttl_ms=0)
                     if response.status_code != 429:
                         break
                     await asyncio.sleep(2 ** attempt)
@@ -571,8 +588,7 @@ class FyersBroker(Broker):
         sends OI on this account and /quotes has no OI field at all (checked 23 Oct 2026, futures included).
         Depth takes exactly one symbol per call."""
         async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(f"{self.data_url}/depth", params={"symbol": symbol, "ohlcv_flag": "1"},
-                                        headers={"Authorization": self.authorization})
+            response = await self._data_get(client, "depth", {"symbol": symbol, "ohlcv_flag": "1"}, priority="high")
             response.raise_for_status()
             payload = response.json()
         if payload.get("s") == "error":
@@ -584,18 +600,14 @@ class FyersBroker(Broker):
                 "ltp": float(row.get("ltp") or 0), "volume": int(row.get("v") or 0)}
 
     async def option_chain(self, symbol: str, expiry_token: str | None = None,
-                           strikecount: int = 12) -> OptionChain:
+                           strikecount: int = 12, priority: str = "high") -> OptionChain:
         params = {"symbol": symbol, "strikecount": str(strikecount)}
         if expiry_token:
             # Fyers keys a specific expiry by the epoch it reports in
             # expiryData; without it the response is always the front expiry.
             params["timestamp"] = str(expiry_token)
         async with httpx.AsyncClient(timeout=18) as client:
-            response = await client.get(
-                f"{self.data_url}/options-chain-v3",
-                params=params,
-                headers={"Authorization": self.authorization},
-            )
+            response = await self._data_get(client, "options-chain-v3", params, priority=priority)
             response.raise_for_status()
             payload = response.json()
         if payload.get("s") == "error":

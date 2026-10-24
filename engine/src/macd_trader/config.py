@@ -290,6 +290,10 @@ class Settings(BaseSettings):
     # The permanent market-data archive (archive.py): a host folder mounted into the containers, so a Docker
     # reset cannot take it. Raw ticks are kept there tick_archive_retention_days; every other dataset forever.
     # The SQLite stores below are the hot window: nothing leaves them until the archive holds it.
+    # The market-intelligence hub (~/market-intelligence): when set, every Fyers data REST call goes through its
+    # shared budget and cache (brokers.FyersBroker._data_get). Empty = straight to Fyers. Switch on only after the
+    # hub's shadow capture has matched this app's over a session (platform phase 2 gate).
+    market_hub_url: str = ""
     archive_dir: str = "/app/archive"
     tick_archive_retention_days: int = Field(default=120, ge=0, le=3650)
     tick_capture_enabled: bool = True

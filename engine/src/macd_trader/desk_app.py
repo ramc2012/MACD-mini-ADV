@@ -78,9 +78,10 @@ class StrategyClient:
 
     # The two broker calls the desk's collectors make, same shapes as a Broker.
     async def option_chain(self, symbol: str, expiry_token: str | None = None,
-                           strikecount: int | None = None) -> OptionChain:
+                           strikecount: int | None = None, priority: str | None = None) -> OptionChain:
         params = {**({"strikecount": strikecount} if strikecount else {}),
-                  **({"expiry": expiry_token} if expiry_token else {})}
+                  **({"expiry": expiry_token} if expiry_token else {}),
+                  **({"priority": priority} if priority else {})}
         raw = await self._broker("GET", f"/api/internal/option-chain/{symbol}", params=params)
         return OptionChain(
             expiry=raw["expiry"], spot_price=raw["spot_price"],

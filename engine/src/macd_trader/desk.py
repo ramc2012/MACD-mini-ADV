@@ -636,14 +636,15 @@ class DeskMixin:
 
     async def _stock_chain(self, name: str, spot: str) -> int:
         stamp = whale.snapshot_stamp()
-        chain = await self.broker.option_chain(spot, strikecount=oi_capture.STOCK_STRIKES)
+        # The sweep is the lowest class in the hub's budget (when routed through it): marks and index chains first.
+        chain = await self.broker.option_chain(spot, strikecount=oi_capture.STOCK_STRIKES, priority="bulk")
         chains = [chain]
         token = oi_capture.next_expiry_token(chain, chain.expiry, oi_capture.NEXT_SERIES_WITHIN_DAYS,
                                              datetime.now(IST).date())
         if token:
             await asyncio.sleep(oi_capture.STOCK_CALL_GAP_SECONDS)
             chains.append(await self.broker.option_chain(spot, expiry_token=token,
-                                                         strikecount=oi_capture.STOCK_STRIKES))
+                                                         strikecount=oi_capture.STOCK_STRIKES, priority="bulk"))
         for one in chains:
             await asyncio.to_thread(self._store_chain, stamp, name, one)
         return sum(len(one.entries) for one in chains)

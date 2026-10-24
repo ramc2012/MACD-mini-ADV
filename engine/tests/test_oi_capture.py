@@ -34,8 +34,9 @@ def test_a_stock_chain_stores_front_and_next_series_under_the_stock_name(tmp_pat
     calls = []
     listed = [Expiry("2026-10-27", "a"), Expiry("2026-11-24", "b")]
 
-    async def option_chain(symbol, expiry_token=None, strikecount=None):
+    async def option_chain(symbol, expiry_token=None, strikecount=None, priority=None):
         calls.append((symbol, expiry_token, strikecount))
+        assert priority == "bulk"                     # the sweep is the hub's lowest class
         return _chain("2026-11-24" if expiry_token else "2026-10-27", listed)
 
     async def no_sleep(_seconds):
