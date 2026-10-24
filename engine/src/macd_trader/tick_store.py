@@ -442,6 +442,13 @@ class TickStore:
                     continue
                 deleted += connection.execute("DELETE FROM ticks WHERE ts_ms >= ? AND ts_ms < ?",
                                               (start, start + 86_400_000)).rowcount
+            # Live minute rows (live_features.py) are the session's working copy; once a day is condensed and
+            # past the hot window the condensed rows (archived) supersede them.
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'live_flow_minutes'").fetchone():
+                cutoff_s = int(datetime.fromisoformat(f"{cutoff}T00:00:00").replace(tzinfo=IST).timestamp())
+                connection.execute("""DELETE FROM live_flow_minutes WHERE minute_ts < ? AND
+                                      date(minute_ts,'unixepoch','+5 hours','+30 minutes')
+                                      IN (SELECT day FROM tick_condensed_days)""", (cutoff_s,))
             connection.commit()
         finally:
             connection.close()

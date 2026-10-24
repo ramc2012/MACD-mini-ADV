@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import fields
 from datetime import datetime
 from itertools import count
@@ -53,11 +54,18 @@ def encode_tick(tick: Tick, *, seq: int, analysis_only: bool, received_at: datet
 
 def decode_tick(payload: bytes) -> tuple[Tick, bool, int]:
     """(tick, analysis_only, seq) from a bus message."""
+    tick, analysis_only, seq, _stamps = decode_tick_stamped(payload)
+    return tick, analysis_only, seq
+
+
+def decode_tick_stamped(payload: bytes) -> tuple[Tick, bool, int, tuple[int | None, int | None]]:
+    """(tick, analysis_only, seq, (exchange_ts_ms, received_ts_ms)) from a bus message."""
     message = orjson.loads(payload)
     values = {name: message.get(name) for name in _TICK_FIELDS if name in message}
     values["timestamp"] = datetime.fromisoformat(message["timestamp"])
     values["volume"] = int(values.get("volume") or 0)
-    return Tick(**values), bool(message.get("analysis_only")), int(message.get("seq") or 0)
+    return (Tick(**values), bool(message.get("analysis_only")), int(message.get("seq") or 0),
+            (message.get("exchange_ts_ms"), message.get("received_ts_ms")))
 
 
 class TickBusPublisher:
@@ -139,9 +147,11 @@ class TickBusPublisher:
 class TickBusSubscriber:
     """Delivers bus ticks to ``handler`` in publish order, counting any loss."""
 
-    def __init__(self, url: str, handler: Callable[[Tick, bool], Awaitable[None]]):
+    def __init__(self, url: str, handler: Callable[[Tick, bool], Awaitable[None]], on_stamps=None):
         self.url = url
         self._handler = handler
+        # on_stamps(exchange_ts_ms, received_ts_ms, delivered_ts_ms): the latency meter's hook (live_features.py)
+        self._on_stamps = on_stamps
         self._connection = None
         self.received = 0
         self.lost = 0
@@ -174,10 +184,15 @@ class TickBusSubscriber:
 
     async def _on_message(self, message) -> None:
         try:
-            tick, analysis_only, seq = decode_tick(message.data)
+            tick, analysis_only, seq, (exchange_ms, received_ms) = decode_tick_stamped(message.data)
         except Exception:  # noqa: BLE001
             self.undecodable += 1
             return
+        if self._on_stamps is not None:
+            try:
+                self._on_stamps(exchange_ms, received_ms, time.time() * 1000)
+            except Exception:  # noqa: BLE001 — measurement never blocks delivery
+                pass
         self.observe_seq(seq)
         self.received += 1
         await self._handler(tick, analysis_only)

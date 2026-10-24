@@ -26,8 +26,12 @@ def is_underlying(symbol: str) -> bool:
 
 
 class EntryFlow:
-    def __init__(self) -> None:
+    def __init__(self, snapshots=None) -> None:
         self.tracker = OrderFlowTracker()
+        # The desk's published flow (live_features.FlowSnapshots), read first; this process's own tracker is the
+        # fallback until the two are shown to agree on live sessions.
+        self.snapshots = snapshots
+        self.reads = {"desk": 0, "local": 0}
         self.day: str | None = None
         self.prints = 0
         self.error: str | None = None
@@ -62,13 +66,25 @@ class EntryFlow:
             if not parsed:
                 return None
             underlying = self._underlying(parsed)
-            state = self.tracker.states.get(underlying) if underlying else None
             out = {"underlying": underlying, "side": parsed["side"], "flow_day": self.day}
+            published = self.snapshots.get(underlying) if (self.snapshots is not None and underlying) else None
+            if published is not None and published.get("day") == self.day:
+                classified = published.get("session_classified_volume") or 0
+                share = published["session_cvd"] / classified if classified else None
+                self.reads["desk"] += 1
+                return {**out, "source": "desk", "session_cvd": published["session_cvd"],
+                        "session_classified_volume": classified,
+                        "session_total_volume": published.get("session_total_volume"),
+                        "session_cvd_share_signed": round(share * parsed["side"], 5) if share is not None else None,
+                        "underlying_price": published.get("last_price"), "prints": published.get("trades")}
+            state = self.tracker.states.get(underlying) if underlying else None
+            self.reads["local"] += 1
             if state is None:
-                return {**out, "session_cvd": None}
+                return {**out, "source": "local", "session_cvd": None}
             classified = state.buy_volume + state.sell_volume
             share = state.cumulative_delta / classified if classified else None
-            return {**out, "session_cvd": state.cumulative_delta, "session_classified_volume": classified,
+            return {**out, "source": "local", "session_cvd": state.cumulative_delta,
+                    "session_classified_volume": classified,
                     "session_total_volume": state.total_volume,
                     "session_cvd_share_signed": round(share * parsed["side"], 5) if share is not None else None,
                     "underlying_price": state.last_price, "prints": state.trades}
@@ -77,4 +93,6 @@ class EntryFlow:
             return None
 
     def health(self) -> dict:
-        return {"day": self.day, "underlyings": len(self.tracker.states), "prints": self.prints, "error": self.error}
+        return {"day": self.day, "underlyings": len(self.tracker.states), "prints": self.prints, "error": self.error,
+                "reads": dict(self.reads),
+                "published": self.snapshots.status() if self.snapshots is not None else None}

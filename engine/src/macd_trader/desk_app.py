@@ -17,6 +17,7 @@ local volume, where SQLite's cross-process locking holds.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -144,7 +145,14 @@ class DeskEngine(DeskMixin):
         self.error: str | None = None
         self.strategy = StrategyClient(settings.strategy_url, settings.api_token)
         self.broker = self.strategy
-        self.bus = TickBusSubscriber(settings.nats_url, self._on_bus_tick)
+        # Live features (live_features.py): the desk's flow tracker and profiles, published as they form, and
+        # the latency of every hop of the live path. The universe is the desk's own (index futures + stocks).
+        from .live_features import LiveFeatures
+        self.features = LiveFeatures(settings.nats_url,
+                                     settings.tick_database_path if settings.tick_capture_enabled else None,
+                                     self.mp.flow, self.mp.profiles,
+                                     universe=lambda: getattr(self.mp, "_universe_set", None) or ())
+        self.bus = TickBusSubscriber(settings.nats_url, self._on_bus_tick, on_stamps=self._on_bus_stamps)
         self.context: dict = {"loaded": False, "at": None, "error": None, "selection_date": None}
         self._configured_key: tuple | None = None
         self._applied_settings: dict = {}
@@ -164,7 +172,19 @@ class DeskEngine(DeskMixin):
         if not self.active:
             return
         self.latest_ticks[tick.symbol] = tick
+        started = time.perf_counter()
         await self._desk_on_tick(tick, analysis_only)
+        self.features.latency.add("desk", (time.perf_counter() - started) * 1000)
+
+    def _on_bus_stamps(self, exchange_ms, received_ms, delivered_ms) -> None:
+        """Feed lag (exchange time -> engine receipt) and bus lag (engine receipt -> desk delivery), per tick.
+        An illiquid contract re-sends its last trade's old exchange time, so only lags under a minute are a
+        measure of the feed rather than of the contract's inactivity."""
+        if not self.active or received_ms is None:
+            return
+        self.features.latency.add("bus", max(0.0, delivered_ms - received_ms))
+        if exchange_ms is not None and 0 <= received_ms - exchange_ms < 60_000:
+            self.features.latency.add("feed", float(received_ms - exchange_ms))
 
     # -- context from the strategy process ------------------------------------
 
@@ -218,12 +238,14 @@ class DeskEngine(DeskMixin):
             return
         self.active = active
         if active:
+            self.features.start()
             loops = [self._holdings_loop(), self._expiry_flatten_loop(), self._session_close_loop(),
                      self._nightly_loop(), self._chain_loop(), self._stock_chain_loop(), self._agent_loop()]
             if self.settings.tick_capture_enabled:
                 loops.append(self._tick_maintenance_loop())
             self._lane_tasks = [asyncio.create_task(loop) for loop in loops]
         else:
+            await self.features.stop()
             for task in self._lane_tasks:
                 task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -311,6 +333,7 @@ class DeskEngine(DeskMixin):
             "chain": self.chain_status,
             "nightly": self.nightly_report,
             "archive": self.archive_report,
+            "features": self.features.status(),
             "tick_store": self.tick_store.status(include_database_counts=False)
             if self.settings.tick_capture_enabled else None,
             "bus": self.bus.status(),

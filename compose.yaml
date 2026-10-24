@@ -99,7 +99,11 @@ services:
   # ~9% CPU even idle. Analytics keeps its in-memory live state without it.)
   nats:
     image: nats:2.10-alpine
-    command: ["--http_port", "8222"]
+    # JetStream on, file-backed: the live feature stream (FT, 3 days) and the latest-snapshot KV bucket
+    # (engine/src/macd_trader/live_features.py). Ticks stay on core subjects.
+    command: ["--http_port", "8222", "-js", "-sd", "/data"]
+    volumes:
+      - nats_data:/data
     restart: unless-stopped
 
   analytics:
@@ -186,4 +190,5 @@ services:
 
 volumes:
   engine_data:
+  nats_data:
   us_paper_data:

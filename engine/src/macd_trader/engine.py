@@ -372,7 +372,9 @@ class TradingEngine(DeskMixin):
         self.context_indices_status: dict = {}
         self.expired_settlements: list[dict] = []
         self._self_heal_task: asyncio.Task | None = None
-        self.entry_flow = EntryFlow()
+        from .live_features import FlowSnapshots
+        self.flow_snapshots = FlowSnapshots(settings.nats_url) if settings.nats_url else None
+        self.entry_flow = EntryFlow(self.flow_snapshots)
         self.entry_grader = EntryGrader(settings.research_database_path)
         quote = lambda symbol: self.latest_ticks.get(symbol)  # noqa: E731
         for execution in (self.execution, self.blast.execution, *[lane.execution for lane in _smart_lanes(self)]):
@@ -395,6 +397,8 @@ class TradingEngine(DeskMixin):
         self._lag_task = asyncio.create_task(self._lag_probe_loop())
         if self.bus is not None:
             self.bus.start()
+        if self.flow_snapshots is not None and not self.desk_local:
+            self.flow_snapshots.start()
         if not self.desk_local and self.settings.desk_url:
             self._desk_status_task = asyncio.create_task(self._desk_status_loop())
         self.status = "connecting"
@@ -1556,6 +1560,8 @@ class TradingEngine(DeskMixin):
                 await self.agentic.telegram.stop()
         if self.bus is not None:
             await self.bus.stop()
+            if self.flow_snapshots is not None:
+                await self.flow_snapshots.stop()
         with suppress(Exception):
             self.repository.save_position_excursions(self.portfolio.positions.values())
         self.repository.close()
@@ -2680,6 +2686,7 @@ class TradingEngine(DeskMixin):
             "candle_writer": self.candle_writer.status(),
             "history_prune": self.history_prune,
             "archive": getattr(self, "archive_report", None) if self.desk_local else self.desk_status.get("archive"),
+            "features": None if self.desk_local else self.desk_status.get("features"),
             "tick_store": (self.tick_store.status(include_database_counts=False)
                            if self.settings.tick_capture_enabled else None)
             if self.desk_local else self.desk_status.get("tick_store"),
