@@ -376,3 +376,26 @@ class FlowSnapshots:
 
     def status(self) -> dict:
         return {"symbols": len(self.latest), "received": self.received, "last_error": self.last_error}
+
+
+def read_live_minutes(tick_db_path: str | None, symbol: str, day: str) -> list[list] | None:
+    """Today's published minutes for one symbol, as FlowState.minutes rows [minute, close, volume, buy, sell, cvd]
+    -- the form mp_annotations and the minute detectors read. None when nothing is stored."""
+    if not tick_db_path:
+        return None
+    from datetime import datetime as _dt
+    start = int(_dt.fromisoformat(f"{day}T00:00:00").replace(tzinfo=IST).timestamp())
+    try:
+        connection = sqlite3.connect(f"file:{tick_db_path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = connection.execute(
+            """SELECT minute_ts, close, volume, buy_volume, sell_volume, cvd FROM live_flow_minutes
+               WHERE symbol = ? AND minute_ts >= ? AND minute_ts < ? ORDER BY minute_ts""",
+            (symbol, start, start + 86_400)).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    return [list(row) for row in rows] or None

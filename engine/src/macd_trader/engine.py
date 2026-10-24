@@ -1673,7 +1673,11 @@ class TradingEngine(DeskMixin):
             and in_session(tick.symbol, exchange_at)
         )
         if in_session(tick.symbol, self.last_tick_at) and current_session_print:
-            if is_underlying(tick.symbol):
+            # One tracker: the desk's, read through its published snapshots. This process folds ticks only while
+            # none has arrived (desk down or not yet publishing), or when configured to ("local").
+            published = (self.flow_snapshots is not None and self.flow_snapshots.received > 0
+                         and getattr(self.settings, "entry_flow_source", "desk") == "desk")
+            if is_underlying(tick.symbol) and not published:
                 try:
                     self.entry_flow.on_tick(tick)
                 except Exception as exc:  # noqa: BLE001 -- measurement must not cost the feed

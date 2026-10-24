@@ -875,9 +875,13 @@ class AgenticLane:
             fut = self._front_future(entry["index"], now)
             if not fut:
                 continue
-            tracker = getattr(getattr(self.engine, "entry_flow", None), "tracker", None)
-            state = tracker.states.get(fut) if tracker is not None else None
-            flow_minutes = [list(m) for m in getattr(state, "minutes", [])] if state is not None else None
+            # The desk's published minutes (live_features), then this process's own tracker as the fallback.
+            from .live_features import read_live_minutes
+            flow_minutes = read_live_minutes(getattr(self.settings, "tick_database_path", None), fut, now.date().isoformat())
+            if flow_minutes is None:
+                tracker = getattr(getattr(self.engine, "entry_flow", None), "tracker", None)
+                state = tracker.states.get(fut) if tracker is not None else None
+                flow_minutes = [list(m) for m in getattr(state, "minutes", [])] if state is not None else None
             notes = mp_annotations.annotate(self.settings.research_database_path, fut, now, flow_minutes, self._annotation_cache)
             if notes.get("notes"):
                 entry["profile_and_period"] = {"read_on": fut.split(":")[-1], "notes": notes["notes"]}

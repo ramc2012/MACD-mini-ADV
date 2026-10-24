@@ -202,6 +202,17 @@ def flow(ticks_path: str, symbol: str, day: str, limit: int = MAX_FLOW_MINUTES) 
                 source = "raw" if rows else "none"
             except sqlite3.OperationalError:
                 source = "none"
+        if not rows:
+            # The desk's published minutes (live_features.py): no OFI or confidence, but present when the raw
+            # tier is not (a store opened without it, or a day whose raw ticks are already archived).
+            try:
+                rows = _rows(connection, """SELECT minute_ts, close, volume, delta, buy_volume, sell_volume
+                       FROM live_flow_minutes WHERE symbol = ?
+                         AND date(minute_ts,'unixepoch','+5 hours','+30 minutes') = ?
+                       ORDER BY minute_ts LIMIT ?""", (symbol, day, limit))
+                source = "live" if rows else source
+            except sqlite3.OperationalError:
+                pass
     finally:
         connection.close()
     cumulative_delta = cumulative_ofi = 0.0

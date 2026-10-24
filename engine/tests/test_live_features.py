@@ -120,3 +120,13 @@ def test_entry_flow_reads_the_desk_snapshot_first_and_falls_back_to_its_own():
     snapshots.get = lambda symbol, now=None: FlowSnapshots.get(snapshots, symbol, now_ms + 600_000)   # stale
     assert flow.context("NSE:RELIANCE26OCT1200CE")["source"] == "local"
     assert flow.health()["reads"] == {"desk": 1, "local": 1}
+
+
+def test_published_minutes_are_read_back_in_tracker_form(tmp_path):
+    from macd_trader.live_features import read_live_minutes
+    features = _features(tmp_path, {"NSE:NIFTY26OCTFUT": _state("NSE:NIFTY26OCTFUT",
+                                                                [(T0, 100.0, 10, 6, 4, 2), (T0 + 60, 101.0, 5, 1, 4, -1)])})
+    asyncio.run(features.publish_once(now=T0 + 130))
+    rows = read_live_minutes(str(tmp_path / "ticks.sqlite3"), "NSE:NIFTY26OCTFUT", "2026-10-26")
+    assert rows == [[T0, 100.0, 10.0, 6.0, 4.0, 2.0], [T0 + 60, 101.0, 5.0, 1.0, 4.0, -1.0]]
+    assert read_live_minutes(str(tmp_path / "missing.sqlite3"), "X", "2026-10-26") is None
