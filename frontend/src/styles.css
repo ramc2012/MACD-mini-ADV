@@ -1260,3 +1260,40 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .auction-notes .auction-note-list { margin: 6px 0 4px; padding-left: 18px; font-size: 12px; color: #cfd9e7; line-height: 1.45; }
 .auction-notes .auction-note-foot { color: #8fa1b8; font-size: 10.5px; }
 .auction-notes .auction-stat-row small { display: block; color: #8fa1b8; font-size: 10px; }
+
+/* Auction page tabs + order-flow workstation (AuctionWorkstation.tsx) */
+.auction-tabs { display: flex; gap: 4px; margin: 0 0 10px; }
+.auction-tabs button { background: #111827; border: 1px solid #243045; color: #9aa8bc; border-radius: 6px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+.auction-tabs button.active { background: #1e3a8a; border-color: #2f5bd3; color: #fff; }
+.auction-flow-page { min-height: 0; }
+.ws-root { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: calc(100vh - 128px); min-height: 560px; background: #0b0f17; border: 1px solid #1c2636; border-radius: 8px; overflow: hidden; }
+.ws-toolbar { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid #1c2636; flex-wrap: wrap; }
+.ws-symbol { background: #111827; color: #e6edf6; border: 1px solid #243045; border-radius: 6px; padding: 5px 8px; font-weight: 600; min-width: 210px; }
+.ws-last { font: 600 15px ui-monospace, Menlo, monospace; color: #e6edf6; display: flex; gap: 8px; align-items: baseline; }
+.ws-last em { font-style: normal; font-size: 12px; }
+.ws-group { display: flex; border: 1px solid #243045; border-radius: 6px; overflow: hidden; }
+.ws-group button, .ws-toggle { background: #111827; border: 0; color: #9aa8bc; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+.ws-group button + button { border-left: 1px solid #243045; }
+.ws-group button.active { background: #2563eb; color: #fff; }
+.ws-toggle { border: 1px solid #243045; border-radius: 6px; }
+.ws-toggle.active { border-color: #2563eb; color: #fff; }
+.ws-row { color: #9aa8bc; font-size: 12px; display: flex; gap: 6px; align-items: center; }
+.ws-row select { background: #111827; color: #e6edf6; border: 1px solid #243045; border-radius: 5px; padding: 3px 4px; }
+.ws-main { display: grid; grid-template-columns: minmax(0, 1fr) 330px; min-height: 0; }
+.ws-chart { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.ws-chart canvas { display: block; cursor: crosshair; touch-action: none; }
+.ws-jump { position: absolute; right: 84px; bottom: 40px; background: #2563eb; color: #fff; border: 0; border-radius: 16px; padding: 7px 14px; font-size: 12px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+.ws-hint { position: absolute; left: 8px; bottom: 26px; font: 10px ui-monospace, Menlo, monospace; color: #4f5d72; pointer-events: none; }
+.ws-side { border-left: 1px solid #1c2636; overflow-y: auto; display: flex; flex-direction: column; }
+.ws-panel { border-bottom: 1px solid #1c2636; padding: 6px 8px; }
+.ws-panel > header { display: flex; justify-content: space-between; align-items: baseline; font-weight: 600; font-size: 12px; color: #e6edf6; margin-bottom: 4px; }
+.ws-panel > header small { font-weight: 400; color: #6f7d92; font-size: 10px; }
+.ws-levels > div { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 6px; font-size: 11px; padding: 2px 0; color: #9aa8bc; }
+.ws-levels i { width: 3px; height: 11px; border-radius: 1px; }
+.ws-levels b { font: 500 11px ui-monospace, Menlo, monospace; }
+.ws-status { display: flex; gap: 16px; align-items: center; padding: 5px 10px; border-top: 1px solid #1c2636; font: 11px ui-monospace, Menlo, monospace; color: #7d8ba0; overflow: hidden; white-space: nowrap; }
+.ws-status .ok { color: #22c58b; } .ws-status .bad { color: #f0566a; }
+.ws-status .ws-spacer { flex: 1; }
+@media (max-width: 900px) { .ws-main { grid-template-columns: 1fr; } .ws-side { display: none; } }
+.ws-panel.ws-bare { padding: 4px 6px; }
+.ws-help { color: #6f7d92; border: 1px solid #243045; border-radius: 50%; width: 20px; height: 20px; display: inline-grid; place-items: center; font-size: 11px; cursor: help; }

@@ -1,5 +1,6 @@
 import { ColorType, createChart, LineSeries, LineStyle, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { AuctionWorkstation } from "./AuctionWorkstation";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import type { AuctionContext, AuctionFlow, BaseRateGroup, BaseRates, ProfileRow, Rate, SetupJournal, WhaleView } from "./types";
 
@@ -89,8 +90,29 @@ function ProfileNotes({ symbol }: { symbol: string }) {
   </section>;
 }
 
+const VIEW_STORE = "macd.auctionView";
+
 export function AuctionPage() {
-  const { data: symbols } = useEndpoint<string[]>("/api/auction/symbols", []);
+  const [view, setView] = useState(() => (recall(VIEW_STORE) === "context" ? "context" : "flow"));
+  const pickView = (value: "flow" | "context") => { setView(value); remember(VIEW_STORE, value); };
+  const { data: auctionSymbols } = useEndpoint<string[]>("/api/auction/symbols", []);
+  if (view === "flow") {
+    return <section className="ledger-page auction-page auction-flow-page">
+      <AuctionTabs view={view} onView={pickView} />
+      <AuctionWorkstation symbols={auctionSymbols || []} />
+    </section>;
+  }
+  return <AuctionContextPage tabs={<AuctionTabs view={view} onView={pickView} />} symbols={auctionSymbols} />;
+}
+
+function AuctionTabs({ view, onView }: { view: string; onView: (v: "flow" | "context") => void }) {
+  return <div className="auction-tabs" role="tablist">
+    <button role="tab" aria-selected={view === "flow"} className={view === "flow" ? "active" : ""} onClick={() => onView("flow")}>Order flow</button>
+    <button role="tab" aria-selected={view === "context"} className={view === "context" ? "active" : ""} onClick={() => onView("context")}>Auction context</button>
+  </div>;
+}
+
+function AuctionContextPage({ tabs, symbols }: { tabs: ReactNode; symbols: string[] | undefined }) {
   const [symbol, setSymbol] = useState("");
   const pickSymbol = (value: string) => { setSymbol(value); remember(SYMBOL_STORE, value); };
   // The remembered symbol only survives while it still has stored sessions —
@@ -128,6 +150,7 @@ export function AuctionPage() {
 
   const reference = context.data;
   return <section className="ledger-page auction-page">
+    {tabs}
     <div className="page-heading auction-heading">
       <div><h1>Auction Context</h1>
         <p>Daily · weekly · monthly value, against this regime's own base rates</p></div>

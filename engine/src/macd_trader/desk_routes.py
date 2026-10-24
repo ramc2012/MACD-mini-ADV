@@ -679,6 +679,58 @@ async def mp_replay(symbol: str, day: str,
     payload["context"] = context
     return payload
 
+# --- completed sessions for the auction workstation ---------------------------
+# The workstation scrolls back across sessions. A finished session never changes, so each (symbol, day,
+# timeframe) is built once from its raw ticks (ReplaySession at the close) and kept; the ticks themselves are
+# dropped as soon as the payload exists. Separate from the replay cache, which serves one moving session.
+_session_payloads: "dict[tuple, dict]" = {}
+_session_build_lock = asyncio.Lock()
+SESSION_PAYLOADS_MAX = 24
+
+
+def _build_session_payload(symbol: str, day: str, timeframe: int) -> dict | None:
+    session = ReplaySession(symbol, day, 60).build(engine.settings.tick_database_path)
+    if not session.ticks:
+        return None
+    history = engine.settings.research_database_path
+    context = auction_views.context(history, desk_underlying(symbol) or symbol, day)
+    scale = profile_scale(history, symbol, day, 0.05)
+    out = session.payload(session.session_end, 180, timeframe, context, scale)
+    profile = session.profiles.get(symbol)
+    if profile is not None:
+        # every level with its TPO letters, not the 90-row sample the live poll uses
+        out["profile"] = profile.snapshot(max_levels=None, row_size=scale["row_size"] if scale else None, scale=scale)
+    out["context"] = context
+    for heavy in ("tape", "dom", "ofi", "tape_speed", "setup"):
+        out.pop(heavy, None)
+    out["day"] = day
+    return out
+
+
+@router.get("/api/mp/session-footprint/{symbol:path}", dependencies=[Depends(authorize)])
+async def mp_session_footprint(symbol: str, day: str = Query(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                               timeframe_seconds: int = Query(default=1800, ge=60, le=3600)):
+    """One COMPLETED session's footprint bars and full profile, for scrolling back on the workstation.
+
+    Only sessions whose raw ticks are still on disk (/api/mp/replay-days); today's is /api/mp/footprint.
+    """
+    if day >= _ist_today():
+        raise HTTPException(400, "today's session is live: use /api/mp/footprint")
+    key = (symbol, day, timeframe_seconds)
+    if key in _session_payloads:
+        _session_payloads[key] = _session_payloads.pop(key)        # most recently used last
+        return _session_payloads[key]
+    async with _session_build_lock:
+        if key not in _session_payloads:
+            payload = await asyncio.to_thread(_build_session_payload, symbol, day, timeframe_seconds)
+            if payload is None:
+                raise HTTPException(404, "No raw ticks are still on disk for that contract and day")
+            _session_payloads[key] = payload
+            while len(_session_payloads) > SESSION_PAYLOADS_MAX:
+                _session_payloads.pop(next(iter(_session_payloads)))
+    return _session_payloads[key]
+
+
 @router.get("/api/mp/statistics", dependencies=[Depends(authorize)])
 async def mp_statistics():
     return engine.mp.statistics()
