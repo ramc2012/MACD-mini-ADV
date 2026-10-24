@@ -41,7 +41,7 @@ services:
       # The agentic lane's brain (xAI Grok). Put XAI_API_KEY=... in the git-ignored .env beside this file;
       # empty leaves the lane in rules-only mode (it manages open positions and opens nothing).
       XAI_API_KEY: ${XAI_API_KEY:-}
-      # The market-intelligence hub (~/market-intelligence); empty = call Fyers directly (the default until the
+      # The market-intelligence hub (~/CLAUDE PROJECTS/market-intelligence); empty = call Fyers directly (the default until the
       # hub's shadow capture has matched this app's).
       MACD_MARKET_HUB_URL: ${MACD_MARKET_HUB_URL:-}
     volumes:
