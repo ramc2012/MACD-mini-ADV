@@ -47,7 +47,7 @@ def test_upstream_error_body_is_not_exposed(monkeypatch):
 def test_both_routes_require_the_existing_app_auth():
     path = Path(__file__).resolve().parents[1] / "src/macd_trader/app.py"
     tree = ast.parse(path.read_text())
-    for name in ("shadow_lane_snapshot", "shadow_lane_archive", "retained_desk_read"):
+    for name in ("shadow_lane_snapshot", "shadow_lane_archive", "retained_desk_read", "local_decision_status"):
         route = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
         assert any("Depends(authorize)" in ast.unparse(d) and "app.get" in ast.unparse(d) for d in route.decorator_list)
 

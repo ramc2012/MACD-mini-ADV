@@ -592,6 +592,22 @@ async def shadow_lane_archive(lane: str):
     return await _shadow_lane_read(lane, archive=True)
 
 
+@app.get('/api/local-decisions', dependencies=[Depends(authorize)])
+async def local_decision_status():
+    from .local_model import configuration
+    import httpx
+    mode,url=configuration()
+    if mode=='off':return {'ready':False,'mode':'off','model':'qwen3.5:9b','recent':[]}
+    try:
+        async with httpx.AsyncClient(timeout=6,trust_env=False) as client:
+            response=await client.get(url+'/status',headers={'X-Macd-Token':engine.settings.api_token})
+            response.raise_for_status()
+        return {**response.json(),'mode':mode}
+    except (httpx.HTTPError,ValueError):
+        return {'ready':False,'mode':mode,'model':'qwen3.5:9b','recent':[],
+                'detail':'Local review service unavailable; new filtered entries wait'}
+
+
 @app.get('/api/nomad/{path:path}', dependencies=[Depends(authorize)])
 async def retained_desk_read(path: str, request: Request):
     """Original desk views through the isolated reader. No write route or arbitrary upstream exists."""

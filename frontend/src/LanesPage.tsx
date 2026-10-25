@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { curvePath, rupees, tone } from "./agentMath";
 import type { Tick } from "./types";
 import { API_TOKEN, API_URL } from "./runtime";
+import {LocalModelPanel} from './LocalModelPanel';
 
 type Stats = { trades: number; wins: number; win_rate: number | null; net: number; gross_profit: number; gross_loss: number; profit_factor: number | null; avg_win: number | null; avg_loss: number | null };
 type Summary = {
@@ -38,7 +39,7 @@ const short = (symbol: string) => symbol.replace(/^(NSE|BSE):/, "");
 const percent = (value: number | null | undefined, digits = 1) => value == null || !Number.isFinite(value) ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(digits)}%`;
 const money = (value: number) => `₹${value >= 100_000 ? `${(value / 100_000).toFixed(2)} L` : `${(value / 1000).toFixed(1)}k`}`;
 const label = (lane: string) => lane.replace("smart_", "₹").toUpperCase();
-const DECISIONS = ["", "TAKEN", "SKIPPED_LOW_SCORE", "MACD_FADED", "LOT_ABOVE_TICKET", "NO_CASH", "TOO_ILLIQUID", "ALREADY_HELD", "STALE", "NO_PRICE", "NOT_TRADABLE", "ENTRY_REJECTED"];
+const DECISIONS = ["", "TAKEN", "QWEN_REJECTED", "QWEN_UNAVAILABLE", "QWEN_STALE", "SKIPPED_LOW_SCORE", "MACD_FADED", "LOT_ABOVE_TICKET", "NO_CASH", "TOO_ILLIQUID", "ALREADY_HELD", "STALE", "NO_PRICE", "NOT_TRADABLE", "ENTRY_REJECTED"];
 
 function LaneCard({ summary, active, curve, onSelect }: { summary: Summary; active: boolean; curve: number[]; onSelect: () => void }) {
   const all = summary.all;
@@ -112,6 +113,7 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
         {rules?.blast && <span className="agent-chip">Blast: stop {Math.round(rules.blast.hard * 100)}% · trail {Math.round(rules.blast.trail * 100)}% from +{Math.round(rules.blast.act * 100)}%</span>}
       </div>}
     </div>
+    <LocalModelPanel/>
     {(error || health?.error) && <div className="agent-error">{error || health?.error}</div>}
     <div className="lane-cards">{lanes.map((lane) => <LaneCard key={lane.lane} summary={lane} active={lane.lane === selected} curve={curves[lane.lane] || []} onSelect={() => setSelected(lane.lane)} />)}
       {lanes.length === 0 && !error && <div className="agent-empty">No smart lanes configured.</div>}</div>

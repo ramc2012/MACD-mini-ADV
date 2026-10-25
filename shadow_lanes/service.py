@@ -54,11 +54,18 @@ class ShadowWorker:
                 result = getattr(source, lane)(connection, now)
                 if lane == "vanguard" and self.feature_error:
                     result.update(status="blocked", blockers=[f"Market feature refresh failed: {self.feature_error}"], watchlist=[])
+                if lane=='vanguard' and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
+                    from .local_model import apply_review
+                    result=apply_review(result,now)
+                    # A slow review cannot freeze a missed or previous-session observation.
+                    finished=datetime.now(source.IST)
+                    if finished.date()!=now.astimezone(source.IST).date() or not source.publication_window(finished,lane):
+                        result.update(status='blocked',blockers=['Local review completed outside the publication window'],watchlist=[])
                 result.update(shadow_only=True, execution_enabled=False, diagnostic=diagnostic)
                 self.store.status(lane, now.isoformat(), result)
                 if not diagnostic and source.publication_window(now, lane) and result.get("source_session") == str(now.astimezone(source.IST).date()):
                     if result.get("status") == "ok" and result.get("watchlist"):
-                        self.store.publish(lane, day, now.isoformat(), source.POLICIES[lane], result)
+                        self.store.publish(lane, day, datetime.now(source.IST).isoformat() if result.get('local_review') else now.isoformat(), result.get('policy',source.POLICIES[lane]), result)
             except Exception as exc:
                 self.store.status(lane, now.isoformat(), dict(status="blocked", blockers=[f"Input check failed: {type(exc).__name__}"],
                     source_session=str(day), policy=source.POLICIES[lane]))

@@ -46,6 +46,8 @@ services:
       # hub's shadow capture has matched this app's).
       MACD_MARKET_HUB_URL: ${MACD_MARKET_HUB_URL:-}
       MACD_SHADOW_LANES_URL: http://shadow-lanes:8430
+      LOCAL_DECISION_URL: http://local-decisions:8435
+      LOCAL_DECISION_MODE: filter
     volumes:
       - ./runtime:/app/runtime
       - engine_data:/app/data
@@ -164,6 +166,28 @@ services:
       - gateway
     restart: unless-stopped
 
+  # One local review worker; it has no order interface or access to trading books.
+  local-decisions:
+    image: tradebot-backend:latest
+    entrypoint: ["python", "-m", "local_decisions.service"]
+    working_dir: /macd
+    environment:
+      OLLAMA_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: qwen3.5:9b
+      LOCAL_DECISION_DATABASE: /runtime/local_decisions/reviews.sqlite3
+      MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./local_decisions:/macd/local_decisions:ro
+      - ./runtime/local_decisions:/runtime/local_decisions
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8435/health',timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+    mem_limit: 384m
+    restart: unless-stopped
+
   # Fresh research observations only. No order interface or legacy paper-book writer is started.
   shadow-lanes:
     profiles: ["shadow-lanes"]
@@ -181,6 +205,8 @@ services:
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       TRADING_CALENDAR_FILE: /runtime/shadow_lanes/trading_calendar.json
       SHARED_MP_REDIS_URL: ""
+      LOCAL_DECISION_URL: http://local-decisions:8435
+      LOCAL_DECISION_MODE: filter
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./shadow_lanes:/macd/shadow_lanes:ro

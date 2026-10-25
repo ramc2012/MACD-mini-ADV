@@ -47,6 +47,7 @@ from .models import Signal, Trade
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
 from .smart_model import MODEL
+from . import local_model
 
 IST = ZoneInfo("Asia/Kolkata")
 MACD_SOURCE = "macd"
@@ -80,6 +81,9 @@ TOO_ILLIQUID = "TOO_ILLIQUID"
 TOO_SMALL = "LOT_ABOVE_TICKET"
 NO_CASH = "NO_CASH"
 ENTRY_REJECTED = "ENTRY_REJECTED"
+QWEN_REJECTED = "QWEN_REJECTED"
+QWEN_UNAVAILABLE = "QWEN_UNAVAILABLE"
+QWEN_STALE = "QWEN_STALE"
 
 
 def score(features: dict) -> float:
@@ -255,6 +259,7 @@ class SmartLane:
         self.recent: list[dict] = []
         self.error: str | None = None
         self.last_batch_at: str | None = None
+        self.local_review: dict | None = None
         self._macd_confirm = lambda symbol, bucket, price: None
         self._dispersion = lambda: None
         self._last_equity = 0.0
@@ -419,7 +424,7 @@ class SmartLane:
             return None
         return int(liquidity * (self.settings.blast_max_volume_share_pct / 100.0) // lot_size)
 
-    async def _decide(self, item: Pending, now: datetime, cut: float) -> None:
+    async def _decide(self, item: Pending, now: datetime, cut: float, local_review=None) -> None:
         symbol = item.symbol
         execution = self.execution
         if symbol in self.portfolio.positions:
@@ -453,6 +458,28 @@ class SmartLane:
             decision = TOO_SMALL if per_lot > ticket and self.portfolio.cash >= per_lot else NO_CASH
             return self._record(item, decision, now, price=price, cut=cut, size=size, ticket=ticket,
                                 detail={"one_lot": round(per_lot, 2)})
+        mode,_ = local_model.configuration()
+        if mode != 'off' and local_review is None:
+            try:
+                review=await local_model.review_smart(item,price,execution.last_price_at[symbol])
+                self.local_review=review
+                item.detail['local_review']=review
+            except Exception as exc:
+                self.local_review={'verdict':'unavailable','reason':type(exc).__name__}
+                item.detail['local_review']=self.local_review
+                if mode=='filter':
+                    return self._record(item,QWEN_UNAVAILABLE,datetime.now(UTC),price=price,cut=cut)
+                review={'verdict':'unavailable','reference_price':price}
+            if mode=='filter' and review['verdict']!='approve':
+                return self._record(item,QWEN_REJECTED,datetime.now(UTC),price=price,cut=cut)
+            # Every original gate, cash/lot calculation and quote is checked again after inference.
+            return await self._decide(item,datetime.now(UTC),self.cutoff(),local_review=review)
+        if mode=='filter' and local_review is not None:
+            try:
+                stale=(datetime.fromisoformat(local_review['expires_at'])<=datetime.now(UTC)
+                       or abs(price/local_review['reference_price']-1)>.02)
+            except (KeyError,ValueError,ZeroDivisionError):stale=True
+            if stale:return self._record(item,QWEN_STALE,now,price=price,cut=cut)
         try:
             order = await execution.submit(symbol, "BUY", lots=lots, signal=item.signal)
         except (ValueError, RuntimeError, PermissionError) as exc:
@@ -650,6 +677,7 @@ class SmartLane:
                 "cutoff": round(self.cutoff(), 4), "rolling_scores": len(self._scores),
                 "counts": dict(self.counts), "recent": self.recent[-12:], "error": self.error,
                 "last_batch_at": self.last_batch_at, "open_positions": len(self.held_symbols()),
+                "local_model": {"mode":local_model.configuration()[0],"model":"qwen3.5:9b","last_review":self.local_review},
                 "rules": {
                     "entry_delay_seconds": self.settings.smart_entry_delay_seconds,
                     "skip_fraction": self.settings.smart_skip_fraction,
