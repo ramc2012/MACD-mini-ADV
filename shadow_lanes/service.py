@@ -152,6 +152,9 @@ def create_app(store=None, worker_enabled=None):
         if expected and x_macd_token != expected:
             raise HTTPException(401, "Invalid API token")
 
+    from .nomad_views import install
+    install(api, store, authorize)
+
     @api.get("/health")
     def health():
         return {"ok": True, "shadow_only": True, "execution_enabled": False, "worker_enabled": enabled}

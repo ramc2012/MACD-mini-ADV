@@ -2,7 +2,9 @@
   "compilerOptions": {
     "target": "ES2020",
     "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/nomad/*"], "next/navigation": ["src/nomad/navigation.ts"] },
     "allowJs": false,
     "skipLibCheck": true,
     "esModuleInterop": true,

@@ -12,7 +12,7 @@ from typing import Literal
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
@@ -590,6 +590,23 @@ async def shadow_lane_snapshot(lane: str):
 @app.get("/api/shadow-lanes/{lane}/archive", dependencies=[Depends(authorize)])
 async def shadow_lane_archive(lane: str):
     return await _shadow_lane_read(lane, archive=True)
+
+
+@app.get('/api/nomad/{path:path}', dependencies=[Depends(authorize)])
+async def retained_desk_read(path: str, request: Request):
+    """Original desk views through the isolated reader. No write route or arbitrary upstream exists."""
+    if path.split('/')[0] not in ('vanguard','cbe','charts','mp') or '..' in path or '://' in path:
+        raise HTTPException(404,'Unknown retained desk view')
+    url=os.environ.get('MACD_SHADOW_LANES_URL','').rstrip('/')
+    if not url:raise HTTPException(503,'Shadow desk service is not configured')
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response=await client.get(f'{url}/api/nomad/{path}',params=list(request.query_params.multi_items()),
+                headers={'X-Macd-Token':engine.settings.api_token} if engine.settings.api_token else {})
+        return Response(response.content,status_code=response.status_code,media_type='application/json')
+    except httpx.HTTPError:
+        raise HTTPException(502,'Retained desk reader is unavailable') from None
 
 
 @app.get("/api/lanes", dependencies=[Depends(authorize)])

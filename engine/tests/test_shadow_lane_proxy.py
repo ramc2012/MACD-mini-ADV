@@ -47,6 +47,33 @@ def test_upstream_error_body_is_not_exposed(monkeypatch):
 def test_both_routes_require_the_existing_app_auth():
     path = Path(__file__).resolve().parents[1] / "src/macd_trader/app.py"
     tree = ast.parse(path.read_text())
-    for name in ("shadow_lane_snapshot", "shadow_lane_archive"):
+    for name in ("shadow_lane_snapshot", "shadow_lane_archive", "retained_desk_read"):
         route = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == name)
         assert any("Depends(authorize)" in ast.unparse(d) and "app.get" in ast.unparse(d) for d in route.decorator_list)
+
+
+def test_retained_proxy_forwards_only_authenticated_reads_and_scope(monkeypatch):
+    import os
+    from fastapi import Request, Response
+    path=Path(__file__).resolve().parents[1]/'src/macd_trader/app.py'
+    function=next(n for n in ast.parse(path.read_text()).body if isinstance(n,ast.AsyncFunctionDef) and n.name=='retained_desk_read')
+    function.decorator_list=[]
+    seen=[]
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(503,json={'detail':'Retained dataset unavailable'})
+    real_client=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:real_client(transport=httpx.MockTransport(handler),**kw))
+    monkeypatch.setenv('MACD_SHADOW_LANES_URL','http://shadow-lanes:8430')
+    namespace=dict(os=os,HTTPException=HTTPException,Request=Request,Response=Response,
+                   engine=SimpleNamespace(settings=SimpleNamespace(api_token='isolated-test-token')))
+    exec(compile(ast.Module(body=[function],type_ignores=[]),str(path),'exec'),namespace)
+    request=Request({'type':'http','query_string':b'scope=retained&limit=20'})
+    read=namespace['retained_desk_read']
+    response=asyncio.run(read('vanguard/paper',request))
+    assert response.status_code==503
+    assert seen[0].method=='GET' and seen[0].headers['X-Macd-Token']=='isolated-test-token'
+    assert seen[0].url.params['scope']=='retained'
+    for invalid in ('orders','https://other.example/api','vanguard/../orders'):
+        with pytest.raises(HTTPException):asyncio.run(read(invalid,request))
+    assert len(seen)==1

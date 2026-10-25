@@ -10,10 +10,14 @@
     "test": "node --test 'tests/**/*.test.ts'"
   },
   "dependencies": {
+    "@tanstack/react-query": "file:vendor/tanstack-react-query-5.100.14-bundled.tgz",
     "@vitejs/plugin-react": "latest",
+    "clsx": "file:vendor/clsx-2.1.1-bundled.tgz",
     "lightweight-charts": "^5.2.1",
+    "lucide-react": "file:vendor/lucide-react-0.383.0-bundled.tgz",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "recharts": "file:vendor/recharts-2.15.4-bundled.tgz",
     "vite": "latest"
   },
   "devDependencies": {

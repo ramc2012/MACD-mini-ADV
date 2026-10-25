@@ -187,6 +187,7 @@ services:
       - ./vanguard:/vanguard:ro
       - ./runtime/shadow_lanes:/runtime/shadow_lanes
       - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/cbe_scanner/paper:/legacy/cbe:ro
+      - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/vanguard:/legacy/vanguard:ro
     networks: [default, tradebot]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8430/health',timeout=3)"]

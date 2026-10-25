@@ -1,0 +1,30 @@
+.nomad-port {--bg-primary: 8 11 24;
+  --bg-secondary: 13 17 23;
+  --bg-tertiary: 19 25 41;
+  --bg-card: 15 23 36;
+  --bg-hover: 26 37 64;
+  --bg-border: 30 45 69;
+  --bg-active: 36 52 84;
+  --accent-green: 0 212 163;
+  --accent-red: 255 71 87;
+  --accent-amber: 255 165 2;
+  --accent-blue: 59 130 246;
+  --accent-purple: 139 92 246;
+  --accent-cyan: 6 182 212;
+  --text-primary: 226 232 240;
+  --text-secondary: 148 163 184;
+  --text-muted: 140 155 174;
+ color:rgb(var(--text-primary));background:rgb(var(--bg-primary));font:13px/1.5 Inter,system-ui,sans-serif;padding:18px;min-height:75vh;isolation:isolate;}
+.nomad-port *, .nomad-port *::before,.nomad-port *::after {box-sizing:border-box;border-style:solid;border-width:0;}
+.nomad-port h1,.nomad-port h2,.nomad-port h3,.nomad-port p {margin:0;}
+.nomad-port button,.nomad-port input,.nomad-port select {font:inherit;color:inherit;}
+.nomad-port button {cursor:pointer;background-color:transparent;}
+.nomad-port header {height:auto;display:block;position:static;background:transparent;}
+.nomad-port header > div {display:block;align-items:normal;gap:normal;}
+.nomad-port table{border-collapse:collapse;}
+.nomad-scope-bar{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;padding:14px 16px;border:1px solid #25606e;border-radius:12px;margin-bottom:18px;background:#0d2029;}
+.nomad-scope-bar p{font-size:12px;color:#b1c6d4;margin-top:4px;}
+.nomad-scope-bar button{padding:8px 14px;border-radius:6px;background:#122c3a;border:1px solid #365165;margin:3px;}
+.nomad-scope-bar button[aria-pressed=true]{background:#216073;}
+.nomad-gap{padding:10px 14px;margin-bottom:12px;background:#392b15;color:#f2cb7e;border:1px solid #72592c;border-radius:8px;}
+@tailwind utilities;
