@@ -7,6 +7,20 @@ from types import SimpleNamespace
 from macd_trader.config import Settings
 
 
+def test_refresh_material_stays_in_credentials_only(monkeypatch):
+    module = importlib.import_module("macd_trader.app")
+    settings_saved, credentials_saved = [], []
+    monkeypatch.setattr(module, "settings_store", SimpleNamespace(save=settings_saved.append))
+    monkeypatch.setattr(module, "credentials_store", SimpleNamespace(save=credentials_saved.append))
+    current = Settings(fyers_secret="test-secret", fyers_access_token="test-token",
+                       fyers_refresh_token="test-refresh", fyers_pin="0000")
+    module.persist_settings(current)
+    module.persist_credentials(current)
+    assert not {"fyers_secret", "fyers_access_token", "fyers_refresh_token", "fyers_pin"} & settings_saved[0].keys()
+    assert credentials_saved[0]["fyers_refresh_token"] == "test-refresh"
+    assert credentials_saved[0]["fyers_pin"] == "0000"
+
+
 def test_put_symbols_reports_pending_and_reconfigures_the_feed(monkeypatch):
     module = importlib.import_module("macd_trader.app")
     current = Settings(symbols_csv="NSE:A-EQ")

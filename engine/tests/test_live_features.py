@@ -115,10 +115,11 @@ def test_entry_flow_reads_the_desk_snapshot_first_and_falls_back_to_its_own():
                                            "trades": 9, "last_price": 1190.0, "day": "2026-10-26",
                                            "computed_at_ms": now_ms}
     snapshots.get = lambda symbol, now=None: FlowSnapshots.get(snapshots, symbol, now_ms + 1000)
-    context = flow.context("NSE:RELIANCE26OCT1200CE")
+    moment = datetime.fromtimestamp(T0 + 1, IST)
+    context = flow.context("NSE:RELIANCE26OCT1200CE", now=moment)
     assert context["source"] == "desk" and context["session_cvd_share_signed"] == 0.25
     snapshots.get = lambda symbol, now=None: FlowSnapshots.get(snapshots, symbol, now_ms + 600_000)   # stale
-    assert flow.context("NSE:RELIANCE26OCT1200CE")["source"] == "local"
+    assert flow.context("NSE:RELIANCE26OCT1200CE", now=moment)["source"] == "local"
     assert flow.health()["reads"] == {"desk": 1, "local": 1}
 
 

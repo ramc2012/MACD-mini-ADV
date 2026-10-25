@@ -1673,13 +1673,12 @@ class TradingEngine(DeskMixin):
             and in_session(tick.symbol, exchange_at)
         )
         if in_session(tick.symbol, self.last_tick_at) and current_session_print:
-            # One tracker: the desk's, read through its published snapshots. This process folds ticks only while
-            # none has arrived (desk down or not yet publishing), or when configured to ("local").
-            published = (self.flow_snapshots is not None and self.flow_snapshots.received > 0
-                         and getattr(self.settings, "entry_flow_source", "desk") == "desk")
-            if is_underlying(tick.symbol) and not published:
+            # EntryFlow checks each symbol's current-session snapshot, rolls its day even while using the desk,
+            # and resumes a labelled local interval when that symbol's snapshot becomes stale.
+            if is_underlying(tick.symbol):
                 try:
-                    self.entry_flow.on_tick(tick)
+                    self.entry_flow.on_tick(tick, now=self.last_tick_at,
+                                            use_snapshots=getattr(self.settings, "entry_flow_source", "desk") == "desk")
                 except Exception as exc:  # noqa: BLE001 -- measurement must not cost the feed
                     self.entry_flow.error = f"{type(exc).__name__}: {exc}"[:200]
             # Measure executable quote freshness by receipt, consistently
@@ -1848,7 +1847,8 @@ class TradingEngine(DeskMixin):
 
     def _entry_context(self, symbol: str) -> dict | None:
         """What every lane logs at a new entry: the underlying's session order flow and the decision matrix's grades."""
-        flow = self.entry_flow.context(symbol)
+        flow = self.entry_flow.context(symbol, now=datetime.now(UTC),
+                                       use_snapshots=getattr(self.settings, "entry_flow_source", "desk") == "desk")
         grade = self.entry_grader.grade(symbol)
         if flow is None and grade is None:
             return None

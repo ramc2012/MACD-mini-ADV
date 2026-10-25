@@ -15,6 +15,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from .orderflow import OrderFlowTracker
+from .rollover import futures_root
 
 IST = ZoneInfo("Asia/Kolkata")
 INDEX_FUTURE_PREFIX = {"NIFTY": "NSE:NIFTY", "BANKNIFTY": "NSE:BANKNIFTY", "SENSEX": "BSE:SENSEX",
@@ -35,44 +36,78 @@ class EntryFlow:
         self.day: str | None = None
         self.prints = 0
         self.error: str | None = None
+        self._partial_symbols: set[str] = set()
+        self._interval_started: dict[str, str] = {}
 
-    def on_tick(self, tick, now: datetime | None = None) -> None:
-        """Feed one in-session underlying tick. The caller filters to the session."""
-        if not is_underlying(tick.symbol):
-            return
-        day = (now or datetime.now(IST)).astimezone(IST).date().isoformat()
+    def _roll_day(self, now: datetime) -> None:
+        day = now.astimezone(IST).date().isoformat()
         if day != self.day:
             self.tracker.reset()
             self.day = day
+            self._partial_symbols.clear()
+            self._interval_started.clear()
+
+    def _snapshot(self, symbol: str, now: datetime) -> dict | None:
+        published = self.snapshots.get(symbol, now.timestamp() * 1000) if self.snapshots is not None else None
+        return published if published is not None and published.get("day") == self.day else None
+
+    def _use_snapshot(self, symbol: str) -> None:
+        # Local ticks were skipped while the desk covered this symbol. A later fallback starts a new baseline;
+        # neither the old local CVD nor the cumulative-volume jump across that gap is a session measurement.
+        self.tracker.reset(symbol)
+        self._partial_symbols.add(symbol)
+        self._interval_started.pop(symbol, None)
+
+    def on_tick(self, tick, now: datetime | None = None, *, use_snapshots: bool = True) -> None:
+        """Use the desk per symbol while fresh; otherwise observe a clearly labelled local interval."""
+        if not is_underlying(tick.symbol):
+            return
+        moment = now or datetime.now(IST)
+        self._roll_day(moment)
+        if use_snapshots and self._snapshot(tick.symbol, moment) is not None:
+            self._use_snapshot(tick.symbol)
+            return
+        if tick.symbol not in self.tracker.states:
+            self._interval_started[tick.symbol] = tick.timestamp.isoformat()
         if self.tracker.on_tick(tick) is not None:
             self.prints += 1
 
-    def _underlying(self, parsed: dict) -> str | None:
+    def _underlying(self, parsed: dict, now: datetime, use_snapshots: bool) -> str | None:
         root = parsed["root"]
         prefix = INDEX_FUTURE_PREFIX.get(root)
         if prefix is None:
             return parsed.get("spot")
         # The live series is the one ticking; with two series listed near expiry take the busier.
-        candidates = [(state.total_volume, symbol) for symbol, state in self.tracker.states.items()
-                      if symbol.startswith(prefix) and symbol.endswith("FUT")
-                      and (root != "NIFTY" or not symbol.startswith(("NSE:NIFTYBANK", "NSE:NIFTYMID")))]
+        exchange = prefix.partition(":")[0]
+        candidates = {symbol: state.total_volume for symbol, state in self.tracker.states.items()
+                      if futures_root(symbol) == (exchange, root)}
+        if use_snapshots and self.snapshots is not None:
+            for symbol in self.snapshots.latest:
+                if futures_root(symbol) == (exchange, root):
+                    published = self._snapshot(symbol, now)
+                    if published is not None:
+                        candidates[symbol] = published.get("session_total_volume") or published.get("session_classified_volume") or 0
+        candidates = [(volume, symbol) for symbol, volume in candidates.items()]
         return max(candidates)[1] if candidates else None
 
-    def context(self, option_symbol: str) -> dict | None:
+    def context(self, option_symbol: str, now: datetime | None = None, *, use_snapshots: bool = True) -> dict | None:
         """The underlying's session flow, signed by the option's side (+ = flow agrees with the trade)."""
         from .option_agent import parse_option
         try:
+            moment = now or datetime.now(IST)
+            self._roll_day(moment)
             parsed = parse_option(option_symbol)
             if not parsed:
                 return None
-            underlying = self._underlying(parsed)
+            underlying = self._underlying(parsed, moment, use_snapshots)
             out = {"underlying": underlying, "side": parsed["side"], "flow_day": self.day}
-            published = self.snapshots.get(underlying) if (self.snapshots is not None and underlying) else None
-            if published is not None and published.get("day") == self.day:
+            published = self._snapshot(underlying, moment) if use_snapshots and underlying else None
+            if published is not None:
+                self._use_snapshot(underlying)
                 classified = published.get("session_classified_volume") or 0
                 share = published["session_cvd"] / classified if classified else None
                 self.reads["desk"] += 1
-                return {**out, "source": "desk", "session_cvd": published["session_cvd"],
+                return {**out, "source": "desk", "flow_scope": "session", "session_cvd": published["session_cvd"],
                         "session_classified_volume": classified,
                         "session_total_volume": published.get("session_total_volume"),
                         "session_cvd_share_signed": round(share * parsed["side"], 5) if share is not None else None,
@@ -83,6 +118,14 @@ class EntryFlow:
                 return {**out, "source": "local", "session_cvd": None}
             classified = state.buy_volume + state.sell_volume
             share = state.cumulative_delta / classified if classified else None
+            if underlying in self._partial_symbols:
+                return {**out, "source": "local", "flow_scope": "fallback_interval", "session_cvd": None,
+                        "session_classified_volume": None, "session_total_volume": None,
+                        "session_cvd_share_signed": None, "interval_cvd": state.cumulative_delta,
+                        "interval_classified_volume": classified, "interval_total_volume": state.total_volume,
+                        "interval_cvd_share_signed": round(share * parsed["side"], 5) if share is not None else None,
+                        "interval_started_at": self._interval_started.get(underlying),
+                        "underlying_price": state.last_price, "prints": state.trades}
             return {**out, "source": "local", "session_cvd": state.cumulative_delta,
                     "session_classified_volume": classified,
                     "session_total_volume": state.total_volume,
@@ -94,5 +137,6 @@ class EntryFlow:
 
     def health(self) -> dict:
         return {"day": self.day, "underlyings": len(self.tracker.states), "prints": self.prints, "error": self.error,
+                "partial_underlyings": len(self._partial_symbols & self.tracker.states.keys()),
                 "reads": dict(self.reads),
                 "published": self.snapshots.status() if self.snapshots is not None else None}

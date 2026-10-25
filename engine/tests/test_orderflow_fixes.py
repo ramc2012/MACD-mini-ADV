@@ -43,7 +43,7 @@ def test_entry_flow_signs_the_underlying_session_cvd_by_option_side():
     now = datetime(2026, 10, 15, 10, 30, tzinfo=IST)
     for tick in _ticks(SPOT, now.astimezone(UTC), 20, buy=True):
         flow.on_tick(tick, now)
-    ce, pe = flow.context(OPTION), flow.context("NSE:SBIN26OCT800PE")
+    ce, pe = flow.context(OPTION, now), flow.context("NSE:SBIN26OCT800PE", now)
     assert ce["underlying"] == SPOT and ce["session_cvd"] > 0
     assert ce["session_cvd_share_signed"] > 0 and pe["session_cvd_share_signed"] == approx(-ce["session_cvd_share_signed"])
     flow.on_tick(Tick("NSE:NIFTY50-INDEX", 25000.0, timestamp=now.astimezone(UTC)), now)  # spots without volume are ignored
@@ -55,7 +55,7 @@ def test_index_options_read_the_index_future():
     now = datetime(2026, 10, 15, 10, 30, tzinfo=IST)
     for tick in _ticks("NSE:NIFTY26OCTFUT", now.astimezone(UTC), 5, buy=False):
         flow.on_tick(tick, now)
-    out = flow.context("NSE:NIFTY26O2025000PE")
+    out = flow.context("NSE:NIFTY26O2025000PE", now)
     assert out["underlying"] == "NSE:NIFTY26OCTFUT" and out["session_cvd_share_signed"] > 0  # selling agrees with a put
 
 

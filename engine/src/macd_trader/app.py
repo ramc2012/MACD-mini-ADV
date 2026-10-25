@@ -33,7 +33,7 @@ from .settings_store import RuntimeSettingsStore
 PERSIST_EXCLUDED = ENVIRONMENT_ONLY | {
     # Broker secrets live in credentials.json only — never mirrored into
     # settings.json, where a stale plaintext token would otherwise linger.
-    "fyers_secret", "fyers_access_token", "telegram_bot_token",
+    "fyers_secret", "fyers_access_token", "fyers_refresh_token", "fyers_pin", "telegram_bot_token",
 }
 
 settings_store = RuntimeSettingsStore(settings.runtime_settings_path)
