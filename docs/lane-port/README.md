@@ -1,5 +1,12 @@
 # Vanguard and CBE port
 
+**Current incident at 2026-10-25 12:37:37 IST:** Docker's containers, images and volumes disappeared after the
+verified activation below. Both contexts point to the same empty daemon; all services are now down. Owner
+clarification about Docker reset/maintenance is pending. No restore or empty replacement database has been started.
+All seven local MACD book backups pass integrity checks; the protected Nomad dump, rollback image archive and host
+market archive survive. Full market-database coverage is unverified. Read the incident at the top of the platform's
+`docs/LANE_PORT_20261025.md`. Deployment success and screenshots below describe the earlier verified state.
+
 Prepared at 2026-10-25 11:26:49 IST. Owner selected **fresh shadow lanes; retain old history**.
 
 ## What is implemented
@@ -61,14 +68,36 @@ that retained market/model database; this is an application-process retirement, 
 
 ## Cutover status and procedure
 
-**Prepared, not activated.** Existing production MACD services have not been changed for this port. The new feed
-has not made broker requests. No persistent grants have been applied. Nomad backend workers still run despite
-Claude's earlier console integration-retirement switch. Live-session coverage, recorder persistence/parity and
-restart/replay behavior of the new feed remain unverified. The inherited rankers remain unproven research models.
+**Activated and closed-session verified at 2026-10-25 12:30:46 IST.** Owner approved the cutover. MACD engine/desk,
+frontend, new shadow worker and platform lane feed are deployed; market-only grants are applied. Both schedulers
+are enabled, execution is disabled, and prospective journals have zero cohorts/outcomes. Retained Vanguard runs
+and CBE history are accessible from the native pages. The new feed reports a closed session and made no Sunday
+broker requests. Live-session coverage, recorder persistence/parity and market replay remain unverified.
+The inherited rankers remain unproven research models.
+
+Nomad's app workers and Redis are stopped; its database remains healthy. Its application recovery registration
+initially restarted the stopped workers, so the registration now retains only the database and disables old app
+outage-data recovery. The original registration is backed up under the platform's
+`backups/nomad-20261025-retirement/`. Its macOS LaunchAgent was not modified. All 34 protected Nomad book/history
+tables match the pre-cutover baseline; only `app_runtime_state` changed. CBE history bytes match. Seven fields in
+Nomad's credential file were re-encrypted by the incidental restart; comparison inside an isolated container with
+the existing app environment confirmed unchanged values. Commodity control heartbeat/commentary fields changed.
+
+All seven MACD book databases pass integrity checks. Positions and cash match across all six existing portfolios;
+settings and credentials are byte-identical. Sixty protected table comparisons match the quiesced backups after
+excluding `saved_at`/`updated_at`. Pre-stop checkpoint payloads were flushed during shutdown. The fresh journal
+retains its four readiness events and zero publications/outcomes across a cold restart.
+
+An independent Docker cleanup removed the original spare images. Rollback images were rebuilt locally from
+`f3def38` source with the already-installed dependencies; all 87 rollback source/installed modules match that
+commit. The frontend rollback uses the same harmless helper rename needed on macOS. These are equivalent-source
+rollback images, not the original image identities. Both are also saved in
+`backups/lane-port-20261025/activation/macd-rollback-images.tar` on the platform. Their identities and preservation
+evidence are recorded in `docs/LANE_PORT_20261025.md` there. No images or packages were downloaded.
 Vanguard may remain blocked until sufficient prior-session feature coverage is available; never relax its gates
 or download/backfill missing data without the owner's authorization.
 
-The owner must approve expanded Upstox data collection before activation under the platform AGENTS.md. After that:
+The following cutover procedure was completed after the owner's approval:
 
 1. Record existing container/image identities and resource use, file hashes of retained CBE books and settings,
    and protected execution-table counts/hashes. Stop the Nomad app writers, then take a stable preservation snapshot.
@@ -90,6 +119,7 @@ The owner must approve expanded Upstox data collection before activation under t
 
 Rollback: stop the two new profile services, restore saved MACD image tags and prior .env worker flag, recreate
 the existing MACD services without build/pull, restart the retained Nomad app services. Keep all databases/journals.
+Restore the backed-up application self-heal registration if Nomad app recovery should be resumed.
 New market-cache rows are retained; no historical data is deleted to roll back. Recheck paper locks and provenance.
 
 ## Rebuild without downloads
@@ -102,6 +132,7 @@ docker build --pull=false --network=none -f frontend/Dockerfile.offline -t macd-
 docker build --pull=false --network=none -f docs/lane-port/Engine.offline.Dockerfile -t macd-mini-parallel-engine:shadow-lanes-20261025 engine
 ```
 
-The offline frontend Dockerfile copies already-built assets. The engine Dockerfile reuses the tested installed
-dependencies in the retained `review-fixes-20261025` image. Default Dockerfiles remain available for a later
+The offline frontend Dockerfile copies already-built assets. Both offline Dockerfiles reuse the retained
+`before-shadow-lanes-20261025` rollback images. If those tags are missing, load the local rollback image archive;
+do not fetch a substitute. Default Dockerfiles remain available for a later
 owner-approved dependency build. Never substitute a network build silently when the offline cache is incomplete.

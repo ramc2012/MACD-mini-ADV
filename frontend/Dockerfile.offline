@@ -1,5 +1,5 @@
 # Build assets first with the locally cached npm packages: npm ci --offline --ignore-scripts --no-audit && npm run build
-FROM nginx:1.27-alpine
+FROM macd-mini-parallel-frontend:before-shadow-lanes-20261025
 COPY dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
