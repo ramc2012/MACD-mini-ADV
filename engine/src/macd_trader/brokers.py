@@ -372,7 +372,24 @@ class FyersBroker(Broker):
         response = await asyncio.to_thread(session.generate_token)
         if not response.get("access_token"):
             raise RuntimeError(str(response.get("message") or "Fyers did not return an access token"))
-        return {"access_token": str(response["access_token"])}
+        refresh = response.get("refresh_token") or response.get("refreshToken")
+        return {"access_token": str(response["access_token"]), **({"refresh_token": str(refresh)} if refresh else {})}
+
+    async def refresh_access_token(self) -> dict[str, str]:
+        """Today's access token from the saved refresh token and PIN (Fyers' validate-refresh-token), no browser."""
+        if not (self.settings.fyers_refresh_token and self.settings.fyers_pin):
+            raise RuntimeError("No refresh token and PIN saved: log in once through the browser (Fyers returns a "
+                               "refresh token with it) and save the PIN")
+        import hashlib
+        app_hash = hashlib.sha256(f"{self.settings.fyers_client_id}:{self.settings.fyers_secret}".encode()).hexdigest()
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post("https://api-t1.fyers.in/api/v3/validate-refresh-token", json={
+                "grant_type": "refresh_token", "appIdHash": app_hash,
+                "refresh_token": self.settings.fyers_refresh_token, "pin": self.settings.fyers_pin})
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.status_code != 200 or not body.get("access_token"):
+            raise RuntimeError(f"Fyers refused the refresh: {body.get('message') or response.text[:160]}")
+        return {"access_token": str(body["access_token"])}
 
     def token_expiry(self) -> datetime | None:
         """Expiry of the daily access token, read from its JWT claim.

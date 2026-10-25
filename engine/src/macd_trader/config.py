@@ -101,6 +101,10 @@ class Settings(BaseSettings):
     fyers_client_id: str = ""
     fyers_secret: str = ""
     fyers_access_token: str = ""
+    # Daily automatic login: the refresh token Fyers returns with an access token (valid ~15 days) and the account
+    # PIN it is exchanged with. Both set through the login flow / the platform's Brokers page; never shown.
+    fyers_refresh_token: str = ""
+    fyers_pin: str = ""
     # Risk-free rate used to solve implied volatility for GEX (India ~6.5%).
     risk_free_rate: float = 0.065
 

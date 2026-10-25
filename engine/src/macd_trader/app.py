@@ -160,6 +160,7 @@ class FyersCredentialsInput(BaseModel):
     client_id: str = Field(min_length=3)
     secret: str | None = None
     redirect_uri: str = Field(min_length=8)
+    pin: str | None = Field(default=None, min_length=4, max_length=8)
 
 
 def fast_json(content) -> Response:
@@ -848,6 +849,8 @@ def public_settings(current: Settings | None = None) -> dict:
         "fyers_client_id": current.fyers_client_id,
         "fyers_secret_configured": bool(current.fyers_secret),
         "fyers_access_token_configured": bool(current.fyers_access_token),
+        "fyers_refresh_token_configured": bool(current.fyers_refresh_token),
+        "fyers_pin_configured": bool(current.fyers_pin),
         "fyers_redirect_uri": current.fyers_redirect_uri,
         "telegram_configured": bool(current.telegram_bot_token and current.telegram_chat_id),
         "telegram_chat_id": current.telegram_chat_id,
@@ -974,6 +977,8 @@ def persist_credentials(new_settings: Settings) -> None:
         "fyers_client_id": new_settings.fyers_client_id,
         "fyers_secret": new_settings.fyers_secret,
         "fyers_access_token": new_settings.fyers_access_token,
+        "fyers_refresh_token": new_settings.fyers_refresh_token,
+        "fyers_pin": new_settings.fyers_pin,
         "fyers_redirect_uri": new_settings.fyers_redirect_uri,
         "telegram_bot_token": new_settings.telegram_bot_token,
         "telegram_chat_id": new_settings.telegram_chat_id,
@@ -996,6 +1001,8 @@ async def fyers_credentials(payload: FyersCredentialsInput):
     }
     if payload.secret:
         updates["fyers_secret"] = payload.secret.strip()
+    if payload.pin:
+        updates["fyers_pin"] = payload.pin.strip()
     new_settings = Settings(**{**desired_settings().model_dump(), **updates})
     persist_settings(new_settings)
     persist_credentials(new_settings)
@@ -1009,12 +1016,13 @@ async def fyers_credentials(payload: FyersCredentialsInput):
     return {"saved": True, "redirect_uri": new_settings.fyers_redirect_uri}
 
 
-async def install_fyers_token(access_token: str, described: dict | None = None) -> dict:
+async def install_fyers_token(access_token: str, described: dict | None = None, refresh_token: str | None = None) -> dict:
     if described and described.get("expires_at") and described["expires_at"] <= datetime.now(UTC):
         expired = described["expires_at"].astimezone(IST).strftime("%d %b %H:%M")
         raise HTTPException(400, f"That access token expired at {expired} IST -- Fyers tokens last until 06:00 IST "
                                  "the next morning. Log in again (step 1) for today's.")
-    merged = {**desired_settings().model_dump(), "fyers_access_token": access_token}
+    merged = {**desired_settings().model_dump(), "fyers_access_token": access_token,
+              **({"fyers_refresh_token": refresh_token} if refresh_token else {})}
     new_settings = Settings(**merged)
     # Validate the token with a fast /profile probe BEFORE persisting, then
     # answer immediately and rebuild the watchlist in the background. The old
@@ -1053,7 +1061,7 @@ async def fyers_exchange(payload: AuthCodeInput):
                                          "Fyers redirected to after you logged in.")
             pasted = str(query["auth_code"][0])
         tokens = await engine.broker.exchange_auth_code(pasted)
-        return await install_fyers_token(tokens["access_token"])
+        return await install_fyers_token(tokens["access_token"], refresh_token=tokens.get("refresh_token"))
     except HTTPException:
         raise
     except Exception as exc:
@@ -1074,6 +1082,17 @@ async def fyers_access_token(payload: AccessTokenInput):
     return await install_fyers_token(pasted["value"], described=pasted)
 
 
+@app.post("/api/auth/fyers/refresh", dependencies=[Depends(authorize)])
+async def fyers_refresh():
+    """The daily login without a browser: refresh token + PIN -> today's access token (the platform calls this
+    before the open)."""
+    try:
+        tokens = await engine.broker.refresh_access_token()
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return await install_fyers_token(tokens["access_token"])
+
+
 @app.get("/api/auth/fyers/callback", response_class=HTMLResponse)
 async def fyers_callback(auth_code: str | None = Query(default=None), code: str | None = Query(default=None)):
     actual_code = auth_code or code
@@ -1081,7 +1100,7 @@ async def fyers_callback(auth_code: str | None = Query(default=None), code: str 
         return HTMLResponse("<h2>Fyers did not return an authorization code.</h2>", status_code=400)
     try:
         tokens = await engine.broker.exchange_auth_code(actual_code)
-        await install_fyers_token(tokens["access_token"])
+        await install_fyers_token(tokens["access_token"], refresh_token=tokens.get("refresh_token"))
     except Exception as exc:
         return HTMLResponse(f"<h2>Fyers connection failed</h2><p>{escape(str(exc))}</p>", status_code=400)
     return HTMLResponse("""
