@@ -564,6 +564,34 @@ def _smart_lane(name: str):
     return lane
 
 
+async def _shadow_lane_read(lane: str, archive: bool = False):
+    """Read the isolated shadow process; no execution or arbitrary upstream path can be proxied."""
+    if lane not in ("vanguard", "cbe"):
+        raise HTTPException(404, "Unknown shadow lane")
+    url = os.environ.get("MACD_SHADOW_LANES_URL", "").rstrip("/")
+    if not url:
+        raise HTTPException(503, "Shadow lanes are not configured")
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(f"{url}/api/shadow-lanes/{lane}" + ("/archive" if archive else ""),
+                headers={"X-Macd-Token": engine.settings.api_token} if engine.settings.api_token else {})
+            response.raise_for_status()
+            return response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, f"Shadow lane service unavailable: {type(exc).__name__}") from exc
+
+
+@app.get("/api/shadow-lanes/{lane}", dependencies=[Depends(authorize)])
+async def shadow_lane_snapshot(lane: str):
+    return await _shadow_lane_read(lane)
+
+
+@app.get("/api/shadow-lanes/{lane}/archive", dependencies=[Depends(authorize)])
+async def shadow_lane_archive(lane: str):
+    return await _shadow_lane_read(lane, archive=True)
+
+
 @app.get("/api/lanes", dependencies=[Depends(authorize)])
 async def smart_lanes_index():
     """The smart lanes (smart_lane.py): one paper book per configured capital, same rules."""

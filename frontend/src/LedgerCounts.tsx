@@ -1,5 +1,5 @@
 import type { Order, Trade } from "./types";
-import { ledgerCounts } from "./ledgerCounts";
+import { ledgerCounts } from "./ledgerCountState";
 
 export function LedgerCounts({orders, trades, ready}: {orders: Order[]; trades: Trade[]; ready: boolean}) {
   const counts = ledgerCounts(orders,trades);

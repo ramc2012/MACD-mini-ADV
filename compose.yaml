@@ -44,6 +44,7 @@ services:
       # The market-intelligence hub (~/CLAUDE PROJECTS/market-intelligence); empty = call Fyers directly (the default until the
       # hub's shadow capture has matched this app's).
       MACD_MARKET_HUB_URL: ${MACD_MARKET_HUB_URL:-}
+      MACD_SHADOW_LANES_URL: http://shadow-lanes:8430
     volumes:
       - ./runtime:/app/runtime
       - engine_data:/app/data
@@ -161,6 +162,37 @@ services:
       - gateway
     restart: unless-stopped
 
+  # Fresh research observations only. No order interface or legacy paper-book writer is started.
+  shadow-lanes:
+    profiles: ["shadow-lanes"]
+    image: tradebot-backend:latest
+    entrypoint: ["python", "-m", "shadow_lanes.service"]
+    working_dir: /macd
+    env_file: /Users/ramachandran/CLAUDE PROJECTS/market-intelligence/secrets/timescale.env
+    environment:
+      MI_PG_HOST: nomadcurie_db
+      LANE_SOURCE_DB: nomadcurie
+      VANGUARD_SOURCE: /vanguard
+      VANGUARD_RUNTIME_DIR: /runtime/shadow_lanes/features
+      SHADOW_DATABASE_PATH: /runtime/shadow_lanes/observations.sqlite3
+      SHADOW_WORKER_ENABLED: ${SHADOW_WORKER_ENABLED:-false}
+      MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      TRADING_CALENDAR_FILE: /runtime/shadow_lanes/trading_calendar.json
+      SHARED_MP_REDIS_URL: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./shadow_lanes:/macd/shadow_lanes:ro
+      - ./vanguard:/vanguard:ro
+      - ./runtime/shadow_lanes:/runtime/shadow_lanes
+      - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/cbe_scanner/paper:/legacy/cbe:ro
+    networks: [default, tradebot]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8430/health',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+    restart: unless-stopped
+
   us-backend:
     profiles: ["us"]
     build:
@@ -190,6 +222,11 @@ services:
       us-backend:
         condition: service_healthy
     restart: unless-stopped
+
+networks:
+  tradebot:
+    external: true
+    name: tradebot_default
 
 volumes:
   engine_data:
