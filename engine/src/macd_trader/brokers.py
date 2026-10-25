@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import math
+import os
 import random
 import time
 from abc import ABC, abstractmethod
@@ -428,6 +429,8 @@ class FyersBroker(Broker):
         hub answers with Fyers' own status and body, so every parser below is unchanged. Empty (the default):
         straight to Fyers, as before.
         """
+        if endpoint == "history" and os.environ.get("MACD_HISTORY_DOWNLOADS_ENABLED", "true").lower() in ("false", "0", "off"):
+            raise RuntimeError("Historical broker downloads disabled during local-archive recovery")
         hub = (getattr(self.settings, "market_hub_url", "") or "").rstrip("/")
         if not hub:
             return await client.get(f"{self.data_url}/{endpoint}", params=params,

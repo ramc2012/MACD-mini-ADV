@@ -3,6 +3,7 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
 from macd_trader.brokers import FyersBroker
 from macd_trader.config import Settings
@@ -47,3 +48,12 @@ def test_with_a_hub_the_call_is_posted_to_it_without_the_token():
     assert seen["auth"] is None                                     # the hub holds the session, not the caller
     assert seen["body"] == {"broker": "fyers", "endpoint": "quotes", "query": {"symbols": "NSE:A,NSE:B"},
                             "priority": "critical", "caller": "macd-mini-adv", "ttl_ms": 0}
+
+
+def test_local_recovery_never_requests_historical_broker_data(monkeypatch):
+    monkeypatch.setenv("MACD_HISTORY_DOWNLOADS_ENABLED", "false")
+    def forbidden(request): pytest.fail("Historical recovery must stay offline")
+    for hub in ("", "http://hub:8400"):
+        broker = _broker(hub)
+        with pytest.raises(RuntimeError, match="disabled"):
+            _run(broker, forbidden, lambda c: broker._data_get(c, "history", {}, priority="bulk"))

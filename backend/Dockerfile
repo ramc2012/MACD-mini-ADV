@@ -1,4 +1,5 @@
 FROM golang:1.24-alpine AS build
+ENV GOMAXPROCS=2
 
 WORKDIR /src
 COPY go.mod go.sum ./
