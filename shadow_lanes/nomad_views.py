@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from .nomad_read import fetch_all
 
 
-def install(api, store, authorize):
+def install(api, store, authorize,paper=None):
     from .nomad_vanguard import router as vanguard
     from fastapi import Depends
 
@@ -34,10 +34,10 @@ def install(api, store, authorize):
                 latest = (snap.get('publications') or [None])[0]
                 rows = (latest or {}).get('watchlist') or []
                 overrides = {
-                    'paper': {'account':None,'shadow_only':True, **snap},
+                    'paper': {'account':None,'shadow_only':True,'macd_paper_only':paper is not None, **snap},
                     'book': {'open_positions':[],'closed':[],'equity_curve':[],'shadow_only':True},
                     'readiness': {**readiness,'selection_allowed':False,'publication_allowed':False,
-                                  'observed_at':snap.get('checked_at'),'detail':'Fresh MACD observations; execution disabled'},
+                                  'observed_at':snap.get('checked_at'),'detail':('New paper entries require current data and Qwen; exits managed separately' if paper else 'Fresh MACD observations; execution disabled')},
                     'summary': {'paper_only':True,'shadow_only':True,'latest_timing_bar':None,'activity':{},'thresholds':{},'capital':None},
                     'watchlist': {'shadow_only':True,'latest':latest,'items':rows,'history':snap.get('publications',[]),'current_items':rows},
                     'strategy-journals': {'journals':{},'swing':{'latest':latest,'items':rows}},
@@ -74,7 +74,7 @@ def install(api, store, authorize):
         rows=(latest or {}).get('watchlist') or []
         result=[{**r,'composite_alpha_score':r.get('score'),'directional_bias':'bullish','gate_passed':True,
                  'is_watchlist':True,'sector_code':r.get('sector'),'details':{'stock_selection':r}} for r in rows]
-        return {'shadow_only':True,'config':{'timeframe':'daily'},'source':'MACD prospective shadow',
+        return {'shadow_only':paper is None,'config':{'timeframe':'daily'},'source':'MACD prospective paper candidates' if paper else 'MACD prospective shadow',
                 'scan_date':(latest or {}).get('source_session'),'created_at':(latest or {}).get('decision_at'),
                 'results':result,'watchlist':result,'watchlist_count':len(result),'scored_count':len(result),
                 'readiness':snap.get('readiness')}
@@ -82,6 +82,10 @@ def install(api, store, authorize):
     @router.get('/cbe/paper-summary')
     def cbe_summary(scope:str='shadow'):
         if scope=='retained':return summary(book())
+        if paper:
+            p=paper.snapshot('cbe')
+            return {**p,'shadow_only':False,'macd_paper_only':True,'total_equity':p['equity'],'open_positions':p['open_count'],
+                    'closed_positions':p['closed_count'],'admissions_blocked':p['paused']}
         return {'shadow_only':True,'admissions_blocked':True,'open_positions':0,'closed_positions':0,
                 'initial_capital':None,'total_equity':None,'realized_pnl':None,'unrealized_pnl':None,'risk_flags':['execution_disabled']}
 
@@ -102,6 +106,9 @@ def install(api, store, authorize):
                     try:records.append(json.loads(line))
                     except ValueError:continue
             return {'count':len(records),'records':records,'read_only':True}
+        if paper:
+            events=paper.snapshot('cbe')['events'][:limit]
+            return {'count':len(events),'records':[{'recorded_at':r['at'],'event':r['kind'],'entry_reason':r['detail'].get('reason') or r['kind'],'order_id':r['order_id']} for r in events]}
         events=store.snapshot('cbe').get('journal',[])
         return {'count':len(events),'records':[{'recorded_at':r['at'],'event':r['kind'],'entry_reason':'Shadow readiness observation; no fill'} for r in events]}
 

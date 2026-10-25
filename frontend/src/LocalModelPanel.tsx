@@ -11,7 +11,7 @@ export function LocalModelPanel(){
  const latest=state?.recent?.[0];
  return <section style={{padding:16,margin:'14px 0',border:'1px solid #284557',borderRadius:10,background:'#0d1923',color:'#dce5f1',fontSize:12,lineHeight:1.6}} aria-label="Local Qwen decision review">
   <div style={{display:'flex',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}><strong>Qwen 3.5 · local decision review</strong><span style={{color:state?.ready?'#68d5c1':'#efc47c'}}>{!state?'Checking model…':state.ready?`Model available · ${state.mode} mode`:'Model unavailable · new filtered entries wait'}</span></div>
-  <div>{state?.model??'qwen3.5:9b'} · New Smart entries and Vanguard shadow selections. Existing admission rules, sizing and exits remain authoritative.</div>
+  <div>{state?.model??'qwen3.5:9b'} · New Smart, Vanguard and CBE paper entries. Existing admission rules, sizing and exits remain authoritative.</div>
   <div style={{color:'#9aafc2'}}>One shared worker · {state?.queue??0} requests queued · {state?.cache_hits??0} cache hits since restart · local inference only</div>
   {(state?.last_error||state?.detail)&&<p style={{margin:'5px 0',color:'#efc47c'}}>{state.last_error||state.detail}</p>}
   {latest?<div style={{borderTop:'1px solid #284557',marginTop:8,paddingTop:8}}>Latest {latest.lane} review · {stamp(latest.at)} · {(latest.latency_ms/1000).toFixed(1)}s{latest.reviews.map(r=><div key={r.id}><b>{r.verdict.toUpperCase()}</b> · {r.reason}</div>)}</div>:<div style={{marginTop:6,color:'#9aafc2'}}>No prospective review recorded yet. Model availability does not establish market-data readiness or trading edge.</div>}

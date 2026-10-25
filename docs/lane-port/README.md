@@ -1,5 +1,10 @@
 # Vanguard and CBE port
 
+**Current upgrade at 2026-10-25 23:50:30 IST:** both lanes are deployed with fresh funded paper books, native
+financial ledgers, Qwen entry gates and independent exits. Read [PAPER_LANES.md](PAPER_LANES.md) for current
+policy, data blockers and evidence. The incident and cutover notes below are historical records; Docker services
+were subsequently recovered. Retained Nomad histories remain separate and read-only.
+
 **Current incident at 2026-10-25 12:37:37 IST:** Docker's containers, images and volumes disappeared after the
 verified activation below. Both contexts point to the same empty daemon; all services are now down. Owner
 clarification about Docker reset/maintenance is pending. No restore or empty replacement database has been started.

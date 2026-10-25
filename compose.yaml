@@ -174,6 +174,7 @@ services:
     environment:
       OLLAMA_URL: http://host.docker.internal:11434
       OLLAMA_MODEL: qwen3.5:9b
+      PAPER_LANES_ENABLED: "true"
       LOCAL_DECISION_DATABASE: /runtime/local_decisions/reviews.sqlite3
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       PYTHONDONTWRITEBYTECODE: "1"
@@ -188,7 +189,7 @@ services:
     mem_limit: 384m
     restart: unless-stopped
 
-  # Fresh research observations only. No order interface or legacy paper-book writer is started.
+  # Fresh paper books and candidate observations. No real-order interface or legacy book writer.
   shadow-lanes:
     profiles: ["shadow-lanes"]
     image: tradebot-backend:latest
@@ -202,6 +203,10 @@ services:
       VANGUARD_RUNTIME_DIR: /runtime/shadow_lanes/features
       SHADOW_DATABASE_PATH: /runtime/shadow_lanes/observations.sqlite3
       SHADOW_WORKER_ENABLED: ${SHADOW_WORKER_ENABLED:-false}
+      PAPER_LANES_ENABLED: "true"
+      PAPER_LANE_CAPITAL: ${PAPER_LANE_CAPITAL:-1000000}
+      PAPER_LANES_DIR: /runtime/paper_lanes
+      PAPER_HUB_URL: http://host.docker.internal:8400
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       TRADING_CALENDAR_FILE: /runtime/shadow_lanes/trading_calendar.json
       SHARED_MP_REDIS_URL: ""
@@ -210,8 +215,10 @@ services:
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:
       - ./shadow_lanes:/macd/shadow_lanes:ro
+      - ./paper_lanes:/macd/paper_lanes:ro
       - ./vanguard:/vanguard:ro
       - ./runtime/shadow_lanes:/runtime/shadow_lanes
+      - ./runtime/paper_lanes:/runtime/paper_lanes
       - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/cbe_scanner/paper:/legacy/cbe:ro
       - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/vanguard:/legacy/vanguard:ro
     networks: [default, tradebot]

@@ -1,0 +1,41 @@
+import {useState} from 'react';
+import {useQuery} from '@tanstack/react-query';
+import {ResponsiveContainer,LineChart,Line,CartesianGrid,XAxis,YAxis,Tooltip} from 'recharts';
+import {api} from './lib/api';
+import {API_URL,API_TOKEN} from '../runtime';
+import {Section,MetricTile,formatIST,formatMoney,formatSignedMoney} from './components/desk-ui';
+
+type Paper={enabled:boolean;lane:string;mode:string;initial_capital:number;cash:number;unsettled_cash:number;equity:number;
+ realized_pnl:number;unrealized_pnl:number;return_pct:number;max_drawdown_pct:number;open_count:number;closed_count:number;
+ fees_paid:number;win_rate:number|null;expectancy:number|null;paused:boolean;stale_positions:number;checked_at:string;
+ status:{state:string};market_error?:string;readiness?:{status?:string;blockers?:string[]};policy:Record<string,any>;
+ positions:any[];closed:any[];orders:any[];fills:any[];events:any[];decisions:any[];equity_curve:any[]};
+
+export function usePaper(lane:string){return useQuery({queryKey:['macd-paper',lane],queryFn:async()=>(await api.get(`/api/paper-lanes/${lane}`)).data as Paper,refetchInterval:5000});}
+
+export function PaperLanePanel({lane,performance=false}:{lane:string;performance?:boolean}){
+ const query=usePaper(lane),p=query.data;const [tab,setTab]=useState(performance?'Equity':'Positions');const [busy,setBusy]=useState(false);const [error,setError]=useState('');
+ const control=async()=>{if(!p)return;setBusy(true);setError('');try{const r=await fetch(`${API_URL}/api/paper-lanes/${lane}/control`,{method:'POST',headers:{'Content-Type':'application/json',...(API_TOKEN?{'X-Macd-Token':API_TOKEN}:{})},body:JSON.stringify({action:p.paused?'resume':'pause'})});if(!r.ok)throw Error('Paper entry control failed');await query.refetch();}catch(e){setError((e as Error).message);}finally{setBusy(false);}};
+ if(query.isError)return <Section title="MACD paper account"><p role="alert">The paper account is unavailable. No financial values have been substituted.</p></Section>;
+ if(!p?.enabled)return <Section title="MACD paper account"><p>Loading the independent paper book…</p></Section>;
+ const tabs=['Positions','Orders','Closed trades','Fills','Qwen decisions','Equity'];
+ const table=(headers:string[],rows:React.ReactNode[][])=><div className="overflow-auto"><table className="w-full text-left text-xs"><thead><tr>{headers.map(h=><th className="p-3" key={h}>{h}</th>)}</tr></thead><tbody>{rows.length?rows.map((r,i)=><tr className="border-t border-bg-border" key={i}>{r.map((cell,j)=><td className="p-3" key={j}>{cell}</td>)}</tr>):<tr><td className="p-4 text-text-secondary" colSpan={headers.length}>No records in this new paper book.</td></tr>}</tbody></table></div>;
+ return <div className="space-y-4"><Section title={`${lane==='vanguard'?'Vanguard':'CBE'} · MACD paper account`} description={lane==='vanguard'?'Fully funded exact-contract option simulations.':'Fully funded long-only cash-equity simulations.'} rightSlot={<button className="rounded-lg border border-bg-border px-3 py-2 text-xs" disabled={busy} onClick={control}>{busy?'Saving…':p.paused?'Resume entries':'Pause entries'}</button>}>
+ <div className="grid grid-cols-2 gap-3 xl:grid-cols-4"><MetricTile label="Net liquidation equity" value={formatMoney(p.equity)} detail={`Starting paper capital ${formatMoney(p.initial_capital)}`}/><MetricTile label="Available cash" value={formatMoney(p.cash)} detail={`Unsettled ${formatMoney(p.unsettled_cash)}`}/><MetricTile label="Realized / unrealized" value={formatSignedMoney(p.realized_pnl)} detail={`${formatSignedMoney(p.unrealized_pnl)} open, after estimated exit costs`}/><MetricTile label="Open / closed" value={`${p.open_count} / ${p.closed_count}`} detail={`Fees paid ${formatMoney(p.fees_paid)}`}/></div>
+ <div className="mt-3 grid grid-cols-2 gap-3 xl:grid-cols-4"><MetricTile label="Return" value={`${p.return_pct.toFixed(2)}%`}/><MetricTile label="Maximum drawdown" value={`${p.max_drawdown_pct.toFixed(2)}%`}/><MetricTile label="Closed-trade strike rate" value={p.win_rate==null?'—':`${(p.win_rate*100).toFixed(1)}%`}/><MetricTile label="Net expectancy / close" value={p.expectancy==null?'—':formatSignedMoney(p.expectancy)}/></div>
+ <p className="mt-4 text-sm text-accent-cyan">Paper {p.paused?'entries paused':'entries enabled'} · {p.status.state.replaceAll('_',' ')} · exits remain managed independently of Qwen.</p>
+ <p className="mt-2 text-xs text-text-secondary">New selections: {p.readiness?.status?.replaceAll('_',' ')??'awaiting inputs'}. {(p.readiness?.blockers??[]).join(' · ')}</p>
+ {!!p.stale_positions&&<p className="mt-2 text-amber-200">{p.stale_positions} held marks are stale. Fresh displayed quotes are required for fills.</p>}
+ {(error||p.market_error)&&<p role="alert" className="mt-2 text-amber-200">{error||p.market_error}</p>}
+ <p className="mt-2 text-xs text-text-muted">Checked {formatIST(p.checked_at)}. Qwen must approve each new entry against fresh quotes; old Nomad holdings and returns are excluded.</p>
+ </Section><Section title="Paper execution ledger" description="Simulated all-or-none L1 fills, adverse slippage and estimated fees. New entries require fresh bid/ask, sufficient displayed depth and unchanged risk gates.">
+ <div className="mb-4 flex flex-wrap gap-2" role="group" aria-label="Paper ledger view">{tabs.map(t=><button className={`rounded-lg border border-bg-border px-3 py-2 text-xs ${tab===t?'text-accent-cyan bg-bg-active':'text-text-secondary'}`} key={t} onClick={()=>setTab(t)} aria-pressed={tab===t}>{t}</button>)}</div>
+ {tab==='Positions'&&table(['Instrument','Quantity / lots','Entry','Liquidation bid','Stop / target','Exit due','Opened'],p.positions.map(r=>[<span>{r.symbol}<br/>{r.instrument}</span>,`${r.quantity} / ${r.quantity/r.lot_size}`,formatMoney(r.entry),<span>{formatMoney(r.last_bid)}<br/>{formatIST(r.last_at)}</span>,`${formatMoney(r.stop)} / ${formatMoney(r.target)}`,formatIST(r.exit_due),formatIST(r.opened_at)]))}
+ {tab==='Orders'&&table(['Stock / instrument','Rank','State','Admission reason','Entry window','Exit due'],p.orders.map(r=>[<span>{r.symbol}<br/>{r.instrument}</span>,r.rank,r.state,r.reason,<span>{formatIST(r.entry_after)}<br/>{formatIST(r.deadline)}</span>,formatIST(r.exit_due)]))}
+ {tab==='Closed trades'&&table(['Stock / instrument','Quantity','Entry / exit','Net P&L','Reason','Opened','Closed'],p.closed.map(r=>[<span>{r.symbol}<br/>{r.instrument}</span>,r.quantity,`${formatMoney(r.entry)} / ${formatMoney(r.exit)}`,formatSignedMoney(r.pnl_paise/100),r.exit_reason,formatIST(r.opened_at),formatIST(r.closed_at)]))}
+ {tab==='Fills'&&table(['Side','Order','Quantity','Fill','Notional','Fee','Filled / quote time'],p.fills.map(r=>[r.side,r.order_id,r.quantity,formatMoney(r.price),formatMoney(r.notional_paise/100),formatMoney(r.fee_paise/100),<span>{formatIST(r.at)}<br/>{formatIST(r.quote_at)}</span>]))}
+ {tab==='Qwen decisions'&&table(['Recorded','Order','Verdict','Reason','Model / digest'],p.decisions.map(r=>[formatIST(r.at),r.order_id,r.verdict,r.payload.reason,`${r.payload.model} · ${r.payload.digest?.slice(0,12)}`]))}
+ {tab==='Equity'&&<><ResponsiveContainer width="100%" height={260}><LineChart data={p.equity_curve.map(r=>({...r,equity:r.equity_paise/100}))}><CartesianGrid stroke="#26364a" strokeDasharray="3 3"/><XAxis dataKey="at" hide/><YAxis domain={['auto','auto']} stroke="#94a3b8" tickFormatter={v=>formatMoney(v)}/><Tooltip labelFormatter={v=>formatIST(String(v))} formatter={v=>formatMoney(Number(v))} contentStyle={{background:'#0d1726',borderColor:'#334155'}}/><Line dataKey="equity" stroke="#22d3ee" dot={p.equity_curve.length===1} isAnimationActive={false}/></LineChart></ResponsiveContainer><p className="mt-2 text-xs text-text-secondary">Prospective net liquidation equity only. No imported historical returns.</p></>}
+ <p className="mt-4 text-xs text-text-muted">Position cap {(p.policy.position_fraction*100).toFixed(0)}% · gross cap {(p.policy.gross_fraction*100).toFixed(0)}% · sector cap {(p.policy.sector_fraction*100).toFixed(0)}% · stop {(p.policy.hard_stop*100).toFixed(0)}% · target {(p.policy.target*100).toFixed(0)}%. Cash-stock sale proceeds settle at the next session open. Fees are estimates; fills do not model queue position or market impact.</p>
+ </Section></div>;
+}

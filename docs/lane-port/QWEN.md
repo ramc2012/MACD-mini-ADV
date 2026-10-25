@@ -1,5 +1,9 @@
 # Local Qwen decision reviews
 
+**Update at 2026-10-25 23:50:30 IST:** Vanguard and CBE now have independent funded paper books and fresh-entry
+Qwen reviews. See [PAPER_LANES.md](PAPER_LANES.md) for the current execution policy and validation. The original
+deployment record below describes the earlier observation-only Vanguard boundary.
+
 Deployed and browser-checked at **2026-10-25 23:05:33 IST**. Owner-selected model: `qwen3.5:9b`, Ollama 0.40.11,
 local MLX runner. No model/package download, cloud inference, real order, model training or agentic-lane test call.
 

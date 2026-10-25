@@ -340,7 +340,7 @@ export default function CbeDesk() {
   return (
     <DeskShell
       title="CBE Paper Trader"
-      description={isShadow ? "Daily long-only stock shadow observations · candidates → frozen watchlist → observed follow-through. Execution disabled." : "Retained Nomad CBE account · recorded positions and history, read only."}
+      description={isShadow ? "Daily long-only cash-equity paper trading · Qwen-reviewed entries, cash accounting and managed exits." : "Retained Nomad CBE account · recorded positions and history, read only."}
       asOf={scan?.created_at ?? scan?.scan_date ?? undefined}
       // CBE scans land once per session (EOD alpha-engine pass) — freshness
       // thresholds follow that cadence, not the intraday default.
@@ -371,7 +371,7 @@ export default function CbeDesk() {
             variant={riskFlags.includes("inside_hedge_mandate") || !riskFlags.length ? "success" : "warn"}
             icon={<ShieldCheck size={12} />}
           />
-          <StatusBadge label={isShadow ? "execution disabled" : "retained history"} variant="warn" />
+          <StatusBadge label={isShadow ? "paper execution" : "retained history"} variant="warn" />
         </div>
       }
     >
@@ -493,7 +493,7 @@ export default function CbeDesk() {
         <p className="mb-3 text-xs text-text-muted">{watchlist.length} selected · signal session {scan?.signal_session_date ?? scan?.scan_date ?? "pending"} · {paperSum?.admissions_blocked ? "New entries blocked: held quotes need recovery" : "Paper admission follows book limits"}</p>
         <CandidateTable rows={watchlist}/>
       </Section>}
-      {activeTab === "journal" && <Section title={isShadow ? "CBE observation journal" : "Retained CBE execution journal"} description="Persisted paper entries and exits, including quantities, costs and reasons. Candidate scans are separate from this financial record.">
+      {activeTab === "journal" && <Section title={isShadow ? "CBE paper journal" : "Retained CBE execution journal"} description="Persisted paper entries and exits, including quantities, costs and reasons. Candidate scans are separate from this financial record.">
         {journalQuery.isLoading ? <p>Loading journal…</p> : journalQuery.isError ? <p role="alert">Journal could not be loaded.</p> : <>
           <p className="mb-3 text-xs text-text-muted">{journalQuery.data?.count ?? 0} recorded events · newest 500 shown</p>
           {!journalQuery.data?.records.length && <p>No paper execution events recorded yet.</p>}

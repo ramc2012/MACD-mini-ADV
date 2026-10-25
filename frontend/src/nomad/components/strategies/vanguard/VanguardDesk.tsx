@@ -213,7 +213,7 @@ export default function VanguardDesk() {
   return (
     <DeskShell
       title="Vanguard"
-      description="Prospective paper trading across daily, weekly and monthly stock horizons, with exact-contract options and frozen-model research."
+      description="Exact-contract option paper trading over 1–3 sessions with Qwen-reviewed entries. Retained model and stock research remains available in separate tabs."
       asOf={s?.latest_timing_bar ?? null}
       asOfLabel="latest timing bar"
       paperMode

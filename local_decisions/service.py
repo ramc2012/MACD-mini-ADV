@@ -49,7 +49,7 @@ class Candidate(BaseModel):
 
 class ReviewInput(BaseModel):
     model_config=ConfigDict(extra='forbid')
-    lane: Literal['smart','vanguard']
+    lane: Literal['smart','vanguard','cbe']
     snapshot_at: datetime
     candidates: list[Candidate]=Field(min_length=1,max_length=10)
 
@@ -175,7 +175,8 @@ def create_app(reviewer=None):
         auth(x_macd_token)
         with worker.db() as db:
             rows=db.execute('SELECT at,lane,output FROM reviews ORDER BY at DESC LIMIT 5').fetchall()
-        return {**await worker.availability(),'mode':'filter','smart_new_entries_only':True,'vanguard_shadow_only':True,
+        return {**await worker.availability(),'mode':'filter','smart_new_entries_only':True,
+                'vanguard_shadow_only':os.environ.get('PAPER_LANES_ENABLED','false')!='true','paper_lanes_only':True,
                 'queue':worker.waiting,'inferences':worker.calls,'cache_hits':worker.hits,'last_error':worker.last_error,
                 'recent':[{'at':a,'lane':lane,**json.loads(output)} for a,lane,output in rows]}
 

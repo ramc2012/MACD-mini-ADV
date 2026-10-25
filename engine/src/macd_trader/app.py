@@ -12,7 +12,7 @@ from typing import Literal
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
@@ -606,6 +606,33 @@ async def local_decision_status():
     except (httpx.HTTPError,ValueError):
         return {'ready':False,'mode':mode,'model':'qwen3.5:9b','recent':[],
                 'detail':'Local review service unavailable; new filtered entries wait'}
+
+
+@app.get('/api/paper-lanes/{lane}',dependencies=[Depends(authorize)])
+async def funded_lane_snapshot(lane:str):
+    import httpx
+    if lane not in ('vanguard','cbe'):raise HTTPException(404,'Unknown paper lane')
+    url=os.environ.get('MACD_SHADOW_LANES_URL','').rstrip('/')
+    if not url:raise HTTPException(503,'Paper service not configured')
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r=await client.get(f'{url}/api/paper-lanes/{lane}',headers={'X-Macd-Token':engine.settings.api_token})
+        return Response(r.content,status_code=r.status_code,media_type='application/json')
+    except httpx.HTTPError:raise HTTPException(502,'Paper account reader unavailable') from None
+
+
+@app.post('/api/paper-lanes/{lane}/control',dependencies=[Depends(authorize)])
+async def funded_lane_control(lane:str,body:dict=Body(...)):
+    import httpx
+    if lane not in ('vanguard','cbe') or set(body)!={'action'} or body['action'] not in ('pause','resume'):
+        raise HTTPException(400,'Only pause/resume new paper entries is supported')
+    url=os.environ.get('MACD_SHADOW_LANES_URL','').rstrip('/')
+    if not url:raise HTTPException(503,'Paper service not configured')
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r=await client.post(f'{url}/api/paper-lanes/{lane}/control',json=body,headers={'X-Macd-Token':engine.settings.api_token})
+        return Response(r.content,status_code=r.status_code,media_type='application/json')
+    except httpx.HTTPError:raise HTTPException(502,'Paper account control unavailable') from None
 
 
 @app.get('/api/nomad/{path:path}', dependencies=[Depends(authorize)])

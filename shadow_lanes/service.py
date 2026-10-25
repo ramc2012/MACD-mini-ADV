@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Body
 import psycopg2
 from psycopg2.extensions import make_dsn
 
@@ -31,8 +31,9 @@ FEATURE_STEPS = (
 
 
 class ShadowWorker:
-    def __init__(self, store):
+    def __init__(self, store, paper=None):
         self.store = store
+        self.paper = paper
         self.features_bar = None
         self.feature_error = None
 
@@ -54,18 +55,26 @@ class ShadowWorker:
                 result = getattr(source, lane)(connection, now)
                 if lane == "vanguard" and self.feature_error:
                     result.update(status="blocked", blockers=[f"Market feature refresh failed: {self.feature_error}"], watchlist=[])
-                if lane=='vanguard' and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
+                if self.paper and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='filter':
+                    result.update(status='blocked',blockers=['Paper cohorts require Qwen filter mode'],watchlist=[])
+                if (lane=='vanguard' or self.paper) and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
                     from .local_model import apply_review
-                    result=apply_review(result,now)
+                    result=apply_review(result,now,lane=lane) if self.paper else apply_review(result,now)
                     # A slow review cannot freeze a missed or previous-session observation.
                     finished=datetime.now(source.IST)
                     if finished.date()!=now.astimezone(source.IST).date() or not source.publication_window(finished,lane):
                         result.update(status='blocked',blockers=['Local review completed outside the publication window'],watchlist=[])
+                if self.paper:
+                    result['paper_account_id']=self.paper.books[lane].account_id
+                    result['policy']=result.get('policy',source.POLICIES[lane])+'-paper-candidates-v1'
+                    result['watchlist']=[{**row,'actionable':False,'actionable_reason':'Paper candidate only; fresh next-session Qwen, quote and risk checks required'} for row in result.get('watchlist',[])]
                 result.update(shadow_only=True, execution_enabled=False, diagnostic=diagnostic)
                 self.store.status(lane, now.isoformat(), result)
                 if not diagnostic and source.publication_window(now, lane) and result.get("source_session") == str(now.astimezone(source.IST).date()):
                     if result.get("status") == "ok" and result.get("watchlist"):
-                        self.store.publish(lane, day, datetime.now(source.IST).isoformat() if result.get('local_review') else now.isoformat(), result.get('policy',source.POLICIES[lane]), result)
+                        inserted=self.store.publish(lane, day, datetime.now(source.IST).isoformat() if result.get('local_review') else now.isoformat(), result.get('policy',source.POLICIES[lane]), result)
+                        if inserted and self.paper:
+                            self.paper.offer(next(p for p in self.store.publications(lane) if p['source_session']==str(day)))
             except Exception as exc:
                 self.store.status(lane, now.isoformat(), dict(status="blocked", blockers=[f"Input check failed: {type(exc).__name__}"],
                     source_session=str(day), policy=source.POLICIES[lane]))
@@ -138,21 +147,26 @@ class ShadowWorker:
             await asyncio.sleep(30)
 
 
-def create_app(store=None, worker_enabled=None):
+def create_app(store=None, worker_enabled=None, paper_manager=None):
     store = store or ShadowStore(os.environ.get("SHADOW_DATABASE_PATH", "/runtime/shadow_lanes/observations.sqlite3"))
-    worker = ShadowWorker(store)
+    paper=paper_manager
+    if paper is None and os.environ.get('PAPER_LANES_ENABLED','false')=='true':
+        from paper_lanes.manager import Manager
+        paper=Manager()
+    worker = ShadowWorker(store,paper)
     enabled = os.environ.get("SHADOW_WORKER_ENABLED", "false").lower() == "true" if worker_enabled is None else worker_enabled
 
     @asynccontextmanager
     async def lifespan(app):
-        task = asyncio.create_task(worker.run()) if enabled else None
+        tasks = [asyncio.create_task(worker.run())] if enabled else []
+        if paper:tasks.extend([asyncio.create_task(paper.run_marks(store)),asyncio.create_task(paper.run_reviews()),asyncio.create_task(paper.run_reconcile(store))])
         yield
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        for task in tasks:task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     api = FastAPI(title="MACD shadow lanes", lifespan=lifespan)
     api.state.store, api.state.worker = store, worker
+    api.state.paper=paper
 
     def authorize(x_macd_token: str = Header(default="")):
         expected = os.environ.get("MACD_API_TOKEN", "")
@@ -160,17 +174,32 @@ def create_app(store=None, worker_enabled=None):
             raise HTTPException(401, "Invalid API token")
 
     from .nomad_views import install
-    install(api, store, authorize)
+    install(api, store, authorize,paper=paper)
 
     @api.get("/health")
     def health():
-        return {"ok": True, "shadow_only": True, "execution_enabled": False, "worker_enabled": enabled}
+        return {"ok": True, "shadow_only": paper is None, "execution_enabled": paper is not None,
+                "execution_mode":"paper","live_orders_possible":False,"worker_enabled": enabled}
+
+    @api.get('/api/paper-lanes/{lane}',dependencies=[Depends(authorize)])
+    def paper_snapshot(lane:str):
+        if lane not in LANES:raise HTTPException(404,'Unknown lane')
+        if not paper:return {'enabled':False,'lane':lane}
+        return {'enabled':True,**paper.snapshot(lane),'readiness':store.snapshot(lane)['readiness']}
+
+    @api.post('/api/paper-lanes/{lane}/control',dependencies=[Depends(authorize)])
+    def paper_control(lane:str,body:dict=Body(...)):
+        if lane not in LANES or not paper:raise HTTPException(404,'Paper lane unavailable')
+        if set(body)!={'action'} or body['action'] not in ('pause','resume'):raise HTTPException(400,'Only pause/resume new entries is supported')
+        paper.books[lane].control(body['action']=='pause',datetime.now(source.IST))
+        return {'ok':True,'paused':body['action']=='pause','exits_remain_managed':True}
 
     @api.get("/api/shadow-lanes/{lane}", dependencies=[Depends(authorize)])
     def snapshot(lane: str):
         if lane not in LANES:
             raise HTTPException(404, "Unknown shadow lane")
         return {**store.snapshot(lane), "worker_enabled": enabled, "legacy_history_preserved": True,
+                'paper_enabled':paper is not None,'execution_mode':'paper',
                 "publication_window": "14:45–15:15 IST" if lane == "vanguard" else "15:15–15:35 IST",
                 "target": "Exact stock-option performers over 1–3 sessions, plus a BTST observation" if lane == "vanguard" else "Long-only daily stock-direction research"}
 

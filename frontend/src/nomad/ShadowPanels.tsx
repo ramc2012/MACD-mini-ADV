@@ -1,12 +1,15 @@
 import {useQuery} from '@tanstack/react-query';
 import {api} from './lib/api';
 import {MetricTile,Section,formatIST,formatNumber} from './components/desk-ui';
+import {PaperLanePanel,usePaper} from './PaperLanePanel';
 
 export function useShadow(lane='vanguard') {
   return useQuery({queryKey:['macd-shadow',lane],queryFn:async()=>(await api.get(`/api/shadow-lanes/${lane}`)).data,refetchInterval:30000});
 }
 export function ShadowPortfolio({lane='vanguard'}:{lane?:string}) {
   const query=useShadow(lane), d=query.data, publications=d?.publications??[],outcomes=d?.outcomes??[];
+  const paper=usePaper(lane);
+  if(paper.isLoading||paper.isError||paper.data?.enabled)return <PaperLanePanel lane={lane}/>;
   return <div className="space-y-4"><Section title="Fresh MACD shadow book" description="Prospective observations in their own journal. Execution and funding are disabled.">
     <div className="grid grid-cols-2 gap-3 xl:grid-cols-4"><MetricTile label="Frozen cohorts" value={String(publications.length)}/><MetricTile label="Selected instruments" value={String(publications.reduce((n:number,p:any)=>n+(p.watchlist?.length??0),0))}/><MetricTile label="Observed outcomes" value={String(outcomes.length)}/><MetricTile label="Orders / funded positions" value="Disabled"/></div>
     <p className="mt-4 text-amber-200">{d?.readiness?.status?.replaceAll('_',' ')??'Checking inputs…'}</p>
@@ -19,6 +22,8 @@ export function ShadowPortfolio({lane='vanguard'}:{lane?:string}) {
 }
 export function ShadowFollowup({lane='vanguard'}:{lane?:string}) {
   const {data}=useShadow(lane); const rows=data?.outcomes??[];
+  const paper=usePaper(lane);
+  if(paper.isLoading||paper.isError||paper.data?.enabled)return <PaperLanePanel lane={lane} performance/>;
   return <Section title="Prospective follow-through" description="Observed quote-to-quote returns before costs; no simulated fills or imported track record.">
     {!rows.length?<p>No completed prospective outcomes yet.</p>:<div className="overflow-auto"><table className="w-full text-left text-xs"><thead><tr>{['Instrument','Horizon','Baseline','Observed quote','Change','Recorded'].map(s=><th key={s} className="p-2">{s}</th>)}</tr></thead><tbody>{rows.map((r:any,i:number)=><tr key={i} className="border-t border-bg-border"><td className="p-2">{r.instrument}</td><td>{r.horizon}</td><td>{formatNumber(r.baseline_price)}</td><td>{formatNumber(r.observed_price)}</td><td>{formatNumber(r.observed_return*100)}%</td><td>{formatIST(r.observed_at)}</td></tr>)}</tbody></table></div>}
   </Section>;

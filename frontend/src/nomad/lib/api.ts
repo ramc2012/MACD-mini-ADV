@@ -7,7 +7,7 @@ export const api = {
     const query = new URLSearchParams({scope:dataScope()});
     Object.entries(options?.params || {}).forEach(([k,v]) => { if(v != null) query.set(k,String(v)); });
     const response = await fetch(`${API_URL}${mapped}${mapped.includes('?')?'&':'?'}${query}`, {signal:options?.timeout?AbortSignal.any([...(options.signal?[options.signal]:[]),AbortSignal.timeout(options.timeout)]):options?.signal,headers:API_TOKEN?{'X-Macd-Token':API_TOKEN}:{}});
-    if (!response.ok) { window.dispatchEvent(new CustomEvent('nomad-data-error',{detail:path})); throw new Error('This view’s retained data is unavailable after recovery'); }
+    if (!response.ok) { if(mapped.startsWith('/api/nomad/'))window.dispatchEvent(new CustomEvent('nomad-data-error',{detail:path})); throw new Error('Data view unavailable'); }
     return {data:await response.json() as T};
   },
 };

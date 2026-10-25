@@ -24,7 +24,7 @@ export default function DecisionReadinessPanel() {
       </div>
       {d?.detail && <p className="mt-2 text-sm text-text-secondary">{d.detail}</p>}
       {d?.artifact_stale && <p role="alert" className="mt-2 text-amber-200">Readiness reporting is stale. New decisions wait for a current check.</p>}
-      <p className="mt-2 text-xs text-text-muted">New selections: {d?.selection_allowed ? "current evidence permits evaluation" : "waiting"}. New publications: {d?.publication_allowed ? "window open" : "waiting"}. Execution is disabled in MACD shadow lanes. Retained Nomad positions are frozen; missed publications and fills are not recreated.</p>
+      <p className="mt-2 text-xs text-text-muted">New selections: {d?.selection_allowed ? "current evidence permits evaluation" : "waiting"}. New publications: {d?.publication_allowed ? "window open" : "waiting"}. New MACD paper entries need current data and Qwen approval. Paper exits run independently; retained Nomad positions remain frozen. Missed fills are not recreated.</p>
       {(d?.blockers ?? []).length > 0 && <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-amber-200">{d.blockers.map((reason: any, index: number) => <li key={index}>{typeof reason === "string" ? reason : reason.detail ?? reason.reason ?? words(reason.stage)}</li>)}</ul>}
       {(d?.missed_sessions ?? []).length > 0 && <p className="mt-3 text-sm text-amber-200">Missed publication: {d.missed_sessions.map((s: any) => `${s.session} (${words(s.status)})`).join(", ")}. The frozen list remains the last actual publication.</p>}
       {stages.length > 0 && <div className="mt-3 overflow-auto"><table className="w-full text-left text-xs">
