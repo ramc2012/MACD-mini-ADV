@@ -88,7 +88,10 @@ def evaluate(base, adapter, corpus, output, resume=False):
     records = {s: [json.loads(line) for line in (Path(corpus)/(s+'.records.jsonl')).read_text().splitlines()] for s in ('valid', 'test')}
     frozen = {s: [json.loads(line)['messages'][:-1] for line in (Path(corpus)/(s+'.jsonl')).read_text().splitlines()] for s in records}
     if any(len(records[s]) != len(frozen[s]) for s in records): raise ValueError('Prompt/record counts differ')
+    corpus_manifest=json.loads((Path(corpus).parent/'manifest.json').read_text())
     result = {'method': receipt['method'], 'live_promotion_allowed': False, 'complete': False,
+              'quality_tier':corpus_manifest.get('quality_tier','recorded_paper_close'),
+              'quality_warning':'Historical selection and exit-policy limitations apply; reconstructed data additionally lacks historical availability/L1 proof',
               'adapter_sha256': receipt['adapter_sha256'], 'evaluations': {}}
     for stage in ('base', 'adapter'):
         if stage == 'adapter': load_adapters(model, adapter); model.eval()

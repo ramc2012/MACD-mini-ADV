@@ -20,7 +20,9 @@ def main():
             folder=Path(c['adapter_path']);receipt=folder/'training_receipt.json'
             if receipt.exists():
                 saved=json.loads(receipt.read_text())
-                if saved.get('complete') and saved.get('adapter_sha256')==hashlib.sha256((folder/'adapters.safetensors').read_bytes()).hexdigest():
+                if (saved.get('complete') and all(saved.get('config',{}).get(k)==v for k,v in c.items())
+                    and saved.get('adapter_sha256')==hashlib.sha256((folder/'adapters.safetensors').read_bytes()).hexdigest()
+                    and all(saved.get('prompts_sha256',{}).get(s)==hashlib.sha256((Path(c['data'])/(s+'.jsonl')).read_bytes()).hexdigest() for s in ('train','valid','test'))):
                     states[lane]={'state':'trained','receipt':str(receipt)}
                     (root/'plan-state.json').write_text(json.dumps(states,indent=2))
                     continue

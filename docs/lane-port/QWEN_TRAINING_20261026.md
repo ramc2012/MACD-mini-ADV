@@ -1,8 +1,9 @@
 # Local Qwen training and data qualification
 
-Progress checked at **2026-10-26 08:13:00 IST**. This document distinguishes research artifacts from serving
+Progress checked at **2026-10-26 08:24:00 IST**. This document distinguishes research artifacts from serving
 weights. The running reviewer still serves the original **qwen3.5:9b**; no trained adapter has been deployed.
-Training/evaluation are incomplete until their final receipts and full held-out reports exist.
+All three adapter training passes completed and have finite-weight receipts. Full held-out evaluation is still
+in progress; training completion is separate from evaluation completion.
 
 The owner's latest instruction, **leave MACD lane as it is**, governs. Its current entry filter, signals,
 execution/risk rules, cash and positions remain unchanged. Smart's optional Blast intake is disabled for new
@@ -92,6 +93,10 @@ Training and evaluation have a nine-GiB allocation limit and bounded cache. They
 and stop by **2026-10-26 08:30:00 IST** for this session. No OS settings or wired-memory limits were changed.
 Only one full model training/evaluation process may run at once. These limits do not prove intraday inference safety.
 
+Training completed: Smart 130 iterations at **2026-10-26 08:19:13 IST**; Vanguard 25 at
+**2026-10-26 08:20:14 IST**; CBE 27 at **2026-10-26 08:23:55 IST**. Adapters and receipts are private;
+`backups/qwen-training-20261026/training-complete.json` in the platform records hashes/status.
+
 ## Evaluation and serving
 
 `evaluate_local.py` freezes prompt/record/model/adapter hashes, compares the derived untrained base with its
@@ -106,6 +111,23 @@ still pinned to the original Qwen tag; no automatic adapter selection or promoti
 served weights separately from the research manifest. Research adapter training does not itself fulfill a claim
 of improved Smart, Vanguard or CBE profitability.
 
+## Completed reconstructed-data diagnostics
+
+Checked at **2026-10-26 08:26:00 IST**. Fixed argmax; no threshold tuning or weight changes after these results.
+Returns below are equal-notional net trade-return diagnostics with the documented candle assumptions.
+
+| Adapter | Validation approvals | Validation mean / approved | Test approvals | Test mean / approved |
+|---|---:|---:|---:|---:|
+| Vanguard | 3 / 6 | -0.85% | 2 / 7 | +6.23% |
+| CBE | 0 / 12 | undefined | 0 / 7 | undefined |
+
+Vanguard's approved validation set has one gain and two losses; test has one gain and one loss. With seven
+reconstructed test cases, this is **not proven**, and the negative validation result remains material. Its untrained
+derived base approved zero validation/test cases. CBE's derived base approved all twelve validation cases and six
+test cases, with mean approved returns -0.23% and -2.05%; its adapter approves none. Zero approval is not trading
+success, and an all-negative seven-row test cannot measure profitable-signal recall. Neither adapter is promoted.
+Smart's full 177-validation/91-test comparison remains in progress and must not be inferred from these lane results.
+
 ## Prospective records and preservation
 
 The shared reviewer now captures the exact fresh input and system prompt before inference, including veto,
@@ -119,7 +141,7 @@ lock remain intact; source/installed engine parity is 88/88 modules. Original No
 Vanguard/CBE paper books are not rewritten.
 
 Validation evidence: platform `backups/qwen-training-20261026/`. The combined offline lane/service suite passed
-114 tests; the final corpus suite passed nine; four native MLX numeric/masking/mode tests passed. Frontend build
+114 tests; the final corpus suite passed eleven; four native MLX numeric/masking/mode tests passed. Frontend build
 and 88 tests passed. Runtime status and book fingerprints are time-specific; refresh before readiness claims.
 
 Reproduction: `local_decisions/{export_sqlite,export_pg,build_corpus,research_requests,label_reconstructed,

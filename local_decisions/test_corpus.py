@@ -88,3 +88,19 @@ def test_reconstructed_same_bar_target_and_stop_uses_stop():
     assert reason is None and result['proxy_exit_reason']=='stop'
     assert result['same_bar_stop_target_ambiguity'] and result['net_return']<0
     assert result['historical_availability_verified'] is False
+
+
+def test_nonfinite_paper_outcome_is_quarantined():
+    f=fixture();row=json.loads(f['tables']['closed_positions'][0]['payload']);row['gross_pnl']=float('nan')
+    f['tables']['closed_positions'][0]['payload']=json.dumps(row)
+    records,excluded=smart_records(f)
+    assert not records and excluded['invalid_or_missing_record']==1
+
+
+def test_compute_guard_refuses_overlapping_model_allocations(tmp_path,monkeypatch):
+    from local_decisions.compute_guard import exclusive_compute
+    monkeypatch.chdir(tmp_path)
+    with exclusive_compute():
+        with pytest.raises(BlockingIOError):
+            with exclusive_compute():pytest.fail('Second allocation must not start')
+    with exclusive_compute():pass
