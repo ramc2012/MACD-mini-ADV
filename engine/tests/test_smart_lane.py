@@ -80,15 +80,23 @@ class TestEntry:
         assert due(lane, T0 + timedelta(seconds=330)) == 1
         assert lane.counts == {"MACD_FADED": 1} and not lane.portfolio.positions
 
-    def test_the_weakest_scores_are_skipped_against_a_rolling_cut(self, tmp_path, monkeypatch):
+    def test_a_weak_score_is_taken_smaller_never_skipped(self, tmp_path, monkeypatch):
+        # Owner, 26 Oct 2026: no score cut-off. Rank 0.11 of the rolling window -> 0.25 + 0.75 * 0.11 of the ticket.
         lane = build(tmp_path)
-        lane._scores = [i / 100 for i in range(100)]                  # rolling cut = 0.30 quantile
-        assert lane.cutoff() == pytest.approx(0.297, abs=1e-3)
+        lane._scores = [i / 100 for i in range(100)]
         monkeypatch.setattr(smart_lane, "score", lambda features: features["s"])
         lane.execution.set_quote(SYMBOL, 10.0)
         lane.on_macd_signal(signal(), "CE", {"s": 0.10}, now=T0)
         due(lane, T0 + timedelta(seconds=330))
-        assert lane.counts == {"SKIPPED_LOW_SCORE": 1}
+        assert lane.counts == {"TAKEN": 1}
+        assert lane.portfolio.positions[SYMBOL].lots == 3            # Rs 10k x 0.3325 / Rs 1,000 a lot
+
+    def test_the_score_scales_size_but_never_below_one_lot(self):
+        window = [i / 100 for i in range(100)]
+        assert smart_lane.score_size(0.99, window, 0.25) == pytest.approx(1.0)
+        assert smart_lane.score_size(0.0, window, 0.25) == pytest.approx(0.2575)
+        assert smart_lane.score_size(None, window, 0.25) == pytest.approx(0.25)
+        assert 0.0 < smart_lane.score_percentile(0.30, []) < 1.0     # training quantiles before the window fills
 
     def test_a_tenth_of_equity_in_whole_lots_sized_down_on_the_weak_side(self, tmp_path, monkeypatch):
         lane = build(tmp_path)

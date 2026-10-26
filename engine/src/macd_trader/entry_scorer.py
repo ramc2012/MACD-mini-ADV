@@ -1,4 +1,4 @@
-"""The MACD lane's entry gate: score every option signal, skip the weakest, spend cash best-first.
+"""The MACD lane's entry gate: score every option signal, size it by its score, spend cash best-first.
 
 Why: the September walk-forward of the old app's 1,410 entries (refit daily on closed trades
 only) kept +Rs 37.1 L of +Rs 18.7 L by skipping the entries its logistic scorer ranked lowest --
@@ -12,10 +12,14 @@ How:
   * ``build_features`` computes the study's features from what the engine holds at the signal
     (ticks, the strategy's committed MACD, the day's range) -- the same definitions as the study.
   * ``probability`` is the exported logistic model (entry_model.MODEL).
-  * ``EntryGate`` routes signals: below the skip threshold -> journal and drop; otherwise queue
-    for ``macd_entry_rank_seconds`` and enter best-first, so when cash is short it goes to the
-    strongest signals rather than to whichever crossed first. Every decision is journalled
-    (research DB, ``macd_entry_scores``) with its features and exact model fingerprint.
+  * ``EntryGate`` routes signals: every scored signal is queued for ``macd_entry_rank_seconds`` and
+    entered best-first, so when cash is short it goes to the strongest signals rather than to
+    whichever crossed first. The score SIZES the entry, it no longer skips (owner, 26 Oct 2026, after
+    ATHERENERG 1400 CE scored 0.441 against a 0.452 cut and went from 76.5 to 240): the signal's
+    percentile among the day's scores maps linearly to ``macd_entry_min_size_fraction``..1 of the
+    normal entry notional, never below one lot. ``cut()`` (the old skip-fraction quantile) is kept
+    as a reference in the journal's threshold column. Every decision is journalled (research DB,
+    ``macd_entry_scores``) with its features, its size fraction and the exact model fingerprint.
 
 The deployed model is a static export. Journalling does not train it or update its weights;
 there is no automatic nightly refit in this gate.
@@ -68,6 +72,26 @@ EXPIRES_WITHIN_HOLD = "EXPIRES_WITHIN_HOLD"
 # model's training percentile. A fixed cut drifts with the features: the September model's skipped 12% on
 # some days and 70% on others against a designed 30%.
 MIN_DAY_SCORES = 20
+
+
+def score_percentile(score: float, day_scores: list[float], model: dict = MODEL) -> float:
+    """Where ``score`` ranks, 0..1: among the day's scores once MIN_DAY_SCORES are in, else on the model's
+    training percentiles (the same two bases the old cut used)."""
+    if len(day_scores) >= MIN_DAY_SCORES:
+        return sum(1 for value in day_scores if value <= score) / len(day_scores)
+    table = sorted((int(k) / 100.0, v) for k, v in model["percentiles"].items())
+    if score <= table[0][1]:
+        return table[0][0] * (score / table[0][1] if table[0][1] > 0 else 0.0)
+    for (q0, v0), (q1, v1) in zip(table, table[1:]):
+        if score <= v1:
+            return q0 + (q1 - q0) * ((score - v0) / (v1 - v0) if v1 > v0 else 1.0)
+    return 1.0
+
+
+def size_fraction(percentile: float, minimum: float) -> float:
+    """Linear in rank: the weakest signal buys ``minimum`` of the normal size, the strongest all of it."""
+    minimum = min(1.0, max(0.0, minimum))
+    return minimum + (1.0 - minimum) * min(1.0, max(0.0, percentile))
 
 
 def theta_share(days_to_expiry: float, hold_days: float) -> float:
@@ -251,16 +275,15 @@ class EntryGate:
         for stale in [key for key in self._day_scores if key != day]:
             del self._day_scores[stale]
         scores.append(score)
-        cut = self.cut()
         self.counts["scored"] += 1
         if features.get("dte_frac") is not None and features["dte_frac"] < HOLD_DAYS:
             # Expires before the lane's expected return period is over: the option would be held into
             # expiry-day decay or flattened by the expiry sweep before the move it was bought for.
             self._decide(signal, features, score, EXPIRES_WITHIN_HOLD)
             return False
-        if score < cut:
-            self._decide(signal, features, score, "SKIPPED_LOW_SCORE")
-            return False
+        signal.size_fraction = round(size_fraction(
+            score_percentile(score, scores),
+            float(getattr(self.settings, "macd_entry_min_size_fraction", 0.25))), 4)
         self._queue.append(_Queued(score, signal, features))
         return True
 
@@ -274,12 +297,15 @@ class EntryGate:
         self.counts[decision] += 1
         now = datetime.now(UTC)
         side = "CE" if signal.symbol.endswith("CE") else "PE"
-        row = {"at": now.isoformat(), "symbol": signal.symbol, "score": round(score, 4), "decision": decision}
+        fraction = getattr(signal, "size_fraction", 1.0)
+        row = {"at": now.isoformat(), "symbol": signal.symbol, "score": round(score, 4), "decision": decision,
+               "size_fraction": fraction}
         self.recent.append(row)
         del self.recent[:-50]
         self._journal.append((now.isoformat(), now.astimezone(IST).date().isoformat(), signal.symbol, side,
                               round(score, 5), round(self.cut(), 5), decision, getattr(signal, "signal_id", None),
-                              json.dumps({k: round(v, 6) for k, v in features.items()}), MODEL_SHA256))
+                              json.dumps({**{k: round(v, 6) for k, v in features.items()}, "size_fraction": fraction}),
+                              MODEL_SHA256))
 
     async def run(self, get_execution, get_portfolio, validate_signal=None) -> None:
         """Drain the queue best-first every ``macd_entry_rank_seconds``; flush the journal.

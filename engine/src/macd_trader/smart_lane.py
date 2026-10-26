@@ -116,6 +116,29 @@ def quantile(values: list[float], q: float) -> float:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
+def score_percentile(score: float, window: list[float]) -> float:
+    """The score's rank, 0..1, among recent MACD-source scores (once MIN_ROLLING_SCORES are in), else on the
+    exported ranker's training quantiles -- the same two bases the old skip cut used."""
+    if len(window) >= MIN_ROLLING_SCORES:
+        return sum(1 for value in window if value <= score) / len(window)
+    table = sorted((float(k), v) for k, v in MODEL["train_quantiles"].items())
+    if score <= table[0][1]:
+        return table[0][0] * (score / table[0][1] if table[0][1] > 0 else 0.0)
+    for (q0, v0), (q1, v1) in zip(table, table[1:]):
+        if score <= v1:
+            return q0 + (q1 - q0) * ((score - v0) / (v1 - v0) if v1 > v0 else 1.0)
+    return 1.0
+
+
+def score_size(score: float | None, window: list[float], minimum: float) -> float:
+    """Ticket multiplier from the ranker (owner, 26 Oct 2026: no score cut-off; a weaker signal buys less, never
+    nothing). An unscorable signal gets the minimum."""
+    minimum = min(1.0, max(0.0, minimum))
+    if score is None:
+        return minimum
+    return minimum + (1.0 - minimum) * min(1.0, max(0.0, score_percentile(score, window)))
+
+
 def dispersion_size(option_type: str, point, minimum: float, min_cohort: int = 20) -> float:
     """Ticket multiplier from CE/PE MACD breadth: 1 on the stronger side, own/other share on the weaker."""
     if point is None or point.ce_eligible < min_cohort or point.pe_eligible < min_cohort:
@@ -441,14 +464,19 @@ class SmartLane:
         if item.source == MACD_SOURCE:
             if self._macd_confirm(symbol, item.bucket, price) is not True:
                 return self._record(item, MACD_FADED, now, price=price, cut=cut)
-            if item.score is None or item.score < cut:
-                return self._record(item, SKIPPED_LOW_SCORE, now, price=price, cut=cut)
-            size = dispersion_size(item.option_type, self._dispersion(), self.settings.smart_min_dispersion_size)
+            base = dispersion_size(item.option_type, self._dispersion(), self.settings.smart_min_dispersion_size)
+            ranked = score_size(item.score, self._scores, getattr(self.settings, "smart_min_score_size", 0.25))
+            item.detail["score_size"] = round(ranked, 4)
+            size = base * ranked
+        else:
+            base = size
         lot = execution.lot_sizes[symbol]
         per_lot = price * lot * (1 + self.settings.slippage_bps / 10_000)
         equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
         ticket = self.settings.smart_ticket_fraction * equity * size
         lots = int(min(ticket, self.portfolio.cash) // per_lot)
+        if lots < 1 and per_lot <= min(self.settings.smart_ticket_fraction * equity * base, self.portfolio.cash):
+            lots = 1                  # the score scaled the ticket below one lot: it sizes, it never skips
         cap = self._liquidity_lots(symbol, lot)
         if lots >= 1 and cap is not None and cap < lots:
             lots = cap

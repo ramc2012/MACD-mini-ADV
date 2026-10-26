@@ -140,12 +140,13 @@ class ExecutionManager:
         self.repository.save_order(order)
         self.events.publish("order", order)
 
-    def entry_lots(self, symbol: str, price: float) -> int:
-        """Choose whole lots nearest the configured entry notional.
+    def entry_lots(self, symbol: str, price: float, size_fraction: float = 1.0) -> int:
+        """Choose whole lots nearest the configured entry notional, scaled by the signal's size fraction.
 
         The result is capped by the notional-entry safety limit and currently
         available paper cash. Manual orders and pyramiding keep their smaller
-        max_trade_lots ceiling. A zero target preserves one-lot entries.
+        max_trade_lots ceiling. A zero target preserves one-lot entries. A
+        scaled-down entry is never below one lot: the score sizes, it does not skip.
         """
         lot_size = self.lot_sizes.get(symbol, 0)
         if lot_size < 1 or price <= 0:
@@ -155,7 +156,8 @@ class ExecutionManager:
         if affordable < 1:
             return 0
         target = self.settings.target_position_notional
-        desired = 1 if target <= 0 else max(1, int(target / per_lot + 0.5))
+        fraction = min(1.0, max(0.0, size_fraction))
+        desired = 1 if target <= 0 else max(1, int(target * fraction / per_lot + 0.5))
         return min(desired, self.settings.max_target_entry_lots, affordable)
 
     async def submit(
@@ -549,7 +551,8 @@ class ExecutionManager:
         position = self.portfolio.positions.get(signal.symbol)
         if signal.side == "BUY" and self.settings.auto_trade and position is None:
             try:
-                lots = self.entry_lots(signal.symbol, self.last_prices.get(signal.symbol, signal.price))
+                lots = self.entry_lots(signal.symbol, self.last_prices.get(signal.symbol, signal.price),
+                                       getattr(signal, "size_fraction", 1.0))
                 if lots < 1:
                     return
                 await self.submit(signal.symbol, signal.side, lots=lots, signal=signal)

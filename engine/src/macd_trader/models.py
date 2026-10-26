@@ -76,6 +76,9 @@ class Signal:
     # The bar being evaluated, distinct from `timestamp`, which is the exact
     # wall-clock time at which the paper signal was emitted.
     evaluated_candle_timestamp: int | None = None
+    # Share of the lane's normal entry size (owner, 26 Oct 2026: no score cut-offs; a lower score buys fewer
+    # lots, never none). 1.0 for every source that does not score its signals.
+    size_fraction: float = 1.0
 
 
 @dataclass(slots=True)

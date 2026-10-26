@@ -339,6 +339,31 @@ def test_notional_entry_can_exceed_pyramiding_lot_cap(tmp_path: Path):
     repository.close()
 
 
+def test_score_size_fraction_scales_the_notional_entry_but_never_below_one_lot(tmp_path: Path):
+    settings = Settings(
+        execution_mode="paper", symbols_csv="NSE:SBIN-EQ", slippage_bps=0,
+        auto_trade=True, max_trade_lots=4, target_position_notional=100_000,
+        max_target_entry_lots=125,
+    )
+    repository = TradeRepository(str(tmp_path / "book.sqlite3"))
+    manager = ExecutionManager(
+        settings, LiveFeedBrokerThatMustNotReceiveOrders(), Portfolio(5_000_000),
+        repository, EventHub(),
+    )
+    symbol = "BSE:SENSEX26AUG77300PE"
+    manager.set_tradable_contracts({symbol: 20})
+    manager.set_quote(symbol, 43.75)
+    assert manager.entry_lots(symbol, 43.75) == 114
+    assert manager.entry_lots(symbol, 43.75, 0.25) == 29             # Rs 25,000 / Rs 875 a lot
+    assert manager.entry_lots(symbol, 43.75, 0.0) == 1
+    signal = Signal(symbol, "BUY", "TEST", 43.75, 1, 0, 1, size_fraction=0.5)
+
+    asyncio.run(manager.on_signal(signal))
+
+    assert manager.portfolio.positions[symbol].lots == 57
+    repository.close()
+
+
 def test_trailing_stop_arms_only_after_thirty_percent_profit(tmp_path: Path):
     settings = Settings(execution_mode="paper", symbols_csv="NSE:SBIN-EQ", slippage_bps=0)
     repository = TradeRepository(str(tmp_path / "book.sqlite3"))

@@ -63,9 +63,13 @@ class Settings(BaseSettings):
     # touched no winner. Off by default: it changes live exit behaviour.
     macd_invalidation_exit: bool = False
     macd_invalidation_max_mfe_pct: float = Field(default=0.10, ge=0.0, le=1.0)
-    # Entry gate (entry_scorer.py): score each option signal, skip the weakest, spend cash best-first.
+    # Entry gate (entry_scorer.py): score each option signal, SIZE it by its score, spend cash best-first.
+    # No score cut-offs (owner, 26 Oct 2026): the weakest of the day's signals buys macd_entry_min_size_fraction
+    # of the normal entry notional, the strongest all of it, never below one lot. The skip fraction now only sets
+    # the reference quantile journalled beside each score.
     macd_entry_filter: bool = True
     macd_entry_skip_fraction: float = Field(default=0.30, ge=0.0, le=0.5)
+    macd_entry_min_size_fraction: float = Field(default=0.25, gt=0.0, le=1.0)
     macd_entry_rank_seconds: float = Field(default=15.0, ge=0.0, le=300.0)
     max_positions: int = Field(default=0, ge=0, le=1000)
     min_cash_reserve: float = Field(default=0.0, ge=0)
@@ -261,6 +265,8 @@ class Settings(BaseSettings):
     smart_entry_delay_seconds: int = Field(default=300, ge=0, le=3600)
     smart_rank_seconds: float = Field(default=15.0, ge=0, le=300)
     smart_skip_fraction: float = Field(default=0.30, ge=0, lt=1)
+    # No score cut-off (owner, 26 Oct 2026): the ranker's percentile scales the ticket from this share up to 1.
+    smart_min_score_size: float = Field(default=0.25, gt=0, le=1)
     smart_hard_stop_pct: float = Field(default=0.40, gt=0, lt=1)
     smart_trail_activation_pct: float = Field(default=0.40, gt=0, lt=5)
     smart_trail_pct: float = Field(default=0.30, gt=0, lt=1)

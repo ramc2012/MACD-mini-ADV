@@ -98,3 +98,25 @@ def test_the_day_tracker_resets_each_session():
     assert days.get("X") == (10.0, 12.0, 9.0)
     days.observe("X", 11.0, datetime(2026, 9, 30, 4, 0, tzinfo=UTC))
     assert days.get("X") == (11.0, 11.0, 11.0)
+
+
+def test_a_low_score_is_queued_with_a_smaller_size_never_skipped(tmp_path):
+    # Owner, 26 Oct 2026: no score cut-off (ATHERENERG 1400 CE scored 0.441 against a 0.452 cut, then 76.5 -> 240).
+    settings = SimpleNamespace(macd_entry_filter=True, macd_entry_skip_fraction=0.3, macd_entry_rank_seconds=0.0,
+                               macd_entry_min_size_fraction=0.25)
+    gate = es.EntryGate(settings, str(tmp_path / "h.sqlite3"))
+    sig = lambda s: SimpleNamespace(symbol=s, signal_id=s)
+    weak, strong = sig("NSE:WEAK26NOV100CE"), sig("NSE:STRONG26NOV100CE")
+    assert gate.admit(weak, feats(expiry="2026-11-24", crowd_same=0, macd_preview=-0.5)) is True
+    assert gate.admit(strong, feats(expiry="2026-11-24", crowd_same=12)) is True
+    assert 0.25 <= weak.size_fraction < strong.size_fraction <= 1.0
+    assert "SKIPPED_LOW_SCORE" not in gate.counts
+
+
+def test_size_fraction_is_linear_in_rank_with_a_floor():
+    assert es.size_fraction(0.0, 0.25) == pytest.approx(0.25)
+    assert es.size_fraction(1.0, 0.25) == pytest.approx(1.0)
+    assert es.size_fraction(0.5, 0.25) == pytest.approx(0.625)
+    day = [i / 100 for i in range(100)]
+    assert es.score_percentile(0.441, day) == pytest.approx(0.45)
+    assert 0.0 <= es.score_percentile(0.0, []) <= es.score_percentile(1.0, []) == 1.0
