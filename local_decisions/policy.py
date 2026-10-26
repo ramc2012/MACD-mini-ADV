@@ -17,3 +17,14 @@ historical/missing context, never as current confirmation. Optional missing cont
 missing core signal/quote evidence requires wait. Do not invent substitutes for missing values.
 Missing evidence must not become a favorable assumption.'''
 SYSTEM_SHA256=hashlib.sha256(SYSTEM.encode()).hexdigest()
+
+# Definitions of the native study's encoded features, not extra market evidence.
+# Keep them in the captured facts so future exports retain the exact vocabulary.
+SMART_FEATURE_NOTES={
+ 'native_direction_definition':'u_ret_*, u_vwap and nifty_ret_prev are signed by CE +1 / PE -1. Moneyness is side*ln(spot/strike). Positive is not always a rising underlying.',
+ 'native_return_units':'Native return-like values and *_pct ratios are fractions: 0.01 = 1%. Shared positioning/flow fields use their own units.',
+ 'native_option_definition':'o_ret_* describe option-premium returns; o_range_pos is low=0/high=1; o_vol_ratio is log1p(today volume/(prior day volume+1)).',
+ 'native_expiry_definition':'dte_frac is calendar days to expiry close. theta_share estimates the fraction of remaining time value lost over the original holding period.',
+ 'native_macd_definition':'macd_*_pct and dip_depth_pct are divided by option premium. dip_bars counts preceding nonpositive premium-MACD bars.',
+ 'native_missing_definition':'Some native study fields encode missing reference prices as zero. A zero alone does not establish a verified flat underlying or neutral evidence.',
+}

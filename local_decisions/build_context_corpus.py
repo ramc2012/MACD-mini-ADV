@@ -10,6 +10,7 @@ from .build_corpus import stamp,split,message
 
 
 def smart_entries(raw):
+    from .policy import SMART_FEATURE_NOTES
     t=raw['tables'];closes=defaultdict(list);excluded=Counter();out=[]
     for r in t['closed_positions']:closes[r['position_id']].append(json.loads(r['payload']))
     buys={(p['symbol'],stamp(p['timestamp'])):p for p in (json.loads(r['payload']) for r in t['trades']) if p['side']=='BUY'}
@@ -28,6 +29,7 @@ def smart_entries(raw):
             facts={k:v for k,v in features.items() if v is None or isinstance(v,(str,bool,int)) or isinstance(v,float) and math.isfinite(v)}
             facts.update(source='macd',phase='smart_entry',feature_snapshot_at=at.isoformat(),signal_price=journal['signal_price'],
                          ranker_score=journal['score'],historical_exit_policy='recorded_smart_book_unversioned')
+            facts.update(SMART_FEATURE_NOTES)
             entry_value=sum(r['entry_price']*r['quantity'] for r in rows);exit_value=sum(r['exit_price']*r['quantity'] for r in rows)
             gross=sum(r['gross_pnl'] for r in rows);fees=max(sum(r.get('fees',0) for r in rows),.001*(entry_value+exit_value))
             if entry_value<=0 or not all(math.isfinite(x) for x in (gross,fees,entry_value,exit_value)):raise ValueError()

@@ -94,6 +94,8 @@ def test_rich_context_preserves_signal_and_uses_bounded_larger_window(tmp_path,m
         body=json.loads(p['messages'][1]['content']);assert body['candidates'][0]['id']=='candidate'
         assert body['candidates'][0]['facts']['ranker_score']==.7
         assert body['candidates'][0]['facts']['context_119']=='x'*60
+        facts=body['candidates'][0]['facts']
+        assert 'PE -1' in facts['native_direction_definition'] and 'zero alone' in facts['native_missing_definition']
         return httpx.Response(200,json={'done':True,'message':{'content':json.dumps({'reviews':[{'id':'candidate','verdict':'wait','reason':'fixture'}]})}})
     client=httpx.AsyncClient
     monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:client(**{**kw,'transport':httpx.MockTransport(handler)}))

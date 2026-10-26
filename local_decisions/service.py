@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Header, HTTPException
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from .policy import SYSTEM,SYSTEM_SHA256
+from .policy import SYSTEM,SYSTEM_SHA256,SMART_FEATURE_NOTES
 
 UTC = timezone.utc
 
@@ -145,7 +145,8 @@ class Reviewer:
                             r.raise_for_status();context=r.json()['contexts'][row.id]
                         self.context_cache={key:(time.monotonic(),context)}
                 # Original signal/risk facts win; providers cannot overwrite reviewed entry terms.
-                merged={**context,**row.facts};row.facts=Candidate.bounded_facts(merged)
+                notes=SMART_FEATURE_NOTES if request.lane=='smart' else {}
+                merged={**context,**row.facts,**notes};row.facts=Candidate.bounded_facts(merged)
             except (httpx.HTTPError,ValueError,KeyError,TypeError):
                 row.facts={**row.facts,'context_status':'unavailable'};context_failed=True
         # Capture the exact observed inputs even when the model is absent, fails or vetoes.
