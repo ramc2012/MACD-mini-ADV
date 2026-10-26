@@ -3,9 +3,18 @@
 Activated and browser-verified at **2026-10-25 23:50:30 IST**. This supersedes the observation-only execution
 boundary in README.md and QWEN.md. Real orders remain impossible in this service.
 
-Both lanes start with **₹10,00,000 of independent simulated cash**. They use new SQLite books under
+**Capital corrected at 2026-10-26 06:17:27 IST:** the owner selected ₹50 lakh per lane. Both accounts were still
+untraded, with no candidates, orders, positions, fills or trading reviews. Both databases and the prior local
+configuration were backed up before a guarded offline correction. The starting cash/equity baseline is now
+₹50 lakh with zero return; original baseline values are retained in an explicit audit event and backup. Account
+ids, activation times, risk policy and earlier pause/resume events are unchanged. Effective Compose configuration
+is persisted at ₹50 lakh. The correction passed three isolated tests and both books' SQLite integrity checks;
+the service was recreated and its API confirms the new capital. Evidence: platform `backups/capital-correction-20261026/`.
+
+Both lanes start with **₹50,00,000 of independent simulated cash**. They use new SQLite books under
 `runtime/paper_lanes/{vanguard,cbe}.sqlite3`; neither old Nomad accounts nor earlier shadow cohorts seed trades.
-Capital and admission policy are frozen with each account. Restarting cannot re-fund it. The original Nomad
+Capital and admission policy are frozen with each account; an owner-authorized, audited offline correction is
+allowed only before either book has any candidate/trading activity. Restarting cannot re-fund it. The original Nomad
 books, positions, returns and watchlists remain available through the separate read-only history scope.
 
 ```mermaid

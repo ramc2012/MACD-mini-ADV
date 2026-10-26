@@ -204,7 +204,7 @@ services:
       SHADOW_DATABASE_PATH: /runtime/shadow_lanes/observations.sqlite3
       SHADOW_WORKER_ENABLED: ${SHADOW_WORKER_ENABLED:-false}
       PAPER_LANES_ENABLED: "true"
-      PAPER_LANE_CAPITAL: ${PAPER_LANE_CAPITAL:-1000000}
+      PAPER_LANE_CAPITAL: ${PAPER_LANE_CAPITAL:-5000000}
       PAPER_LANES_DIR: /runtime/paper_lanes
       PAPER_HUB_URL: http://host.docker.internal:8400
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
