@@ -1,9 +1,9 @@
 # Local Qwen training and data qualification
 
-Progress checked at **2026-10-26 08:24:00 IST**. This document distinguishes research artifacts from serving
+Progress checked at **2026-10-26 08:30:25 IST**. This document distinguishes research artifacts from serving
 weights. The running reviewer still serves the original **qwen3.5:9b**; no trained adapter has been deployed.
-All three adapter training passes completed and have finite-weight receipts. Full held-out evaluation is still
-in progress; training completion is separate from evaluation completion.
+All three adapter training passes completed and have finite-weight receipts. Vanguard/CBE research evaluation completed. Smart evaluation stopped at the market-hours cutoff with saved
+progress; training completion is separate from evaluation completion.
 
 The owner's latest instruction, **leave MACD lane as it is**, governs. Its current entry filter, signals,
 execution/risk rules, cash and positions remain unchanged. Smart's optional Blast intake is disabled for new
@@ -126,7 +126,11 @@ reconstructed test cases, this is **not proven**, and the negative validation re
 derived base approved zero validation/test cases. CBE's derived base approved all twelve validation cases and six
 test cases, with mean approved returns -0.23% and -2.05%; its adapter approves none. Zero approval is not trading
 success, and an all-negative seven-row test cannot measure profitable-signal recall. Neither adapter is promoted.
-Smart's full 177-validation/91-test comparison remains in progress and must not be inferred from these lane results.
+Smart's full 177-validation/91-test comparison remains incomplete. 143 / 177 base-validation predictions are saved;
+its remaining baseline and adapter comparisons are pending. The evaluator exited with cutoff code 75, and no full-model
+training/evaluation processes remain. Partial predictions carry no completed performance claim. Resume after the
+market-hours hold with `PYTHONPATH=. runtime/qwen-training/venv/bin/python local_decisions/run_evaluation_plan.py`.
+No after-close automation was created; the optional scheduling answer remains pending.
 
 ## Prospective records and preservation
 
