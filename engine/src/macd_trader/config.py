@@ -267,7 +267,7 @@ class Settings(BaseSettings):
     smart_target_pct: float = Field(default=1.00, gt=0, le=20)
     smart_max_hold_sessions: int = Field(default=4, ge=0, le=60)
     smart_min_dispersion_size: float = Field(default=0.25, gt=0, le=1)
-    smart_blast_source: bool = True
+    smart_blast_source: bool = False
 
     # Agentic lane (agentic_lane.py): a paper options book run by a Grok model that opens, adds, reduces,
     # closes and re-levels positions every cycle with written reasoning. The API key comes from the

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import hashlib
 import math
 import os
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
 import httpx
@@ -26,8 +27,12 @@ def scalar_facts(values):
 async def review_smart(item,price,quote_at):
     mode,url=configuration()
     identity=hashlib.sha256(f'{item.source}:{item.symbol}:{item.bucket if item.bucket is not None else item.signal.timestamp.isoformat()}'.encode()).hexdigest()[:24]
+    local=item.signal.timestamp.astimezone(ZoneInfo('Asia/Kolkata'))
     facts=scalar_facts({'source':item.source,'ranker_score':item.score,
-                        **dict(list(item.features.items())[:18]),**dict(list(item.detail.items())[:3])})
+        'signal_macd':item.signal.macd,'signal_signal':item.signal.signal,'signal_histogram':item.signal.histogram,
+        'signal_price':item.signal.price,'minutes_since_open':local.hour*60+local.minute-555})
+    for key,value in scalar_facts(item.features).items():
+        if key in facts or len(facts)<24:facts[key]=value
     payload={'lane':'smart','snapshot_at':datetime.now(UTC).isoformat(),'candidates':[
         {'id':identity,'instrument':item.symbol,'side':item.option_type,'reference_price':price,
          'source_at':quote_at.isoformat(),'facts':facts}]}

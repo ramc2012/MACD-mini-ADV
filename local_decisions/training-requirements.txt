@@ -1,0 +1,5 @@
+# Optional isolated Apple-silicon research environment; never install in serving containers.
+# Owner approval is required before installing/downloading dependencies.
+mlx==0.32.4
+mlx-lm==0.32.2
+transformers==5.20.2

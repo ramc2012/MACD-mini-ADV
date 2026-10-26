@@ -509,7 +509,8 @@ class SmartLane:
                 cut: float | None = None, size: float | None = None, ticket: float | None = None,
                 lots: int | None = None, order_id: str | None = None, detail: dict | None = None) -> str:
         row_id = uuid4().hex
-        info = {**item.detail, **(detail or {})}
+        info = {**item.detail, **(detail or {}),'signal_id':item.signal.signal_id,
+                'signal_at':item.signal.timestamp.isoformat(),'features_available_at':item.created.isoformat()}
         if item.features:
             info["features"] = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in item.features.items()}
         self._journal_buffer.append((

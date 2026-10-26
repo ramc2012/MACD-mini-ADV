@@ -1,5 +1,10 @@
 # Local Qwen decision reviews
 
+**Training progress at 2026-10-26 08:13:00 IST:** see [QWEN_TRAINING_20261026.md](QWEN_TRAINING_20261026.md). MACD is preserved
+per the owner's latest instruction. Smart research adapters and historical-data qualification are separate from
+the original weights still served in trading. Vanguard/CBE have separate small reconstructed research datasets,
+with zero examples meeting verified historical-availability requirements; no trained adapter is deployed.
+
 **Update at 2026-10-25 23:50:30 IST:** Vanguard and CBE now have independent funded paper books and fresh-entry
 Qwen reviews. See [PAPER_LANES.md](PAPER_LANES.md) for the current execution policy and validation. The original
 deployment record below describes the earlier observation-only Vanguard boundary.

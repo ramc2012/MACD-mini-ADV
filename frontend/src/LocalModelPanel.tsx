@@ -2,7 +2,8 @@ import {useEffect,useState} from 'react';
 import {API_URL,API_TOKEN} from './runtime';
 
 type Review={at:string;lane:string;latency_ms:number;reviews:{id:string;verdict:string;reason:string}[]};
-type Status={ready:boolean;model:string;mode:string;queue?:number;cache_hits?:number;detail?:string;last_error?:string;recent:Review[]};
+type Status={ready:boolean;model:string;mode:string;queue?:number;cache_hits?:number;detail?:string;last_error?:string;recent:Review[];
+ training?:{deployed_weight_finetune:boolean;smart?:{status:string};vanguard?:{status:string};cbe?:{status:string}}};
 const stamp=(value:string)=>{const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(value)).map(x=>[x.type,x.value]));return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} IST`;};
 
 export function LocalModelPanel(){
@@ -13,6 +14,7 @@ export function LocalModelPanel(){
   <div style={{display:'flex',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}><strong>Qwen 3.5 · local decision review</strong><span style={{color:state?.ready?'#68d5c1':'#efc47c'}}>{!state?'Checking model…':state.ready?`Model available · ${state.mode} mode`:'Model unavailable · new filtered entries wait'}</span></div>
   <div>{state?.model??'qwen3.5:9b'} · New Smart, Vanguard and CBE paper entries. Existing admission rules, sizing and exits remain authoritative.</div>
   <div style={{color:'#9aafc2'}}>One shared worker · {state?.queue??0} requests queued · {state?.cache_hits??0} cache hits since restart · local inference only</div>
+  {state?.training&&<div style={{marginTop:6,color:'#9aafc2'}}>Served weights: {state.training.deployed_weight_finetune?'validated tuned model':'original local Qwen'}. Research tuning: Smart {state.training.smart?.status?.replaceAll('_',' ')??'pending'}; Vanguard {state.training.vanguard?.status?.replaceAll('_',' ')??'pending'}; CBE {state.training.cbe?.status?.replaceAll('_',' ')??'pending'}.</div>}
   {(state?.last_error||state?.detail)&&<p style={{margin:'5px 0',color:'#efc47c'}}>{state.last_error||state.detail}</p>}
   {latest?<div style={{borderTop:'1px solid #284557',marginTop:8,paddingTop:8}}>Latest {latest.lane} review · {stamp(latest.at)} · {(latest.latency_ms/1000).toFixed(1)}s{latest.reviews.map(r=><div key={r.id}><b>{r.verdict.toUpperCase()}</b> · {r.reason}</div>)}</div>:<div style={{marginTop:6,color:'#9aafc2'}}>No prospective review recorded yet. Model availability does not establish market-data readiness or trading edge.</div>}
  </section>;

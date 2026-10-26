@@ -74,3 +74,27 @@ def test_cash_is_rechecked_after_inference(tmp_path,monkeypatch):
     monkeypatch.setattr(local_model,'review_smart',review)
     asyncio.run(lane._decide(item,now,0))
     assert lane.counts['NO_CASH']==1 and not lane.portfolio.positions
+
+
+def test_live_input_preserves_training_signal_fields_with_bounded_facts(tmp_path,monkeypatch):
+    import httpx,json
+    lane,item,now=prepared(tmp_path,monkeypatch)
+    item.features={f'feature_{i}':i for i in range(40)}
+    seen=[]
+    def handler(request):
+        p=json.loads(request.content);seen.append(p)
+        return httpx.Response(200,json={'reviews':[{'id':p['candidates'][0]['id'],'verdict':'wait'}],
+            'expires_at':(datetime.now(UTC)+timedelta(seconds=30)).isoformat()})
+    client=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:client(transport=httpx.MockTransport(handler),**kw))
+    asyncio.run(local_model.review_smart(item,10,now))
+    f=seen[0]['candidates'][0]['facts']
+    assert len(f)==24 and f['signal_macd']==1 and f['signal_histogram']==1 and f['signal_price']==10
+
+
+def test_smart_default_only_accepts_macd_stream_and_macd_filter_default_is_preserved(tmp_path):
+    from macd_trader.config import Settings
+    lane=build(tmp_path)
+    assert Settings().macd_entry_filter is True
+    lane.on_blast_candidate({'symbol':SYMBOL},now=datetime.now(UTC))
+    assert not lane._pending

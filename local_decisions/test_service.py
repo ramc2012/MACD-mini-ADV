@@ -54,6 +54,9 @@ def test_missing_model_never_downloads_or_calls_generation(tmp_path):
     r=worker(tmp_path,handler)
     with pytest.raises(HTTPException) as caught:asyncio.run(r.review(ReviewInput(**payload())))
     assert caught.value.status_code==503 and calls==['/api/tags']
+    with r.db() as db:
+        saved=db.execute('SELECT lane,input FROM training_snapshots').fetchall()
+    assert len(saved)==1 and saved[0][0]=='smart' and 'fixture-1' in saved[0][1]
 
 
 @pytest.mark.parametrize('url',['https://ollama.com','http://external.example:11434','http://localhost:11434/other','http://user:password@localhost:11434'])

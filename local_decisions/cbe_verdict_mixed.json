@@ -1,0 +1,32 @@
+{
+  "model": "runtime/qwen-training/base-9b-int4-int8",
+  "data": "runtime/qwen-training/research-corpus-v2/cbe",
+  "adapter_path": "runtime/qwen-training/cbe-verdict-adapter-mixed",
+  "train": true,
+  "fine_tune_type": "lora",
+  "num_layers": 1,
+  "batch_size": 4,
+  "grad_accumulation_steps": 1,
+  "iters": 27,
+  "learning_rate": 2e-05,
+  "max_seq_length": 384,
+  "mask_prompt": true,
+  "val_batches": 5,
+  "steps_per_eval": 20,
+  "steps_per_report": 5,
+  "save_every": 20,
+  "seed": 42610,
+  "report_to": null,
+  "lora_parameters": {
+    "rank": 4,
+    "scale": 8.0,
+    "dropout": 0.0,
+    "keys": [
+      "self_attn.q_proj",
+      "self_attn.v_proj"
+    ]
+  },
+  "allow_reconstructed_research": true,
+  "objective": "constrained_verdict_cross_entropy",
+  "mixed_frozen_prefix": true
+}

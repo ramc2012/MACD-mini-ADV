@@ -159,7 +159,7 @@ class TestExits:
 
 class TestBlastSource:
     def test_blast_candidates_keep_the_blast_lanes_exits(self, tmp_path):
-        lane = build(tmp_path)
+        lane = build(tmp_path,smart_blast_source=True)
         lane.execution.set_quote(SYMBOL, 10.0)
         lane.on_blast_candidate({"symbol": SYMBOL, "premium": 10.0, "option_type": "CE", "macd": -0.4,
                                  "signal": -0.5, "histogram": 0.1, "bar_timestamp": 900, "premium_pct": 0.8,
