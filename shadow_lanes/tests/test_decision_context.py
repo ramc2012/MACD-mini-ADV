@@ -44,6 +44,15 @@ def test_session_date_does_not_invent_a_0915_timestamp_or_hourly_staleness():
     assert block('eod',row,'dt','computed_at','eod',('score',),NOW)=={'eod.status':'not_available_at_decision'}
 
 
+def test_prior_session_cross_asset_beta_is_not_current_session_confirmation():
+    from shadow_lanes.decision_context import cross_asset_context
+    row={'driver':'crude_oil','dt':date(2026,10,23),'computed_at':NOW-timedelta(days=2),'beta':.2,'corr':.3,'lookback_days':60}
+    facts=cross_asset_context([row],NOW)
+    assert facts['cross_asset.status']=='prior_session' and facts['cross_asset.crude_oil.status']=='prior_session'
+    assert facts['cross_asset.crude_oil.event_at'] is None and facts['cross_asset.crude_oil.event_date']=='2026-10-23'
+    assert facts['cross_asset.crude_oil.beta']==.2
+
+
 def test_independent_feature_stages_continue_after_failure(tmp_path,monkeypatch):
     monkeypatch.setenv('FEATURE_RECEIPTS_PATH',str(tmp_path/'receipts.sqlite3'))
     monkeypatch.setenv('MI_PG_USER','fixture');monkeypatch.setenv('MI_PG_PASSWORD','fixture')

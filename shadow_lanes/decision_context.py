@@ -70,6 +70,18 @@ def normalize(value):
     return {'NIFTY50':'NIFTY','NIFTYBANK':'BANKNIFTY'}.get(value,value)
 
 
+def cross_asset_context(rows,as_of):
+    facts={};states=[]
+    for row in rows:
+        if row['driver'] not in ('lme_metals','crude_oil','usdinr'):continue
+        prefix='cross_asset.'+row['driver']
+        value=block(prefix,dict(row),'dt','computed_at','intraday_day',('beta','corr','lookback_days'),as_of)
+        facts.update(value);states.append(value[prefix+'.status'])
+    facts['cross_asset.status']=('not_applicable_or_missing' if not states else 'stale' if all(s=='stale' for s in states)
+        else 'prior_session' if any(s!='observed' for s in states) else 'observed')
+    return facts
+
+
 def context_database():
     path=Path(os.environ.get('FEATURE_CONTEXT_DATABASE','/runtime/shadow_lanes/context.sqlite3'));path.parent.mkdir(parents=True,exist_ok=True)
     c=sqlite3.connect(path,timeout=10)
@@ -152,13 +164,9 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
                 result[c['id']]['risk.fno_banned']=banned if received==entry_day else None
                 result[c['id']]['risk.fno_ban_list_status']='entry_session_published' if received==entry_day else 'missing_or_stale'
                 q.execute('''SELECT DISTINCT ON(driver) * FROM cross_asset_beta WHERE sector_group=%s AND dt<%s AND computed_at<=%s ORDER BY driver,dt DESC''',(meta['sector_group'],as_of.date(),as_of))
-                drivers=q.fetchall();result[c['id']]['cross_asset.status']='observed' if drivers else 'not_applicable_or_missing'
-                for r in drivers:
-                    if r['driver'] not in ('lme_metals','crude_oil','usdinr'):continue
-                    prefix='cross_asset.'+r['driver']
-                    for k in ('beta','corr','lookback_days'):result[c['id']][prefix+'.'+k]=float(r[k]) if r[k] is not None else None
-                    result[c['id']][prefix+'.event_at']=str(r['dt'])
-            result[c['id']]['feature_count']=sum('.' in k and not k.endswith(('.status','.event_at','.available_at','.age_hours','.receipt_basis')) for k in result[c['id']])
+                result[c['id']].update(cross_asset_context(q.fetchall(),as_of))
+            result[c['id']]['feature_count']=sum('.' in k and not k.endswith(('.status','.event_at','.event_date','.event_time_resolution',
+                '.available_at','.age_hours','.age_days','.receipt_basis')) for k in result[c['id']])
     if persist:
         with context_database() as db:
             for c in candidates:
