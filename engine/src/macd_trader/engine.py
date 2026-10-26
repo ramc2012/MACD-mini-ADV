@@ -1771,13 +1771,17 @@ class TradingEngine(DeskMixin):
         option_buy = (signal.side == "BUY" and contract is not None
                       and signal.symbol in self.execution.tradable_symbols)
         if option_buy:
+            smart_features = None
             try:
                 features = self._entry_features(signal, contract)
+                smart_features = {**features, 'underlying': contract.spot_symbol,
+                                  'strike': float(contract.strike), 'expiry': str(contract.expiry),
+                                  'features_available_at': datetime.now(UTC).isoformat()} if features else features
             except Exception as exc:  # noqa: BLE001 -- a scoring fault must not cost the entry
                 feature_error = f"features {signal.symbol}: {type(exc).__name__}: {exc}"[:300]
             for smart in _smart_lanes(self):
                 try:
-                    smart.on_macd_signal(signal, contract.option_type, features)
+                    smart.on_macd_signal(signal, contract.option_type, smart_features)
                 except Exception as exc:  # noqa: BLE001
                     smart.error = f"intake {signal.symbol}: {type(exc).__name__}: {exc}"[:300]
         if (not gate.enabled or not option_buy or not self.settings.auto_trade

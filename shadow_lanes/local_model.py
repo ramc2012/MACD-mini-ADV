@@ -27,19 +27,28 @@ def apply_review(result,now,lane='vanguard'):
                 'expected_net_return','option_volume','option_oi','contract_kind','strike','expiry','conviction',
                 'momentum_fast','momentum_slow','relative_momentum','score','direction']
         facts={k:row[k] for k in fields if k in row and (isinstance(row[k],(str,int,bool)) or isinstance(row[k],float) and math.isfinite(row[k]))}
+        facts.update(phase='next_session_watchlist',underlying=row.get('symbol') or row.get('instrument'))
         candidates.append({'id':identity,'instrument':row['instrument'],'side':row.get('option_type') or 'LONG',
                            'reference_price':row['source_mark'],'source_at':str(row['source_mark_ts']),'facts':facts})
-    response=httpx.post(url+'/review',json={'lane':lane,'snapshot_at':now.isoformat(),'candidates':candidates},
-                        headers={'X-Macd-Token':os.environ.get('MACD_API_TOKEN','')},timeout=80,follow_redirects=False,trust_env=False)
-    response.raise_for_status();review=response.json();decisions=review.get('reviews',[])
-    if len(decisions)!=len(identities) or {r.get('id') for r in decisions}!=set(identities):raise ValueError('Review identities do not match the frozen candidates')
-    if datetime.fromisoformat(review['expires_at'])<=datetime.now(timezone.utc):raise ValueError('Expired local review')
+    # Each candidate gets its complete context within the small local model's window.
+    # Watchlist reviews are observations made individually; tomorrow's entries require separate fresh reviews.
+    decisions=[];receipts=[]
+    for candidate in candidates:
+        response=httpx.post(url+'/review',json={'lane':lane,'snapshot_at':datetime.now(timezone.utc).isoformat(),'candidates':[candidate]},
+                            headers={'X-Macd-Token':os.environ.get('MACD_API_TOKEN','')},timeout=80,follow_redirects=False,trust_env=False)
+        response.raise_for_status();receipt=response.json();rows=receipt.get('reviews',[])
+        if len(rows)!=1 or rows[0].get('id')!=candidate['id']:raise ValueError('Review identities do not match the frozen candidates')
+        if datetime.fromisoformat(receipt['expires_at'])<=datetime.now(timezone.utc):raise ValueError('Expired local review')
+        decisions.extend(rows);receipts.append(receipt)
+    review={**receipts[-1],'reviews':decisions,'candidate_receipts':receipts,'phase':'next_session_watchlist',
+            'not_an_entry_approval':True}
     selected=[]
     for decision in decisions:
         if decision['verdict'] not in ('approve','reject','wait'):raise ValueError('Invalid local verdict')
         if mode=='shadow' or decision['verdict']=='approve':
             selected.append({**identities[decision['id']],'local_review':{**decision,'model':review['model'],
-                'digest':review['digest'],'context_hash':review['context_hash'],'created_at':review['created_at']}})
+                'digest':review['digest'],'context_hash':next(r['context_hash'] for r in receipts if r['reviews'][0]['id']==decision['id']),
+                'created_at':next(r['created_at'] for r in receipts if r['reviews'][0]['id']==decision['id'])}})
     return {**result,'watchlist':selected,'status':'ok' if selected else 'blocked',
             'blockers':[] if selected else [f'Qwen did not approve an eligible {lane} candidate'],
             'policy':result['policy']+('-qwen35-filter-v1' if mode=='filter' else '-qwen35-shadow-v1'),

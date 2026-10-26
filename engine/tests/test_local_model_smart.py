@@ -89,7 +89,10 @@ def test_live_input_preserves_training_signal_fields_with_bounded_facts(tmp_path
     monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:client(transport=httpx.MockTransport(handler),**kw))
     asyncio.run(local_model.review_smart(item,10,now))
     f=seen[0]['candidates'][0]['facts']
-    assert len(f)==24 and f['signal_macd']==1 and f['signal_histogram']==1 and f['signal_price']==10
+    assert f['feature_39']==39 and f['signal_macd']==1 and f['signal_histogram']==1 and f['signal_price']==10
+    assert f['phase']=='smart_entry' and f['feature_snapshot_at']==item.created.isoformat()
+    assert f['signal_basis']=='option_premium' and f['signal_action']=='BUY'
+    assert 'not a BUY/SELL command' in f['signal_signal_definition']
 
 
 def test_smart_default_only_accepts_macd_stream_and_macd_filter_default_is_preserved(tmp_path):
@@ -98,3 +101,23 @@ def test_smart_default_only_accepts_macd_stream_and_macd_filter_default_is_prese
     assert Settings().macd_entry_filter is True
     lane.on_blast_candidate({'symbol':SYMBOL},now=datetime.now(UTC))
     assert not lane._pending
+
+
+@pytest.mark.parametrize('metadata_ok',[True,False])
+def test_smart_context_copy_cannot_change_or_block_macd_routing(metadata_ok):
+    from types import SimpleNamespace
+    from macd_trader.engine import TradingEngine
+    received=[];intake=[];features={'native_signal_feature':1}
+    async def on_signal(value):received.append(value)
+    smart=SimpleNamespace(on_macd_signal=lambda *args:intake.append(args))
+    contract=SimpleNamespace(option_type='CE',spot_symbol='NSE:FIXTURE-EQ',strike=100 if metadata_ok else None,expiry='2026-11-24')
+    signal=Signal(SYMBOL,'BUY','fixture',10,1,1,1)
+    engine=SimpleNamespace(entry_gate=SimpleNamespace(enabled=False),settings=SimpleNamespace(),
+        contract_selector=SimpleNamespace(contracts={SYMBOL:contract}),
+        execution=SimpleNamespace(tradable_symbols={SYMBOL},on_signal=on_signal),
+        smart_lanes=SimpleNamespace(lanes=[smart]),_entry_features=lambda *_:features)
+    asyncio.run(TradingEngine._route_signal(engine,signal))
+    assert received==[signal] and features=={'native_signal_feature':1}
+    assert len(intake)==1
+    if metadata_ok:assert intake[0][2]['underlying']=='NSE:FIXTURE-EQ' and intake[0][2] is not features
+    else:assert intake[0][2] is None

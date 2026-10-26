@@ -14,7 +14,7 @@ import threading
 from zoneinfo import ZoneInfo
 
 
-def verdict_loss(model,batch,lengths,token_ids):
+def verdict_loss(model,batch,lengths,token_ids,class_weights=None):
     import mlx.core as mx
     import mlx.nn as nn
     rows=mx.arange(batch.shape[0]);prefix=lengths[:,0]
@@ -26,7 +26,8 @@ def verdict_loss(model,batch,lengths,token_ids):
     logits=verdict_logits(language,hidden,token_ids)
     matches=batch[rows,prefix][:,None]==token_ids[None,:]
     targets=mx.argmax(matches,axis=1)
-    loss=nn.losses.cross_entropy(logits,targets,reduction='mean')
+    losses=nn.losses.cross_entropy(logits,targets,reduction='none')
+    loss=losses.mean() if class_weights is None else (losses*class_weights[targets]).mean()
     return mx.where(mx.all(matches.sum(axis=1)==1),loss,mx.array(float('nan'))),mx.array(batch.shape[0])
 
 
@@ -54,7 +55,7 @@ def run(config):
     enable_global_scaled_linear();mx.set_memory_limit(9*1024**3);mx.set_cache_limit(128*1024**2)
     c=json.loads(Path(config).read_text());folder=Path(c['data'])
     manifest=json.loads((folder.parent/'manifest.json').read_text())
-    if manifest.get('quality_tier')=='reconstructed_unverified_availability' and not c.get('allow_reconstructed_research'):
+    if 'reconstruct' in manifest.get('quality_tier','') and not c.get('allow_reconstructed_research'):
         raise ValueError('Reconstructed examples require an explicit research-only opt-in')
     counts=manifest['lanes'][folder.name]
     if min(counts['train']['positive'],counts['train']['negative'])<3 or counts['train']['rows']<25:
@@ -76,6 +77,12 @@ def run(config):
             result.append((tokens+[ids[classes[target]][0]],len(tokens)))
         return result
     train_data=dataset('train');valid_data=dataset('valid')
+    class_weights=None
+    if c.get('class_balance'):
+        counts_per_class=[sum(row[0][-1]==ids[i][0] for row in train_data) for i in range(3)]
+        present=sum(n>0 for n in counts_per_class)
+        weights=[min(3.,len(train_data)/(present*n)) if n else 0. for n in counts_per_class]
+        class_weights=mx.array(weights);c['class_weights_from_training_only']=weights
     adapter=Path(c['adapter_path']);adapter.mkdir(parents=True,exist_ok=False)
     c['fine_tune_type']='lora';c['objective']='constrained_verdict_cross_entropy';c['train_examples']=len(train_data)
     (adapter/'adapter_config.json').write_text(json.dumps(c,indent=2))
@@ -86,7 +93,7 @@ def run(config):
     mx.random.seed(c['seed'])
     print('Constrained-verdict training',folder.name,'rows',len(train_data),'iterations',c['iters'],flush=True)
     train(model=model,optimizer=optim.Adam(learning_rate=c['learning_rate']),args=args,
-          train_dataset=train_data,val_dataset=valid_data,loss=lambda m,b,l:verdict_loss(m,b,l,token_ids))
+          train_dataset=train_data,val_dataset=valid_data,loss=lambda m,b,l:verdict_loss(m,b,l,token_ids,class_weights))
     weights=mx.load(str(adapter/'adapters.safetensors'))
     if not all(bool(mx.all(mx.isfinite(v)).item()) for v in weights.values()):raise ValueError('Nonfinite adapter')
     receipt={'complete':True,'classification_only':True,'live_promotion_allowed':False,

@@ -61,4 +61,20 @@ class NativeTrainingTests(unittest.TestCase):
         self.assertLess(float(mx.max(mx.abs(layer(x)-expected)).item()), 1e-5)
 
 
+@unittest.skipUnless(importlib.util.find_spec('mlx'), 'Native MLX only')
+class WeightedObjectiveTests(unittest.TestCase):
+    def test_class_weight_has_effect_for_batch_size_one(self):
+        import mlx.core as mx
+        import mlx.nn as nn
+        from local_decisions.train_verdict import verdict_loss
+        class Body:
+            def __call__(self,inputs):return mx.ones((*inputs.shape,64))
+        language=SimpleNamespace(model=Body(),lm_head=nn.Linear(64,17).to_quantized(group_size=32,bits=4))
+        model=SimpleNamespace(language_model=language)
+        batch=mx.array([[8,9,2]]);lengths=mx.array([[2,3]]);ids=mx.array([2,7,13])
+        basic,_=verdict_loss(model,batch,lengths,ids)
+        weighted,_=verdict_loss(model,batch,lengths,ids,mx.array([3.,1.,1.]))
+        self.assertAlmostEqual(float(weighted.item()),3*float(basic.item()),places=5)
+
+
 if __name__ == '__main__': unittest.main()

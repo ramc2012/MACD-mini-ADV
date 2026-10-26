@@ -151,11 +151,12 @@ class Manager:
     def review_once(self):
         if not session_open(datetime.now(IST)):return
         for lane,book in self.books.items():
-            now=datetime.now(IST);orders=book.review_candidates(dict(self.last_quotes),now)
+            now=datetime.now(IST);orders=book.review_candidates(dict(self.last_quotes),now,limit=1)
             if not orders:continue
             candidates=[]
             for o in orders:
                 row=json.loads(o['payload']);facts={'phase':'fresh_entry_review','source_session':o['source_session'],
+                    'underlying':row.get('symbol') or row.get('instrument'),'strike':row.get('strike'),'expiry':row.get('expiry'),
                     'rank':row.get('rank') or row.get('side_rank'),'planned_quantity':o['planned_quantity'],
                     'spread_pct':(o['quote']['ask']/o['quote']['bid']-1)*100,
                     'position_limit_pct':book.terms['position_fraction']*100,

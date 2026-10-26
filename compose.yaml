@@ -176,6 +176,7 @@ services:
       OLLAMA_MODEL: qwen3.5:9b
       PAPER_LANES_ENABLED: "true"
       LOCAL_DECISION_DATABASE: /runtime/local_decisions/reviews.sqlite3
+      LOCAL_CONTEXT_URL: http://shadow-lanes:8430
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       PYTHONDONTWRITEBYTECODE: "1"
     volumes:

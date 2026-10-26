@@ -80,3 +80,75 @@ def test_auth_and_upstream_failure_do_not_expose_private_error(tmp_path,monkeypa
         assert c.post('/review',json=payload()).status_code==401
         response=c.post('/review',json=payload(),headers={'X-Macd-Token':'fixture-only-token'})
         assert response.status_code==503 and 'private' not in response.text
+
+
+def test_rich_context_preserves_signal_and_uses_bounded_larger_window(tmp_path,monkeypatch):
+    monkeypatch.setenv('LOCAL_CONTEXT_URL','http://shadow-lanes:8430')
+    seen=[]
+    def handler(request):
+        if request.url.path=='/api/decision-context':
+            facts={f'context_{n}':'x'*60 for n in range(120)};facts['ranker_score']=-999
+            return httpx.Response(200,json={'contexts':{'fixture-1':facts}})
+        if request.url.path=='/api/tags':return httpx.Response(200,json={'models':[{'name':'qwen3.5:9b','digest':'fixture'}]})
+        p=json.loads(request.content);seen.append(p)
+        body=json.loads(p['messages'][1]['content']);assert body['candidates'][0]['id']=='candidate'
+        assert body['candidates'][0]['facts']['ranker_score']==.7
+        assert body['candidates'][0]['facts']['context_119']=='x'*60
+        return httpx.Response(200,json={'done':True,'message':{'content':json.dumps({'reviews':[{'id':'candidate','verdict':'wait','reason':'fixture'}]})}})
+    client=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:client(**{**kw,'transport':httpx.MockTransport(handler)}))
+    r=worker(tmp_path,handler);result=asyncio.run(r.review(ReviewInput(**payload())))
+    assert result['reviews'][0]['id']=='fixture-1'
+    assert seen[0]['options']['num_ctx']==8192
+
+
+def test_canonical_model_cache_rebinds_each_callers_candidate_id(tmp_path,monkeypatch):
+    monkeypatch.setenv('LOCAL_CONTEXT_URL','http://shadow-lanes:8430')
+    calls=[]
+    def handler(request):
+        if request.url.path=='/api/decision-context':
+            identity=json.loads(request.content)['candidates'][0]['id']
+            return httpx.Response(200,json={'contexts':{identity:{'context_status':'observed'}}})
+        if request.url.path=='/api/tags':return httpx.Response(200,json={'models':[{'name':'qwen3.5:9b','digest':'fixture'}]})
+        calls.append(request.url.path)
+        return httpx.Response(200,json={'done':True,'message':{'content':json.dumps({'reviews':[{'id':'candidate','verdict':'wait','reason':'fixture'}]})}})
+    client=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:client(**{**kw,'transport':httpx.MockTransport(handler)}))
+    r=worker(tmp_path,handler);first=payload();second=json.loads(json.dumps(first))
+    second['candidates'][0]['id']='another-book-entry'
+    async def run():
+        return await r.review(ReviewInput(**first)),await r.review(ReviewInput(**second))
+    a,b=asyncio.run(run())
+    assert a['reviews'][0]['id']=='fixture-1' and b['reviews'][0]['id']=='another-book-entry'
+    assert b['cache_hit'] and len(calls)==1
+
+
+def test_failed_context_fetch_is_captured_and_never_runs_bare_generation(tmp_path,monkeypatch):
+    monkeypatch.setenv('LOCAL_CONTEXT_URL','http://shadow-lanes:8430')
+    def handler(request):
+        assert request.url.path=='/api/decision-context'
+        return httpx.Response(503)
+    client=httpx.AsyncClient
+    monkeypatch.setattr(httpx,'AsyncClient',lambda **kw:client(**{**kw,'transport':httpx.MockTransport(handler)}))
+    r=worker(tmp_path,handler)
+    with pytest.raises(HTTPException) as error:asyncio.run(r.review(ReviewInput(**payload())))
+    assert error.value.status_code==503
+    with r.db() as db:assert db.execute('select count(*) from training_snapshots').fetchone()[0]==1
+
+
+def test_native_training_lease_prevents_an_overlapping_model_allocation(tmp_path,monkeypatch):
+    path=tmp_path/'lease.json';path.write_text(json.dumps({'active':True,'expires_at':(datetime.now(timezone.utc)+timedelta(minutes=1)).isoformat()}))
+    monkeypatch.setenv('LOCAL_MODEL_WORKLOAD_FILE',str(path))
+    r=worker(tmp_path,lambda _:pytest.fail('Research already owns the model memory'))
+    with pytest.raises(HTTPException) as error:asyncio.run(r.review(ReviewInput(**payload())))
+    assert error.value.status_code==503
+    with r.db() as db:assert db.execute('select count(*) from training_snapshots').fetchone()[0]==1
+
+
+def test_stale_active_research_lease_waits_until_explicitly_cleared(tmp_path,monkeypatch):
+    from local_decisions.service import training_busy
+    path=tmp_path/'lease.json';monkeypatch.setenv('LOCAL_MODEL_WORKLOAD_FILE',str(path))
+    path.write_text(json.dumps({'active':True,'expires_at':(datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat()}))
+    assert training_busy()
+    path.write_text(json.dumps({'active':False,'expires_at':datetime.now(timezone.utc).isoformat()}))
+    assert not training_busy()

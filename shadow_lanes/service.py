@@ -18,16 +18,8 @@ from .store import ShadowStore
 
 LANES = ("vanguard", "cbe")
 # Only derived market-data modules. Legacy selection/publication/paper/funding commands are never invoked.
-FEATURE_STEPS = (
-    ("implied_vol", "features/m_implied_vol.py", "--lookback-days", "1", "--write"),
-    ("premium_ratios", "features/m_option_ratios.py", "--lookback-days", "3", "--write"),
-    ("iv_surface", "features/m_iv_surface.py", "--lookback-days", "120", "--write"),
-    ("sentiment", "features/m_sentiment.py", "--lookback-days", "5", "--write"),
-    ("flow", "features/m2_flow.py", "--lookback-days", "130"),
-    ("regime", "features/m3_gex.py", "--lookback-days", "60"),
-    ("sector", "features/m4_sector.py", "--lookback-days", "90"),
-    ("timing", "features/m5_timing.py", "--lookback-days", "3", "--buffer-days", "60", "--write", "--no-spot-check"),
-)
+from .feature_pipeline import LIVE_STEPS as FEATURE_STEPS, EOD_STEPS, refresh as refresh_features, status as feature_status,completed_bar_key
+
 
 
 class ShadowWorker:
@@ -36,6 +28,11 @@ class ShadowWorker:
         self.paper = paper
         self.features_bar = None
         self.feature_error = None
+        self.feature_attempts = {}
+        self.eod_day = None
+        self.eod_attempts = {}
+        self.public_sync_at = None
+        self.public_sync_error = None
 
     def check(self, now, diagnostic=False):
         """No missed-session publication, legacy write, or order interface exists here."""
@@ -96,47 +93,56 @@ class ShadowWorker:
 
     async def features(self, now):
         local = now.astimezone(source.IST)
-        if not source.is_session(local.date()) or not (9 * 60 + 46 <= local.hour * 60 + local.minute < 15 * 60 + 40):
-            return
-        # Completed :15/:45 grid, with 90 seconds for the input sweep to commit.
-        shifted = local - timedelta(seconds=90)
-        minutes = (shifted.hour * 60 + shifted.minute - 9 * 60 - 15) // 30
-        key = (str(local.date()), minutes)
+        key=completed_bar_key(now)
+        if key is None:return
         if key == self.features_bar:
             return
-        env = dict(os.environ)
-        env["VANGUARD_DATABASE_URL"] = make_dsn(host=env.get("MI_PG_HOST", "nomadcurie_db"),
-            dbname=env.get("LANE_SOURCE_DB", "nomadcurie"), user=env["MI_PG_USER"], password=env["MI_PG_PASSWORD"])
-        env["SHARED_MP_REDIS_URL"] = ""
-        env["VANGUARD_SCHEMA_MANAGED"] = "true"
-        self.feature_error = None
+        # Retry a failed bar at most twice, spaced by the normal loop; independent stages always run.
+        self.feature_attempts[key] = self.feature_attempts.get(key,0)+1
+        if self.feature_attempts[key]>2:return
         from .context import sync_participants
-        destination = source.connect(readonly=False)
+        destination=source.connect(readonly=False)
         try:
-            await asyncio.to_thread(sync_participants, destination)
-        finally:
-            destination.close()
-        for name, script, *args in FEATURE_STEPS:
-            process = await asyncio.create_subprocess_exec(sys.executable, str(source.VG_ROOT / script), *args,
-                cwd=source.VG_ROOT, env=env, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-            try:
-                _, error = await asyncio.wait_for(process.communicate(), timeout=180)
-                if process.returncode:
-                    category = "permission denied" if b"permission denied" in error else "stage failed"
-                    self.feature_error = f"{name}: {category} (exit {process.returncode})"
-                    break
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                if process.returncode is None:
-                    process.kill()
-                await process.communicate()
-                raise
-        self.features_bar = key
+            await asyncio.to_thread(sync_participants,destination)
+        finally:destination.close()
+        results=await refresh_features(key)
+        from .decision_context import capture_universe
+        await asyncio.to_thread(capture_universe,datetime.now(source.IST))
+        failures=[f'{name}: {state}' for name,state in results.items() if state!='ok' and name not in ('futures_baselines','shared_futures_ticks')]
+        self.feature_error='; '.join(failures) if failures else None
+        if not failures or self.feature_attempts[key]>=2:self.features_bar=key
+
+    async def end_of_day(self,now):
+        local=now.astimezone(source.IST)
+        if not source.is_session(local.date()) or local.hour*60+local.minute<15*60+50 or self.eod_day==str(local.date()):return
+        previous=feature_status()
+        if all(previous.get(s[0],{}).get('status')=='ok' and previous[s[0]]['checked_at'][:10]==str(local.date()) for s in EOD_STEPS):
+            self.eod_day=str(local.date());return
+        key=str(local.date())
+        attempts,last=self.eod_attempts.get(key,(0,None))
+        if attempts>=2 or last and (local-last).total_seconds()<900:return
+        self.eod_attempts[key]=(attempts+1,local)
+        results=await refresh_features(('eod',str(local.date())),EOD_STEPS)
+        from .decision_context import capture_universe
+        await asyncio.to_thread(capture_universe,datetime.now(source.IST))
+        if all(v=='ok' for v in results.values()):self.eod_day=str(local.date())
 
     async def run(self):
         while True:
             try:
                 now = datetime.now(source.IST)
+                if self.public_sync_at is None or (now-self.public_sync_at).total_seconds()>=300:
+                    from .context import sync_public_reports
+                    c=None
+                    try:
+                        c=source.connect(readonly=False)
+                        await asyncio.to_thread(sync_public_reports,c);self.public_sync_error=None
+                    except Exception as exc:self.public_sync_error=type(exc).__name__
+                    finally:
+                        if c is not None:c.close()
+                        self.public_sync_at=now
                 await self.features(now)
+                await self.end_of_day(datetime.now(source.IST))
                 await asyncio.to_thread(self.check, datetime.now(source.IST))
             except asyncio.CancelledError:
                 raise
@@ -176,6 +182,18 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
     from .nomad_views import install
     install(api, store, authorize,paper=paper)
 
+    @api.post('/api/decision-context',dependencies=[Depends(authorize)])
+    def decision_context(body:dict=Body(...)):
+        from .decision_context import build
+        rows=body.get('candidates',[])
+        if not isinstance(rows,list) or not 1<=len(rows)<=10 or any(not isinstance(r,dict) or not isinstance(r.get('id'),str) or not isinstance(r.get('instrument'),str) for r in rows):
+            raise HTTPException(422,'Bounded candidate identities required')
+        if body.get('phase') not in ('smart_entry','fresh_entry_review','next_session_watchlist'):
+            raise HTTPException(422,'Known decision phase required')
+        c=source.connect(readonly=True)
+        try:return {'contexts':build(c,rows,datetime.now(source.IST),body['phase'])}
+        finally:c.close()
+
     @api.get("/health")
     def health():
         return {"ok": True, "shadow_only": paper is None, "execution_enabled": paper is not None,
@@ -198,9 +216,12 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
     def snapshot(lane: str):
         if lane not in LANES:
             raise HTTPException(404, "Unknown shadow lane")
+        from .decision_context import summary as context_summary
         return {**store.snapshot(lane), "worker_enabled": enabled, "legacy_history_preserved": True,
+                'feature_context':context_summary(),
                 'paper_enabled':paper is not None,'execution_mode':'paper',
                 "publication_window": "14:45–15:15 IST" if lane == "vanguard" else "15:15–15:35 IST",
+                "feature_pipeline":feature_status(),
                 "target": "Exact stock-option performers over 1–3 sessions, plus a BTST observation" if lane == "vanguard" else "Long-only daily stock-direction research"}
 
     @api.get("/api/shadow-lanes/{lane}/archive", dependencies=[Depends(authorize)])

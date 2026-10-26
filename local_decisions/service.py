@@ -21,6 +21,18 @@ from .policy import SYSTEM,SYSTEM_SHA256
 UTC = timezone.utc
 
 
+def training_busy():
+    path=Path(os.environ.get('LOCAL_MODEL_WORKLOAD_FILE','/runtime/local_decisions/model_workload.json'))
+    try:
+        value=json.loads(path.read_text())
+        # A dead lease writer must not permit Ollama to overlap a still-running
+        # native trainer. The watcher explicitly clears active when jobs end.
+        datetime.fromisoformat(value['expires_at'])
+        return bool(value.get('active'))
+    except FileNotFoundError:return False
+    except (OSError,ValueError,KeyError,TypeError):return True
+
+
 def local_url(value):
     parsed=urlparse(value)
     if parsed.scheme!='http' or parsed.hostname not in ('localhost','127.0.0.1','host.docker.internal') or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('','/'):
@@ -40,7 +52,7 @@ class Candidate(BaseModel):
     @field_validator('facts')
     @classmethod
     def bounded_facts(cls,value):
-        if len(value)>24:raise ValueError('Too many candidate fields')
+        if len(value)>320:raise ValueError('Too many candidate fields')
         for key,v in value.items():
             if len(str(key))>64 or not isinstance(v,(str,int,float,bool,type(None))):raise ValueError('Only bounded scalar facts are accepted')
             if isinstance(v,str) and len(v)>160:raise ValueError('Fact text too long')
@@ -81,6 +93,7 @@ class Reviewer:
         self.path.parent.mkdir(parents=True,exist_ok=True)
         self.transport=transport;self.lock=asyncio.Lock();self.waiting=0;self.status_cache=None;self.status_at=0.
         self.calls=0;self.hits=0;self.last_error=None
+        self.context_lock=asyncio.Lock();self.context_cache={}
         with self.db() as db:
             db.execute('''CREATE TABLE IF NOT EXISTS reviews(context_hash TEXT NOT NULL,at TEXT NOT NULL,lane TEXT NOT NULL,model TEXT NOT NULL,digest TEXT NOT NULL,input TEXT NOT NULL,output TEXT NOT NULL,PRIMARY KEY(context_hash,at))''')
             db.execute('''CREATE TABLE IF NOT EXISTS training_snapshots(context_hash TEXT PRIMARY KEY,at TEXT NOT NULL,lane TEXT NOT NULL,input TEXT NOT NULL)''')
@@ -114,10 +127,33 @@ class Reviewer:
 
     async def review(self,request):
         self.fresh(request)
+        context_url=os.environ.get('LOCAL_CONTEXT_URL','')
+        context_failed=False
+        if context_url:
+            if context_url not in ('http://shadow-lanes:8430','http://127.0.0.1:8430'):
+                raise HTTPException(503,'Invalid local market context endpoint')
+            if len(request.candidates)!=1:raise HTTPException(413,'Rich market context requires one candidate per review')
+            row=request.candidates[0];phase=row.facts.get('phase','smart_entry' if request.lane=='smart' else 'next_session_watchlist')
+            key=json.dumps([phase,row.instrument,row.facts.get('underlying'),row.facts.get('expiry'),row.facts.get('strike')],sort_keys=True)
+            try:
+                async with self.context_lock:
+                    saved=self.context_cache.get(key)
+                    if saved and time.monotonic()-saved[0]<5:context=saved[1]
+                    else:
+                        async with httpx.AsyncClient(timeout=6,trust_env=False,follow_redirects=False) as client:
+                            r=await client.post(context_url+'/api/decision-context',json={'phase':phase,'candidates':[row.model_dump(mode='json')]},headers={'X-Macd-Token':os.environ.get('MACD_API_TOKEN','')})
+                            r.raise_for_status();context=r.json()['contexts'][row.id]
+                        self.context_cache={key:(time.monotonic(),context)}
+                # Original signal/risk facts win; providers cannot overwrite reviewed entry terms.
+                merged={**context,**row.facts};row.facts=Candidate.bounded_facts(merged)
+            except (httpx.HTTPError,ValueError,KeyError,TypeError):
+                row.facts={**row.facts,'context_status':'unavailable'};context_failed=True
         # Capture the exact observed inputs even when the model is absent, fails or vetoes.
         snapshot=json.dumps({'request':request.model_dump(mode='json'),'system':SYSTEM,'system_sha256':SYSTEM_SHA256},sort_keys=True,allow_nan=False)
         with self.db() as db:db.execute('INSERT OR IGNORE INTO training_snapshots VALUES(?,?,?,?)',
             (hashlib.sha256(snapshot.encode()).hexdigest(),datetime.now(UTC).isoformat(),request.lane,snapshot))
+        if context_failed:raise HTTPException(503,'Shared market context unavailable; new entries wait')
+        if training_busy():raise HTTPException(503,'Native research training is active; new model-reviewed entries wait')
         if self.waiting>=4:raise HTTPException(503,'Local review queue is full; new entries wait')
         self.waiting+=1
         try:
@@ -126,29 +162,34 @@ class Reviewer:
                 async with self.lock:
                     status=await self.availability()
                     if not status['ready']:raise HTTPException(503,status['detail'])
-                    context={'policy':'qwen35-review-v1','lane':request.lane,'candidates':[r.model_dump(mode='json') for r in request.candidates]}
+                    model_ids=['candidate'] if context_url else [r.id for r in request.candidates]
+                    model_rows=[{**r.model_dump(mode='json'),'id':identity} for r,identity in zip(request.candidates,model_ids)]
+                    context={'policy':'qwen35-review-v1','lane':request.lane,'candidates':model_rows}
+                    def bind(value):
+                        return {**value,'reviews':[{**value['reviews'][0],'id':request.candidates[0].id}]} if context_url else value
                     body=json.dumps(context,sort_keys=True,allow_nan=False,separators=(',',':'))
-                    if len(body)>12000:raise HTTPException(413,'Review context exceeds its local budget')
+                    if len(body)>20000:raise HTTPException(413,'Review context exceeds its local budget')
                     key=hashlib.sha256((str(status['digest'])+SYSTEM_SHA256+body).encode()).hexdigest()
                     with self.db() as db:saved=db.execute('SELECT output FROM reviews WHERE context_hash=? ORDER BY at DESC LIMIT 1',(key,)).fetchone()
                     if saved:
                         result=json.loads(saved[0])
                         if datetime.fromisoformat(result['expires_at'])>datetime.now(UTC):
-                            self.hits+=1;return {**result,'cache_hit':True}
+                            self.hits+=1;return bind({**result,'cache_hit':True})
                     self.fresh(request)
                     payload={'model':self.model,'stream':False,'think':False,'keep_alive':0,
-                             'options':{'temperature':0,'num_ctx':4096,'num_predict':640},
-                             'format':output_schema([r.id for r in request.candidates]),
+                             'options':{'temperature':0,'num_ctx':8192 if len(body)>6000 else 4096,'num_predict':640},
+                             'format':output_schema(model_ids),
                              'messages':[{'role':'system','content':SYSTEM},{'role':'user','content':body}]}
                     started=time.monotonic()
                     async with httpx.AsyncClient(transport=self.transport,timeout=65,follow_redirects=False,trust_env=False) as client:
                         r=await client.post(self.url+'/api/chat',json=payload);r.raise_for_status();response=r.json()
                     if response.get('done') is not True or response.get('done_reason')=='length':raise ValueError('Incomplete model response')
-                    reviews=validate_reviews(json.loads(response['message']['content']),[r.id for r in request.candidates])
+                    reviews=validate_reviews(json.loads(response['message']['content']),model_ids)
                     at=datetime.now(UTC)
                     result={'reviews':reviews,'model':self.model,'digest':status['digest'],'context_hash':key,
                             'created_at':at.isoformat(),'expires_at':(at+timedelta(seconds=30)).isoformat(),
                             'latency_ms':round((time.monotonic()-started)*1000),'cache_hit':False,'policy':'qwen35-review-v1'}
+                    result=bind(result)
                     with self.db() as db:db.execute('INSERT INTO reviews VALUES(?,?,?,?,?,?,?)',
                         (key,at.isoformat(),request.lane,self.model,status['digest'],body,json.dumps(result)))
                     self.calls+=1;self.last_error=None;return result
@@ -176,7 +217,7 @@ def create_app(reviewer=None):
             captures=dict(db.execute('SELECT lane,count(*) FROM training_snapshots GROUP BY lane').fetchall())
         try:training=json.loads(Path('/runtime/local_decisions/training_manifest.json').read_text())
         except (OSError,ValueError):training={'status':'base_model_only','deployed_weight_finetune':False}
-        return {**await worker.availability(),'mode':'filter','smart_new_entries_only':True,
+        return {**await worker.availability(),'mode':'filter','smart_new_entries_only':True,'training_busy':training_busy(),
                 'vanguard_shadow_only':os.environ.get('PAPER_LANES_ENABLED','false')!='true','paper_lanes_only':True,
                 'queue':worker.waiting,'inferences':worker.calls,'cache_hits':worker.hits,'last_error':worker.last_error,
                 'training':training,'captured_input_snapshots':captures,

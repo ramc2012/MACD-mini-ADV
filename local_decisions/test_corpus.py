@@ -104,3 +104,10 @@ def test_compute_guard_refuses_overlapping_model_allocations(tmp_path,monkeypatc
         with pytest.raises(BlockingIOError):
             with exclusive_compute():pytest.fail('Second allocation must not start')
     with exclusive_compute():pass
+
+
+def test_richer_smart_split_purges_outcome_crossing_development_boundary():
+    from local_decisions.build_context_corpus import context_split
+    row={'decision_at':'2026-10-16T14:00:00+05:30','label_available_at':'2026-10-19T11:00:00+05:30'}
+    assert context_split(row)=='purged'
+    row['label_available_at']='2026-10-16T15:00:00+05:30';assert context_split(row)=='train'
