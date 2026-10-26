@@ -14,7 +14,12 @@ flow/OI, IV/skew/chain structure, timing/value area, expiry/theta and event risk
 volatility/hedging structure, not by itself bullish or bearish direction. A high model rank is not a profit forecast.
 Group event_at, available_at, age_hours and status describe provenance. Treat stale or unavailable readings as
 historical/missing context, never as current confirmation. Optional missing context alone is not negative evidence;
-missing core signal/quote evidence requires wait. Do not invent substitutes for missing values.
+missing core signal evidence requires wait. For next_session_watchlist, latest completed-session marks and
+published session context can support planning without a live executable quote. Fresh_entry_review and smart_entry
+require current quote evidence. A session_date_only event has no known intraday timestamp: use its event_date and
+receipt basis, never invent an hourly age or treat an arbitrary session-start time as a stale observation.
+Session-date-only fields provide dated context, not proof of intraday freshness.
+Do not invent substitutes for missing values.
 Missing evidence must not become a favorable assumption.'''
 SYSTEM_SHA256=hashlib.sha256(SYSTEM.encode()).hexdigest()
 

@@ -34,6 +34,16 @@ def test_no_execution_or_outcome_features_are_in_context_contract():
     assert not any(forbidden.intersection(fields) for *_,fields in SPECS)
 
 
+def test_session_date_does_not_invent_a_0915_timestamp_or_hourly_staleness():
+    row={'dt':NOW.date(),'computed_at':NOW,'score':.2}
+    value=block('sector',row,'dt','computed_at','intraday_day',('score',),NOW)
+    assert value['sector.status']=='observed' and value['sector.score']==.2
+    assert value['sector.event_at'] is None and value['sector.age_hours'] is None
+    assert value['sector.event_date']=='2026-10-26' and value['sector.event_time_resolution']=='session_date_only'
+    assert value['sector.age_days']==0
+    assert block('eod',row,'dt','computed_at','eod',('score',),NOW)=={'eod.status':'not_available_at_decision'}
+
+
 def test_independent_feature_stages_continue_after_failure(tmp_path,monkeypatch):
     monkeypatch.setenv('FEATURE_RECEIPTS_PATH',str(tmp_path/'receipts.sqlite3'))
     monkeypatch.setenv('MI_PG_USER','fixture');monkeypatch.setenv('MI_PG_PASSWORD','fixture')
@@ -50,6 +60,8 @@ def test_independent_feature_stages_continue_after_failure(tmp_path,monkeypatch)
 
 def test_bar_refresh_runs_once_after_close_delay_and_includes_final_bar():
     from shadow_lanes.feature_pipeline import completed_bar_key
+    for hour,minute in ((0,0),(0,1),(0,2),(8,0),(9,15)):
+        assert completed_bar_key(NOW.replace(hour=hour,minute=minute,second=0)) is None
     assert completed_bar_key(NOW.replace(hour=9,minute=46,second=0)) is None
     assert completed_bar_key(NOW.replace(hour=9,minute=46,second=30))==('2026-10-26',0)
     assert completed_bar_key(NOW.replace(hour=10,minute=0,second=0))==('2026-10-26',0)

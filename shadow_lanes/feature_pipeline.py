@@ -28,7 +28,7 @@ EOD_STEPS = (
 
 def completed_bar_key(now):
     local=now.astimezone(source.IST);shifted=local-timedelta(seconds=90)
-    if not source.is_session(local.date()) or local.time()>=time(15,50) or shifted.time()<time(9,45):return None
+    if not source.is_session(local.date()) or shifted.date()!=local.date() or local.time()>=time(15,50) or shifted.time()<time(9,45):return None
     from model.session_clock import session_close
     if shifted.time()>=session_close(local.date()):index=12
     else:index=(shifted.hour*60+shifted.minute-555)//30-1

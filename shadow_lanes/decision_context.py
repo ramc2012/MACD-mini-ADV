@@ -42,16 +42,21 @@ def stamp(value):
 
 def block(group,row,event,receipt,cadence,fields,as_of):
     if not row:return {group+'.status':'missing'}
-    observed=stamp(row[event])
+    date_only=not isinstance(row[event],datetime)
+    if date_only and (cadence=='bar' or cadence=='eod' and row[event]==as_of.date() and as_of.time()<time(15,30)):
+        return {group+'.status':'not_available_at_decision'}
+    observed=datetime.combine(row[event],time(0),source.IST) if date_only else stamp(row[event])
     if cadence=='bar':observed+=timedelta(minutes=30)
-    if cadence=='intraday_day' and not isinstance(row[event],datetime):observed=datetime.combine(row[event],time(9,15),source.IST)
     received=stamp(row[receipt]) if receipt and row.get(receipt) else as_of
     if observed>as_of or received>as_of:return {group+'.status':'not_available_at_decision'}
     max_age=timedelta(days=5) if cadence=='eod' else timedelta(days=4) if cadence=='intraday_day' else timedelta(hours=20)
     # Overnight/weekend values retain their age; never advertise them as a fresh intraday observation.
-    age=(as_of-observed).total_seconds()
-    result={group+'.status':'stale' if as_of-observed>max_age else 'prior_session' if observed.date()<as_of.date() else 'observed',group+'.event_at':observed.isoformat(),
-            group+'.available_at':received.isoformat(),group+'.age_hours':round(age/3600,2)}
+    elapsed=timedelta(days=(as_of.date()-observed.date()).days) if date_only else as_of-observed
+    result={group+'.status':'stale' if elapsed>max_age else 'prior_session' if observed.date()<as_of.date() else 'observed',
+            group+'.event_at':None if date_only else observed.isoformat(),group+'.available_at':received.isoformat(),
+            group+'.age_hours':None if date_only else round(elapsed.total_seconds()/3600,2)}
+    if date_only:result.update({group+'.event_date':str(row[event]),group+'.event_time_resolution':'session_date_only',
+                               group+'.age_days':elapsed.days})
     if not receipt:result[group+'.receipt_basis']='first_observed_now; historical availability unverified'
     for key in fields:
         value=row.get(key)
