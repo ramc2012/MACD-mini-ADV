@@ -111,3 +111,22 @@ def test_richer_smart_split_purges_outcome_crossing_development_boundary():
     row={'decision_at':'2026-10-16T14:00:00+05:30','label_available_at':'2026-10-19T11:00:00+05:30'}
     assert context_split(row)=='purged'
     row['label_available_at']='2026-10-16T15:00:00+05:30';assert context_split(row)=='train'
+
+
+def test_research_enrichment_preserves_split_and_excludes_receipts_and_same_day_aggregates(tmp_path):
+    from local_decisions.build_context_corpus import enrich_research
+    root=tmp_path/'source';(root/'cbe').mkdir(parents=True)
+    (root/'manifest.json').write_text(json.dumps({'quality_tier':'reconstructed_unverified_availability','lanes':{'cbe':{}}}))
+    row={'id':'frozen','lane':'cbe','decision_at':'2026-10-14T15:00:00+05:30','label_available_at':'2026-10-25T12:00:00+05:30',
+         'instrument':'NSE:FIXTURE-EQ','side':'LONG','reference_price':10,'features':{'score':1},'net_return':.1}
+    (root/'cbe'/'test.records.jsonl').write_text(json.dumps(row)+'\n')
+    market=tmp_path/'market.json';market.write_text(json.dumps({'specs':[['flow','features','symbol','ts','receipt','bar',['value']]],
+         'rows':{'features':[{'symbol':'FIXTURE','ts':'2026-10-13','receipt':'2026-10-26','value':2},
+                            {'symbol':'FIXTURE','ts':'2026-10-14','receipt':'2026-10-26','value':9999}]}}))
+    out=tmp_path/'out';manifest=enrich_research(root,market,out)
+    result=json.loads((out/'cbe'/'test.records.jsonl').read_text());prompt=(out/'cbe'/'test.jsonl').read_text()
+    assert result['id']=='frozen' and result['label_available_at']==row['label_available_at']
+    assert result['features']['flow.value']==2 and result['context_receipt_audit']['flow']=='2026-10-26'
+    assert '2026-10-26' not in prompt and '9999' not in prompt and 'net_return' not in prompt
+    assert (out/'cbe'/'train.records.jsonl').read_text()=='' and not manifest['live_promotion_allowed']
+    with pytest.raises(FileExistsError):enrich_research(root,market,out)

@@ -87,7 +87,47 @@ def write(records,output,quality,source_hashes,exclusions):
     (output/'manifest.json').write_text(json.dumps(manifest,indent=2));return manifest
 
 
+def enrich_research(source,market_path,output):
+    """Enrich a frozen reconstructed corpus without changing any split or label.
+
+    Receipt audit stays outside model facts. Choose a new output directory;
+    this never replaces a corpus already used for evaluation.
+    """
+    from .policy import SYSTEM_SHA256
+    source=Path(source);market_path=Path(market_path);output=Path(output)
+    manifest=json.loads((source/'manifest.json').read_text())
+    if 'reconstruct' not in manifest.get('quality_tier',''):
+        raise ValueError('This enrichment is research-only; verified inputs need their own receipt audit')
+    market=json.loads(market_path.read_text());output.mkdir(parents=True,exist_ok=False)
+    fingerprints={}
+    for lane in manifest['lanes']:
+        folder=output/lane;folder.mkdir()
+        for part in ('train','valid','test','purged'):
+            path=source/lane/(part+'.records.jsonl')
+            records=[json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            if path.exists():fingerprints[str(path.relative_to(source))]=hashlib.sha256(path.read_bytes()).hexdigest()
+            enriched=[]
+            for row in records:
+                if 'context_version' in row['features']:
+                    raise ValueError('Use the original un-enriched frozen corpus, not a prior context export')
+                facts,audit=prior_context(row,market)
+                enriched.append({**row,'features':{**row['features'],**facts},'context_receipt_audit':audit,
+                                 'historical_availability_verified':False})
+            (folder/(part+'.records.jsonl')).write_text(''.join(json.dumps(r,sort_keys=True,allow_nan=False)+'\n' for r in enriched))
+            if part!='purged':(folder/(part+'.jsonl')).write_text(''.join(json.dumps(message(r),sort_keys=True,allow_nan=False)+'\n' for r in enriched))
+    manifest.update(live_promotion_allowed=False,system_sha256=SYSTEM_SHA256,
+        context_source_sha256=hashlib.sha256(market_path.read_bytes()).hexdigest(),frozen_record_sources=fingerprints,
+        context_policy='Prior-session research only; preserve frozen split and label; receipt audit outside model inputs')
+    (output/'manifest.json').write_text(json.dumps(manifest,indent=2));return manifest
+
+
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--raw',required=True);p.add_argument('--output',required=True);a=p.parse_args()
-    source=Path(a.raw);records,excluded=smart_entries(json.loads(source.read_text()))
-    print(json.dumps(write(records,a.output,'recorded_preentry_snapshot',{source.name:hashlib.sha256(source.read_bytes()).hexdigest()},excluded),indent=2))
+    p=argparse.ArgumentParser();inputs=p.add_mutually_exclusive_group(required=True)
+    inputs.add_argument('--raw');inputs.add_argument('--research-corpus');p.add_argument('--market-export');p.add_argument('--output',required=True);a=p.parse_args()
+    if a.research_corpus:
+        if not a.market_export:p.error('--market-export is required with --research-corpus')
+        result=enrich_research(a.research_corpus,a.market_export,a.output)
+    else:
+        source=Path(a.raw);records,excluded=smart_entries(json.loads(source.read_text()))
+        result=write(records,a.output,'recorded_preentry_snapshot',{source.name:hashlib.sha256(source.read_bytes()).hexdigest()},excluded)
+    print(json.dumps(result,indent=2))

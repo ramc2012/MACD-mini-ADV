@@ -34,6 +34,8 @@ Smart uses one capital book's actual MACD-source executed positions, exact order
 
 Vanguard has 25/6/7 train/validation/test examples; CBE has 108/12/7. Their context is reconstructed from prior-session market features. Historical receipt availability and L1 fills remain unverified. Strict availability-verified Vanguard/CBE labels remain zero. Large retained feature tables do not change this evidence quality.
 
+Usable Smart pre-entry snapshots span 2026-10-05 through 2026-10-23; no September Smart snapshot survived these joins. Vanguard's non-purged set contains 19 September and 19 October examples; CBE contains 103 and 24. Vanguard's frozen test decision is from 2026-10-14; CBE test decisions span 2026-10-19 through 2026-10-22. These are the original research splits, distinct from Smart's later cut dates. Do not silently apply the Smart split function to Vanguard/CBE. `build_context_corpus.py --research-corpus ORIGINAL_UNENRICHED_CORPUS --market-export CONSOLIDATED_MARKET_JSON --output NEW_DIRECTORY` preserves every source split/label and records source hashes. It refuses an existing output directory and a previously enriched input. This does not rerun or alter the completed evaluation corpus.
+
 | Lane | Frozen test observation | Serving decision |
 | --- | --- | --- |
 | Smart | 10/25 approved, 3 wins, mean net return -4.04%, profit factor 0.82. All 25 mean -2.65%. Stress mean of approved -4.83%. | Improvement not proven; adapter stays research-only. |
@@ -45,6 +47,8 @@ Derived-base verdict-head scoring approved zero Smart and Vanguard validation/te
 ## Deployment evidence and limits
 
 Both images build offline from retained local rollback images. The installed engine has 88/88 source-module parity. All seven original protected MACD books match their pre-deployment table hashes; settings have no changed keys. Paper mode and live-order locks remain set. Current public report downloads are complete; broad historical recovery stays held. Original Nomad workers remain retired and their histories are retained.
+
+Validation includes 166 isolated Python checks, 29 collector checks, 88 frontend checks and five native numerical checks. The expanded corpus-rebuild check is run separately. Served HTML/JS/CSS match the final frontend build. The market role has zero write privileges across 33 checked retained Nomad tables; a fresh full protected-PostgreSQL rowset comparison was not performed because this role cannot read protected books. Existing recovery limitations remain in force.
 
 Private evidence is in `runtime/qwen-context-v2/` and the platform's `backups/qwen-context-20261026/`. Research artifacts include immutable prompts, split records, predictions, adapter hashes and evaluation reports. The new market capture and UI were checked after deployment. The engine's startup read-only integrity scan briefly outlasted its health grace period; it completed successfully and the dependent desk was then started.
 
