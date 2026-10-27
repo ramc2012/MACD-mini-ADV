@@ -78,6 +78,11 @@ the fresh executable quote; there is no duplicate planning inference consuming
 the entry window. Qwen also receives the full shared context and the new daily
 indicator group, with units, timestamps, missingness and seed gaps.
 
+This same-session entry basis differs from the inherited rankers' next-session
+training target. Their scores are ordinal research context only: inherited
+expected-return estimates are explicitly removed from the fresh lane, and Qwen
+receives the mismatch. No calibration, entry timing or strategy edge is claimed.
+
 Before review and again before a fill, the selected strike must still be nearest
 to the fresh underlying bid/ask midpoint in the actual expiry's catalog. If it
 has moved away from ATM, the order waits/skips with a reason; no different

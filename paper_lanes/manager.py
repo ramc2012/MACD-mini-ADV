@@ -183,6 +183,7 @@ class Manager:
                     value=row.get(key)
                     if isinstance(value,(int,float)) and math.isfinite(value):facts[key]=value
                 guard=row.get('atm_guard') or {};spot=self.last_quotes.get(guard.get('spot_instrument'))
+                if row.get('ranker_entry_basis'):facts['ranker_entry_basis']=row['ranker_entry_basis']
                 if spot and fresh(spot,now):
                     facts.update(current_underlying_bid=spot['bid'],current_underlying_ask=spot['ask'],
                         underlying_quote_at=spot['at'],atm_strike=guard['strike'])

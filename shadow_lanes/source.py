@@ -144,7 +144,10 @@ def select_atm(candidates):
     selected=[];seen=set()
     for row in ranked:
         if row['symbol'] in seen:continue
-        seen.add(row['symbol']);selected.append({**row,'rank':len(selected)+1})
+        seen.add(row['symbol']);selected.append({**row,'rank':len(selected)+1,
+            'expected_net_return':None,'expected_net_lower':None,
+            'return_refusal':'Same-session ATM entry differs from the inherited next-session calibration',
+            'ranker_entry_basis':'Inherited rankers target next-session returns. Their scores are ordinal research context only; same-session ATM admission is not calibrated or proven.'})
         if len(selected)==10:break
     return selected
 

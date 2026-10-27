@@ -26,7 +26,7 @@ def apply_review(result,now,lane='vanguard'):
         fields=['symbol','rank','horizon_sessions','direction_score','contract_score','combined_score',
                 'expected_net_return','option_volume','option_oi','contract_kind','strike','expiry','conviction',
                 'momentum_fast','momentum_slow','relative_momentum','score','direction',
-                'ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14']
+                'ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14','ranker_entry_basis']
         facts={k:row[k] for k in fields if k in row and (isinstance(row[k],(str,int,bool)) or isinstance(row[k],float) and math.isfinite(row[k]))}
         facts.update(phase='next_session_watchlist',underlying=row.get('symbol') or row.get('instrument'))
         candidates.append({'id':identity,'instrument':row['instrument'],'side':row.get('option_type') or 'LONG',

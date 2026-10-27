@@ -59,3 +59,5 @@ def test_atm_selection_excludes_wings_and_duplicate_directions():
           for s,side,kind,score in [('A','CE','WING_25D',100),('A','PE','ATM',90),('A','CE','ATM',80),('B','CE','ATM',70)]]
     selected=source.select_atm(rows)
     assert [(r['symbol'],r['option_type']) for r in selected]==[('A','PE'),('B','CE')]
+    assert all(r['expected_net_return'] is None and r['expected_net_lower'] is None for r in selected)
+    assert all('not calibrated' in r['ranker_entry_basis'] for r in selected)
