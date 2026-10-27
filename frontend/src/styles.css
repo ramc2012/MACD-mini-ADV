@@ -493,6 +493,8 @@ main { min-width: 0; }
 button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid #8ab7ff; outline-offset: 2px; }
 .main-tabs { overflow-x: auto; scrollbar-width: thin; height: 48px; padding: 0 10px; }
 .main-tabs button { flex: 0 0 auto; padding: 0 13px; white-space: nowrap; }
+.main-tabs .mi-hub-link { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; margin-left: auto; padding: 0 14px; border-left: 1px solid #26364c; color: #9fc2f5; font-size: 11px; font-weight: 700; text-decoration: none; white-space: nowrap; }
+.main-tabs .mi-hub-link:hover, .main-tabs .mi-hub-link:focus-visible { color: #fff; background: #132033; }
 .metrics { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .metrics > div { min-width: 0; padding: 12px 14px; }
 .metrics b { font-variant-numeric: tabular-nums; line-height: 1.4; }

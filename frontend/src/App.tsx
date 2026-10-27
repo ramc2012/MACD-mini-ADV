@@ -7,7 +7,7 @@ import { PositionChartModal } from "./PositionChartModal";
 import { SettingsPanel } from "./SettingsPanel";
 import { TradingLedger, type LedgerTab } from "./Ledger";
 import { DispersionPage, useDispersionSeries } from "./Dispersion";
-import { API_TOKEN, API_URL } from "./runtime";
+import { API_TOKEN, API_URL, MI_URL } from "./runtime";
 
 // Pages opened from the tab bar load on first visit, so the trading view
 // does not wait for the footprint, profile, research and analytics code.
@@ -539,7 +539,7 @@ export default function App() {
         <button className="settings-button settings-glyph" onClick={() => openSettings("FYERS")} aria-label="Settings" title="Settings">⚙</button>
       </div>
     </header>
-    <nav className="main-tabs" aria-label="Lanes">{LANES.map(([key, label]) => <button key={key} className={lane === key ? "active" : ""} aria-current={lane === key ? "page" : undefined} onClick={() => setLane(key)}>{label}<span>{key === "MACD" ? portfolio.positions.length || "" : key === "BLAST" ? blastBadge : ""}</span></button>)}</nav>
+    <nav className="main-tabs" aria-label="Lanes">{LANES.map(([key, label]) => <button key={key} className={lane === key ? "active" : ""} aria-current={lane === key ? "page" : undefined} onClick={() => setLane(key)}>{label}<span>{key === "MACD" ? portfolio.positions.length || "" : key === "BLAST" ? blastBadge : ""}</span></button>)}<a className="mi-hub-link" href={`${MI_URL}/`} target="_blank" rel="noopener noreferrer" title="Open Market Intelligence: brokers, feeds and shared data">MI hub <span aria-hidden="true">↗</span></a></nav>
     {lane === "MACD" && <SubTabs className="lane-views" value={macdView} options={MACD_VIEWS} onChange={setMacdView}
       titles={{ ORDERS: "All saved order attempts, including filled and rejected orders", TRADES: "Executed buy and sell fills; includes partial exits" }}
       badges={{ PORTFOLIO: portfolio.positions.length || "", ORDERS: loadStatus.Orders === "" ? orders.length : "…", TRADES: loadStatus.Trades === "" ? trades.length : "…", SIGNALS: signals.length || "",

@@ -7,3 +7,7 @@ export const WS_URL = import.meta.env.VITE_WS_URL
   || `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws/stream`;
 
 export const API_TOKEN = import.meta.env.VITE_API_TOKEN || "";
+
+const miOrigin = new URL(window.location.origin);
+miOrigin.port = "8410";
+export const MI_URL = miOrigin.origin;
