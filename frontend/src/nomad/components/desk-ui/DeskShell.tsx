@@ -16,6 +16,7 @@ import { clsx } from "clsx";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback } from "react";
 import { Activity } from "lucide-react";
+import {InfoNote} from './InfoNote';
 
 import { StatusBadge } from "./StatusBadge";
 import { ExecutionModeBadge, SchedulerBadge } from "./SemanticBadges";
@@ -84,11 +85,12 @@ export function DeskShell({
 }) {
   return (
     <div className="space-y-4">
-      <header className="rounded-2xl border border-bg-border bg-bg-secondary/22 px-5 py-4">
+      <header className="rounded-xl border border-bg-border bg-bg-secondary/22 px-4 py-2">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <h1 className="text-xl font-semibold text-text-primary">{title}</h1>
+              {description ? <InfoNote title={`About ${title}`}>{description}</InfoNote> : null}
               {/* Paper is BLUE, live is amber. Green is reserved for
                   healthy-live / actionable-confirmed, and "we are not sending
                   real orders" is neither — it is a mode, not a health light. */}
@@ -103,9 +105,6 @@ export function DeskShell({
                 <SchedulerBadge state="armed" />
               ) : null}
             </div>
-            {description ? (
-              <p className="mt-1 text-sm text-text-muted max-w-2xl">{description}</p>
-            ) : null}
             {showStatus && <div className="mt-2 flex flex-wrap items-center gap-3 text-[11.5px] text-text-muted">
               <span className="inline-flex items-center gap-1.5">
                 <Activity size={12} className={isFetching ? "animate-pulse text-accent-blue" : undefined} />

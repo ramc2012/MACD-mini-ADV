@@ -54,7 +54,11 @@ class ShadowWorker:
                     result.update(status="blocked", blockers=[f"Market feature refresh failed: {self.feature_error}"], watchlist=[])
                 if self.paper and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='filter':
                     result.update(status='blocked',blockers=['Paper cohorts require Qwen filter mode'],watchlist=[])
-                if (lane=='vanguard' or self.paper) and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
+                # Vanguard paper candidates go straight to their SAME-session
+                # entry queue. One Qwen review uses the fresh executable quote;
+                # a second planning pass would consume the short entry window.
+                needs_plan_review=(lane=='vanguard' and not self.paper) or (lane=='cbe' and self.paper)
+                if needs_plan_review and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
                     from .local_model import apply_review
                     result=apply_review(result,now,lane=lane) if self.paper else apply_review(result,now)
                     # A slow review cannot freeze a missed or previous-session observation.
@@ -64,7 +68,7 @@ class ShadowWorker:
                 if self.paper:
                     result['paper_account_id']=self.paper.books[lane].account_id
                     result['policy']=result.get('policy',source.POLICIES[lane])+'-paper-candidates-v1'
-                    result['watchlist']=[{**row,'actionable':False,'actionable_reason':'Paper candidate only; fresh next-session Qwen, quote and risk checks required'} for row in result.get('watchlist',[])]
+                    result['watchlist']=[{**row,'actionable':False,'actionable_reason':('Same-session ATM paper candidate; fresh Qwen, spot, quote and risk checks required' if lane=='vanguard' else 'Paper candidate only; fresh next-session Qwen, quote and risk checks required')} for row in result.get('watchlist',[])]
                 result.update(shadow_only=True, execution_enabled=False, diagnostic=diagnostic)
                 self.store.status(lane, now.isoformat(), result)
                 if not diagnostic and source.publication_window(now, lane) and result.get("source_session") == str(now.astimezone(source.IST).date()):
@@ -220,7 +224,7 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
         return {**store.snapshot(lane), "worker_enabled": enabled, "legacy_history_preserved": True,
                 'feature_context':context_summary(),
                 'paper_enabled':paper is not None,'execution_mode':'paper',
-                "publication_window": "14:45–15:15 IST" if lane == "vanguard" else "15:15–15:35 IST",
+                "publication_window": "14:45–15:15 IST" if lane == "vanguard" else "15:31–16:30 IST",
                 "feature_pipeline":feature_status(),
                 "target": "Exact stock-option performers over 1–3 sessions, plus a BTST observation" if lane == "vanguard" else "Long-only daily stock-direction research"}
 

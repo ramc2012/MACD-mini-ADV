@@ -2,6 +2,8 @@
 
 /** Vanguard research and prospective paper-trading desk. */
 import { useMemo, useState } from "react";
+import {MarketContextPanel} from '@/MarketContextPanel';
+import {dataScope} from '@/lib/api';
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -158,7 +160,7 @@ export default function VanguardDesk() {
     queryKey: ["vanguard", "market"],
     queryFn: (): Promise<any> => getVanguardMarket().then((r) => r.data),
     refetchInterval: REFRESH_MS.summary,
-    enabled: activeTab === "market" || activeTab === "decision",
+    enabled: (activeTab === "market" && dataScope()==='retained') || activeTab === "decision",
   });
   const detail = useQuery({
     queryKey: ["vanguard", "symbol", symbol],
@@ -213,7 +215,7 @@ export default function VanguardDesk() {
   return (
     <DeskShell
       title="Vanguard"
-      description="Exact-contract option paper trading over 1–3 sessions with Qwen-reviewed entries. Retained model and stock research remains available in separate tabs."
+      description="ATM option paper trading over 1–3 sessions. Current-session candidates require fresh Qwen approval, a fresh ATM check and executable quotes before fills. Stops, targets, expiry and scheduled exits are managed independently."
       asOf={s?.latest_timing_bar ?? null}
       asOfLabel="latest timing bar"
       paperMode
@@ -249,9 +251,10 @@ export default function VanguardDesk() {
           <p className="mt-3 text-xs text-text-muted">{s.activity.swing.actionable_note || "Actionable selections remain paper only."}</p>
         </Section>
       )}
-      {activeTab === "paper" && <div className="space-y-5"><DecisionReadinessPanel /><PaperTrading /></div>}
+      {activeTab === "paper" && <div className="space-y-5">{dataScope()==='retained'&&<DecisionReadinessPanel />}<PaperTrading /></div>}
       {activeTab === "equityChallenger" && <EquityChallenger />}
-      {activeTab === "market" &&
+      {activeTab === "market" && dataScope()==='shadow' && <MarketContextPanel lane="vanguard"/>}
+      {activeTab === "market" && dataScope()==='retained' &&
         (symbol ? (
           <SymbolDetail
             data={detail.data}

@@ -1,4 +1,5 @@
 import {dataScope} from "@/lib/api";
+import {MarketContextPanel} from '@/MarketContextPanel';
 import {ShadowPortfolio,ShadowFollowup} from "@/ShadowPanels";
 "use client";
 
@@ -56,6 +57,7 @@ import { Sparkline } from "@/components/desk-ui";
 
 const TABS = [
   { key: "portfolio", label: "Paper trading", icon: Briefcase },
+  { key: "market", label: "Market", icon: Layers3 },
   { key: "rotation", label: "Rotation", icon: Radar },
   { key: "watchlist", label: "Watchlist", icon: Target },
   { key: "journal", label: "Journal", icon: Activity },
@@ -110,6 +112,7 @@ type ScanPayload = {
   scan_date?: string | null;
   signal_session_date?: string | null;
   created_at?: string | null;
+  source_as_of?: string | null;
   universe_size?: number;
   scored_count?: number;
   watchlist_count?: number;
@@ -217,7 +220,7 @@ const trendTone = (t?: string | null) =>
 export default function CbeDesk() {
   const isShadow = dataScope() === "shadow";
   // Hedge-fund portfolio construction is the headline view when the desk opens.
-  const [activeTab, setActiveTab] = useUrlTab("portfolio");
+  const [activeTab, setActiveTab] = useUrlTab(isShadow ? "market" : "portfolio");
 
   const latestQuery = useQuery({
     queryKey: ["cbe", "latest"],
@@ -341,7 +344,8 @@ export default function CbeDesk() {
     <DeskShell
       title="CBE Paper Trader"
       description={isShadow ? "Daily long-only cash-equity paper trading · Qwen-reviewed entries, cash accounting and managed exits." : "Retained Nomad CBE account · recorded positions and history, read only."}
-      asOf={scan?.created_at ?? scan?.scan_date ?? undefined}
+      asOf={scan?.source_as_of ?? scan?.created_at ?? scan?.scan_date ?? undefined}
+      asOfLabel={isShadow ? "completed daily session" : "Updated"}
       // CBE scans land once per session (EOD alpha-engine pass) — freshness
       // thresholds follow that cadence, not the intraday default.
       asOfStaleSeconds={30 * 3600}
@@ -489,6 +493,7 @@ export default function CbeDesk() {
         </div>
       ) : null}
 
+      {activeTab === "market" && <MarketContextPanel lane="cbe"/>}
       {activeTab === "watchlist" && <Section title="Qualified long watchlist" description="Selected names from the latest persisted CBE scan. Selection does not guarantee a fill: fresh execution prices, available cash and concentration limits still apply.">
         <p className="mb-3 text-xs text-text-muted">{watchlist.length} selected · signal session {scan?.signal_session_date ?? scan?.scan_date ?? "pending"} · {paperSum?.admissions_blocked ? "New entries blocked: held quotes need recovery" : "Paper admission follows book limits"}</p>
         <CandidateTable rows={watchlist}/>

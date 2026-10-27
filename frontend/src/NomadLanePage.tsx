@@ -6,8 +6,10 @@ import {updateQuotes} from './nomad/hooks/useQuoteStore';
 import {dataScope} from './nomad/lib/api';
 import type {Tick} from './types';
 import './nomad/nomad.generated.css';
+import './lane-data.css';
 import {LocalModelPanel} from './LocalModelPanel';
 import {FeaturePipelinePanel} from './FeaturePipelinePanel';
+import {InfoNote} from './nomad/components/desk-ui/InfoNote';
 
 class DeskBoundary extends Component<{children:ReactNode},{failed:boolean}>{state={failed:false};static getDerivedStateFromError(){return {failed:true};}render(){return this.state.failed?<div role="alert" className="rounded-xl border border-bg-border p-6">This retained view cannot be rendered from the recovered dataset. Choose another tab or return to the fresh paper book.</div>:this.props.children;}}
 
@@ -18,8 +20,8 @@ export function NomadLanePage({lane,ticks,connected}:{lane:'vanguard'|'cbe';tick
  useEffect(()=>{const sync=()=>{setScope(dataScope());setView(window.location.hash);setNotices([]);};const failed=(e:Event)=>setNotices(v=>[...new Set([...v,(e as CustomEvent<string>).detail])].slice(-4));window.addEventListener('hashchange',sync);window.addEventListener('nomad-data-error',failed);return()=>{window.removeEventListener('hashchange',sync);window.removeEventListener('nomad-data-error',failed);};},[]);
  useEffect(()=>{setNotices([]);return()=>client.clear();},[client]);
  const choose=(next:'shadow'|'retained')=>{const p=new URLSearchParams();if(next==='retained')p.set('scope',next);window.history.replaceState(null,'',`#/${lane.toUpperCase()}${p.size?'?'+p:''}`);window.dispatchEvent(new HashChangeEvent('hashchange'));};
- return <div className="nomad-port"><div className="nomad-scope-bar"><div><b>{scope==='shadow'?'Fresh MACD paper lane':'Retained Nomad history · read only'}</b><p>{scope==='shadow'?'Independent paper cash, Qwen-reviewed entries and managed exits. Research and legacy panels use retained Nomad data.':'Original frozen lists, positions and recorded returns. Retired workers do not manage these accounts.'}</p></div><div role="group" aria-label="Lane data scope"><button onClick={()=>choose('shadow')} aria-pressed={scope==='shadow'}>MACD paper</button><button onClick={()=>choose('retained')} aria-pressed={scope==='retained'}>Nomad history</button></div></div>
+ return <div className="nomad-port"><div className="lane-ledger-toolbar"><label>Ledger <select aria-label="Lane ledger" value={scope} onChange={e=>choose(e.target.value as 'shadow'|'retained')}><option value="shadow">Fresh {lane==='vanguard'?'Vanguard':'CBE'}</option><option value="retained">Retained Nomad history</option></select></label><InfoNote title="Ledger information">Fresh paper cash and entries are separate from the retained Nomad book. Historical market data remains available in either view. Retained positions and returns are read only.</InfoNote>
+ {scope==='shadow'&&<span className="lane-diagnostics">Qwen &amp; data <InfoNote title="Qwen and data status"><LocalModelPanel lane={lane}/><FeaturePipelinePanel lane={lane}/></InfoNote></span>}</div>
  {!!notices.length&&<div className="nomad-gap" role="status">Some retained datasets were outside the recovery backup. Unavailable views: {notices.map(n=>n.split('/').pop()).join(', ')}. Missing values are not new observations.</div>}
- {scope==='shadow'&&<><LocalModelPanel/><FeaturePipelinePanel lane={lane}/></>}
  <QueryClientProvider client={client}><DeskBoundary key={view}><div key={`${lane}-${scope}`}>{lane==='vanguard'?<VanguardDesk/>:<CbeDesk/>}</div></DeskBoundary></QueryClientProvider></div>;
 }

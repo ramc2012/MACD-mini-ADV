@@ -1,4 +1,5 @@
 import { clsx } from "clsx";
+import {InfoNote} from './InfoNote';
 
 import { ProvenanceChip } from "./SemanticBadges";
 import type { Provenance } from "@/lib/market-semantics";
@@ -46,10 +47,8 @@ export function Section({
             <div className="flex items-center gap-2 text-sm font-semibold text-text-primary">
               {icon}
               {title}
+              {description ? <InfoNote title="About this panel">{description}</InfoNote> : null}
             </div>
-            {description ? (
-              <div className="mt-1 text-xs text-text-muted">{description}</div>
-            ) : null}
           </div>
           {rightSlot}
         </div>

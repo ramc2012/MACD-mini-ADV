@@ -112,7 +112,7 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
                                'expiry':meta.get('expiry') or c.get('facts',{}).get('expiry'),'strike':meta.get('strike') or c.get('facts',{}).get('strike'),
                                'side':meta.get('option_type') or c.get('side')}
         symbols=list({r['symbol'] for r in resolved.values() if r['symbol']});sectors=list({r['sector'] for r in resolved.values() if r['sector']})
-        result={c['id']:{'context_version':'market-context-v2','phase':phase,'context_as_of':as_of.isoformat(),'underlying':resolved[c['id']]['symbol']} for c in candidates}
+        result={c['id']:{'context_version':'market-context-v3-daily','phase':phase,'context_as_of':as_of.isoformat(),'underlying':resolved[c['id']]['symbol']} for c in candidates}
         for group,table,key,event,receipt,cadence,fields in SPECS:
             universe=sectors if key=='sector20' else symbols
             cutoff=as_of-timedelta(minutes=30) if cadence=='bar' else as_of
@@ -167,6 +167,23 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
                 result[c['id']].update(cross_asset_context(q.fetchall(),as_of))
             result[c['id']]['feature_count']=sum('.' in k and not k.endswith(('.status','.event_at','.event_date','.event_time_resolution',
                 '.available_at','.age_hours','.age_days','.receipt_basis')) for k in result[c['id']])
+    # The same local completed-session indicators are visible to the trader and
+    # to Qwen. These are current observations, not historical decision evidence.
+    from .daily_market import view
+    daily=view(as_of=as_of)
+    daily_by={r['symbol']:r for r in daily['results']}
+    for c in candidates:
+        row=daily_by.get(resolved[c['id']]['symbol'])
+        if not row:
+            result[c['id']]['daily.status']='outside_active_stock_universe'
+            continue
+        result[c['id']].update({'daily.source_session':daily['source_session'],
+            'daily.status':'completed_session_context','daily.price_basis':row['price_basis'],
+            'daily.units':'Cash prices and EMA/MACD in INR; RSI14 0-100; momentum and relative momentum are fractions (0.01 = 1%). Completed daily context is not an executable quote.',
+            'daily.history_basis':'Actual common daily observations; no interpolation. CBE qualification requires 60 observed closes and all of the latest 50 exchange sessions. Older seed gaps remain explicit.',
+            'daily.aligned_observations':row['aligned_daily_observations'],'daily.older_seed_gaps':row['older_seed_gaps']})
+        for field in ('latest_close','ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14','momentum_fast','momentum_slow','relative_momentum'):
+            result[c['id']]['daily.'+field]=row.get(field)
     if persist:
         with context_database() as db:
             for c in candidates:

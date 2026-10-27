@@ -68,7 +68,7 @@ def test_combined_quotes_use_one_shared_hub_request_and_clear_subscriptions(monk
 
 def test_new_cbe_cohort_flows_into_only_its_new_account(tmp_path,monkeypatch):
     from shadow_lanes import service,source,local_model
-    now=datetime(2026,10,26,15,20,tzinfo=IST)
+    now=datetime(2026,10,26,15,50,tzinfo=IST)
     class Clock(datetime):
         @classmethod
         def now(cls,tz=None):return now

@@ -1,5 +1,5 @@
 """Read-only adapters for Nomad's original desks and fresh MACD observations."""
-from datetime import datetime
+from datetime import datetime,date,time
 import json
 import os
 from pathlib import Path
@@ -33,12 +33,18 @@ def install(api, store, authorize,paper=None):
                 readiness = snap.get('readiness') or {}
                 latest = (snap.get('publications') or [None])[0]
                 rows = (latest or {}).get('watchlist') or []
+                timing_bar=None
+                if resource=='summary':
+                    try:
+                        values=await fetch_all('SELECT max(ts) AS latest FROM timing WHERE ts<=now()')
+                        timing_bar=values[0]['latest'] if values else None
+                    except HTTPException:pass
                 overrides = {
                     'paper': {'account':None,'shadow_only':True,'macd_paper_only':paper is not None, **snap},
                     'book': {'open_positions':[],'closed':[],'equity_curve':[],'shadow_only':True},
                     'readiness': {**readiness,'selection_allowed':False,'publication_allowed':False,
                                   'observed_at':snap.get('checked_at'),'detail':('New paper entries require current data and Qwen; exits managed separately' if paper else 'Fresh MACD observations; execution disabled')},
-                    'summary': {'paper_only':True,'shadow_only':True,'latest_timing_bar':None,'activity':{},'thresholds':{},'capital':None},
+                    'summary': {'paper_only':True,'shadow_only':True,'latest_timing_bar':timing_bar,'activity':{},'thresholds':{},'capital':None},
                     'watchlist': {'shadow_only':True,'latest':latest,'items':rows,'history':snap.get('publications',[]),'current_items':rows},
                     'strategy-journals': {'journals':{},'swing':{'latest':latest,'items':rows}},
                     'selection': {'rows':rows,'selected':rows,'shadow_only':True},
@@ -54,6 +60,13 @@ def install(api, store, authorize,paper=None):
     api.include_router(vanguard, dependencies=[Depends(authorize)])
     router = APIRouter(prefix='/api/nomad', dependencies=[Depends(authorize)])
 
+    @router.get('/{lane}/market-context')
+    def market_context(lane: str, session: str | None=None):
+        from .daily_market import view
+        if lane not in ('vanguard','cbe'):raise HTTPException(404,'Unknown lane')
+        try:return view(date.fromisoformat(session) if session else None)
+        except ValueError:raise HTTPException(422,'Choose an available completed session') from None
+
     def book():
         path=Path(os.environ.get('LEGACY_CBE_FILE','/legacy/cbe/paper_positions.json'))
         try: return json.loads(path.read_text())
@@ -68,15 +81,26 @@ def install(api, store, authorize,paper=None):
 
     @router.get('/cbe/latest')
     def cbe_latest(scope: str='shadow'):
-        snap=store.snapshot('cbe'); latest=(snap.get('publications') or [None])[0]
+        snap=store.snapshot('cbe')
+        publications=[p for p in snap.get('publications',[]) if not paper or p.get('paper_account_id')==paper.books['cbe'].account_id]
+        latest=(publications or [None])[0]
         if scope=='retained':
             raise HTTPException(503,'The original CBE scan dataset was outside the recovery backup; its paper book remains available')
-        rows=(latest or {}).get('watchlist') or []
-        result=[{**r,'composite_alpha_score':r.get('score'),'directional_bias':'bullish','gate_passed':True,
-                 'is_watchlist':True,'sector_code':r.get('sector'),'details':{'stock_selection':r}} for r in rows]
+        from .daily_market import view
+        from .source import IST
+        market=view()
+        selected={r['instrument'] for r in (latest or {}).get('watchlist',[])}
+        result=[{**{k:v for k,v in r.items() if k!='history'},'composite_alpha_score':r.get('score'),
+                 'directional_bias':{'LONG':'bullish','SHORT':'bearish'}.get(r.get('direction'),'neutral'),
+                 'gate_passed':r['eligible'],'is_watchlist':r['instrument'] in selected,'sector_code':r.get('sector'),
+                 'recent_closes_30d':[b['close'] for b in r['history'][-30:]],
+                 'details':{'stock_selection':{k:v for k,v in r.items() if k not in ('history','profile')}}} for r in market['results']]
         return {'shadow_only':paper is None,'config':{'timeframe':'daily'},'source':'MACD prospective paper candidates' if paper else 'MACD prospective shadow',
-                'scan_date':(latest or {}).get('source_session'),'created_at':(latest or {}).get('decision_at'),
-                'results':result,'watchlist':result,'watchlist_count':len(result),'scored_count':len(result),
+                'scan_date':market['source_session'],'created_at':market['observed_at'],
+                'source_as_of':datetime.combine(date.fromisoformat(market['source_session']),time(15,30),IST).isoformat(),
+                'universe_size':market['expected'],
+                'results':result,'watchlist':[r for r in result if r['is_watchlist']],
+                'watchlist_count':len(selected),'scored_count':len(result),
                 'readiness':snap.get('readiness')}
 
     @router.get('/cbe/paper-summary')

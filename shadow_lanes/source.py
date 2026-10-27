@@ -17,18 +17,18 @@ sys.path.insert(0, str(VG_ROOT))
 from model.market_calendar import is_session, previous_session
 
 IST = ZoneInfo("Asia/Kolkata")
-POLICIES = {"vanguard": "macd-vanguard-option-payoff-shadow-v1", "cbe": VERSION + "-macd-shadow-v1"}
+POLICIES = {"vanguard": "macd-vanguard-atm-qwen-paper-v2", "cbe": "cbe-daily-cash-mp-v2-20261027"}
 
 
 def source_session(now, lane):
     local = now.astimezone(IST)
-    cutoff = time(14, 45) if lane == "vanguard" else time(15, 15)
+    cutoff = time(14, 45) if lane == "vanguard" else time(15, 30)
     return local.date() if is_session(local.date()) and local.time() >= cutoff else previous_session(local.date())
 
 
 def publication_window(now, lane):
     local = now.astimezone(IST)
-    start, end = (time(14, 45), time(15, 15)) if lane == "vanguard" else (time(15, 15), time(15, 35))
+    start, end = (time(14, 45), time(15, 15)) if lane == "vanguard" else (time(15, 31), time(16, 30))
     return is_session(local.date()) and start <= local.time() < end
 
 
@@ -56,6 +56,11 @@ def blocked(lane, day, *reasons, **details):
 
 
 def cbe(connection, now):
+    from .daily_market import scan
+    return scan(connection, now, source_session(now, 'cbe'))
+
+
+def legacy_cbe_diagnostic(connection, now):
     day = source_session(now, "cbe")
     with connection.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(DAILY_SQL.replace(":start", "%(start)s").replace(":as_of", "%(as_of)s"),
@@ -118,13 +123,30 @@ def vanguard(connection, now):
     candidates, coverage = swing.form_candidates(connection, direction, payoff, bar, inputs)
     if coverage.get("universe_rows", 0) < swing.MIN_UNIVERSE_ROWS:
         return blocked("vanguard", day, "Exact-contract chain universe is too thin to rank", **diagnostics, chain=coverage)
-    selected = swing.select_top(swing.performer_candidates(candidates), 10)
+    # The maintained paper lane trades ATM only, with one direction per stock.
+    # The retained research selector may still compare wings and both sides.
+    selected = select_atm(swing.performer_candidates(candidates))
+    by_symbol={e.symbol:e for e in fresh}
     for row in selected:
-        row.update(actionable=False, actionable_reason="Fresh MACD shadow observation; execution disabled")
-    return dict(status="ok" if selected else "blocked", blockers=[] if selected else ["No eligible exact contracts"],
+        evaluation=by_symbol[row['symbol']]
+        row.update(sector20=evaluation.sector20,conviction=evaluation.conviction,
+                   underlying_signal_close=float(spots[row['symbol']]['close']))
+        row.update(actionable=False, actionable_reason="Fresh paper candidate; current ATM, Qwen and risk checks required")
+    return dict(status="ok" if selected else "blocked", blockers=[] if selected else ["No eligible exact ATM contracts"],
                 source_session=str(day), policy=POLICIES["vanguard"], watchlist=selected, **diagnostics, chain=coverage,
-                inputs="Inherited M2 flow, M3 regime, M4 sector RS/lead-lag, M5 timing, and frozen direction/payoff rankers",
+                inputs="Inherited M2 flow, M3 regime, M4 sector RS/lead-lag, M5 timing, frozen direction/payoff rankers and full shared Qwen context",
                 model_status="Research only; no promotion or expected-profit claim")
+
+
+def select_atm(candidates):
+    ranked = sorted([r for r in candidates if r.get('contract_kind')=='ATM'],
+                    key=lambda r:(-r['combined_score'],-r['direction_score'],-r['contract_score'],r['symbol'],r['option_type']))
+    selected=[];seen=set()
+    for row in ranked:
+        if row['symbol'] in seen:continue
+        seen.add(row['symbol']);selected.append({**row,'rank':len(selected)+1})
+        if len(selected)==10:break
+    return selected
 
 
 def observe_outcomes(connection, publication, now):

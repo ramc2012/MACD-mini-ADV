@@ -10,6 +10,46 @@ from pathlib import Path
 from .book import money
 
 
+def reset_cbe(folder, archive, capital, now):
+    """Owner-authorized fresh epoch; caller must stop the shared paper writer.
+
+    Keep the complete old SQLite file and a verified portable backup. No old
+    cohort can enter the new epoch, which has a different account ID and time.
+    """
+    from .book import Book
+    folder,archive=Path(folder),Path(archive)
+    original=folder/'cbe.sqlite3'
+    if not original.is_file() or archive.exists() or now.tzinfo is None:
+        raise ValueError('Existing CBE book, unused archive path and aware time required')
+    archive.mkdir(parents=True)
+    with sqlite3.connect(original,timeout=5) as old:
+        old.row_factory=sqlite3.Row
+        old.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        if old.execute('PRAGMA quick_check(1)').fetchone()[0]!='ok':raise ValueError('Old book integrity failed')
+        account=dict(old.execute('SELECT * FROM account').fetchone())
+        counts={t:old.execute('SELECT count(*) FROM '+t).fetchone()[0] for t in ('orders','positions','fills','decisions','events','equity','settlements')}
+        with sqlite3.connect(archive/'backup.sqlite3') as backup:
+            old.backup(backup)
+            if backup.execute('PRAGMA quick_check(1)').fetchone()[0]!='ok':raise ValueError('Archive integrity failed')
+    old.close()
+    fresh_path=folder/'cbe-reset-prepared.sqlite3'
+    if fresh_path.exists():raise ValueError('Prepared reset path already exists')
+    new=Book(fresh_path,'cbe',capital,now)
+    with new.transaction() as db:
+        new.event(db,now,'ACCOUNT_RESET',None,{'reason':'Owner requested a fresh daily cash-stock CBE paper ledger',
+            'previous_account_id':account['account_id'],'archive':str(archive),'initial_capital':capital,
+            'no_historical_fills':True,'policy':'cbe-daily-cash-mp-v2-20261027'})
+    manifest={'at':now.isoformat(),'previous_account_id':account['account_id'],'new_account_id':new.account_id,
+              'capital':capital,'archived_counts':counts,'archive':str(archive)}
+    (archive/'manifest.json').write_text(json.dumps(manifest,indent=2))
+    original.replace(archive/'original.sqlite3')
+    for suffix in ('-wal','-shm','-journal'):
+        side=Path(str(original)+suffix)
+        if side.exists():side.replace(archive/('original.sqlite3'+suffix))
+    fresh_path.replace(original)
+    return manifest
+
+
 def correct_untraded_starting_capital(folder, expected_capital, capital, now):
     target,expected=money(capital),money(expected_capital)
     if target<=0 or expected<=0 or now.tzinfo is None:

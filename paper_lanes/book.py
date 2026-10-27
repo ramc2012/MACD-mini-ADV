@@ -159,11 +159,23 @@ class Book:
                 if now>=datetime.fromisoformat(o['deadline']):self.set_state(db,o['id'],'EXPIRED','Entry window missed; no historical fill',now);continue
                 if o['attempts']>=self.terms['review_attempts']:self.set_state(db,o['id'],'REJECTED','Qwen retry limit reached',now);continue
                 if o['retry_after'] and now<datetime.fromisoformat(o['retry_after']):continue
+                atm_reason=self.atm_reason(o,quotes,now)
+                if atm_reason:db.execute('UPDATE orders SET reason=? WHERE id=?',(atm_reason,o['id']));continue
                 q=quotes.get(o['instrument']);qty,reason=self.checks(db,o,q,now)
                 if not qty:db.execute('UPDATE orders SET reason=? WHERE id=?',(reason,o['id']));continue
                 o['quote']=q;o['planned_quantity']=qty;result.append(o)
                 if len(result)>=limit:break
         return result
+
+    def atm_reason(self,order,quotes,now):
+        guard=json.loads(order['payload']).get('atm_guard')
+        if not guard:return ''  # Old queued orders keep their immutable entry terms.
+        spot=quotes.get(guard.get('spot_instrument'))
+        if not fresh(spot,now,self.terms['quote_age_seconds']):return 'Fresh underlying quote required to verify ATM'
+        strikes=guard.get('strikes') or []
+        if not strikes:return 'ATM strike catalog unavailable'
+        nearest=min(strikes,key=lambda strike:(abs(strike-(spot['bid']+spot['ask'])/2),strike))
+        return '' if nearest==guard['strike'] else 'Selected strike is no longer ATM; no substituted contract or fill'
 
     def set_state(self,db,identity,state,reason,now):
         db.execute('UPDATE orders SET state=?,reason=? WHERE id=?',(state,reason,identity));self.event(db,now,state,identity,{'reason':reason})
@@ -228,6 +240,8 @@ class Book:
             if session_open:
                 for row in db.execute("SELECT * FROM orders WHERE state='APPROVED' ORDER BY created_at,rank,id").fetchall():
                     o=dict(row);q=quotes.get(o['instrument']);review=json.loads(o['approval'])
+                    atm_reason=self.atm_reason(o,quotes,now)
+                    if atm_reason:db.execute('UPDATE orders SET reason=? WHERE id=?',(atm_reason,o['id']));continue
                     if datetime.fromisoformat(review['expires_at'])<=now:
                         self.set_state(db,o['id'],'PENDING_AI','Entry approval expired; fresh review required',now);continue
                     qty,reason=self.checks(db,o,q,now)

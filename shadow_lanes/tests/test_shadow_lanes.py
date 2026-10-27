@@ -85,7 +85,7 @@ def test_worker_freezes_once_without_calling_any_legacy_publisher(tmp_path, monk
 
 @pytest.mark.parametrize("lane,hour,minute,expected", [
     ("vanguard", 14, 44, False), ("vanguard", 14, 45, True), ("vanguard", 15, 15, False),
-    ("cbe", 15, 14, False), ("cbe", 15, 15, True), ("cbe", 15, 35, False),
+    ("cbe", 15, 15, False), ("cbe", 15, 30, False), ("cbe", 15, 31, True), ("cbe", 16, 30, False),
 ])
 def test_causal_publication_windows(lane, hour, minute, expected):
     assert source.publication_window(NOW.replace(hour=hour, minute=minute), lane) is expected

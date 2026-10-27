@@ -79,10 +79,19 @@ class MarketData:
         try:
             with c.cursor(cursor_factory=RealDictCursor) as cur:
                 if lane=='vanguard':
-                    cur.execute('''SELECT instrument_key,underlying AS symbol,expiry,lot_size,tick_size
-                      FROM fo_contract_catalog WHERE instrument_key=ANY(%s)''',([r['instrument'] for r in rows],))
-                    return {r['instrument_key']:{'instrument':r['instrument_key'],'symbol':r['symbol'],
-                            'expiry':str(r['expiry']),'lot_size':r['lot_size'],'tick':float(r['tick_size'] or 0)} for r in cur.fetchall()}
+                    cur.execute('''SELECT c.instrument_key,c.underlying AS symbol,c.expiry,c.lot_size,c.tick_size,c.strike,
+                      u.spot_instrument_key,s.sector20 FROM fo_contract_catalog c JOIN fo_underlying_catalog u ON u.symbol=c.underlying
+                      LEFT JOIN sector_taxonomy s ON s.symbol=u.symbol
+                      WHERE c.instrument_key=ANY(%s)''',([r['instrument'] for r in rows],))
+                    contracts=cur.fetchall();out={}
+                    for r in contracts:
+                        cur.execute('''SELECT DISTINCT strike FROM fo_contract_catalog WHERE underlying=%s AND expiry=%s
+                          AND option_type IN ('CE','PE') AND strike>0 ORDER BY strike''',(r['symbol'],r['expiry']))
+                        strikes=[float(s['strike']) for s in cur.fetchall()]
+                        out[r['instrument_key']]={'instrument':r['instrument_key'],'symbol':r['symbol'],
+                            'expiry':str(r['expiry']),'lot_size':r['lot_size'],'tick':float(r['tick_size'] or 0),'sector':r['sector20'],
+                            'atm_guard':{'strike':float(r['strike']),'spot_instrument':r['spot_instrument_key'],'strikes':strikes}}
+                    return out
                 cur.execute('''SELECT u.symbol,u.spot_instrument_key,s.sector20 FROM fo_underlying_catalog u
                   LEFT JOIN sector_taxonomy s ON s.symbol=u.symbol WHERE u.symbol=ANY(%s) AND u.kind='STOCK' AND u.fno_active IS TRUE''',
                   ([r.get('symbol') or r['instrument'] for r in rows],))
@@ -120,10 +129,14 @@ class Manager:
             due_day=next_session(day,horizon)
             expiry=meta.get('expiry')
             if lane=='vanguard' and (not expiry or date.fromisoformat(expiry)<due_day):continue
+            if lane=='vanguard' and (candidate.get('contract_kind')!='ATM' or not meta.get('atm_guard')):continue
             prepared.append({**meta,'sector':candidate.get('sector20') or candidate.get('sector') or meta.get('sector') or 'UNKNOWN',
-                             'candidate':candidate,'exit_due':datetime.combine(due_day,time(15,10) if expiry==str(due_day) else time(15,15),IST)})
-        inserted=book.enqueue(publication['id'],prepared,decided,str(day),datetime.combine(entry_day,time(9,20),IST),
-                              datetime.combine(entry_day,time(9,55),IST),publication['paper_account_id'])
+                             'candidate':{**candidate,**({'atm_guard':meta['atm_guard']} if lane=='vanguard' else {})},
+                             'exit_due':datetime.combine(due_day,time(15,10) if expiry==str(due_day) else time(15,15),IST)})
+        entry_after=decided+timedelta(seconds=1) if lane=='vanguard' else datetime.combine(entry_day,time(9,20),IST)
+        deadline=datetime.combine(day,time(15,15),IST) if lane=='vanguard' else datetime.combine(entry_day,time(9,55),IST)
+        if entry_after>=deadline:return 0
+        inserted=book.enqueue(publication['id'],prepared,decided,str(day),entry_after,deadline,publication['paper_account_id'])
         if len(prepared)<len(rows):
             with book.transaction() as db:
                 book.event(db,datetime.now(IST),'METADATA_BLOCKED',None,{'cohort':publication['id'],'eligible':len(rows),'exact_metadata':len(prepared)})
@@ -133,7 +146,9 @@ class Manager:
         keys=set()
         for book in self.books.values():
             with book.db() as db:
-                keys.update(r[0] for r in db.execute("SELECT instrument FROM orders WHERE state IN ('PENDING_AI','APPROVED','FILLED')"))
+                for r in db.execute("SELECT instrument,payload FROM orders WHERE state IN ('PENDING_AI','APPROVED','FILLED')"):
+                    keys.add(r[0]);spot=json.loads(r[1]).get('atm_guard',{}).get('spot_instrument')
+                    if spot:keys.add(spot)
         return keys
 
     def poll(self,now=None):
@@ -163,9 +178,14 @@ class Manager:
                     'hard_stop_pct':book.terms['hard_stop']*100,'target_pct':book.terms['target']*100,
                     'horizon_sessions':row.get('horizon_sessions',1),'exit_due':o['exit_due']}
                 for key in ('direction_score','contract_score','combined_score','momentum_fast','momentum_slow','relative_momentum','score',
-                            'expected_net_return','option_volume','option_oi','conviction'):
+                            'expected_net_return','option_volume','option_oi','conviction',
+                            'ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14','underlying_signal_close'):
                     value=row.get(key)
                     if isinstance(value,(int,float)) and math.isfinite(value):facts[key]=value
+                guard=row.get('atm_guard') or {};spot=self.last_quotes.get(guard.get('spot_instrument'))
+                if spot and fresh(spot,now):
+                    facts.update(current_underlying_bid=spot['bid'],current_underlying_ask=spot['ask'],
+                        underlying_quote_at=spot['at'],atm_strike=guard['strike'])
                 candidates.append({'id':o['id'],'instrument':o['instrument'],'side':row.get('option_type') or 'LONG',
                                    'reference_price':o['quote']['ask'],'source_at':o['quote']['at'],'facts':facts})
             try:
