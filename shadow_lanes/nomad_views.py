@@ -67,6 +67,12 @@ def install(api, store, authorize,paper=None):
         try:return view(date.fromisoformat(session) if session else None)
         except ValueError:raise HTTPException(422,'Choose an available completed session') from None
 
+    @router.get('/{lane}/market-features')
+    def market_features(lane:str):
+        if lane not in ('vanguard','cbe'):raise HTTPException(404,'Unknown lane')
+        from .current_features import view
+        return view()
+
     def book():
         path=Path(os.environ.get('LEGACY_CBE_FILE','/legacy/cbe/paper_positions.json'))
         try: return json.loads(path.read_text())

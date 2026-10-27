@@ -28,7 +28,7 @@ def source_session(now, lane):
 
 def publication_window(now, lane):
     local = now.astimezone(IST)
-    start, end = (time(14, 45), time(15, 15)) if lane == "vanguard" else (time(15, 31), time(16, 30))
+    start, end = (time(14, 45), time(15, 15)) if lane == "vanguard" else (time(15, 31), time(20, 0))
     return is_session(local.date()) and start <= local.time() < end
 
 
@@ -125,6 +125,8 @@ def vanguard(connection, now):
         return blocked("vanguard", day, "Exact-contract chain universe is too thin to rank", **diagnostics, chain=coverage)
     # The maintained paper lane trades ATM only, with one direction per stock.
     # The retained research selector may still compare wings and both sides.
+    from .contracts import verify_candidates
+    candidates=verify_candidates(candidates)
     selected = select_atm(swing.performer_candidates(candidates))
     by_symbol={e.symbol:e for e in fresh}
     for row in selected:

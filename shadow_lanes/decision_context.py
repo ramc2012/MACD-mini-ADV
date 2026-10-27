@@ -96,6 +96,13 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
         instruments=[c['instrument'] for c in candidates]
         q.execute('SELECT instrument_key,underlying,expiry,strike,option_type FROM fo_contract_catalog WHERE instrument_key=ANY(%s)',(instruments,))
         contracts={r['instrument_key']:dict(r) for r in q.fetchall()}
+        live_keys=[c['instrument'] for c in candidates if c['instrument'].startswith(('NSE_FO|','BSE_FO|'))]
+        if live_keys:
+            from .contracts import resolve,expiry
+            for key,meta in resolve(live_keys).items():
+                if not meta:raise ValueError('Current exact option identity unavailable')
+                contracts[key]={'underlying':meta['underlying'],'expiry':datetime.fromisoformat(expiry(meta)).date(),
+                                'strike':meta['strike'],'option_type':meta['option_type']}
         q.execute('SELECT symbol,spot_instrument_key,sector20,sector_group FROM fo_underlying_catalog LEFT JOIN sector_taxonomy USING(symbol) WHERE spot_instrument_key=ANY(%s) OR symbol=ANY(%s)',
                   (instruments,[normalize(c.get('facts',{}).get('underlying') or c.get('symbol')) for c in candidates]))
         catalog=[dict(r) for r in q.fetchall()]
@@ -180,7 +187,7 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
         result[c['id']].update({'daily.source_session':daily['source_session'],
             'daily.status':'completed_session_context','daily.price_basis':row['price_basis'],
             'daily.units':'Cash prices and EMA/MACD in INR; RSI14 0-100; momentum and relative momentum are fractions (0.01 = 1%). Completed daily context is not an executable quote.',
-            'daily.history_basis':'Actual common daily observations; no interpolation. CBE qualification requires 60 observed closes and all of the latest 50 exchange sessions. Older seed gaps remain explicit.',
+            'daily.history_basis':'Actual closes; no interpolation. CBE needs 60 observations and 50 complete recent exchange sessions. Older seed gaps are disclosed.',
             'daily.aligned_observations':row['aligned_daily_observations'],'daily.older_seed_gaps':row['older_seed_gaps']})
         for field in ('latest_close','ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14','momentum_fast','momentum_slow','relative_momentum'):
             result[c['id']]['daily.'+field]=row.get(field)

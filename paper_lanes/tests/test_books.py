@@ -80,7 +80,7 @@ def test_qwen_veto_or_unavailable_never_fills(tmp_path,verdict):
         assert not orders # quote is now stale
     other=book(tmp_path/'other');enqueue(other)
     orders=other.review_candidates(qs,OPEN);other.review_failed(orders,OPEN);cycle(other,qs)
-    assert not other.snapshot(OPEN)['fills'] and other.snapshot(OPEN)['orders'][0]['attempts']==1
+    assert not other.snapshot(OPEN)['fills'] and other.snapshot(OPEN)['orders'][0]['attempts']==0 and other.snapshot(OPEN)['orders'][0]['service_failures']==1
 
 
 def test_whole_lot_depth_fee_cash_and_idempotent_restart(tmp_path):

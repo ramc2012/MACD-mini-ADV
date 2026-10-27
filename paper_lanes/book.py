@@ -68,6 +68,8 @@ class Book:
             CREATE TABLE IF NOT EXISTS settlements(order_id TEXT PRIMARY KEY,due TEXT NOT NULL,amount_paise INTEGER NOT NULL,settled INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS status(id INTEGER PRIMARY KEY CHECK(id=1),at TEXT NOT NULL,payload TEXT NOT NULL);
             ''')
+            if 'service_failures' not in {r[1] for r in db.execute('PRAGMA table_info(orders)')}:
+                db.execute('ALTER TABLE orders ADD COLUMN service_failures INTEGER NOT NULL DEFAULT 0')
             db.execute('INSERT OR IGNORE INTO account VALUES(1,?,?,?,?,0,?,?,0)',
                 (uuid4().hex,now.isoformat(),money(capital),money(capital),json.dumps(policy(lane)),money(capital)))
             a=db.execute('SELECT * FROM account').fetchone()
@@ -154,7 +156,7 @@ class Book:
     def review_candidates(self,quotes,now,limit=3):
         result=[]
         with self.transaction() as db:
-            for row in db.execute("SELECT * FROM orders WHERE state='PENDING_AI' ORDER BY created_at,rank,id").fetchall():
+            for row in db.execute("SELECT * FROM orders WHERE state='PENDING_AI' ORDER BY created_at,rank,coalesce(CAST(json_extract(payload,'$.score') AS REAL),0) DESC,id").fetchall():
                 o=dict(row)
                 if now>=datetime.fromisoformat(o['deadline']):self.set_state(db,o['id'],'EXPIRED','Entry window missed; no historical fill',now);continue
                 if o['attempts']>=self.terms['review_attempts']:self.set_state(db,o['id'],'REJECTED','Qwen retry limit reached',now);continue
@@ -200,8 +202,10 @@ class Book:
     def review_failed(self,orders,now):
         with self.transaction() as db:
             for o in orders:
-                db.execute("UPDATE orders SET attempts=attempts+1,retry_after=?,reason='Qwen unavailable; no entry' WHERE id=? AND state='PENDING_AI'",
-                           ((now+timedelta(seconds=60)).isoformat(),o['id']))
+                failures=db.execute('SELECT service_failures FROM orders WHERE id=?',(o['id'],)).fetchone()[0]+1
+                delay=min(120,15*2**min(failures-1,3))
+                db.execute("UPDATE orders SET service_failures=service_failures+1,retry_after=?,reason='Qwen service unavailable; no verdict or entry' WHERE id=? AND state='PENDING_AI'",
+                           ((now+timedelta(seconds=delay)).isoformat(),o['id']))
                 self.event(db,now,'QWEN_UNAVAILABLE',o['id'],{'reason':'Local review failed; no deterministic fallback entry'})
 
     def cycle(self,quotes,now,session_open,settle_at):
@@ -238,7 +242,7 @@ class Book:
         # Exit fills are committed before any entry processing can fail.
         with self.transaction() as db:
             if session_open:
-                for row in db.execute("SELECT * FROM orders WHERE state='APPROVED' ORDER BY created_at,rank,id").fetchall():
+                for row in db.execute("SELECT * FROM orders WHERE state='APPROVED' ORDER BY created_at,rank,coalesce(CAST(json_extract(payload,'$.score') AS REAL),0) DESC,id").fetchall():
                     o=dict(row);q=quotes.get(o['instrument']);review=json.loads(o['approval'])
                     atm_reason=self.atm_reason(o,quotes,now)
                     if atm_reason:db.execute('UPDATE orders SET reason=? WHERE id=?',(atm_reason,o['id']));continue

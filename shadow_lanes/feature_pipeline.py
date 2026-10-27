@@ -14,20 +14,19 @@ LIVE_STEPS = (
  ('premium_ratios','features/m_option_ratios.py','--lookback-days','3','--write'),
  ('iv_surface','features/m_iv_surface.py','--lookback-days','120','--write'),
  ('sentiment','features/m_sentiment.py','--lookback-days','5','--write'),
- ('flow','features/m2_flow.py','--lookback-days','130'),
- ('regime','features/m3_gex.py','--lookback-days','60'),
  ('sector','features/m4_sector.py','--lookback-days','180'),
  ('timing','features/m5_timing.py','--lookback-days','3','--buffer-days','60','--write','--no-spot-check'),
  ('futures_baselines','features/m_futures_oi.py','--lookback-days','3'),
 )
 EOD_STEPS = (
+ ('flow','features/m2_flow.py','--lookback-days','130'),
  ('market_profile','features/m_market_profile.py','--lookback-days','200','--write-days','2','--write'),
  ('oi_positioning','features/m_oi_positioning.py','--lookback-days','5','--write'),
 )
 
 
 def completed_bar_key(now):
-    local=now.astimezone(source.IST);shifted=local-timedelta(seconds=90)
+    local=now.astimezone(source.IST);shifted=local-timedelta(seconds=60)
     if not source.is_session(local.date()) or shifted.date()!=local.date() or local.time()>=time(15,50) or shifted.time()<time(9,45):return None
     from model.session_clock import session_close
     if shifted.time()>=session_close(local.date()):index=12
@@ -62,6 +61,15 @@ async def refresh(run_key,steps=LIVE_STEPS):
     env['VANGUARD_DATABASE_URL']=make_dsn(host=env.get('MI_PG_HOST','nomadcurie_db'),dbname=env.get('LANE_SOURCE_DB','nomadcurie'),user=env['MI_PG_USER'],password=env['MI_PG_PASSWORD'])
     env.update(SHARED_MP_REDIS_URL='',VANGUARD_SCHEMA_MANAGED='true')
     results={}
+    if steps is LIVE_STEPS or any(s[0]=='timing' for s in steps):
+        from .incremental_regime import run
+        started=datetime.now(source.IST).isoformat()
+        try:
+            detail=await asyncio.to_thread(run);state='ok' if detail.get('written') else 'no_current_gamma'
+        except Exception as exc:state='stage_failed';detail={'exception_class':type(exc).__name__}
+        with database() as c:c.execute('INSERT INTO runs(run_key,stage,started_at,finished_at,status,detail) VALUES(?,?,?,?,?,?)',
+            (str(run_key),'regime',started,datetime.now(source.IST).isoformat(),state,json.dumps(detail)))
+        results['regime']=state
     if any(s[0]=='futures_baselines' for s in steps):
         from .futures_context import sync
         start=datetime.now(source.IST).isoformat()

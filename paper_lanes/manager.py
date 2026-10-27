@@ -59,6 +59,8 @@ class MarketData:
         if self.hub not in ('http://hub:8400','http://host.docker.internal:8400','http://127.0.0.1:8400'):
             raise ValueError('Paper lane data must use the existing local hub')
         self.last_subscriptions=None
+        self.live=None;self.reference={}
+        self.reference_day=None
 
     def quotes(self,instruments):
         keys=sorted(set(instruments))
@@ -69,9 +71,23 @@ class MarketData:
                 response=c.post(self.hub+'/v1/subscriptions',json={'caller':'macd-paper-lanes','upstox':keys})
                 response.raise_for_status();self.last_subscriptions=keys
             if not keys:return {}
+            reused={}
+            if self.live:
+                from shadow_lanes.contracts import resolve
+                if self.reference_day!=datetime.now(IST).date():self.reference={};self.reference_day=datetime.now(IST).date()
+                missing=[k for k in keys if k not in self.reference]
+                if missing:self.reference.update(resolve(missing))
+                for key in keys:
+                    tick=self.live.quotes.get((self.reference.get(key) or {}).get('canonical'),{})
+                    if not tick:continue
+                    q={'instrument':key,'at':datetime.fromtimestamp(tick['exchange_ts_ms']/1000,IST).isoformat(),
+                       'bid':tick.get('bid'),'ask':tick.get('ask'),'bid_qty':tick.get('bid_qty'),
+                       'ask_qty':tick.get('ask_qty'),'volume':tick.get('cum_volume')}
+                    if fresh(q,datetime.now(IST)):reused[key]=q
+                if len(reused)==len(keys):return reused
             response=c.post(self.hub+'/v1/request',json={'broker':'upstox','endpoint':'market-quote/quotes',
-                'query':{'instrument_key':','.join(keys)},'caller':'macd-paper-lanes','priority':'critical','ttl_ms':1000})
-            response.raise_for_status();return parse_quotes(response.json(),set(keys))
+                'query':{'instrument_key':','.join(k for k in keys if k not in reused)},'caller':'macd-paper-lanes','priority':'critical','ttl_ms':1000})
+            response.raise_for_status();return {**reused,**parse_quotes(response.json(),set(keys)-set(reused))}
 
     def metadata(self,lane,rows):
         from shadow_lanes import source
@@ -79,18 +95,19 @@ class MarketData:
         try:
             with c.cursor(cursor_factory=RealDictCursor) as cur:
                 if lane=='vanguard':
-                    cur.execute('''SELECT c.instrument_key,c.underlying AS symbol,c.expiry,c.lot_size,c.tick_size,c.strike,
-                      u.spot_instrument_key,s.sector20 FROM fo_contract_catalog c JOIN fo_underlying_catalog u ON u.symbol=c.underlying
-                      LEFT JOIN sector_taxonomy s ON s.symbol=u.symbol
-                      WHERE c.instrument_key=ANY(%s)''',([r['instrument'] for r in rows],))
-                    contracts=cur.fetchall();out={}
-                    for r in contracts:
-                        cur.execute('''SELECT DISTINCT strike FROM fo_contract_catalog WHERE underlying=%s AND expiry=%s
-                          AND option_type IN ('CE','PE') AND strike>0 ORDER BY strike''',(r['symbol'],r['expiry']))
-                        strikes=[float(s['strike']) for s in cur.fetchall()]
-                        out[r['instrument_key']]={'instrument':r['instrument_key'],'symbol':r['symbol'],
-                            'expiry':str(r['expiry']),'lot_size':r['lot_size'],'tick':float(r['tick_size'] or 0),'sector':r['sector20'],
-                            'atm_guard':{'strike':float(r['strike']),'spot_instrument':r['spot_instrument_key'],'strikes':strikes}}
+                    from shadow_lanes.contracts import resolve,matches,expiry,option_rows
+                    master=resolve([r['instrument'] for r in rows]);out={}
+                    for candidate in rows:
+                        key=candidate['instrument'];r=master.get(key)
+                        if not matches(candidate,r):continue
+                        cur.execute('SELECT spot_instrument_key,sector20 FROM fo_underlying_catalog LEFT JOIN sector_taxonomy USING(symbol) WHERE symbol=%s',(r['underlying'],))
+                        stock=cur.fetchone()
+                        if not stock:continue
+                        strikes=sorted({float(s['strike']) for s in option_rows(r['underlying'])
+                            if s.get('upstox') and s.get('expiry_ms')==r['expiry_ms'] and s.get('strike')})
+                        out[key]={'instrument':key,'symbol':r['underlying'],'expiry':expiry(r),'lot_size':r['lot_size'],
+                            'tick':float(r['tick_size']),'sector':stock['sector20'],'canonical':r['canonical'],
+                            'atm_guard':{'strike':float(r['strike']),'spot_instrument':stock['spot_instrument_key'],'strikes':strikes}}
                     return out
                 cur.execute('''SELECT u.symbol,u.spot_instrument_key,s.sector20 FROM fo_underlying_catalog u
                   LEFT JOIN sector_taxonomy s ON s.symbol=u.symbol WHERE u.symbol=ANY(%s) AND u.kind='STOCK' AND u.fno_active IS TRUE''',
@@ -157,6 +174,12 @@ class Manager:
             try:self.last_quotes=self.market.quotes(self.instruments());self.last_error=None
             except Exception as e:self.last_quotes={};self.last_error=f'Market quote request failed: {type(e).__name__}'
         else:self.last_quotes={}
+        if opened and hasattr(self.market,'reference') and self.market.live:
+            from shadow_lanes.contracts import matches
+            with self.books['vanguard'].db() as db:
+                for identity,payload in db.execute("SELECT instrument,payload FROM orders WHERE state IN ('PENDING_AI','APPROVED','FILLED')"):
+                    if not matches(json.loads(payload),self.market.reference.get(identity)):
+                        self.last_quotes.pop(identity,None);self.last_error='Option identity mismatch; original contract quote required'
         settlement=datetime.combine(next_session(now.date()),time(9,15),IST)
         for book in self.books.values():
             try:book.cycle(self.last_quotes,now,opened,settlement)

@@ -3,6 +3,7 @@
 /** Vanguard research and prospective paper-trading desk. */
 import { useMemo, useState } from "react";
 import {MarketContextPanel} from '@/MarketContextPanel';
+import {LaneCandidates} from '@/LaneCandidates';
 import {dataScope} from '@/lib/api';
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -288,7 +289,8 @@ export default function VanguardDesk() {
           followup={followupPerformance.data}
         />
       )}
-      {activeTab === "watchlist" && <WatchlistTab data={watchlist.data} strategies={strategyJournals.data}
+      {activeTab === "watchlist" && dataScope()==='shadow' && <LaneCandidates lane="vanguard"/>}
+      {activeTab === "watchlist" && dataScope()==='retained' && <WatchlistTab data={watchlist.data} strategies={strategyJournals.data}
         selectedSession={watchlistSession} onSession={setWatchlistSession}
         onBtst={() => setActiveTab("mp")} />}
       {activeTab === "sentiment" && <SentimentTab data={sentiment.data} />}

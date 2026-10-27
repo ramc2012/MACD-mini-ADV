@@ -208,6 +208,7 @@ services:
       PAPER_LANE_CAPITAL: ${PAPER_LANE_CAPITAL:-5000000}
       PAPER_LANES_DIR: /runtime/paper_lanes
       PAPER_HUB_URL: http://host.docker.internal:8400
+      LANE_LIVE_NATS_URL: nats://market-intelligence-nats-1:4222
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
       TRADING_CALENDAR_FILE: /runtime/shadow_lanes/trading_calendar.json
       SHARED_MP_REDIS_URL: ""
@@ -222,7 +223,7 @@ services:
       - ./runtime/paper_lanes:/runtime/paper_lanes
       - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/cbe_scanner/paper:/legacy/cbe:ro
       - /Users/ramachandran/CLAUDE PROJECTS/Nomad Curie/TradeBot/backend/runtime/vanguard:/legacy/vanguard:ro
-    networks: [default, tradebot]
+    networks: [default, tradebot, market-data]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8430/health',timeout=3)"]
       interval: 15s
@@ -261,6 +262,9 @@ services:
     restart: unless-stopped
 
 networks:
+  market-data:
+    external: true
+    name: market-intelligence_default
   tradebot:
     external: true
     name: tradebot_default

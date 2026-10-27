@@ -1,5 +1,6 @@
 import {dataScope} from "@/lib/api";
 import {MarketContextPanel} from '@/MarketContextPanel';
+import {LaneCandidates} from '@/LaneCandidates';
 import {ShadowPortfolio,ShadowFollowup} from "@/ShadowPanels";
 "use client";
 
@@ -494,7 +495,8 @@ export default function CbeDesk() {
       ) : null}
 
       {activeTab === "market" && <MarketContextPanel lane="cbe"/>}
-      {activeTab === "watchlist" && <Section title="Qualified long watchlist" description="Selected names from the latest persisted CBE scan. Selection does not guarantee a fill: fresh execution prices, available cash and concentration limits still apply.">
+      {activeTab === "watchlist" && isShadow && <LaneCandidates lane="cbe"/>}
+      {activeTab === "watchlist" && !isShadow && <Section title="Qualified long watchlist" description="Selected names from the latest persisted CBE scan. Selection does not guarantee a fill: fresh execution prices, available cash and concentration limits still apply.">
         <p className="mb-3 text-xs text-text-muted">{watchlist.length} selected · signal session {scan?.signal_session_date ?? scan?.scan_date ?? "pending"} · {paperSum?.admissions_blocked ? "New entries blocked: held quotes need recovery" : "Paper admission follows book limits"}</p>
         <CandidateTable rows={watchlist}/>
       </Section>}

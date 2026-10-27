@@ -143,7 +143,8 @@ def scan(connection,now,day=None):
         observed_at=now.isoformat(),sessions=[str(d) for d in available[:100]],expected=expected,current_complete=current,
         mp_complete=sum(r['mp_current'] for r in results),status='ok' if complete else 'blocked',
         blockers=[] if complete else ['Latest completed-session daily breadth below 80% or benchmark is stale'],
-        results=results,watchlist=[{k:v for k,v in r.items() if k!='history'} for r in results if r['eligible']][:10],
+        results=results,watchlist=[{**{k:v for k,v in r.items() if k!='history'},'rank':i+1}
+            for i,r in enumerate(r for r in results if r['eligible'])][:10],
         benchmark_recent_gaps=[str(d) for d in recent if d not in benchmark],
         long_only=True,inputs='Completed cash daily OHLCV, EMA20/50, 5/20 momentum, relative strength, MACD12/26/9, RSI14 and market profile',
         provenance='Recomputed from locally retained broker bars and MP features. Historical receipt availability is unverified; these rows are not original decisions or fills.')

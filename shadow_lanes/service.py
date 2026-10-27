@@ -33,6 +33,7 @@ class ShadowWorker:
         self.eod_attempts = {}
         self.public_sync_at = None
         self.public_sync_error = None
+        self.last_outcomes=None
 
     def check(self, now, diagnostic=False):
         """No missed-session publication, legacy write, or order interface exists here."""
@@ -57,7 +58,7 @@ class ShadowWorker:
                 # Vanguard paper candidates go straight to their SAME-session
                 # entry queue. One Qwen review uses the fresh executable quote;
                 # a second planning pass would consume the short entry window.
-                needs_plan_review=(lane=='vanguard' and not self.paper) or (lane=='cbe' and self.paper)
+                needs_plan_review=lane=='vanguard' and not self.paper
                 if needs_plan_review and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
                     from .local_model import apply_review
                     result=apply_review(result,now,lane=lane) if self.paper else apply_review(result,now)
@@ -70,6 +71,7 @@ class ShadowWorker:
                     result['policy']=result.get('policy',source.POLICIES[lane])+'-paper-candidates-v1'
                     result['watchlist']=[{**row,'actionable':False,'actionable_reason':('Same-session ATM paper candidate; fresh Qwen, spot, quote and risk checks required' if lane=='vanguard' else 'Paper candidate only; fresh next-session Qwen, quote and risk checks required')} for row in result.get('watchlist',[])]
                 result.update(shadow_only=True, execution_enabled=False, diagnostic=diagnostic)
+                result.pop('results',None)
                 self.store.status(lane, now.isoformat(), result)
                 if not diagnostic and source.publication_window(now, lane) and result.get("source_session") == str(now.astimezone(source.IST).date()):
                     if result.get("status") == "ok" and result.get("watchlist"):
@@ -84,6 +86,8 @@ class ShadowWorker:
                     connection.close()
         # Outcomes are additive observations of already-frozen identities, never regenerated selections.
         connection = None
+        if self.last_outcomes and (now-self.last_outcomes).total_seconds()<60:return
+        self.last_outcomes=now
         try:
             publications = self.store.publications()
             if publications:
@@ -121,6 +125,8 @@ class ShadowWorker:
         if not source.is_session(local.date()) or local.hour*60+local.minute<15*60+50 or self.eod_day==str(local.date()):return
         previous=feature_status()
         if all(previous.get(s[0],{}).get('status')=='ok' and previous[s[0]]['checked_at'][:10]==str(local.date()) for s in EOD_STEPS):
+            from .incremental_regime import ensure_baseline
+            await asyncio.to_thread(ensure_baseline)
             self.eod_day=str(local.date());return
         key=str(local.date())
         attempts,last=self.eod_attempts.get(key,(0,None))
@@ -129,7 +135,10 @@ class ShadowWorker:
         results=await refresh_features(('eod',str(local.date())),EOD_STEPS)
         from .decision_context import capture_universe
         await asyncio.to_thread(capture_universe,datetime.now(source.IST))
-        if all(v=='ok' for v in results.values()):self.eod_day=str(local.date())
+        if all(v=='ok' for v in results.values()):
+            from .incremental_regime import ensure_baseline
+            await asyncio.to_thread(ensure_baseline)
+            self.eod_day=str(local.date())
 
     async def run(self):
         while True:
@@ -145,8 +154,6 @@ class ShadowWorker:
                     finally:
                         if c is not None:c.close()
                         self.public_sync_at=now
-                await self.features(now)
-                await self.end_of_day(datetime.now(source.IST))
                 await asyncio.to_thread(self.check, datetime.now(source.IST))
             except asyncio.CancelledError:
                 raise
@@ -154,7 +161,16 @@ class ShadowWorker:
                 for lane in LANES:
                     self.store.status(lane, datetime.now(source.IST).isoformat(),
                                       {"status": "blocked", "blockers": [f"Worker failed: {type(exc).__name__}"]})
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
+
+    async def run_features(self):
+        while True:
+            try:
+                await self.features(datetime.now(source.IST))
+                await self.end_of_day(datetime.now(source.IST))
+            except asyncio.CancelledError:raise
+            except Exception as exc:self.feature_error=type(exc).__name__
+            await asyncio.sleep(5)
 
 
 def create_app(store=None, worker_enabled=None, paper_manager=None):
@@ -164,11 +180,15 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
         from paper_lanes.manager import Manager
         paper=Manager()
     worker = ShadowWorker(store,paper)
+    from .live_market import LiveMarket
+    live=LiveMarket()
+    live.store=store
+    if paper:paper.market.live=live
     enabled = os.environ.get("SHADOW_WORKER_ENABLED", "false").lower() == "true" if worker_enabled is None else worker_enabled
 
     @asynccontextmanager
     async def lifespan(app):
-        tasks = [asyncio.create_task(worker.run())] if enabled else []
+        tasks = [asyncio.create_task(worker.run()),asyncio.create_task(worker.run_features()),asyncio.create_task(live.run()),asyncio.create_task(live.run_follow())] if enabled else []
         if paper:tasks.extend([asyncio.create_task(paper.run_marks(store)),asyncio.create_task(paper.run_reviews()),asyncio.create_task(paper.run_reconcile(store))])
         yield
         for task in tasks:task.cancel()
@@ -177,6 +197,7 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
     api = FastAPI(title="MACD shadow lanes", lifespan=lifespan)
     api.state.store, api.state.worker = store, worker
     api.state.paper=paper
+    api.state.live=live
 
     def authorize(x_macd_token: str = Header(default="")):
         expected = os.environ.get("MACD_API_TOKEN", "")
@@ -195,8 +216,26 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
         if body.get('phase') not in ('smart_entry','fresh_entry_review','next_session_watchlist'):
             raise HTTPException(422,'Known decision phase required')
         c=source.connect(readonly=True)
-        try:return {'contexts':build(c,rows,datetime.now(source.IST),body['phase'])}
+        try:
+            contexts=build(c,rows,datetime.now(source.IST),body['phase'])
+            for key,fields in live.contexts(rows).items():contexts[key].update(fields)
+            return {'contexts':contexts}
         finally:c.close()
+
+    @api.get('/api/lane-live/snapshot',dependencies=[Depends(authorize)])
+    def live_snapshot():return live.snapshot()
+
+    @api.get('/api/lane-live/stream',dependencies=[Depends(authorize)])
+    async def live_stream():
+        from fastapi.responses import StreamingResponse
+        async def events():
+            previous=None;silent=0
+            while True:
+                if live.sequence!=previous or silent>=10:
+                    yield 'data: '+json.dumps(live.snapshot(),allow_nan=False)+'\n\n'
+                    previous=live.sequence;silent=0
+                silent+=1;await asyncio.sleep(1)
+        return StreamingResponse(events(),media_type='text/event-stream',headers={'Cache-Control':'no-store','X-Accel-Buffering':'no'})
 
     @api.get("/health")
     def health():
@@ -224,7 +263,7 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
         return {**store.snapshot(lane), "worker_enabled": enabled, "legacy_history_preserved": True,
                 'feature_context':context_summary(),
                 'paper_enabled':paper is not None,'execution_mode':'paper',
-                "publication_window": "14:45–15:15 IST" if lane == "vanguard" else "15:31–16:30 IST",
+                "publication_window": "14:45–15:15 IST" if lane == "vanguard" else "15:31–20:00 IST",
                 "feature_pipeline":feature_status(),
                 "target": "Exact stock-option performers over 1–3 sessions, plus a BTST observation" if lane == "vanguard" else "Long-only daily stock-direction research"}
 

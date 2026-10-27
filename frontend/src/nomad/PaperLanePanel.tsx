@@ -5,7 +5,7 @@ import {api} from './lib/api';
 import {API_URL,API_TOKEN} from '../runtime';
 import {Section,MetricTile,formatIST,formatMoney,formatSignedMoney} from './components/desk-ui';
 
-type Paper={enabled:boolean;lane:string;mode:string;initial_capital:number;cash:number;unsettled_cash:number;equity:number;
+type Paper={enabled:boolean;account_id:string;lane:string;mode:string;initial_capital:number;cash:number;unsettled_cash:number;equity:number;
  realized_pnl:number;unrealized_pnl:number;return_pct:number;max_drawdown_pct:number;open_count:number;closed_count:number;
  fees_paid:number;win_rate:number|null;expectancy:number|null;paused:boolean;stale_positions:number;checked_at:string;
  status:{state:string};market_error?:string;readiness?:{status?:string;blockers?:string[]};policy:Record<string,any>;

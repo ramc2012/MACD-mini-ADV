@@ -52,7 +52,7 @@ class Candidate(BaseModel):
     @field_validator('facts')
     @classmethod
     def bounded_facts(cls,value):
-        if len(value)>320:raise ValueError('Too many candidate fields')
+        if len(value)>384:raise ValueError('Too many candidate fields')
         for key,v in value.items():
             if len(str(key))>64 or not isinstance(v,(str,int,float,bool,type(None))):raise ValueError('Only bounded scalar facts are accepted')
             if isinstance(v,str) and len(v)>160:raise ValueError('Fact text too long')
@@ -82,6 +82,19 @@ def validate_reviews(value,ids):
         if not isinstance(r,dict) or set(r)!={'id','verdict','reason'} or r['id'] not in ids or r['verdict'] not in ('approve','reject','wait') or not isinstance(r['reason'],str) or not 1<=len(r['reason'])<=240:
             raise ValueError('Invalid review')
     return rows
+
+
+def compact_facts(facts):
+    """Keep every scalar while sharing repeated group prefixes in model input."""
+    out={}
+    for key,value in facts.items():
+        if '.' in key:
+            group,field=key.split('.',1)
+            if group not in facts:
+                out.setdefault(group,{})[field]=value
+                continue
+        out[key]=value
+    return out
 
 
 class Reviewer:
@@ -122,7 +135,8 @@ class Reviewer:
         for row in request.candidates:
             if row.source_at.tzinfo is None:raise HTTPException(422,'Source timestamps need a timezone')
             age=(request.snapshot_at-row.source_at).total_seconds()
-            limit=15 if request.lane=='smart' else 7200
+            phase=row.facts.get('phase','smart_entry' if request.lane=='smart' else 'fresh_entry_review')
+            limit=96*3600 if phase=='next_session_watchlist' and request.lane!='smart' else 15
             if not -5<=age<=limit:raise HTTPException(409,'Candidate source data is stale')
 
     async def review(self,request):
@@ -146,9 +160,15 @@ class Reviewer:
                         self.context_cache={key:(time.monotonic(),context)}
                 # Original signal/risk facts win; providers cannot overwrite reviewed entry terms.
                 notes=SMART_FEATURE_NOTES if request.lane=='smart' else {}
+                if request.lane!='smart':
+                    notes={'execution_quote_required_for_this_review':phase!='next_session_watchlist',
+                        'market_closed_expected_for_phase':phase=='next_session_watchlist',
+                        'cash_spot_lane':request.lane=='cbe','option_greeks_required':request.lane=='vanguard'}
                 merged={**context,**row.facts,**notes};row.facts=Candidate.bounded_facts(merged)
-            except (httpx.HTTPError,ValueError,KeyError,TypeError):
-                row.facts={**row.facts,'context_status':'unavailable'};context_failed=True
+            except (httpx.HTTPError,ValueError,KeyError,TypeError) as exc:
+                code='context_validation' if isinstance(exc,ValueError) else 'context_http' if isinstance(exc,httpx.HTTPError) else 'context_schema'
+                self.last_error=code
+                row.facts={**row.facts,'context_status':'unavailable','context_error':code};context_failed=True
         # Capture the exact observed inputs even when the model is absent, fails or vetoes.
         snapshot=json.dumps({'request':request.model_dump(mode='json'),'system':SYSTEM,'system_sha256':SYSTEM_SHA256},sort_keys=True,allow_nan=False)
         with self.db() as db:db.execute('INSERT OR IGNORE INTO training_snapshots VALUES(?,?,?,?)',
@@ -165,6 +185,8 @@ class Reviewer:
                     if not status['ready']:raise HTTPException(503,status['detail'])
                     model_ids=['candidate'] if context_url else [r.id for r in request.candidates]
                     model_rows=[{**r.model_dump(mode='json'),'id':identity} for r,identity in zip(request.candidates,model_ids)]
+                    if request.lane in ('vanguard','cbe'):
+                        for r in model_rows:r['facts']=compact_facts(r['facts'])
                     context={'policy':'qwen35-review-v1','lane':request.lane,'candidates':model_rows}
                     def bind(value):
                         return {**value,'reviews':[{**value['reviews'][0],'id':request.candidates[0].id}]} if context_url else value
@@ -188,6 +210,7 @@ class Reviewer:
                     reviews=validate_reviews(json.loads(response['message']['content']),model_ids)
                     at=datetime.now(UTC)
                     result={'reviews':reviews,'model':self.model,'digest':status['digest'],'context_hash':key,
+                            'purpose':'validation_only' if request.candidates[0].facts.get('validation_only') else request.candidates[0].facts.get('phase','entry'),
                             'created_at':at.isoformat(),'expires_at':(at+timedelta(seconds=30)).isoformat(),
                             'latency_ms':round((time.monotonic()-started)*1000),'cache_hit':False,'policy':'qwen35-review-v1'}
                     result=bind(result)
@@ -216,12 +239,21 @@ def create_app(reviewer=None):
         with worker.db() as db:
             rows=db.execute('SELECT at,lane,output FROM reviews ORDER BY at DESC LIMIT 5').fetchall()
             captures=dict(db.execute('SELECT lane,count(*) FROM training_snapshots GROUP BY lane').fetchall())
+            lane_stats={name:{'completed':0,'approve':0,'reject':0,'wait':0,'validation_only':0,'context_failures':0} for name in ('smart','vanguard','cbe')}
+            for lane,body in db.execute('SELECT lane,output FROM reviews'):
+                result=json.loads(body)
+                if result.get('purpose')=='validation_only':lane_stats[lane]['validation_only']+=1;continue
+                lane_stats[lane]['completed']+=1
+                for verdict in result['reviews']:lane_stats[lane][verdict['verdict']]+=1
+            for lane,body in db.execute('SELECT lane,input FROM training_snapshots'):
+                facts=json.loads(body)['request']['candidates'][0]['facts']
+                if facts.get('context_status')=='unavailable':lane_stats[lane]['context_failures']+=1
         try:training=json.loads(Path('/runtime/local_decisions/training_manifest.json').read_text())
         except (OSError,ValueError):training={'status':'base_model_only','deployed_weight_finetune':False}
         return {**await worker.availability(),'mode':'filter','smart_new_entries_only':True,'training_busy':training_busy(),
                 'vanguard_shadow_only':os.environ.get('PAPER_LANES_ENABLED','false')!='true','paper_lanes_only':True,
                 'queue':worker.waiting,'inferences':worker.calls,'cache_hits':worker.hits,'last_error':worker.last_error,
-                'training':training,'captured_input_snapshots':captures,
+                'training':training,'captured_input_snapshots':captures,'lane_stats':lane_stats,
                 'recent':[{'at':a,'lane':lane,**json.loads(output)} for a,lane,output in rows]}
 
     @app.post('/review')

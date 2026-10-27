@@ -71,7 +71,7 @@ def test_bar_refresh_runs_once_after_close_delay_and_includes_final_bar():
     from shadow_lanes.feature_pipeline import completed_bar_key
     for hour,minute in ((0,0),(0,1),(0,2),(8,0),(9,15)):
         assert completed_bar_key(NOW.replace(hour=hour,minute=minute,second=0)) is None
-    assert completed_bar_key(NOW.replace(hour=9,minute=46,second=0)) is None
+    assert completed_bar_key(NOW.replace(hour=9,minute=45,second=59)) is None
     assert completed_bar_key(NOW.replace(hour=9,minute=46,second=30))==('2026-10-26',0)
     assert completed_bar_key(NOW.replace(hour=10,minute=0,second=0))==('2026-10-26',0)
     assert completed_bar_key(NOW.replace(hour=10,minute=16,second=30))==('2026-10-26',1)
