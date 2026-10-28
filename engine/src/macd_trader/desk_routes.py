@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import auction_views
+from . import auction_views, straddle_views
 from .api_models import OrderInput, _as_json
 from .desk import AGENT_JOB_LOCK as _agent_lock
 from .profile_scale import cached_scale, profile_scale
@@ -368,6 +368,20 @@ async def auction_whale_alerts(day: str | None = None,
     return await asyncio.to_thread(
         auction_views.whale_alerts, engine.settings.research_database_path,
         day or _ist_today(), limit)
+
+@router.get("/api/auction/straddle/instruments", dependencies=[Depends(authorize)])
+async def straddle_instruments():
+    """Underlyings with stored option chains (indices first) for the ATM straddle & OI view."""
+    return await asyncio.to_thread(straddle_views.instruments, engine.settings.research_database_path)
+
+@router.get("/api/auction/straddle/series/{underlying}", dependencies=[Depends(authorize)])
+async def straddle_series(underlying: str, expiry: str | None = None,
+                          span: str = Query(default="day", pattern="^(day|week|expiry)$"),
+                          day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                          strike: float | None = Query(default=None, gt=0)):
+    """ATM (or fixed-strike) straddle with day/week/month VWAPs and ATM CE/PE open interest for one expiry."""
+    return await asyncio.to_thread(straddle_views.series, engine.settings.research_database_path,
+                                   underlying.upper(), expiry, span, day, strike)
 
 @router.get("/api/auction/positional", dependencies=[Depends(authorize)])
 async def auction_positional(day: str | None = None,

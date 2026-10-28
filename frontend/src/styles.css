@@ -1299,3 +1299,28 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @media (max-width: 900px) { .ws-main { grid-template-columns: 1fr; } .ws-side { display: none; } }
 .ws-panel.ws-bare { padding: 4px 6px; }
 .ws-help { color: #6f7d92; border: 1px solid #243045; border-radius: 50%; width: 20px; height: 20px; display: inline-grid; place-items: center; font-size: 11px; cursor: help; }
+.straddle-page { display:flex; flex-direction:column; gap:10px; }
+.straddle-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.straddle-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; }
+.straddle-tiles > div { display:flex; flex-direction:column; gap:3px; padding:10px 12px; border:1px solid #1f2a3a; border-radius:6px; background:#0c131d; }
+.straddle-tiles span { color:#8294ac; font-size:10px; text-transform:uppercase; letter-spacing:.05em; }
+.straddle-tiles b { color:#e6edf3; font-size:18px; font-variant-numeric:tabular-nums; }
+.straddle-tiles small { color:#718198; font-size:10px; }
+.straddle-panel { position:relative; padding:8px; }
+.straddle-legend { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:2px 4px 8px; color:#aebdd0; font-size:11px; }
+.straddle-legend span, .straddle-legend label { display:inline-flex; align-items:center; gap:5px; cursor:default; }
+.straddle-legend label { cursor:pointer; }
+.straddle-legend i { display:inline-block; width:14px; height:3px; border-radius:2px; }
+.straddle-legend i.dash { height:0; border-top:2px dashed; background:none; }
+.straddle-legend i.dash.month { border-top-style:dotted; }
+.straddle-legend small { color:#718198; }
+.straddle-legend .sep { width:1px; height:14px; background:#263144; }
+.straddle-chart { position:relative; height:min(620px, 70vh); min-height:360px; }
+.straddle-readout { position:absolute; left:8px; top:6px; z-index:3; padding:6px 9px; border:1px solid #263144; border-radius:4px; background:#0c131dee; color:#aebdd0; font-size:11px; line-height:1.5; pointer-events:none; font-variant-numeric:tabular-nums; }
+.straddle-readout b { color:#e6edf3; }
+.straddle-table summary { cursor:pointer; padding:8px; color:#aebdd0; font-size:12px; }
+.straddle-table table { width:100%; font-size:11px; border-collapse:collapse; white-space:nowrap; }
+.straddle-table th, .straddle-table td { padding:4px 8px; text-align:right; border-top:1px solid #1a2433; }
+.straddle-table th:first-child, .straddle-table td:first-child { text-align:left; }
+.straddle-table .overflow-auto { max-height:420px; overflow:auto; }
+@media (max-width: 700px) { .straddle-controls { justify-content:flex-start; } .straddle-chart { height:440px; } }
