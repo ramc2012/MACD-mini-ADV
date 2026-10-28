@@ -160,6 +160,34 @@ class Manager:
                 book.event(db,datetime.now(IST),'METADATA_BLOCKED',None,{'cohort':publication['id'],'eligible':len(rows),'exact_metadata':len(prepared)})
         return inserted
 
+    def convert_watchlist(self,publication,now=None):
+        """Owner, 28 Oct 2026: enter an already-published watchlist that did not become positions. Same exact contracts and
+        planned exits (source session + horizon); entry from now until 15:15 today; contracts whose planned exit is today
+        or earlier are skipped. Idempotent per publication (cohort '<id>:owner-convert')."""
+        now=(now or datetime.now(IST)).astimezone(IST);lane=publication['lane'];book=self.books[lane]
+        if publication.get('paper_account_id')!=book.account_id or not session_open(now):return 0
+        day=date.fromisoformat(publication['source_session']);rows=publication['watchlist']
+        metadata=self.market.metadata(lane,rows);prepared=[];skipped=[]
+        with book.db() as db:
+            held={r[0] for r in db.execute("SELECT instrument FROM orders WHERE state IN ('FILLED','APPROVED','PENDING_AI')")}
+        for candidate in rows:
+            key=candidate['instrument'] if lane=='vanguard' else candidate.get('symbol') or candidate['instrument']
+            meta=metadata.get(key);horizon=int(candidate.get('horizon_sessions') or 1);due_day=next_session(day,horizon)
+            if not meta or due_day<=now.date() or meta['instrument'] in held:
+                skipped.append({'symbol':candidate.get('symbol'),'reason':'no exact metadata' if not meta else 'planned exit today or earlier' if due_day<=now.date() else 'already active'});continue
+            expiry=meta.get('expiry')
+            if lane=='vanguard' and (not expiry or date.fromisoformat(expiry)<due_day):
+                skipped.append({'symbol':candidate.get('symbol'),'reason':'expires before planned exit'});continue
+            prepared.append({**meta,'sector':candidate.get('sector20') or candidate.get('sector') or meta.get('sector') or 'UNKNOWN',
+                             'candidate':{**candidate,'owner_conversion':True},
+                             'exit_due':datetime.combine(due_day,time(15,10) if expiry==str(due_day) else time(15,15),IST)})
+        deadline=datetime.combine(now.date(),time(15,15),IST)
+        inserted=book.enqueue(publication['id']+':owner-convert',prepared,now,str(day),now+timedelta(seconds=1),deadline,
+                              publication['paper_account_id'],owner_conversion=True)
+        with book.transaction() as db:
+            book.event(db,now,'OWNER_WATCHLIST_CONVERSION',None,{'publication':publication['id'],'queued':inserted,'skipped':skipped})
+        return inserted
+
     def instruments(self):
         keys=set()
         for book in self.books.values():
@@ -213,9 +241,23 @@ class Manager:
                         underlying_quote_at=spot['at'],atm_strike=guard['strike'])
                 candidates.append({'id':o['id'],'instrument':o['instrument'],'side':row.get('option_type') or 'LONG',
                                    'reference_price':o['quote']['ask'],'source_at':o['quote']['at'],'facts':facts})
+            gate=book.terms.get('model_gate',True)
             try:
                 from . import local_intelligence
-                response=local_intelligence.review(lane,candidates,self.contexts(candidates,now),datetime.now(IST))
+                try:
+                    response=local_intelligence.review(lane,candidates,self.contexts(candidates,now),datetime.now(IST))
+                except Exception as exc:
+                    if gate:raise
+                    # owner 28 Oct: no model gate; enter the published watchlist with neutral priority
+                    t=datetime.now(IST)
+                    response={'reviews':[{'id':c['id'],'verdict':'approve','reason':'Owner: watchlist entered as published (context unavailable: '+type(exc).__name__+')','priority':None} for c in candidates],
+                              'model':'owner-watchlist-entry','digest':None,'context_hash':None,'decision_engine':'local',
+                              'created_at':t.isoformat(),'expires_at':(t+timedelta(seconds=30)).isoformat()}
+                if not gate:
+                    for r in response['reviews']:
+                        if r['verdict']=='wait' or (r['verdict']=='reject' and 'ban' not in r.get('reason','').lower() and 'exact CE/PE' not in r.get('reason','')):
+                            r['model_verdict'],r['verdict']=r['verdict'],'approve'
+                            r['reason']='Owner: watchlist entered as published; model said '+r['model_verdict']+': '+r.get('reason','')
                 book.apply_reviews(orders,response,datetime.now(IST));self.last_review[lane]=response
             except Exception as exc:
                 book.review_failed(orders,datetime.now(IST),local=True)

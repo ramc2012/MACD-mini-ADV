@@ -207,6 +207,8 @@ services:
       PAPER_LANES_ENABLED: "true"
       PAPER_LANE_CAPITAL: ${PAPER_LANE_CAPITAL:-5000000}
       PAPER_LANES_DIR: /runtime/paper_lanes
+      # Owner overrides 28 Oct 2026 (paper_lanes/book.py OWNER_OVERRIDES): CBE Rs 2 lakh per position; Vanguard watchlist entered as published
+      PAPER_OWNER_OVERRIDES: owner-20261028
       PAPER_HUB_URL: http://host.docker.internal:8400
       LANE_LIVE_NATS_URL: nats://market-intelligence-nats-1:4222
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}

@@ -10,6 +10,7 @@ import './lane-data.css';
 import {LaneIntelligencePanel} from './LaneIntelligencePanel';
 import {FeaturePipelinePanel} from './FeaturePipelinePanel';
 import {InfoNote} from './nomad/components/desk-ui/InfoNote';
+import {SortableTables} from './SortableTables';
 import {formatIST} from './nomad/components/desk-ui';
 import {useLaneLive,useLaneLiveConnection} from './nomad/hooks/useLaneLive';
 
@@ -29,5 +30,5 @@ export function NomadLanePage({lane,ticks,connected}:{lane:'vanguard'|'cbe';tick
  {scope==='shadow'&&<span role="status" className="lane-diagnostics">{live.connected?'Shared feed connected':'Shared feed reconnecting'} · Latest market quote {lastQuote?formatIST(new Date(lastQuote)):'awaiting quotes'}</span>}
  {scope==='shadow'&&<span className="lane-diagnostics">Local model &amp; data <InfoNote title="Local intelligence and data status"><LaneIntelligencePanel lane={lane}/><FeaturePipelinePanel lane={lane}/></InfoNote></span>}</div>
  {!!notices.length&&<div className="nomad-gap" role="status">Some retained datasets were outside the recovery backup. Unavailable views: {notices.map(n=>n.split('/').pop()).join(', ')}. Missing values are not new observations.</div>}
- <QueryClientProvider client={client}><DeskBoundary key={view}><div key={`${lane}-${scope}`}>{lane==='vanguard'?<VanguardDesk/>:<CbeDesk/>}</div></DeskBoundary></QueryClientProvider></div>;
+ <QueryClientProvider client={client}><DeskBoundary key={view}><div key={`${lane}-${scope}`}>{lane==='vanguard'?<SortableTables><VanguardDesk/></SortableTables>:<CbeDesk/>}</div></DeskBoundary></QueryClientProvider></div>;
 }
