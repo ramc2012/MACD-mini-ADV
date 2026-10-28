@@ -146,7 +146,11 @@ class Manager:
             if not 1<=horizon<=3:continue
             due_day=next_session(day,horizon)
             expiry=meta.get('expiry')
-            if lane=='vanguard' and (not expiry or date.fromisoformat(expiry)<due_day):continue
+            if lane=='vanguard' and not expiry:continue
+            if lane=='vanguard' and date.fromisoformat(expiry)<due_day:
+                # owner 28 Oct: every pick is entered; a series ending inside the hold exits on its expiry day
+                if date.fromisoformat(expiry)<=day:continue
+                due_day=date.fromisoformat(expiry)
             if lane=='vanguard' and (candidate.get('contract_kind')!='ATM' or not meta.get('atm_guard')):continue
             prepared.append({**meta,'sector':candidate.get('sector20') or candidate.get('sector') or meta.get('sector') or 'UNKNOWN',
                              'candidate':{**candidate,**({'atm_guard':meta['atm_guard']} if lane=='vanguard' else {})},
@@ -227,7 +231,7 @@ class Manager:
                     'rank':row.get('rank') or row.get('side_rank') or len(candidates)+1,'planned_quantity':o['planned_quantity'],
                     'spread_pct':(o['quote']['ask']/o['quote']['bid']-1)*100,
                     'position_limit_pct':book.terms['position_fraction']*100,
-                    'hard_stop_pct':book.terms['hard_stop']*100,'target_pct':book.terms['target']*100,
+                    'hard_stop_pct':book.terms['hard_stop']*100,'target_pct':book.terms['target']*100 if book.terms.get('target') else None,
                     'horizon_sessions':row.get('horizon_sessions',1),'exit_due':o['exit_due'],'signal_close':row.get('source_mark')}
                 for key in ('direction_score','contract_score','combined_score','momentum_fast','momentum_slow','relative_momentum','score',
                             'expected_net_return','option_volume','option_oi','conviction',

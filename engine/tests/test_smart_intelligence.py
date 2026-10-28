@@ -38,7 +38,7 @@ def test_missing_quote_waits_for_shared_tick_then_fills_once_without_refreshing_
 def test_missing_quote_expires_and_does_not_replay_a_missed_entry(tmp_path):
     lane=build(tmp_path);lane.on_macd_signal(signal(),'CE',{},now=T0)
     asyncio.run(lane.step(T0+timedelta(seconds=320)))
-    asyncio.run(lane.step(T0+timedelta(seconds=481)))
+    asyncio.run(lane.step(T0+timedelta(seconds=901)))
     assert lane.counts=={'WAITING_PRICE':1,'NO_PRICE':1} and not lane._pending
     assert not lane.repository.rows('orders')
 

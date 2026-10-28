@@ -44,6 +44,15 @@ def policy(lane):
 OWNER_OVERRIDES={'cbe':{'position_amount':200000,'liquidity_basis':'session_volume'},
                  'vanguard':{'model_gate':False,'atm_recheck':False,'liquidity_basis':'session_volume','max_spread':.05}}
 OWNER_OVERRIDE_TAG='owner-20261028'
+# Owner, 28 Oct 2026 (evening): "vanguard to generate 10 CE, 10 PE every day irrespective of open positions. generated
+#       lists are entered and tested for returns in 1-3 days or SL whichever is earlier." -> 20 picks a day held up to 3
+#       sessions = up to 60 open, so each pick gets 1/60 of equity (at least one lot when cash allows); no position,
+#       gross, sector or daily-loss caps, no stale-mark block, no profit target (exit at the stop or the third session).
+LIST_TEST_OVERRIDES={'vanguard':{'max_positions':60,'position_fraction':round(1/60,6),'gross_fraction':1.,'sector_fraction':1.,
+                                 'daily_loss_stop':None,'target':None,'min_one_lot':True,'stale_mark_block':False}}
+LIST_TEST_TAG='owner-20261028-list-test'
+# The setting names the newest enabled tag; each tag up to it is applied once, in order.
+OVERRIDE_SERIES=[(OWNER_OVERRIDE_TAG,OWNER_OVERRIDES),(LIST_TEST_TAG,LIST_TEST_OVERRIDES)]
 
 
 def fresh(q,now,limit=10):
@@ -80,6 +89,8 @@ class Book:
             CREATE TABLE IF NOT EXISTS equity(at TEXT PRIMARY KEY,day TEXT NOT NULL,equity_paise INTEGER NOT NULL,cash_paise INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS settlements(order_id TEXT PRIMARY KEY,due TEXT NOT NULL,amount_paise INTEGER NOT NULL,settled INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS status(id INTEGER PRIMARY KEY CHECK(id=1),at TEXT NOT NULL,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS marks(id TEXT NOT NULL REFERENCES orders(id),day TEXT NOT NULL,bid REAL NOT NULL,at TEXT NOT NULL,
+              PRIMARY KEY(id,day));
             ''')
             if 'service_failures' not in {r[1] for r in db.execute('PRAGMA table_info(orders)')}:
                 db.execute('ALTER TABLE orders ADD COLUMN service_failures INTEGER NOT NULL DEFAULT 0')
@@ -88,13 +99,18 @@ class Book:
             a=db.execute('SELECT * FROM account').fetchone()
             if a['initial_paise']!=money(capital):raise ValueError('Existing paper capital cannot be rewritten')
             self.account_id=a['account_id'];self.activated_at=datetime.fromisoformat(a['activated_at']);self.terms=json.loads(a['policy'])
-            override=OWNER_OVERRIDES.get(lane,{})
-            if override and os.environ.get('PAPER_OWNER_OVERRIDES')==OWNER_OVERRIDE_TAG and self.terms.get('owner_override')!=OWNER_OVERRIDE_TAG:
+            enabled=os.environ.get('PAPER_OWNER_OVERRIDES')
+            tags=[tag for tag,_ in OVERRIDE_SERIES]
+            for tag,series in OVERRIDE_SERIES[:tags.index(enabled)+1] if enabled in tags else []:
+                applied=self.terms.get('owner_overrides') or ([self.terms['owner_override']] if self.terms.get('owner_override') else [])
+                override=series.get(lane,{})
+                if tag in applied:continue
                 before={k:self.terms.get(k) for k in override}
-                self.terms={**self.terms,**override,'owner_override':OWNER_OVERRIDE_TAG}
+                self.terms={**self.terms,**override,'owner_override':tag,'owner_overrides':[*applied,tag]}
                 db.execute('UPDATE account SET policy=?',(json.dumps(self.terms),))
-                db.execute('INSERT INTO events(at,kind,order_id,detail) VALUES(?,?,?,?)',(now.isoformat(),'POLICY_UPDATED_BY_OWNER',None,
-                           json.dumps({'tag':OWNER_OVERRIDE_TAG,'before':before,'after':override})))
+                if override:
+                    db.execute('INSERT INTO events(at,kind,order_id,detail) VALUES(?,?,?,?)',(now.isoformat(),'POLICY_UPDATED_BY_OWNER',None,
+                               json.dumps({'tag':tag,'before':before,'after':override})))
             if not db.execute('SELECT 1 FROM equity LIMIT 1').fetchone():
                 db.execute('INSERT INTO equity VALUES(?,?,?,?)',(now.isoformat(),str(now.date()),a['initial_paise'],a['cash_paise']))
 
@@ -159,11 +175,11 @@ class Book:
         if not fresh(q,now,self.terms['quote_age_seconds']):return 0,'Fresh two-sided quote and displayed quantity required'
         if any(p['instrument']==o['instrument'] for p in held):return 0,'Already held'
         if len(held)>=self.terms['max_positions']:return 0,'Position limit reached'
-        if any((now-datetime.fromisoformat(p['last_at'])).total_seconds()>60 for p in held):return 0,'Held marks are stale'
+        if self.terms.get('stale_mark_block',True) and any((now-datetime.fromisoformat(p['last_at'])).total_seconds()>60 for p in held):return 0,'Held marks are stale'
         if (q['ask']-q['bid'])/q['ask']>self.terms['max_spread']:return 0,'Spread exceeds lane limit'
         if o['expiry'] and datetime.fromisoformat(o['exit_due']).date()>datetime.fromisoformat(o['expiry']).date():return 0,'Contract expires before its planned exit'
         first=db.execute('SELECT equity_paise FROM equity WHERE day=? ORDER BY at LIMIT 1',(str(now.date()),)).fetchone()
-        if first and equity<first[0]*(1-self.terms['daily_loss_stop']):return 0,'Daily loss stop blocks new entries'
+        if first and self.terms.get('daily_loss_stop') and equity<first[0]*(1-self.terms['daily_loss_stop']):return 0,'Daily loss stop blocks new entries'
         fill=price(q['ask']*(1+self.terms['slippage_bps']/10000),o['tick'],True)
         gross=sum(money(p['last_bid']*p['quantity']) for p in held)
         sector=sum(money(p['last_bid']*p['quantity']) for p in held if p['sector']==o['sector'])
@@ -171,6 +187,7 @@ class Book:
         budget=min(per_position,equity*self.terms['gross_fraction']-gross,
                    equity*self.terms['sector_fraction']-sector,a['cash_paise']/(1+self.terms['fee_bps']/10000))
         lot=o['lot_size'];qty=max(0,int(budget/money(fill))//lot*lot)
+        if qty<lot and self.terms.get('min_one_lot') and money(fill*lot)<=2*per_position:qty=lot  # a pick is never dropped for a lot slightly above its share
         if self.terms.get('liquidity_basis')=='session_volume':
             qty=min(qty,int(q['volume']*self.terms['volume_fraction'])//lot*lot)
         else:
@@ -254,7 +271,9 @@ class Book:
                     q=quotes.get(p['instrument'])
                     if not fresh(q,now,self.terms['quote_age_seconds']):continue
                     db.execute('UPDATE positions SET last_bid=?,last_at=? WHERE id=?',(q['bid'],q['at'],p['id']))
-                    reason=('STOP' if q['bid']<=p['stop'] else 'TARGET' if q['bid']>=p['target'] else
+                    db.execute('INSERT INTO marks VALUES(?,?,?,?) ON CONFLICT(id,day) DO UPDATE SET bid=excluded.bid,at=excluded.at',
+                               (p['id'],str(now.date()),q['bid'],q['at']))
+                    reason=('STOP' if q['bid']<=p['stop'] else 'TARGET' if p['target']>0 and q['bid']>=p['target'] else
                             'TIME_EXIT' if now>=datetime.fromisoformat(p['exit_due']) else None)
                     if not reason:continue
                     if q['bid_qty']<p['quantity'] and self.terms.get('liquidity_basis')!='session_volume':
@@ -286,7 +305,7 @@ class Book:
                     db.execute('UPDATE account SET cash_paise=cash_paise-? WHERE cash_paise>=?',(notional+fee,notional+fee))
                     if db.execute('SELECT changes()').fetchone()[0]!=1:raise ValueError('Paper cash invariant violated')
                     db.execute('INSERT INTO positions(id,quantity,entry,entry_fee,opened_at,stop,target,last_bid,last_at) VALUES(?,?,?,?,?,?,?,?,?)',
-                        (o['id'],qty,fill,fee,now.isoformat(),fill*(1-self.terms['hard_stop']),fill*(1+self.terms['target']),q['bid'],q['at']))
+                        (o['id'],qty,fill,fee,now.isoformat(),fill*(1-self.terms['hard_stop']),fill*(1+self.terms['target']) if self.terms.get('target') else 0,q['bid'],q['at']))
                     db.execute('INSERT INTO fills VALUES(?,?,?,?,?,?,?,?,?,?)',
                         (uuid4().hex,o['id'],'BUY',qty,fill,notional,fee,now.isoformat(),q['at'],json.dumps(q)))
                     self.set_state(db,o['id'],'FILLED','Fresh displayed ask, adverse slippage and costs',now)
@@ -298,6 +317,51 @@ class Book:
                 db.execute('INSERT OR IGNORE INTO equity VALUES(?,?,?,?)',(now.isoformat(),str(now.date()),equity,a['cash_paise']))
             state={'state':'armed' if session_open else 'market_closed','paper_only':True,'paused':bool(a['paused'])}
             db.execute('INSERT INTO status VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET at=excluded.at,payload=excluded.payload',(now.isoformat(),json.dumps(state)))
+
+    def list_tests(self,db,limit=15):
+        """Each published list as a test: per pick the return at the close of the 1st, 2nd and 3rd session after entry
+        (last stored bid / entry - 1, before costs), or the exit return from the session it was stopped or closed."""
+        rows=[dict(r) for r in db.execute('''SELECT o.id,o.cohort,o.symbol,o.state,o.source_session,json_extract(o.payload,'$.option_type') side,
+            json_extract(o.payload,'$.side_rank') side_rank,p.entry,p.opened_at,p.exit,p.closed_at,p.exit_reason,p.pnl_paise,p.last_bid,
+            p.quantity,p.entry_fee FROM orders o LEFT JOIN positions p ON p.id=o.id
+            WHERE o.cohort IN (SELECT id FROM cohorts ORDER BY at DESC LIMIT ?) ORDER BY o.created_at,o.rank''',(limit,))]
+        marks={}
+        for r in db.execute('SELECT id,day,bid FROM marks WHERE id IN (%s) ORDER BY day'%','.join('?'*len(rows)),[r['id'] for r in rows]):
+            marks.setdefault(r['id'],[]).append((r['day'],r['bid']))
+        tests={}
+        for r in rows:
+            t=tests.setdefault(r['cohort'],{'cohort':r['cohort'],'source_session':r['source_session'],'picks':0,'filled':0,'open':0,
+                'stopped':0,'by_side':{},'realized_pnl':0.,'open_value_change':0.,'rows':[]})
+            t['picks']+=1
+            pick={k:r[k] for k in ('symbol','side','side_rank','state','entry','opened_at','closed_at','exit_reason')}
+            pick['returns']=[None,None,None]
+            if r['entry']:
+                t['filled']+=1;entry_day=r['opened_at'][:10];closed_day=(r['closed_at'] or '')[:10]
+                after=[(d,b) for d,b in marks.get(r['id'],[]) if d>entry_day]
+                days=[d for d,_ in after]
+                # the session it closed in (entry day = 0); from then on the exit return carries forward
+                closed_n=None if not r["closed_at"] else 0 if closed_day<=entry_day else days.index(closed_day) if closed_day in days else len(days)
+                for n in range(3):
+                    if closed_n is not None and n>=closed_n:pick['returns'][n]=r['exit']/r['entry']-1
+                    elif n<len(after):pick['returns'][n]=after[n][1]/r['entry']-1
+                if r['closed_at']:
+                    t['realized_pnl']+=r['pnl_paise']/100;t['stopped']+=r['exit_reason']=='STOP'
+                else:
+                    t['open']+=1;t['open_value_change']+=(r['last_bid']-r['entry'])*r['quantity']
+            side=t['by_side'].setdefault(pick['side'] or '?',{'picks':0,'filled':0,'returns':[[],[],[]]})
+            side['picks']+=1;side['filled']+=bool(r['entry'])
+            for n,v in enumerate(pick['returns']):
+                if v is not None:side['returns'][n].append(v)
+            t['rows'].append(pick)
+        out=[]
+        for t in tests.values():
+            every=[[v for s in t['by_side'].values() for v in s['returns'][n]] for n in range(3)]
+            t['mean_returns']=[sum(v)/len(v) if v else None for v in every]
+            t['observed']=[len(v) for v in every]
+            for s in t['by_side'].values():
+                s['mean_returns']=[sum(v)/len(v) if v else None for v in s['returns']];s['observed']=[len(v) for v in s['returns']];del s['returns']
+            out.append(t)
+        return sorted(out,key=lambda t:t['source_session'],reverse=True)
 
     def control(self,pause,now):
         with self.transaction() as db:
@@ -316,6 +380,7 @@ class Book:
             total_fees=db.execute('SELECT coalesce(sum(fee_paise),0) FROM fills').fetchone()[0]
             state=db.execute('SELECT * FROM status').fetchone()
             stale=sum((now-datetime.fromisoformat(p['last_at'])).total_seconds()>self.terms['quote_age_seconds'] for p in held)
+            tests=self.list_tests(db) if self.lane=='vanguard' else []
             return {'lane':self.lane,'account_id':self.account_id,'activated_at':a['activated_at'],'mode':'paper','execution_enabled':True,
                     'initial_capital':a['initial_paise']/100,'cash':a['cash_paise']/100,'unsettled_cash':unsettled/100,'equity':equity/100,
                     'realized_pnl':realized/100,'unrealized_pnl':unrealized/100,'return_pct':(equity/a['initial_paise']-1)*100,
@@ -323,5 +388,5 @@ class Book:
                     'win_rate':sum(p['pnl_paise']>0 for p in closed)/len(closed) if closed else None,
                     'expectancy':realized/100/len(closed) if closed else None,'paused':bool(a['paused']),'stale_positions':stale,
                     'policy':self.terms,'positions':held,'closed':closed[-300:],'orders':orders,'equity_curve':curves,
-                    'events':events,'decisions':decisions,'fills':fills,'fees_paid':total_fees/100,'checked_at':state['at'] if state else None,
+                    'events':events,'decisions':decisions,'fills':fills,'list_tests':tests,'fees_paid':total_fees/100,'checked_at':state['at'] if state else None,
                     'status':json.loads(state['payload']) if state else {'state':'awaiting_first_check'}}

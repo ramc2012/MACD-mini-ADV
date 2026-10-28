@@ -35,7 +35,8 @@ BLAST_SOURCE = "blast"
 STAGED_EXITS = (0.30, 0.50, 0.75)
 FLATTEN_AT = time(15, 10)          # expiry day: out before the last-half-hour collapse
 HOLD_EXIT_AT = time(15, 25)        # the hold limit closes on the Nth session's last minutes
-STALE_SECONDS = 180.0              # a due entry not acted on within this is history
+STALE_SECONDS = 600.0              # a due entry still without a fresh quote after this is history (was 180 s:
+                                   # 109 such NO_PRICE signals averaged +8.7% in the MACD lane, 3-28 Oct 2026)
 SCORE_WINDOW = 300                 # recent MACD-source scores the skip cut is taken from
 MIN_ROLLING_SCORES = 50
 EQUITY_EVERY_SECONDS = 30.0
@@ -60,6 +61,7 @@ SKIPPED_LOW_SCORE = "SKIPPED_LOW_SCORE"
 TOO_ILLIQUID = "TOO_ILLIQUID"
 TOO_SMALL = "LOT_ABOVE_TICKET"
 NO_CASH = "NO_CASH"
+POSITION_LIMIT = "POSITION_LIMIT"
 ENTRY_REJECTED = "ENTRY_REJECTED"
 QWEN_REJECTED = "QWEN_REJECTED"
 QWEN_UNAVAILABLE = "QWEN_UNAVAILABLE"
@@ -239,9 +241,10 @@ class SmartExecutionManager(ExecutionManager):
 
 
 class SmartLane:
-    def __init__(self, name: str, capital: float, settings, broker, events, database_path: str):
+    def __init__(self, name: str, capital: float, settings, broker, events, database_path: str, slots: int = 0):
         self.name = name
         self.capital = float(capital)
+        self.slots = int(slots)          # 0: no position limit; tickets are smart_ticket_fraction of equity
         self.settings = settings
         self.database_path = database_path
         Path(database_path).parent.mkdir(parents=True, exist_ok=True)
@@ -515,10 +518,19 @@ class SmartLane:
         per_lot = estimated * lot
         item.detail['estimated_buy_price'] = estimated
         equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
-        ticket = self.settings.smart_ticket_fraction * equity * size
+        if self.slots:
+            held = len(self.held_symbols())
+            if held >= self.slots:
+                return self._record(item, POSITION_LIMIT, now, price=price, cut=cut, size=size,
+                                    detail={"held": held, "slots": self.slots})
+            share = self.portfolio.cash / (self.slots - held)     # available capital, shared by the free slots
+        else:
+            share = self.settings.smart_ticket_fraction * equity
+        ticket = share * size
+        item.detail["share"] = round(share, 2)
         lots = int(min(ticket, self.portfolio.cash) // per_lot)
-        if lots < 1 and per_lot <= min(self.settings.smart_ticket_fraction * equity, self.portfolio.cash):
-            lots = 1                  # rank/breadth round to one affordable lot, within the unscaled ticket cap
+        if lots < 1 and per_lot <= min(share, self.portfolio.cash):
+            lots = 1                  # rank/breadth round to one affordable lot, within the unscaled share
         cap = self._liquidity_lots(symbol, lot)
         if lots >= 1 and cap is not None and cap < lots:
             lots = cap
@@ -730,12 +742,17 @@ class SmartLane:
                 "intelligence": {"policy":smart_intelligence.VERSION,"mode":"local","qwen_required":False,
                     "last_allocation":self.local_allocation,"weights":smart_intelligence.WEIGHTS,
                     "quote_retry_seconds":5,"admission_deadline_seconds":STALE_SECONDS,
-                    "score_cutoff_active":False,"size_policy":"research rank × side breadth; whole lots within ticket and cash",
+                    "score_cutoff_active":False,"size_policy":("available cash / free slots" if self.slots else "equity ticket")
+                        + (" × research rank" if self.settings.smart_min_score_size < 1 else "")
+                        + " × side breadth; whole lots within the share and cash",
                     "validation":"prospective profitability not proven"},
                 "rules": {
                     "entry_delay_seconds": self.settings.smart_entry_delay_seconds,
                     "skip_fraction": self.settings.smart_skip_fraction,
-                    "ticket_fraction": self.settings.smart_ticket_fraction,
+                    "ticket_fraction": None if self.slots else self.settings.smart_ticket_fraction,
+                    "slots": self.slots or None,
+                    "sizing": ("available cash / free slots x side breadth" if self.slots
+                               else "ticket fraction of equity x side breadth"),
                     "macd": self.execution.exit_rules(MACD_SOURCE),
                     "blast": self.execution.exit_rules(BLAST_SOURCE) if self.settings.smart_blast_source else None,
                     "liquidity_share_pct": self.settings.blast_max_volume_share_pct,
@@ -756,13 +773,15 @@ class SmartLanes:
         if not settings.smart_lanes_enabled:
             return
         base = Path(settings.database_path).parent    # beside the MACD book: /app/data in Compose
+        slots = lane_slots(getattr(settings, "smart_lane_slots_csv", ""))
         for raw in str(settings.smart_lane_capitals_csv).split(","):
             raw = raw.strip()
             if not raw:
                 continue
             capital = float(raw)
             name = f"smart_{lane_label(capital)}"
-            self.lanes.append(SmartLane(name, capital, settings, broker, events, str(base / f"{name}.sqlite3")))
+            self.lanes.append(SmartLane(name, capital, settings, broker, events, str(base / f"{name}.sqlite3"),
+                                        slots=slots.get(capital, 0)))
 
     def get(self, name: str) -> SmartLane | None:
         return next((lane for lane in self.lanes if lane.name == name), None)
@@ -788,7 +807,9 @@ class SmartLanes:
 
     def apply_settings(self, settings) -> None:
         self.settings = settings
+        slots = lane_slots(getattr(settings, "smart_lane_slots_csv", ""))
         for lane in self.lanes:
+            lane.slots = slots.get(lane.capital, 0)
             lane.apply_settings(settings)
 
     def rebind_broker(self, broker) -> None:
@@ -797,6 +818,19 @@ class SmartLanes:
 
     def health(self) -> dict:
         return {lane.name: lane.health() for lane in self.lanes}
+
+
+def lane_slots(text: str) -> dict[float, int]:
+    """'100000:3,5000000:25' -> {100000.0: 3, 5000000.0: 25}; malformed pairs are ignored."""
+    out: dict[float, int] = {}
+    for pair in str(text or "").split(","):
+        capital, _, slots = pair.partition(":")
+        try:
+            if int(slots) > 0:
+                out[float(capital)] = int(slots)
+        except ValueError:
+            continue
+    return out
 
 
 def lane_label(capital: float) -> str:

@@ -547,8 +547,8 @@ export default function App() {
     </header>
     <nav className="main-tabs" aria-label="Lanes">{LANES.map(([key, label]) => <button key={key} className={lane === key ? "active" : ""} aria-current={lane === key ? "page" : undefined} onClick={() => setLane(key)}>{label}<span>{key === "MACD" ? portfolio.positions.length || "" : key === "BLAST" ? blastBadge : ""}</span></button>)}<a className="mi-hub-link" href={`${MI_URL}/`} target="_blank" rel="noopener noreferrer" title="Open Market Intelligence: brokers, feeds and shared data">MI hub <span aria-hidden="true">↗</span></a></nav>
     {lane === "MACD" && <SubTabs className="lane-views" value={macdView} options={MACD_VIEWS} onChange={setMacdView}
-      titles={{ ORDERS: "All saved order attempts, including filled and rejected orders", TRADES: "Executed buy and sell fills; includes partial exits" }}
-      badges={{ PORTFOLIO: portfolio.positions.length || "", ORDERS: loadStatus.Orders === "" ? orders.length : "…", TRADES: loadStatus.Trades === "" ? trades.length : "…", SIGNALS: signals.length || "",
+      titles={{ ORDERS: "Today's order attempts (IST), including filled and rejected orders; the full log is one click away", TRADES: "Today's executed buy and sell fills (IST), including partial exits" }}
+      badges={{ PORTFOLIO: portfolio.positions.length || "", ORDERS: loadStatus.Orders === "" ? todayActivity.orders : "…", TRADES: loadStatus.Trades === "" ? todayActivity.fills : "…", SIGNALS: signals.length || "",
         MARKET: dispersion.current ? `${dispersion.current.ceAbove}/${dispersion.current.peAbove}` : "" }} />}
     {lane === "AUCTION" && <SubTabs className="lane-views" value={auctionView} options={AUCTION_VIEWS} onChange={setAuctionView} />}
     {Object.entries(loadStatus).some(([, message]) => message) && <div className="data-status" role="status">

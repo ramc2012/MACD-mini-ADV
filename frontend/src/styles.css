@@ -1325,3 +1325,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .straddle-table th:first-child, .straddle-table td:first-child { text-align:left; }
 .straddle-table .overflow-auto { max-height:420px; overflow:auto; }
 @media (max-width: 700px) { .straddle-controls { justify-content:flex-start; } .straddle-chart { height:440px; } }
+/* MACD portfolio: no page heading, the CE / PE / Closed tabs sit under the Portfolio view tab (28 Oct 2026). */
+.ledger-page.portfolio-page { padding-top: 8px; }
+.ledger-page.portfolio-page .full-ledger { height: 100%; }
+.page-heading h1 .ledger-day { color: #8fa6c4; font-size: 13px; font-weight: 500; }
+.ledger-day-toggle { display: inline-flex; align-items: center; gap: 8px; }
+.ledger-day-toggle b { color: #d7e3f4; }
+.ledger-day-toggle button { border: 1px solid #2a3a52; border-radius: 10px; background: #0f1826; color: #9fc3ff; padding: 3px 9px; font-size: 10px; cursor: pointer; }
+.ledger-day-toggle button:hover { background: #172539; }

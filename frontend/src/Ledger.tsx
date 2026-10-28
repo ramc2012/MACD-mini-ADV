@@ -7,8 +7,8 @@ import { LedgerCounts } from "./LedgerCounts";
 
 const number = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
 const currency = (value: number) => `₹${number.format(value)}`;
-const clock = (value: string) => new Date(value).toLocaleTimeString("en-IN", {
-  timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+const fullStamp = (value: string) => new Date(value).toLocaleString("en-IN", {
+  timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
 });
 const entryStamp = (value: string) => new Date(value).toLocaleString("en-IN", {
   timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false,
@@ -22,6 +22,9 @@ const pct = (value?: number | null) => value === undefined || value === null ? "
 const priceTitle = (price?: number | null) => price === undefined || price === null || !(price > 0) ? undefined : currency(price);
 const lotsLabel = (row: { lots: number; lot_size: number }) => row.lot_size > 0 ? `${row.lots} × ${row.lot_size}` : "—";
 const heldLabel = (ms: number) => { const m = Math.round(ms / 60_000); return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`; };
+/** The IST calendar day (YYYY-MM-DD) of a timestamp. */
+export const istDay = (value: string | number | Date) => new Date(value).toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+const dayHeading = (day: string) => new Date(`${day}T12:00:00+05:30`).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", year: "numeric" });
 
 export type LedgerTab = "ORDERS" | "TRADES" | "PORTFOLIO" | "STATISTICS" | "SIGNALS";
 type SortValue = string | number;
@@ -74,6 +77,13 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     return () => window.clearInterval(timer);
   }, []);
   const rounds = useMemo(() => completedRoundTrips(trades), [trades]);
+  // Orders and trades open on the current IST day; the full log is one click away.
+  const [allDays, setAllDays] = useState(false);
+  const today = istDay(now);
+  const todayOrders = useMemo(() => orders.filter((row) => istDay(row.created_at) === today), [orders, today]);
+  const todayTrades = useMemo(() => trades.filter((row) => istDay(row.timestamp) === today), [trades, today]);
+  const shownOrders = allDays ? orders : todayOrders;
+  const shownTrades = allDays ? trades : todayTrades;
   const holidaySet = useMemo(() => new Set(holidays ?? []), [holidays]);
   // Backend records only: a trade-log reconstruction would carry a second P&L
   // definition (no fees, one row per fill, no excursion) beside the real one.
@@ -85,7 +95,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
   const bookSince = bookStartLabel(closedBookStart(now, holidaySet), now);
 
   const orderColumns: Column<Order>[] = [
-    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.created_at), render: (row) => clock(row.created_at) },
+    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.created_at), render: (row) => fullStamp(row.created_at) },
     { key: "symbol", label: "Symbol", value: (row) => row.symbol },
     { key: "side", label: "Side", value: (row) => row.side, tone: (row) => row.side === "BUY" ? "positive" : "negative" },
     { key: "lots", label: "Lots", value: (row) => row.lots || 0, render: (row) => row.lots || "—" },
@@ -94,7 +104,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     { key: "status", label: "Status", value: (row) => row.status },
   ];
   const tradeColumns: Column<Trade>[] = [
-    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.timestamp), render: (row) => clock(row.timestamp) },
+    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.timestamp), render: (row) => fullStamp(row.timestamp) },
     { key: "symbol", label: "Symbol", value: (row) => row.symbol },
     { key: "side", label: "Side", value: (row) => row.side, tone: (row) => row.side === "BUY" ? "positive" : "negative" },
     { key: "lots", label: "Lots", value: (row) => row.lots || 0, render: (row) => row.lots || "—" },
@@ -141,7 +151,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     { key: "reason", label: "Exit reason", value: (row) => row.exit_reason || "", render: (row) => row.exit_reason || "—" },
   ];
   const signalColumns: Column<Signal>[] = [
-    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.timestamp as unknown as string), render: (row) => clock(row.timestamp as unknown as string) },
+    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.timestamp as unknown as string), render: (row) => fullStamp(row.timestamp as unknown as string) },
     { key: "symbol", label: "Symbol", value: (row) => row.symbol },
     { key: "side", label: "Side", value: (row) => row.side, tone: (row) => row.side === "BUY" ? "positive" : "negative" },
     { key: "trigger", label: "Trigger", value: (row) => row.kind },
@@ -187,12 +197,17 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     ({ symbol: row.symbol, entryTime: row.entry_time ?? row.opened_at ?? "", entryPrice: row.entry_price ?? row.average_price ?? 0 });
   const positionTabs = <div className="watch-tabs book-tabs position-tabs">{bookTabsAvailable.map((row) => <button key={row.key} className={`${activeBook === row.key ? "active" : ""}${row.key === "CLOSED" ? " closed" : ""}`} onClick={() => setPositionBook(row.key)} title={row.key === "CLOSED" ? `Since ${bookSince}: buy/sell counts are filled trades; partial exits count separately from closed positions.` : undefined}>{row.label}<span>{row.count}</span>{row.key === "CLOSED" && <><span className="book-side-count buy">Buy {ledgerReady ? bookFills.buys : "…"}</span><span className="book-side-count sell">Sell {ledgerReady ? bookFills.sells : "…"}</span></>}</button>)}</div>;
 
-  return <section className="ledger-page">
-    <div className="page-heading"><div><h1>{tab === "STATISTICS" ? "Trade statistics" : titleCase(tab)}</h1><p>{pageDescription(tab)}</p></div><span>{tabCount(tab, orders, trades, portfolio, signals, rounds)} records</span></div>
-    {(tab === "ORDERS" || tab === "TRADES") && <LedgerCounts orders={orders} trades={trades} ready={ledgerReady} />}
+  const daily = tab === "ORDERS" || tab === "TRADES";
+  const dayTotal = tab === "ORDERS" ? todayOrders.length : todayTrades.length;
+  const allTotal = tab === "ORDERS" ? orders.length : trades.length;
+  // The portfolio needs no page heading: its CE / PE / Closed tabs sit directly under the Portfolio view tab.
+  return <section className={tab === "PORTFOLIO" ? "ledger-page portfolio-page" : "ledger-page"}>
+    {tab !== "PORTFOLIO" && <div className="page-heading"><div><h1>{tab === "STATISTICS" ? "Trade statistics" : titleCase(tab)}{daily && !allDays && <small className="ledger-day"> · {dayHeading(today)}</small>}</h1><p>{daily && !allDays ? `${tab === "ORDERS" ? "Order attempts" : "Paper fills"} placed today (IST). ${allTotal.toLocaleString("en-IN")} in the full log.` : pageDescription(tab)}</p></div>
+      {daily ? <span className="ledger-day-toggle"><b>{(allDays ? allTotal : dayTotal).toLocaleString("en-IN")}</b> {allDays ? "records" : "today"}<button type="button" onClick={() => setAllDays((v) => !v)} aria-pressed={allDays}>{allDays ? "Show today" : "Show all days"}</button></span> : <span>{tabCount(tab, orders, trades, portfolio, signals, rounds)} records</span>}</div>}
+    {daily && <LedgerCounts orders={shownOrders} trades={shownTrades} ready={ledgerReady} />}
     <div className="full-ledger panel">
-      {tab === "ORDERS" && <SortableTable rows={orders} columns={orderColumns} sort={sort} onSort={updateSort} empty="No paper orders recorded yet" />}
-      {tab === "TRADES" && <SortableTable rows={trades} columns={tradeColumns} sort={sort} onSort={updateSort} empty="No paper fills recorded yet" />}
+      {tab === "ORDERS" && <SortableTable rows={shownOrders} columns={orderColumns} sort={sort} onSort={updateSort} empty={allDays ? "No paper orders recorded yet" : `No orders today (${dayHeading(today)}). Show all days for the full log.`} />}
+      {tab === "TRADES" && <SortableTable rows={shownTrades} columns={tradeColumns} sort={sort} onSort={updateSort} empty={allDays ? "No paper fills recorded yet" : `No fills today (${dayHeading(today)}). Show all days for the full log.`} />}
       {tab === "PORTFOLIO" && <div className="book-stack">{positionTabs}<div className="book-fill">
         {activeBook === "CLOSED"
           ? <PositionBook title={`Closed today · since ${bookSince}`} closed rows={closedToday} empty={`No positions closed since ${bookSince}`} summary={closedSummary} columns={closedColumns} sort={closedSort} onSort={updateClosedSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />

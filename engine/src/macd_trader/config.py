@@ -261,12 +261,17 @@ class Settings(BaseSettings):
     # (extreme_booking.py; research/extreme_moves_20261014).
     extreme_booking_enabled: bool = True
     smart_lane_capitals_csv: str = "100000,5000000"
+    # Owner, 28 Oct 2026: "Limit positions to upto 3 in 1L lane to maintain size with each position sized proportional
+    # to available capital." capital:slots pairs; a lane with slots sizes each entry at available cash / free slots
+    # (times side breadth) instead of smart_ticket_fraction of equity, and takes no entry while every slot is used.
+    smart_lane_slots_csv: str = "100000:3,5000000:25"
     smart_ticket_fraction: float = Field(default=0.10, gt=0, le=1)
     smart_entry_delay_seconds: int = Field(default=300, ge=0, le=3600)
     smart_rank_seconds: float = Field(default=15.0, ge=0, le=300)
     smart_skip_fraction: float = Field(default=0.30, ge=0, lt=1)
     # No score cut-off (owner, 26 Oct 2026): the ranker's percentile scales the ticket from this share up to 1.
-    smart_min_score_size: float = Field(default=0.25, gt=0, le=1)
+    # 1 (28 Oct 2026) sizes every signal alike: live, the ranker's lowest fifth did best and its top fifth worst.
+    smart_min_score_size: float = Field(default=1.0, gt=0, le=1)
     smart_hard_stop_pct: float = Field(default=0.40, gt=0, lt=1)
     smart_trail_activation_pct: float = Field(default=0.40, gt=0, lt=5)
     smart_trail_pct: float = Field(default=0.30, gt=0, lt=1)

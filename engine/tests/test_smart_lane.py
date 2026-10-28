@@ -82,7 +82,7 @@ class TestEntry:
 
     def test_a_weak_score_is_taken_smaller_never_skipped(self, tmp_path, monkeypatch):
         # Owner, 26 Oct 2026: no score cut-off. Rank 0.11 of the rolling window -> 0.25 + 0.75 * 0.11 of the ticket.
-        lane = build(tmp_path)
+        lane = build(tmp_path, smart_min_score_size=0.25)
         lane._scores = [i / 100 for i in range(100)]
         monkeypatch.setattr(smart_lane, "score", lambda features: features["s"])
         lane.execution.set_quote(SYMBOL, 10.0)
@@ -120,6 +120,41 @@ class TestEntry:
         assert lane.counts == {"LOT_ABOVE_TICKET": 1}
         row = lane.journal_rows()[0]
         assert row["decision"] == "LOT_ABOVE_TICKET" and row["detail"]["one_lot"] == 20_000
+
+    def test_scores_size_every_signal_alike_by_default(self, tmp_path, monkeypatch):
+        lane = build(tmp_path)
+        lane._scores = [i / 100 for i in range(100)]
+        assert enter(lane, monkeypatch, s=0.05).lots == 10              # the weakest score buys the full ticket
+
+    def test_slots_share_available_cash_and_cap_open_positions(self, tmp_path, monkeypatch):
+        # Owner, 28 Oct 2026: up to 3 positions in the 1 L lane, each sized from the available capital.
+        lane = build(tmp_path)
+        lane.slots = 3
+        monkeypatch.setattr(smart_lane, "score", lambda features: 0.5)
+        symbols = [f"NSE:S{i}26OCT100CE" for i in range(4)]
+        lane.set_tradable_contracts({s: 100 for s in symbols})
+        lane.set_contract_context({s: {"option_type": "CE", "expiry": "2099-12-30", "volume": 0, "oi": 0} for s in symbols})
+        lots = []
+        for i, symbol in enumerate(symbols):
+            at = T0 + timedelta(minutes=10 * i)
+            lane.on_macd_signal(Signal(symbol, "BUY", "TEST", 10.0, 0.1, 0.0, 0.1, evaluated_candle_timestamp=i), "CE", {}, now=at)
+            lane.execution.set_quote(symbol, 10.0)
+            due(lane, at + timedelta(seconds=330))
+            lots.append(lane.portfolio.positions[symbol].lots if symbol in lane.portfolio.positions else None)
+        assert lots == [33, 33, 34, None]                              # Rs 1 L / 3, then the rest / 2, then / 1
+        assert lane.counts["POSITION_LIMIT"] == 1
+        assert lane.health()["rules"]["slots"] == 3
+
+    def test_a_missing_quote_waits_up_to_ten_minutes(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(smart_lane, "score", lambda features: 0.5)
+        lane = build(tmp_path)
+        lane.on_macd_signal(signal(), "CE", {}, now=T0)
+        due(lane, T0 + timedelta(seconds=330))                         # no quote yet
+        assert lane.counts == {"WAITING_PRICE": 1}
+        later = T0 + timedelta(seconds=300 + 480)
+        lane.execution.set_quote(SYMBOL, 10.0)
+        due(lane, later)
+        assert lane.counts.get("TAKEN") == 1
 
     def test_the_liquidity_cap_bounds_the_fifty_lakh_book(self, tmp_path, monkeypatch):
         lane = build(tmp_path, capital=5_000_000)
@@ -264,6 +299,8 @@ class TestBooks:
         assert [lane.name for lane in lanes.lanes] == ["smart_1l", "smart_50l"]
         assert [lane.capital for lane in lanes.lanes] == [100_000, 5_000_000]
         assert lane_label(25_000) == "25k" and lane_label(1e7) == "1cr"
+        assert [lane.slots for lane in lanes.lanes] == [3, 25]
+        assert smart_lane.lane_slots("100000:3, bad, 5000000:0") == {100000.0: 3}
 
 
 def test_dispersion_sizing_and_the_ranker():

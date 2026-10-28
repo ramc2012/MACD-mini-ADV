@@ -61,3 +61,16 @@ def test_atm_selection_excludes_wings_and_duplicate_directions():
     assert [(r['symbol'],r['option_type']) for r in selected]==[('A','PE'),('B','CE')]
     assert all(r['expected_net_return'] is None and r['expected_net_lower'] is None for r in selected)
     assert all('not calibrated' in r['ranker_entry_basis'] for r in selected)
+
+
+def test_atm_selection_fills_ten_calls_and_ten_puts():
+    rows=[dict(symbol=f'C{i}',option_type='CE',contract_kind='ATM',combined_score=100-i,direction_score=1,contract_score=1,horizon_sessions=1)
+          for i in range(30)]+[
+          dict(symbol=f'P{i}',option_type='PE',contract_kind='ATM',combined_score=10-i,direction_score=1,contract_score=1,horizon_sessions=2)
+          for i in range(12)]
+    selected=source.select_atm(rows)
+    sides=[r['option_type'] for r in selected]
+    assert sides.count('CE')==10 and sides.count('PE')==10           # strong calls do not crowd out the puts
+    assert all(r['horizon_sessions']==3 for r in selected)
+    assert {r['model_horizon_sessions'] for r in selected}=={1,2}
+    assert [r['side_rank'] for r in selected if r['option_type']=='PE']==list(range(1,11))

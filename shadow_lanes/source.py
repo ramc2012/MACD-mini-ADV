@@ -140,17 +140,24 @@ def vanguard(connection, now):
                 model_status="Research only; no promotion or expected-profit claim")
 
 
-def select_atm(candidates):
+PER_SIDE = 10      # owner, 28 Oct 2026: 10 CE and 10 PE every day, whatever is already held
+HOLD_SESSIONS = 3  # each pick is held up to 3 sessions or until its stop, and measured at D1/D2/D3
+
+
+def select_atm(candidates, per_side=PER_SIDE):
     ranked = sorted([r for r in candidates if r.get('contract_kind')=='ATM'],
                     key=lambda r:(-r['combined_score'],-r['direction_score'],-r['contract_score'],r['symbol'],r['option_type']))
-    selected=[];seen=set()
+    selected=[];seen=set();count={'CE':0,'PE':0}
     for row in ranked:
-        if row['symbol'] in seen:continue
-        seen.add(row['symbol']);selected.append({**row,'rank':len(selected)+1,
+        side=row.get('option_type')
+        if row['symbol'] in seen or side not in count or count[side]>=per_side:continue
+        seen.add(row['symbol']);count[side]+=1
+        selected.append({**row,'rank':len(selected)+1,'side_rank':count[side],
+            'model_horizon_sessions':row.get('horizon_sessions'),'horizon_sessions':HOLD_SESSIONS,
             'expected_net_return':None,'expected_net_lower':None,
             'return_refusal':'Same-session ATM entry differs from the inherited next-session calibration',
             'ranker_entry_basis':'Inherited rankers target next-session returns. Their scores are ordinal research context only; same-session ATM admission is not calibrated or proven.'})
-        if len(selected)==10:break
+        if all(n>=per_side for n in count.values()):break
     return selected
 
 
