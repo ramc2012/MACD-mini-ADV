@@ -1299,7 +1299,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @media (max-width: 900px) { .ws-main { grid-template-columns: 1fr; } .ws-side { display: none; } }
 .ws-panel.ws-bare { padding: 4px 6px; }
 .ws-help { color: #6f7d92; border: 1px solid #243045; border-radius: 50%; width: 20px; height: 20px; display: inline-grid; place-items: center; font-size: 11px; cursor: help; }
-.straddle-page { display:flex; flex-direction:column; gap:10px; }
+.straddle-page { display:flex; flex-direction:column; gap:10px; height:auto; min-height:0; }
+.straddle-page .page-heading { height:auto; gap:12px; flex-wrap:wrap; }
 .straddle-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
 .straddle-tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:8px; }
 .straddle-tiles > div { display:flex; flex-direction:column; gap:3px; padding:10px 12px; border:1px solid #1f2a3a; border-radius:6px; background:#0c131d; }
