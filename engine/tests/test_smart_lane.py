@@ -106,6 +106,14 @@ class TestEntry:
         other.set_resolvers(dispersion=lambda: DispersionPoint(0, 20, 80, 100, 100, 200))  # CE 20% vs PE 80%
         assert enter(other, monkeypatch).lots == 2                     # x0.25
 
+    def test_weak_breadth_keeps_affordable_single_lot_within_normal_cap(self, tmp_path, monkeypatch):
+        lane = build(tmp_path)
+        lane.set_resolvers(dispersion=lambda: DispersionPoint(0, 20, 80, 100, 100, 200))
+        assert enter(lane, monkeypatch, price=80.0).lots == 1  # 8k fits normal 10k, not scaled 2.5k
+        other = build(tmp_path / "b")
+        other.set_resolvers(dispersion=lambda: DispersionPoint(0, 20, 80, 100, 100, 200))
+        assert enter(other, monkeypatch, price=110.0) is None  # never raise the normal cap
+
     def test_one_lot_above_the_ticket_is_not_forced(self, tmp_path, monkeypatch):
         lane = build(tmp_path)
         assert enter(lane, monkeypatch, price=200.0) is None           # Rs 20,000 a lot vs a Rs 10,000 ticket

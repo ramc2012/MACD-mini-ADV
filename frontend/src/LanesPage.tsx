@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { curvePath, rupees, tone } from "./agentMath";
 import type { Tick } from "./types";
+import { currentSmartBook } from "./laneMarks";
 import { API_TOKEN, API_URL } from "./runtime";
 
 type Stats = { trades: number; wins: number; win_rate: number | null; net: number; gross_profit: number; gross_loss: number; profit_factor: number | null; avg_win: number | null; avg_loss: number | null };
@@ -18,7 +19,7 @@ type Health = { pending: number; cutoff: number; rolling_scores: number; error: 
   intelligence?:{policy:string;mode:string;qwen_required:boolean;validation:string;last_allocation?:{priority:number;observed_at:string}};
   rules: { entry_delay_seconds: number; skip_fraction: number; ticket_fraction: number; liquidity_share_pct: number;
     macd: { hard: number; act: number; trail: number; target: number | null; hold: number }; blast: { hard: number; act: number; trail: number } | null } };
-type Snapshot = { lane: string; capital: number; portfolio: { cash: number; equity: number; positions: Position[] }; health: Health };
+type Snapshot = { requestedAt?:number; lane: string; capital: number; portfolio: { cash: number; equity: number; positions: Position[] }; health: Health };
 type Trade = { position_id: string; symbol: string; source: string; entry_time: string; exit_time: string; entry_price: number; lots: number; pnl: number; return_pct: number; exit_reason: string | null; max_return_pct: number | null; closed: boolean };
 type JournalRow = { id: string; at: string; source: string; symbol: string; option_type: string; decision: string; score: number | null; cutoff: number | null;
   dispersion: number | null; ticket: number | null; lots: number | null; signal_price: number | null; check_price: number | null; detail: Record<string, unknown> };
@@ -58,8 +59,9 @@ function LaneCard({ summary, active, curve, onSelect }: { summary: Summary; acti
   </button>;
 }
 
-export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
+export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; portfolios: Record<string, any> }) {
   const [lanes, setLanes] = useState<Summary[]>([]);
+  const [snapshots, setSnapshots] = useState<Record<string, Snapshot>>({});
   const [curves, setCurves] = useState<Record<string, number[]>>({});
   const [selected, setSelected] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -74,6 +76,9 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
     try {
       const index = await call<{ lanes: Summary[] }>("/api/lanes");
       setLanes(index.lanes);
+      const requestedAt=Date.now();
+      const books = await Promise.all(index.lanes.map(async lane => [lane.lane, {...await call<Snapshot>(`/api/lanes/${lane.lane}/snapshot`),requestedAt}] as const));
+      setSnapshots(Object.fromEntries(books));
       setSelected((current) => current ?? index.lanes[0]?.lane ?? null);
       const pairs = await Promise.all(index.lanes.map(async (lane) =>
         [lane.lane, (await call<{ equity: { equity: number }[] }>(`/api/lanes/${lane.lane}/equity`)).equity.map((p) => p.equity)] as const));
@@ -86,12 +91,13 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
     if (!selected) return;
     try {
       const query = new URLSearchParams({ limit: "400", ...(day ? { day } : {}), ...(decision ? { decision } : {}) });
+      const requestedAt=Date.now();
       const [snap, closed, rows] = await Promise.all([
         call<Snapshot>(`/api/lanes/${selected}/snapshot`),
         call<{ trades: Trade[] }>(`/api/lanes/${selected}/trades?limit=300`),
         call<{ rows: JournalRow[]; days: string[] }>(`/api/lanes/${selected}/journal?${query}`),
       ]);
-      setSnapshot(snap); setTrades(closed.trades); setJournal(rows.rows); setDays(rows.days);
+      setSnapshot({...snap,requestedAt}); setTrades(closed.trades); setJournal(rows.rows); setDays(rows.days);
       setError(null);
     } catch (exc) { setError(String(exc instanceof Error ? exc.message : exc)); }
   }, [selected, day, decision]);
@@ -101,7 +107,10 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
 
   const health = snapshot?.health;
   const rules = health?.rules;
-  const positions = snapshot?.portfolio.positions || [];
+  const books=Object.fromEntries(lanes.map(lane=>[lane.lane,currentSmartBook(
+    lane.lane===selected&&snapshot?.lane===selected?snapshot:snapshots[lane.lane],portfolios[lane.lane],ticks)]));
+  const marked = selected ? books[selected] : null;
+  const positions: Position[] = marked?.positions || [];
   return <div className="agent-page lanes-page">
     <div className="agent-head panel-row">
       <div><b>Smart lanes · local intelligence</b><span className="agent-sub">MACD signals · paper only · Qwen independent</span></div>
@@ -112,10 +121,15 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
         {rules?.blast && <span className="agent-chip">Blast: stop {Math.round(rules.blast.hard * 100)}% · trail {Math.round(rules.blast.trail * 100)}% from +{Math.round(rules.blast.act * 100)}%</span>}
       </div>}
     </div>
-    <section className="panel agent-panel" aria-label="Local allocation status"><div className="panel-title">{health?.intelligence?.policy??'Checking allocation policy…'}</div><div className="agent-actions"><span className="agent-chip">{snapshot?`${Math.max(0,(1-snapshot.portfolio.cash/Math.max(1,snapshot.portfolio.equity))*100).toFixed(1)}%`:'—'} capital deployed</span><span className="agent-chip">{health?.pending??0} queued</span><span className="agent-chip">Last batch {when(health?.last_batch_at)}</span></div><details><summary>ⓘ Allocation policy and limits</summary><p>Same MACD BUY signals, rechecked after {rules?rules.entry_delay_seconds/60:5} minutes. Local research rank, current premium MACD, side breadth, fresh spot alignment and existing exposure determine priority. Rank and breadth size whole-lot tickets within {rules?Math.round(rules.ticket_fraction*100):10}% of equity and available cash. Missing quotes retry within the original three-minute admission deadline. No Qwen call is required. Flow is recorded as context, without a directional veto. Existing exits are retained. Priority is a heuristic, not a calibrated profit probability; prospective improvement is unproven.</p></details></section>
+    <section className="panel agent-panel" aria-label="Local allocation status"><div className="panel-title">{health?.intelligence?.policy??'Checking allocation policy…'}</div><div className="agent-actions"><span className="agent-chip">{marked?`${Math.max(0,(1-marked.cash/Math.max(1,marked.equity))*100).toFixed(1)}%`:'—'} capital deployed</span><span className="agent-chip">{health?.pending??0} queued</span><span className="agent-chip">Last batch {when(health?.last_batch_at)}</span></div><details><summary>ⓘ Allocation policy and limits</summary><p>Same MACD BUY signals, rechecked after {rules?rules.entry_delay_seconds/60:5} minutes. Local research rank, current premium MACD, side breadth, fresh spot alignment and existing exposure determine priority. Rank and breadth size whole-lot tickets within {rules?Math.round(rules.ticket_fraction*100):10}% of equity and available cash. Missing quotes retry within the original three-minute admission deadline. No Qwen call is required. Flow is recorded as context, without a directional veto. Existing exits are retained. Priority is a heuristic, not a calibrated profit probability; prospective improvement is unproven.</p></details></section>
     {(error || health?.error) && <div className="agent-error">{error || health?.error}</div>}
     <small>Retained book history · totals below include earlier policies and do not measure the new allocation policy.</small>
-    <div className="lane-cards">{lanes.map((lane) => <LaneCard key={lane.lane} summary={lane} active={lane.lane === selected} curve={curves[lane.lane] || []} onSelect={() => setSelected(lane.lane)} />)}
+    <div className="lane-cards">{lanes.map((lane) => {
+      const book=books[lane.lane];
+      const summary=book?{...lane,equity:book.equity,cash:book.cash,unrealized:book.unrealized_pnl,
+        realized:book.realized_pnl??lane.realized,open_positions:book.positions.length,return_pct:(book.equity/lane.capital-1)*100}:lane;
+      return <LaneCard key={lane.lane} summary={summary} active={lane.lane===selected} curve={curves[lane.lane]||[]} onSelect={()=>setSelected(lane.lane)}/>;
+    })}
       {lanes.length === 0 && !error && <div className="agent-empty">No smart lanes configured.</div>}</div>
 
     {selected && <>

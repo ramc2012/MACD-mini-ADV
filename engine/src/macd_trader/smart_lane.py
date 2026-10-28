@@ -517,8 +517,8 @@ class SmartLane:
         equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
         ticket = self.settings.smart_ticket_fraction * equity * size
         lots = int(min(ticket, self.portfolio.cash) // per_lot)
-        if lots < 1 and per_lot <= min(self.settings.smart_ticket_fraction * equity * base, self.portfolio.cash):
-            lots = 1                  # the score scaled the ticket below one lot: it sizes, it never skips
+        if lots < 1 and per_lot <= min(self.settings.smart_ticket_fraction * equity, self.portfolio.cash):
+            lots = 1                  # rank/breadth round to one affordable lot, within the unscaled ticket cap
         cap = self._liquidity_lots(symbol, lot)
         if lots >= 1 and cap is not None and cap < lots:
             lots = cap

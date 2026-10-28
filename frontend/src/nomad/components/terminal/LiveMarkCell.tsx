@@ -78,7 +78,7 @@ export const LiveMarkCell = memo(function LiveMarkCell({
   fallbackAt,
   decimals = 2,
   prefix = "",
-  showAge = true,
+  showAge = false,
   staleAfterSeconds = 30,
 }: {
   /** Broker/tape symbol (namespaced) to stream; null/undefined → fallback only. */
@@ -140,7 +140,7 @@ export const LiveMarkCell = memo(function LiveMarkCell({
   return (
     <span className="inline-flex flex-col items-end leading-tight" title={title}>
       <span
-        className={`inline-flex items-center justify-end gap-1 rounded px-1 font-mono tabular-nums transition-colors ${flashBg}`}
+        className={`inline-flex items-center justify-end gap-1 rounded px-1 font-mono tabular-nums transition-colors ${flashBg} ${!live||ageMs==null||ageMs>staleAfterSeconds*1000?ageTone:""}`}
       >
         {value != null ? `${prefix}${formatNumber(value, decimals)}` : "—"}
         {live ? <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${ageMs!=null&&ageMs<=staleAfterSeconds*1000&&(symbol?.endsWith('-EQ')?market.cash_open:market.market_open)?'bg-accent-green':'bg-text-muted'}`} /> : null}

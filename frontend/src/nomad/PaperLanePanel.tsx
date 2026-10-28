@@ -5,6 +5,9 @@ import {api} from './lib/api';
 import {API_URL,API_TOKEN} from '../runtime';
 import {Section,MetricTile,formatIST,formatMoney,formatSignedMoney} from './components/desk-ui';
 
+import {useLaneLive} from './hooks/useLaneLive';
+import {paperMark,paperQuote} from '../laneMarks';
+export const positionQuote=paperQuote;
 type Paper={enabled:boolean;account_id:string;lane:string;mode:string;initial_capital:number;cash:number;unsettled_cash:number;equity:number;
  realized_pnl:number;unrealized_pnl:number;return_pct:number;max_drawdown_pct:number;open_count:number;closed_count:number;
  fees_paid:number;win_rate:number|null;expectancy:number|null;paused:boolean;stale_positions:number;checked_at:string;
@@ -14,7 +17,11 @@ type Paper={enabled:boolean;account_id:string;lane:string;mode:string;initial_ca
 export function usePaper(lane:string){return useQuery({queryKey:['macd-paper',lane],queryFn:async()=>(await api.get(`/api/paper-lanes/${lane}`)).data as Paper,refetchInterval:5000});}
 
 export function PaperLanePanel({lane,performance=false}:{lane:string;performance?:boolean}){
- const query=usePaper(lane),p=query.data;const [tab,setTab]=useState(performance?'Equity':'Positions');const [busy,setBusy]=useState(false);const [error,setError]=useState('');
+ const live=useLaneLive();
+ const query=usePaper(lane),raw=query.data;
+ const marks=raw?.positions.map(r=>paperMark(r,raw.policy,positionQuote(r,live)))??[];
+ const equity=raw?raw.cash+raw.unsettled_cash+marks.reduce((v,m)=>v+m.netValue,0):0;
+ const p=raw?{...raw,equity,unrealized_pnl:marks.reduce((v,m)=>v+m.pnl,0),return_pct:(equity/raw.initial_capital-1)*100}:undefined;const [tab,setTab]=useState(performance?'Equity':'Positions');const [busy,setBusy]=useState(false);const [error,setError]=useState('');
  const control=async()=>{if(!p)return;setBusy(true);setError('');try{const r=await fetch(`${API_URL}/api/paper-lanes/${lane}/control`,{method:'POST',headers:{'Content-Type':'application/json',...(API_TOKEN?{'X-Macd-Token':API_TOKEN}:{})},body:JSON.stringify({action:p.paused?'resume':'pause'})});if(!r.ok)throw Error('Paper entry control failed');await query.refetch();}catch(e){setError((e as Error).message);}finally{setBusy(false);}};
  if(query.isError)return <Section title="MACD paper account"><p role="alert">The paper account is unavailable. No financial values have been substituted.</p></Section>;
  if(!p?.enabled)return <Section title="MACD paper account"><p>Loading the independent paper book…</p></Section>;
@@ -30,7 +37,7 @@ export function PaperLanePanel({lane,performance=false}:{lane:string;performance
  <p className="mt-2 text-xs text-text-muted">Checked {formatIST(p.checked_at)}. Local review and fresh executable quotes are required; old Nomad holdings and returns are excluded.</p>
  </Section><Section title="Paper execution ledger" description="Simulated all-or-none L1 fills, adverse slippage and estimated fees. New entries require fresh bid/ask, sufficient displayed depth and unchanged risk gates.">
  <div className="mb-4 flex flex-wrap gap-2" role="group" aria-label="Paper ledger view">{tabs.map(t=><button className={`rounded-lg border border-bg-border px-3 py-2 text-xs ${tab===t?'text-accent-cyan bg-bg-active':'text-text-secondary'}`} key={t} onClick={()=>setTab(t)} aria-pressed={tab===t}>{t}</button>)}</div>
- {tab==='Positions'&&table(['Instrument','Quantity / lots','Entry','Liquidation bid','Stop / target','Exit due','Opened'],p.positions.map(r=>[<span>{r.symbol}<br/>{r.instrument}</span>,`${r.quantity} / ${r.quantity/r.lot_size}`,formatMoney(r.entry),<span>{formatMoney(r.last_bid)}<br/>{formatIST(r.last_at)}</span>,`${formatMoney(r.stop)} / ${formatMoney(r.target)}`,formatIST(r.exit_due),formatIST(r.opened_at)]))}
+ {tab==='Positions'&&table(['Instrument','Quantity / lots','Entry','Liquidation bid','Net open P/L','Stop / target','Exit due','Opened'],p.positions.map((r,i)=>[<span>{r.symbol}<br/>{r.instrument}</span>,`${r.quantity} / ${r.quantity/r.lot_size}`,formatMoney(r.entry),<span title={`Stored quote ${formatIST(r.last_at)}`}>{formatMoney(marks[i].bid)}</span>,formatSignedMoney(marks[i].pnl),`${formatMoney(r.stop)} / ${formatMoney(r.target)}`,formatIST(r.exit_due),formatIST(r.opened_at)]))}
  {tab==='Orders'&&table(['Stock / instrument','Rank','State','Admission reason','Entry window','Exit due'],p.orders.map(r=>[<span>{r.symbol}<br/>{r.instrument}</span>,r.rank,r.state==='PENDING_AI'?'PENDING_REVIEW':r.state,r.reason==='Awaiting entry window and fresh Qwen review'?'Awaiting entry window and local review':r.reason,<span>{formatIST(r.entry_after)}<br/>{formatIST(r.deadline)}</span>,formatIST(r.exit_due)]))}
  {tab==='Closed trades'&&table(['Stock / instrument','Quantity','Entry / exit','Net P&L','Reason','Opened','Closed'],p.closed.map(r=>[<span>{r.symbol}<br/>{r.instrument}</span>,r.quantity,`${formatMoney(r.entry)} / ${formatMoney(r.exit)}`,formatSignedMoney(r.pnl_paise/100),r.exit_reason,formatIST(r.opened_at),formatIST(r.closed_at)]))}
  {tab==='Fills'&&table(['Side','Order','Quantity','Fill','Notional','Fee','Filled / quote time'],p.fills.map(r=>[r.side,r.order_id,r.quantity,formatMoney(r.price),formatMoney(r.notional_paise/100),formatMoney(r.fee_paise/100),<span>{formatIST(r.at)}<br/>{formatIST(r.quote_at)}</span>]))}
