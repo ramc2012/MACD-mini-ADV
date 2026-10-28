@@ -1,6 +1,6 @@
 """ATM straddle and ATM open interest series from the stored option chains (Market breadth -> ATM straddle & OI).
 
-Source: chain_snapshots (oi_capture.py) -- index chains every minute, every F&O stock chain (+-4 strikes) once per
+Source: chain_snapshots (oi_capture.py) -- index chains every minute, every F&O stock chain (+-8 strikes since 28 Oct 2026, +-4 before) once per
 15-minute sweep, front series only (stocks add the next series in a series' last week). Nothing is downloaded here.
 
 Each snapshot's ATM strike is the stored strike nearest the chain's spot (or a fixed strike when one is chosen). The
@@ -19,7 +19,14 @@ from zoneinfo import ZoneInfo
 IST = ZoneInfo("Asia/Kolkata")
 INDICES = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX")
 SPANS = {"day": 60, "week": 300, "expiry": 900}     # displayed resolution (seconds) per range
-BAND = 0.04                                           # strikes within 4% of spot are read
+BAND = 0.08                                           # strikes within 8% of spot are read (a 4% window dropped a
+                                                      # fixed OI-band strike once a stock moved through the day)
+# OI (28 Oct 2026: the rolling ATM flipped between 50-point strikes whose OI differs several-fold, so the ATM OI line
+# spiked and dipped although every strike's own OI was smooth and matched the Upstox chain to 0.0% median):
+OI_BAND_STRIKES = 3       # the OI line sums the day's opening ATM +-3 strikes, a set fixed for the whole session, so
+                          # it moves only when OI does (a band that follows the ATM still swapped round strikes in/out)
+HYSTERESIS = 0.75         # the rolling ATM changes only once spot is 3/4 of a strike step past the current one
+PARTIAL_SNAPSHOT = 0.6    # a snapshot with fewer strikes than this share of the typical one is skipped
 _cache: dict[tuple, tuple[float, object]] = {}
 
 
@@ -109,11 +116,13 @@ def series(path: str, underlying: str, expiry: str | None = None, span: str = "d
 def _build(path, underlying, chosen, span, view_day, strike, load_start, range_start, end) -> dict:
     connection = _read(path)
     try:
+        # Index chains are wide (every strike near spot each minute): read 8% around spot. A stock chain is swept as
+        # ATM +-8 strikes only (+-4 before 28 Oct 2026), so read all of it (low-priced stocks have 1-rupee steps an 8% window cuts short).
         rows = connection.execute(
             """SELECT ts, strike, option_type, symbol, ltp, volume, oi, spot FROM chain_snapshots
                WHERE underlying = ? AND ts >= ? AND ts < ? AND expiry = ? AND spot > 0
                  AND abs(strike - spot) <= spot * ? ORDER BY ts""",
-            (underlying, load_start, end, chosen["expiry"], BAND)).fetchall()
+            (underlying, load_start, end, chosen["expiry"], BAND if underlying in INDICES else 1.0)).fetchall()
         days = [r[0] for r in connection.execute(
             "SELECT day FROM chain_days WHERE underlying = ? AND day BETWEEN ? AND ? ORDER BY day",
             (underlying, _day(chosen["first_ts"]).isoformat(), _day(chosen["last_ts"]).isoformat()))]
@@ -130,7 +139,15 @@ def _build(path, underlying, chosen, span, view_day, strike, load_start, range_s
     seen_day: date | None = None
     step = SPANS[span]
     points: list[dict] = []
+    sizes = sorted(len(legs) for _ts, _spot, legs in snapshots)
+    typical = sizes[len(sizes) // 2] if sizes else 0
+    held_atm: float | None = None
+    day_band: dict[date, list[float]] = {}
+    skipped = 0
     for ts, spot, legs in snapshots:
+        if typical >= 10 and len(legs) < PARTIAL_SNAPSHOT * typical:
+            skipped += 1
+            continue
         d = _day(ts)
         first_of_day = d != seen_day
         seen_day = d
@@ -145,15 +162,38 @@ def _build(path, underlying, chosen, span, view_day, strike, load_start, range_s
                 traded[(k, side)] = volume if first_of_day else None
             if volume is not None:
                 previous[symbol] = (d, volume)
-        pairs = [k for (k, side) in legs if side == "CE" and (k, "PE") in legs
-                 and (legs[(k, "CE")][1] or 0) > 0 and (legs[(k, "PE")][1] or 0) > 0]
+        priced = [k for (k, side) in legs if side == "CE" and (k, "PE") in legs
+                  and (legs[(k, "CE")][1] or 0) > 0 and (legs[(k, "PE")][1] or 0) > 0]
+        # A contract that has not traded today carries a stale last price (360ONE 960 CE showed 274 with spot at 970
+        # on 28 Oct 2026); the straddle uses strikes whose two legs both traded today, falling back to any priced pair.
+        pairs = [k for k in priced if (legs[(k, "CE")][2] or 0) > 0 and (legs[(k, "PE")][2] or 0) > 0] or priced
+        listed = sorted(pairs)
         if strike is not None:
             atm = strike if strike in pairs else None
         else:
-            atm = min(pairs, key=lambda k: (abs(k - spot), k)) if pairs else None
+            atm = min(listed, key=lambda k: (abs(k - spot), k)) if listed else None
+            if atm is not None and held_atm in pairs and held_atm != atm:
+                i = listed.index(held_atm)
+                gaps_near = [b - a for a, b in zip(listed[max(0, i - 1):i + 1], listed[i:i + 2]) if b > a]
+                if gaps_near and abs(spot - held_atm) <= HYSTERESIS * min(gaps_near):
+                    atm = held_atm
+            held_atm = atm
         if atm is None:
             continue
         ce, pe = legs[(atm, "CE")], legs[(atm, "PE")]
+        if d not in day_band:                     # fixed at the session's first usable snapshot
+            strikes = sorted({k for (k, side) in legs if side == "CE" and (k, "PE") in legs})   # every listed strike
+            opening = min(strikes, key=lambda k: (abs(k - spot), k))
+            i = strikes.index(opening)
+            # A +-4-strike stock sweep (before 28 Oct 2026) soon left a wider fixed band: +-2 for those small chains.
+            width = OI_BAND_STRIKES if typical >= 30 else 2
+            day_band[d] = strikes[i - width:i + width + 1] if i >= width and len(strikes) >= i + width + 1 else []
+        band = day_band[d]
+        band_oi = {}
+        for side in ("CE", "PE"):
+            values = [(legs.get((k, side)) or (None, None, None, None))[3] for k in band]
+            # an untraded strike's OI of 0 is a real zero; only a strike missing from the snapshot voids the band
+            band_oi[side] = sum(values) if band and all(v is not None and v >= 0 for v in values) else None
         price = ce[1] + pe[1]
         v_ce, v_pe = traded[(atm, "CE")], traded[(atm, "PE")]
         weight = (v_ce or 0) + (v_pe or 0) if v_ce is not None and v_pe is not None else 0
@@ -169,7 +209,9 @@ def _build(path, underlying, chosen, span, view_day, strike, load_start, range_s
         if ts < range_start:
             continue
         point = dict(t=ts, spot=spot, strike=atm, ce=ce[1], pe=pe[1], straddle=round(price, 2),
-                     ce_oi=ce[3], pe_oi=pe[3], volume=weight,
+                     ce_oi=ce[3] or None, pe_oi=pe[3] or None, volume=weight,
+                     ce_oi_band=band_oi["CE"], pe_oi_band=band_oi["PE"],
+                     band=[band[0], band[-1]] if band else None,
                      vwap_day=vwap["d"], vwap_week=vwap["w"], vwap_month=vwap["m"])
         if points and points[-1]["t"] // step == ts // step and _day(points[-1]["t"]) == d:
             point["volume"] += points[-1]["volume"]
@@ -181,6 +223,7 @@ def _build(path, underlying, chosen, span, view_day, strike, load_start, range_s
     return dict(
         expiry=chosen["expiry"], day=view_day.isoformat(), days=days,
         cadence_seconds=gaps[len(gaps) // 2] if gaps else None, resolution_seconds=step,
+        skipped_partial_snapshots=skipped, oi_band_strikes=OI_BAND_STRIKES,
         strikes=sorted({k for (k, side) in last_legs if side == "CE" and (k, "PE") in last_legs}),
         anchors={"day": anchors["d"], "week": anchors["w"], "month": anchors["m"]},
         series_first_ts=chosen["first_ts"], series_last_ts=chosen["last_ts"], points=points,

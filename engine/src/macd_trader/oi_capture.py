@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS oi_minutes (
 """
 
 NEXT_SERIES_WITHIN_DAYS = 7      # calendar days to the front expiry from which the next series is collected too
-STOCK_STRIKES = 4                # strikes either side of the money per stock chain
+STOCK_STRIKES = 8                # strikes either side of the money per stock chain (4 until 28 Oct 2026: a stock that moved
+                                 # 5+ strikes left the morning's fixed OI band outside the sweep; same one call per stock)
 STOCK_SWEEP_MINUTES = 15         # one sweep of every F&O stock per window
 STOCK_CALL_GAP_SECONDS = 2.5     # spacing between stock chain calls (~24 a minute, well inside Fyers' 200/min)
 

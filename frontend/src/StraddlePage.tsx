@@ -5,11 +5,17 @@ import { API_TOKEN, API_URL } from "./runtime";
 
 type Instrument = { underlying: string; kind: "index" | "stock"; first_day: string; last_day: string; days: number };
 type Point = { t: number; spot: number; strike: number; ce: number; pe: number; straddle: number; ce_oi: number | null; pe_oi: number | null;
-  volume: number; vwap_day: number | null; vwap_week: number | null; vwap_month: number | null };
+  ce_oi_band?: number | null; pe_oi_band?: number | null; band?: [number, number] | null; volume: number; vwap_day: number | null; vwap_week: number | null; vwap_month: number | null };
 type Series = { underlying: string; expiry?: string; span: Span; day?: string; days?: string[]; strike_mode: "atm" | "fixed";
   expiries: { expiry: string; first_ts: number; last_ts: number; snapshots: number }[]; strikes?: number[];
   cadence_seconds?: number | null; resolution_seconds?: number; anchors?: Record<"day" | "week" | "month", number | null>;
-  series_first_ts?: number; series_last_ts?: number; points: Point[]; note?: string };
+  series_first_ts?: number; series_last_ts?: number; points: Point[]; note?: string; skipped_partial_snapshots?: number };
+// OI view (28 Oct 2026): the ATM strike's own OI jumps whenever the ATM moves to a strike with a different OI (NIFTY's
+// round 100-point strikes hold several times the 50-point ones). The default sums the day's opening ATM +-3 strikes, a set
+// fixed for the session, so the line moves only when OI does.
+type OiMode = "band" | "atm";
+const oiOf = (p: Point | undefined, side: "ce" | "pe", mode: OiMode) => !p ? null : mode === "band" ? (p[`${side}_oi_band`] ?? null) : p[`${side}_oi`];
+const OI_LABEL: Record<OiMode, string> = { band: "OI · opening ATM ±3 strikes", atm: "OI · ATM strike only" };
 type Span = "day" | "week" | "expiry";
 type Anchor = "day" | "week" | "month";
 
@@ -38,6 +44,7 @@ export function StraddlePage() {
   const [span, setSpan] = useState<Span>((saved.span as Span) || "day");
   const [day, setDay] = useState("");
   const [strike, setStrike] = useState("");
+  const [oiMode, setOiMode] = useState<OiMode>(saved.oi === "atm" ? "atm" : "band");
   const [shown, setShown] = useState<Record<Anchor, boolean>>({ day: saved.vwap_day !== "0", week: saved.vwap_week !== "0", month: saved.vwap_month !== "0" });
   const [data, setData] = useState<Series>();
   const [loading, setLoading] = useState(false);
@@ -49,7 +56,7 @@ export function StraddlePage() {
       .then((r) => setInstruments(r.instruments)).catch(() => undefined);
     return () => controller.abort();
   }, []);
-  useEffect(() => remember({ underlying, span, vwap_day: shown.day ? "1" : "0", vwap_week: shown.week ? "1" : "0", vwap_month: shown.month ? "1" : "0" }), [underlying, span, shown]);
+  useEffect(() => remember({ underlying, span, oi: oiMode, vwap_day: shown.day ? "1" : "0", vwap_week: shown.week ? "1" : "0", vwap_month: shown.month ? "1" : "0" }), [underlying, span, shown, oiMode]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -98,37 +105,40 @@ export function StraddlePage() {
           <option value="">Rolling ATM</option>
           {(data?.strikes ?? []).map((k) => <option key={k} value={String(k)}>{k} fixed</option>)}
         </select>
+        <select className="rrg-select" value={oiMode} onChange={(e) => setOiMode(e.target.value as OiMode)} aria-label="Open interest view">
+          <option value="band">OI: opening ATM ±3 strikes (fixed for the day)</option><option value="atm">OI: ATM strike only</option>
+        </select>
       </div>
     </div>
     <div className="straddle-tiles">
       <div><span>Straddle {data?.strike_mode === "fixed" ? `· ${strike}` : "· ATM"}</span><b>{num(last?.straddle)}</b><small>{last ? `${last.strike} · CE ${num(last.ce)} + PE ${num(last.pe)}` : "—"}</small></div>
       <div><span>vs day VWAP</span><b className={vsDay == null ? "" : vsDay >= 0 ? "positive" : "negative"}>{vsDay == null ? "—" : `${vsDay >= 0 ? "+" : ""}${num(vsDay)}`}</b><small>{vsDay == null ? "No traded volume yet" : vsDay >= 0 ? "Premium above day VWAP" : "Premium below day VWAP"}</small></div>
-      <div><span>ATM CE OI</span><b>{qty(last?.ce_oi)}</b><small>open contracts × lot</small></div>
-      <div><span>ATM PE OI</span><b>{qty(last?.pe_oi)}</b><small>PE/CE {last?.ce_oi ? (Number(last.pe_oi) / last.ce_oi).toFixed(2) : "—"}</small></div>
+      <div><span>CE {OI_LABEL[oiMode]}</span><b>{qty(oiOf(last, "ce", oiMode))}</b><small>{oiMode === "band" && last?.band ? `strikes ${last.band[0]}–${last.band[1]} · contracts × lot` : "open contracts × lot"}</small></div>
+      <div><span>PE {OI_LABEL[oiMode]}</span><b>{qty(oiOf(last, "pe", oiMode))}</b><small>PE/CE {oiOf(last, "ce", oiMode) ? (Number(oiOf(last, "pe", oiMode)) / Number(oiOf(last, "ce", oiMode))).toFixed(2) : "—"}</small></div>
       <div><span>Spot</span><b>{num(last?.spot)}</b><small>{full(last?.t)}</small></div>
     </div>
     <section className="panel straddle-panel">
       <div className="straddle-legend" aria-label="Chart legend">
         <span><i style={{ background: COLORS.straddle }} />Straddle</span>
         {ANCHORS.map(([key, label]) => <label key={key}><input type="checkbox" checked={shown[key]} onChange={(e) => setShown((s) => ({ ...s, [key]: e.target.checked }))} /><i className={`dash ${key}`} style={{ borderColor: COLORS[key] }} />{label}{data?.anchors?.[key] ? <small> since {full(data.anchors[key])}</small> : null}</label>)}
-        <span className="sep" /><span><i style={{ background: COLORS.ce }} />ATM CE OI</span><span><i style={{ background: COLORS.pe }} />ATM PE OI</span>
+        <span className="sep" /><span><i style={{ background: COLORS.ce }} />CE {OI_LABEL[oiMode]}</span><span><i style={{ background: COLORS.pe }} />PE {OI_LABEL[oiMode]}</span>
       </div>
-      <StraddleChart data={data} shown={shown} loading={loading} error={error} fitKey={`${underlying}:${data?.expiry}:${span}:${data?.day}:${strike}`} />
+      <StraddleChart data={data} shown={shown} oiMode={oiMode} loading={loading} error={error} fitKey={`${underlying}:${data?.expiry}:${span}:${data?.day}:${strike}`} />
     </section>
     <div className="ratio-footer">
       <span>{data?.points.length ? `${data.underlying} ${data.expiry} · ${data.points.length} points at ${Math.round((data.resolution_seconds || 60) / 60)}-minute resolution · ${cadence} · series stored ${full(data.series_first_ts)} → ${full(data.series_last_ts)}` : "Select an instrument with stored option chains."}</span>
-      <span role={error ? "alert" : undefined} className={error ? "negative" : "muted"}>{error || data?.note || ""}</span>
+      <span role={error ? "alert" : undefined} className={error ? "negative" : "muted"}>{error || [data?.note, data?.skipped_partial_snapshots ? `${data.skipped_partial_snapshots} partial chain snapshots skipped` : ""].filter(Boolean).join(" · ")}</span>
     </div>
     <details className="panel straddle-table"><summary>Data table · latest first</summary>
-      <div className="overflow-auto"><table><thead><tr>{["Time", "Spot", "Strike", "CE", "PE", "Straddle", "Day VWAP", "Week VWAP", "Month VWAP", "CE OI", "PE OI", "Volume"].map((h) => <th key={h}>{h}</th>)}</tr></thead>
-        <tbody>{[...(data?.points ?? [])].reverse().slice(0, 400).map((p) => <tr key={p.t}><td>{full(p.t)}</td><td>{num(p.spot)}</td><td>{p.strike}</td><td>{num(p.ce)}</td><td>{num(p.pe)}</td><td>{num(p.straddle)}</td><td>{num(p.vwap_day)}</td><td>{num(p.vwap_week)}</td><td>{num(p.vwap_month)}</td><td>{qty(p.ce_oi)}</td><td>{qty(p.pe_oi)}</td><td>{qty(p.volume)}</td></tr>)}</tbody></table></div>
+      <div className="overflow-auto"><table><thead><tr>{["Time", "Spot", "Strike", "CE", "PE", "Straddle", "Day VWAP", "Week VWAP", "Month VWAP", "CE OI (ATM)", "PE OI (ATM)", "CE OI band", "PE OI band", "Volume"].map((h) => <th key={h}>{h}</th>)}</tr></thead>
+        <tbody>{[...(data?.points ?? [])].reverse().slice(0, 400).map((p) => <tr key={p.t}><td>{full(p.t)}</td><td>{num(p.spot)}</td><td>{p.strike}</td><td>{num(p.ce)}</td><td>{num(p.pe)}</td><td>{num(p.straddle)}</td><td>{num(p.vwap_day)}</td><td>{num(p.vwap_week)}</td><td>{num(p.vwap_month)}</td><td>{qty(p.ce_oi)}</td><td>{qty(p.pe_oi)}</td><td>{qty(p.ce_oi_band ?? null)}</td><td>{qty(p.pe_oi_band ?? null)}</td><td>{qty(p.volume)}</td></tr>)}</tbody></table></div>
     </details>
   </section>;
 }
 
 type Handles = { chart: IChartApi; straddle: ISeriesApi<"Line">; vwap: Record<Anchor, ISeriesApi<"Line">>; ce: ISeriesApi<"Line">; pe: ISeriesApi<"Line"> };
 
-function StraddleChart({ data, shown, loading, error, fitKey }: { data?: Series; shown: Record<Anchor, boolean>; loading: boolean; error: string; fitKey: string }) {
+function StraddleChart({ data, shown, oiMode, loading, error, fitKey }: { data?: Series; shown: Record<Anchor, boolean>; oiMode: OiMode; loading: boolean; error: string; fitKey: string }) {
   const element = useRef<HTMLDivElement>(null);
   const handles = useRef<Handles>();
   const lastFit = useRef("");
@@ -170,15 +180,15 @@ function StraddleChart({ data, shown, loading, error, fitKey }: { data?: Series;
     h.vwap.day.setData(shown.day ? series((p) => p.vwap_day) : []);
     h.vwap.week.setData(shown.week ? series((p) => p.vwap_week) : []);
     h.vwap.month.setData(shown.month ? series((p) => p.vwap_month) : []);
-    h.ce.setData(series((p) => p.ce_oi));
-    h.pe.setData(series((p) => p.pe_oi));
+    h.ce.setData(series((p) => oiOf(p, "ce", oiMode)));
+    h.pe.setData(series((p) => oiOf(p, "pe", oiMode)));
     if (points.length && lastFit.current !== fitKey) { lastFit.current = fitKey; h.chart.timeScale().fitContent(); }
-  }, [data, shown, fitKey]);
+  }, [data, shown, oiMode, fitKey]);
   const p = hover;
   return <div className="straddle-chart" ref={element}>
     {p && <div className="straddle-readout" role="status"><b>{full(p.t)}</b> · strike {p.strike} · spot {num(p.spot)}<br />
       straddle <b>{num(p.straddle)}</b> (CE {num(p.ce)} + PE {num(p.pe)}) · VWAP d {num(p.vwap_day)} · w {num(p.vwap_week)} · m {num(p.vwap_month)}<br />
-      CE OI {qty(p.ce_oi)} · PE OI {qty(p.pe_oi)} · traded {qty(p.volume)}</div>}
+      CE OI {qty(p.ce_oi)} · PE OI {qty(p.pe_oi)} (strike {p.strike}){p.band ? <> · band {p.band[0]}–{p.band[1]}: CE {qty(p.ce_oi_band ?? null)} · PE {qty(p.pe_oi_band ?? null)}</> : null} · traded {qty(p.volume)}</div>}
     {!data?.points.length && <div className={`chart-empty${error ? " error" : ""}`}>{error || (loading ? "Reading stored option chains…" : data?.note || "No stored chain for this selection.")}</div>}
   </div>;
 }

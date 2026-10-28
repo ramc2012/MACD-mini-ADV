@@ -67,3 +67,27 @@ def test_fixed_strike_and_unknown_volume_after_a_gap(tmp_path):
     ])
     p = straddle_views.series(path, "X", span="day", strike=103.0)["points"]
     assert len(p) == 1 and p[0]["volume"] == 0 and p[0]["vwap_day"] is None
+
+
+def test_hysteresis_holds_the_atm_and_band_oi_is_smooth_across_a_switch(tmp_path):
+    # Strikes step 10; the multiples of 20 carry 10x the OI. Spot 1010 -> 1016 (held) -> 1019.5 (past 3/4 step).
+    d = "2026-10-28"
+    def strikes(spot):
+        return chain(spot, {k: leg(5, 5, 1, 1, oce=1000 if k % 20 == 0 else 100, ope=1000 if k % 20 == 0 else 100)
+                            for k in range(900, 1120, 10)})        # a full index-size chain (30+ legs)
+    path = _db(tmp_path, [(_ts(d, "09:16"), 1010.0, strikes(1010.0)), (_ts(d, "09:17"), 1016.0, strikes(1016.0)),
+                          (_ts(d, "09:18"), 1019.5, strikes(1019.5))])
+    pts = straddle_views.series(path, "X", span="day", day=d, today=date(2026, 10, 28))["points"]
+    assert [p["strike"] for p in pts] == [1010, 1010, 1020]      # 1016 stays on 1010; 1019.5 is past 3/4 of a step
+    assert pts[1]["ce_oi"] == 100 and pts[2]["ce_oi"] == 1000    # the single-strike line jumps 10x on the switch ...
+    # ... the OI band is the session's opening ATM +-3 strikes (980-1040), fixed all day, so it does not move at all
+    assert [p["band"] for p in pts] == [[980, 1040]] * 3 and {p["ce_oi_band"] for p in pts} == {1000 + 100 + 1000 + 100 + 1000 + 100 + 1000}
+
+
+def test_a_partial_snapshot_is_skipped(tmp_path):
+    d = "2026-10-28"
+    full = chain(1010, {k: leg(5, 5, 1, 1) for k in range(980, 1050, 10)})
+    partial = {key: v for key, v in full.items() if key[0] in (1000, 1010)}
+    path = _db(tmp_path, [(_ts(d, "09:16"), 1010.0, full), (_ts(d, "09:17"), 1010.0, partial), (_ts(d, "09:18"), 1010.0, full)])
+    out = straddle_views.series(path, "X", span="day", day=d, today=date(2026, 10, 28))
+    assert len(out["points"]) == 2 and out["skipped_partial_snapshots"] == 1
