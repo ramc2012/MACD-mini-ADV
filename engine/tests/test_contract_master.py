@@ -152,3 +152,94 @@ def test_snapshot_reference_comes_from_todays_ladder_not_a_held_contract(tmp_pat
     selector._save([today, held])
 
     assert json.loads(path.read_text())["spots"][SBIN]["selection_price"] == 1053.0
+
+
+# --- 28 Oct 2026: stale carried selections and the intraday "active contract" refresh -------------------------
+
+def test_a_spot_with_only_next_series_legs_is_selected_again(tmp_path):
+    # NIFTY's front weekly expired, leaving only its NEXT- ladder in today's file; SBIN is complete. The pooled
+    # role check used to count NIFTY as covered by SBIN's ITM/ATM/OTM legs and never select it again.
+    master = [*_master("SBIN", "NSE", FRONT, range(1000, 1110, 10), 750),
+              *_master("NIFTY", "NSE", FRONT, range(22000, 23100, 50), 75),
+              *_master("NIFTY", "NSE", NEXT, range(22000, 23100, 50), 75)]
+    broker = MasterBroker(master, {SBIN: 1053.0, NIFTY: 22610.0})
+    path = tmp_path / "contracts.json"
+    selector = ContractSelector(broker, str(path))
+    rows = asyncio.run(selector.build([SBIN, NIFTY]))
+    payload = json.loads(path.read_text())
+    payload["contracts"] = [row for row in payload["contracts"]
+                            if row["spot_symbol"] != NIFTY or row["moneyness"].startswith("NEXT-")]
+    path.write_text(json.dumps(payload))
+    again = ContractSelector(broker, str(path))
+    rows = asyncio.run(again.build([SBIN, NIFTY]))
+    assert {("CE", "ATM"), ("PE", "ATM")} <= {(r.option_type, r.moneyness) for r in rows if r.spot_symbol == NIFTY}
+
+
+def test_a_held_tick_keeps_the_selection_date(tmp_path):
+    master = _master("SBIN", "NSE", FRONT, range(1000, 1110, 10), 750)
+    path = tmp_path / "contracts.json"
+    selector = ContractSelector(MasterBroker(master, {SBIN: 1053.0}), str(path))
+    rows = asyncio.run(selector.build([SBIN]))
+    selector.selection_date = (TODAY - timedelta(days=2)).isoformat()   # as if selected two days ago
+    atm = next(r for r in rows if r.moneyness == "ATM")
+    selector.retain(atm.symbol)
+    assert json.loads(path.read_text())["date"] == selector.selection_date   # not re-dated as today
+    before = path.stat().st_mtime_ns
+    selector.retain(atm.symbol)                                         # already retained: no rewrite
+    assert path.stat().st_mtime_ns == before
+
+
+def _now():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.combine(TODAY, datetime.min.time(), ZoneInfo("Asia/Kolkata")).replace(hour=11)
+
+
+def test_refresh_moves_an_idle_or_distant_atm_to_the_active_strike_near_spot(tmp_path):
+    master = _master("SBIN", "NSE", FRONT, range(1000, 1210, 10), 750)
+    broker = MasterBroker(master, {SBIN: 1053.0})
+    selector = ContractSelector(broker, str(tmp_path / "contracts.json"))
+    rows = asyncio.run(selector.build([SBIN]))
+    atm = {r.option_type: r for r in rows if r.moneyness == "ATM"}
+    now = _now()
+    active = {r.symbol: now - timedelta(minutes=1) for r in rows}
+    # Spot still next to the ATM strike and both legs trading: nothing changes.
+    assert asyncio.run(selector.refresh({SBIN: 1055.0}, active, now)) == {}
+    # Spot has run 4 strikes away: the ladder is chosen again around 1094.
+    changed = asyncio.run(selector.refresh({SBIN: 1094.0}, active, now))
+    assert changed[SBIN]["to"] == {"CE": "NSE:SBIN" + FRONT + "1100CE", "PE": "NSE:SBIN" + FRONT + "1090PE"}
+    assert "strikes from spot" in changed[SBIN]["reasons"][0]
+    assert atm["CE"].symbol not in selector.contracts and "NSE:SBIN" + FRONT + "1100CE" in selector.new_symbols
+    saved = json.loads((tmp_path / "contracts.json").read_text())
+    assert saved["refreshes"][-1]["spot"] == SBIN
+    assert saved["spots"][SBIN]["selection_price"] == 1094.0
+
+
+def test_refresh_keeps_a_held_contract_and_replaces_an_idle_atm(tmp_path):
+    master = _master("SBIN", "NSE", FRONT, range(1000, 1210, 10), 750)
+    ce = lambda strike: f"NSE:SBIN{FRONT}{strike}CE"
+    broker = MasterBroker(master, {SBIN: 1053.0}, {ce(1060): 5000})    # morning: 1060 is the busy call
+    selector = ContractSelector(broker, str(tmp_path / "contracts.json"))
+    rows = asyncio.run(selector.build([SBIN]))
+    assert next(r for r in rows if r.moneyness == "ATM" and r.option_type == "CE").symbol == ce(1060)
+    selector.retain(ce(1060))                                           # an open position in it
+    broker.volumes = {ce(1060): 0, ce(1050): 5000}                      # by 11:00 only 1050 trades
+    now = _now()
+    last = {r.symbol: now - timedelta(minutes=1) for r in rows if r.symbol != ce(1060)}
+    changed = asyncio.run(selector.refresh({SBIN: 1053.0}, last, now))
+    assert "no trade today" in changed[SBIN]["reasons"][0]
+    assert changed[SBIN]["to"]["CE"] == ce(1050) and ce(1050) in selector.contracts
+    assert ce(1060) in selector.contracts                               # held: stays subscribed until it exits
+
+
+def test_a_held_leg_chosen_today_keeps_its_spot_covered_on_restart(tmp_path):
+    master = _master("SBIN", "NSE", FRONT, range(1000, 1110, 10), 750)
+    broker = MasterBroker(master, {SBIN: 1053.0})
+    path = tmp_path / "contracts.json"
+    selector = ContractSelector(broker, str(path))
+    rows = asyncio.run(selector.build([SBIN]))
+    selector.retain(next(r for r in rows if r.moneyness == "ATM").symbol)
+    calls = len(broker.quote_calls)
+    restarted = ContractSelector(broker, str(path))
+    asyncio.run(restarted.build([SBIN]))
+    assert len(broker.quote_calls) == calls                             # no re-selection, ladder unchanged

@@ -29,8 +29,13 @@ def next_session(day,count=1):
     return day
 
 
-def session_open(now):
-    return is_session(now.date()) and time(9,15)<=now.time()<time(15,30)
+# Continuous sessions since 3 Aug 2026 (engine sessions.py regime 2026-08-session): F&O to 15:40; the cash book keeps its
+# 15:30 marking clock (its entries end 09:55 and its sales settle next session).
+SESSION_END={'vanguard':time(15,40),'cbe':time(15,30)}
+
+
+def session_open(now,lane='cbe'):
+    return is_session(now.date()) and time(9,15)<=now.time()<SESSION_END[lane]
 
 
 def parse_quotes(body,requested):
@@ -169,7 +174,7 @@ class Manager:
         planned exits (source session + horizon); entry from now until 15:15 today; contracts whose planned exit is today
         or earlier are skipped. Idempotent per publication (cohort '<id>:owner-convert')."""
         now=(now or datetime.now(IST)).astimezone(IST);lane=publication['lane'];book=self.books[lane]
-        if publication.get('paper_account_id')!=book.account_id or not session_open(now):return 0
+        if publication.get('paper_account_id')!=book.account_id or not session_open(now,lane):return 0
         day=date.fromisoformat(publication['source_session']);rows=publication['watchlist']
         metadata=self.market.metadata(lane,rows);prepared=[];skipped=[]
         with book.db() as db:
@@ -202,7 +207,7 @@ class Manager:
         return keys
 
     def poll(self,now=None):
-        now=(now or datetime.now(IST)).astimezone(IST);opened=session_open(now)
+        now=(now or datetime.now(IST)).astimezone(IST);opened=any(session_open(now,lane) for lane in self.books)
         if opened:
             try:self.last_quotes=self.market.quotes(self.instruments());self.last_error=None
             except Exception as e:self.last_quotes={};self.last_error=f'Market quote request failed: {type(e).__name__}'
@@ -215,12 +220,12 @@ class Manager:
                         self.last_quotes.pop(identity,None);self.last_error='Option identity mismatch; original contract quote required'
         settlement=datetime.combine(next_session(now.date()),time(9,15),IST)
         for book in self.books.values():
-            try:book.cycle(self.last_quotes,now,opened,settlement)
+            try:book.cycle(self.last_quotes,now,session_open(now,book.lane),settlement)
             except Exception as e:self.last_error=f'{book.lane} paper cycle failed: {type(e).__name__}'
         self.last_poll=now.isoformat()
 
     def review_once(self):
-        if not session_open(datetime.now(IST)):return
+        if not any(session_open(datetime.now(IST),lane) for lane in self.books):return
         for lane,book in self.books.items():
             now=datetime.now(IST);orders=book.review_candidates(dict(self.last_quotes),now,limit=10,local=True)
             if not orders:continue

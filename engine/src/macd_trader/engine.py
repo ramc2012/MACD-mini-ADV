@@ -22,6 +22,7 @@ from .tick_store import TickStore
 from .regimes import regime_for
 from .rollover import days_to_expiry, first_tradable, is_futures_symbol, Expiry, is_stock_option, stock_exit_due, stock_last_day
 from .sessions import in_session, market_close, market_open
+from .chain_warmup import chain_candles
 from .candles import CandleAggregator
 from .chart_history import aggregate_session_candles, load_chart_history
 from .config import Settings
@@ -300,6 +301,10 @@ class TradingEngine(DeskMixin):
         self.signals_dropped_stale = 0
         self.last_stale_drop: dict | None = None
         self._selection_date: str | None = None
+        self._contracts_live_since: datetime | None = None
+        self.chain_seeded: dict[str, int] = {}
+        self._last_contract_refresh: datetime | None = None
+        self.contract_refresh_status: dict = {}
         self._auth_validated_date: str | None = None
         self._reconfigure_lock = asyncio.Lock()
         self.contract_selector = ContractSelector(
@@ -805,6 +810,7 @@ class TradingEngine(DeskMixin):
                     + ", ".join(sorted(missing_held))
                 )
             self._selection_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+            self._contracts_live_since = datetime.now(UTC)
             # ITM/OTM legs are market-context inputs only.  They are live-feed
             # subscribers and chart sources, never additions to either paper
             # strategy's entry universe. Held contracts remain manageable.
@@ -902,8 +908,10 @@ class TradingEngine(DeskMixin):
             expiry_by_symbol = {row.symbol: row.expiry for row in contracts}
             history_backfill: list[str] = []
             downloaded: set[str] = set()
+            self.chain_seeded = {}
 
             async def warm(symbol: str) -> None:
+                partial: list[Candle] = []
                 for attempt in range(WARMUP_ATTEMPTS):
                     try:
                         async with load_slots:
@@ -927,6 +935,17 @@ class TradingEngine(DeskMixin):
                         broker_rows = []
                         minute_rows = []
                         needed = self.minimum_warmup_bars()
+                        if len(stored["candles"]) < needed:
+                            # Too few stored bars (a strike chosen around today's price): seed from the option-chain
+                            # marks already on disk before asking the broker, whose history may be switched off.
+                            seeded = await asyncio.to_thread(chain_candles, self.settings.research_database_path,
+                                                             symbol, self.settings.timeframe_seconds)
+                            if seeded:
+                                by_time = {row.timestamp: row for row in seeded}
+                                by_time.update({row.timestamp: row for row in stored["candles"]})
+                                stored["candles"] = [by_time[key] for key in sorted(by_time)]
+                                self.chain_seeded[symbol] = len(seeded)
+                        partial = stored["candles"]
                         if symbol in new_contracts:
                             # The rest of its 90 days follows in the
                             # background once the feed is warm.
@@ -993,9 +1012,11 @@ class TradingEngine(DeskMixin):
                             rate_limited = "429" in str(exc) or "Too Many Requests" in str(exc)
                             delay = WARMUP_RATE_LIMIT_BACKOFF[attempt] if rate_limited else 0.5 * (attempt + 1)
                             await asyncio.sleep(delay)
-                # No broker history was available. Release the symbol with
-                # whatever closed live bars arrived while FYERS was retried.
-                self._finish_symbol_warmup(symbol, [])
+                # No broker history was available. Release the symbol with the
+                # stored / chain-seeded bars it has (short of the full warm-up,
+                # so its indicators mature with each live bar) plus whatever
+                # closed live bars arrived while FYERS was retried.
+                self._finish_symbol_warmup(symbol, partial)
 
             # The blast lane runs on one-minute bars, so it seeds from the
             # stored minute bars rather than this strategy-timeframe replay.
@@ -1022,7 +1043,8 @@ class TradingEngine(DeskMixin):
                 "finished_at": datetime.now(IST).isoformat(timespec="seconds"),
                 "seconds": round(time.monotonic() - warm_started, 1),
                 "symbols": len(warm_symbols), "new_contracts": len(new_contracts & set(warm_symbols)),
-                "downloaded": len(downloaded), "selection": dict(self.contract_selector.selection_source),
+                "downloaded": len(downloaded), "chain_seeded": len(self.chain_seeded),
+                "selection": dict(self.contract_selector.selection_source),
             }
             if downloaded:
                 # The blast lane seeded from the store before these strikes'
@@ -2381,6 +2403,7 @@ class TradingEngine(DeskMixin):
             if self.status != "connected":
                 continue
             if (now.hour, now.minute) < (8, 45) or now.date().isoformat() == self._selection_date:
+                await self._refresh_inactive_contracts(now)
                 continue
             async with self._reconfigure_lock:
                 await self.disconnect_feed()
@@ -2389,6 +2412,49 @@ class TradingEngine(DeskMixin):
                 self.latest_ticks.clear()
                 await self.connect_feed()
                 self.events.publish("snapshot_required", {"reason": "daily_contract_rollover"})
+
+    async def _refresh_inactive_contracts(self, now: datetime) -> dict:
+        """Swap a spot's ladder for one around the live price when its ATM contract is not trading (owner, 28 Oct).
+
+        Runs inside the F&O session window only, at most every contract_refresh_minutes, and only after the feed
+        has been live long enough to judge inactivity. A changed ladder re-runs the same feed reconfiguration the
+        daily rollover uses: held contracts stay subscribed, new ones warm from stored bars and option-chain marks.
+        """
+        every = int(getattr(self.settings, "contract_refresh_minutes", 0) or 0)
+        inactive = int(getattr(self.settings, "contract_inactive_minutes", 15)) * 60
+        local = now.astimezone(IST)
+        if (not every or not fo_session_open(now) or not (9, 45) <= (local.hour, local.minute) <= (14, 30)
+                or self._contracts_live_since is None
+                or (datetime.now(UTC) - self._contracts_live_since).total_seconds() < inactive
+                or (self._last_contract_refresh and (now - self._last_contract_refresh).total_seconds() < every * 60)):
+            return {}
+        self._last_contract_refresh = now
+        spots = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items()
+                 if symbol in set(self.settings.symbols) and tick.ltp > 0}
+        today = local.date()
+        last_trade = {}
+        for symbol, tick in self.latest_ticks.items():
+            at = tick.timestamp if tick.timestamp.tzinfo else tick.timestamp.replace(tzinfo=UTC)
+            if tick.volume > 0 and at.astimezone(IST).date() == today:
+                last_trade[symbol] = at          # Fyers stamps a tick with its last TRADE time when it has one
+        try:
+            changed = await self.contract_selector.refresh(
+                spots, last_trade, now, inactive_seconds=inactive,
+                max_steps=float(getattr(self.settings, "contract_refresh_max_steps", 2.0)))
+        except Exception as exc:  # noqa: BLE001 -- a refresh failure keeps the current ladders
+            self.contract_refresh_status = {"at": local.isoformat(timespec="seconds"), "error": f"{type(exc).__name__}: {exc}"[:300]}
+            return {}
+        self.contract_refresh_status = {"at": local.isoformat(timespec="seconds"), "checked_spots": len(spots),
+                                        "replaced": sorted(changed)}
+        if changed:
+            async with self._reconfigure_lock:
+                await self.disconnect_feed()
+                self.history.clear()
+                self.history_errors.clear()
+                self.latest_ticks.clear()
+                await self.connect_feed()
+            self.events.publish("snapshot_required", {"reason": "contract_refresh", "spots": sorted(changed)})
+        return changed
 
     async def _validate_broker_session(self, today: str | None = None) -> bool:
         """Fail the visible broker state when its read-only auth probe is rejected."""
@@ -2595,6 +2661,13 @@ class TradingEngine(DeskMixin):
                     "rollover": "new ATM contracts selected daily after 08:45 IST; held contracts remain until exit; expiry exit at 15:20 IST",
                     "errors": self.contract_selector.errors,
                     "source": self.contract_selector.selection_source,
+                    "intraday_refresh": {
+                        "every_minutes": getattr(self.settings, "contract_refresh_minutes", 0),
+                        "inactive_minutes": getattr(self.settings, "contract_inactive_minutes", 15),
+                        "max_steps": getattr(self.settings, "contract_refresh_max_steps", 2.0),
+                        "window": "09:45-14:30 IST", "last": self.contract_refresh_status,
+                        "replaced": self.contract_selector.refreshes[-40:],
+                    },
                 },
                 # Last two bars per symbol only — the full series for the
                 # selected chart streams from /api/chart, and shipping 636×500

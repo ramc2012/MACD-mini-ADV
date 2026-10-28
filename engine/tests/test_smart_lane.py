@@ -145,6 +145,20 @@ class TestEntry:
         assert lane.counts["POSITION_LIMIT"] == 1
         assert lane.health()["rules"]["slots"] == 3
 
+    def test_options_enter_until_the_fo_close_at_1540(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(smart_lane, "score", lambda features: 0.5)
+        lane = build(tmp_path)
+        late = datetime(2026, 10, 5, 10, 0, tzinfo=UTC)         # 15:30 IST: after the cash close, inside F&O
+        lane.on_macd_signal(signal(), "CE", {}, now=late - timedelta(seconds=300))
+        lane.execution.set_quote(SYMBOL, 10.0)
+        due(lane, late + timedelta(seconds=20))
+        assert lane.counts == {"TAKEN": 1}
+        other = build(tmp_path / "b")
+        other.on_macd_signal(signal(), "CE", {}, now=late)
+        other.execution.set_quote(SYMBOL, 10.0)
+        due(other, late + timedelta(seconds=620))               # 15:40:20 IST
+        assert other.counts == {"SESSION_CLOSED": 1}
+
     def test_a_missing_quote_waits_up_to_ten_minutes(self, tmp_path, monkeypatch):
         monkeypatch.setattr(smart_lane, "score", lambda features: 0.5)
         lane = build(tmp_path)

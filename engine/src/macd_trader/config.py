@@ -352,6 +352,14 @@ class Settings(BaseSettings):
     # from settlement. 0 restores the previous "anything unexpired" rule.
     # Applies to the ATM option lane and to the desk's futures series alike.
     min_days_to_expiry: int = 1
+    # Owner, 28 Oct 2026: a selected contract that is not trading is replaced by an active one around the live
+    # price. Every contract_refresh_minutes inside 09:45-14:30 IST, a spot whose ATM leg has had no trade for
+    # contract_inactive_minutes, or whose live price sits contract_refresh_max_steps strikes or more from the ATM
+    # strike, gets its ladder selected again from the master and live quotes; the library and feed are updated
+    # and held contracts stay subscribed. 0 minutes turns it off.
+    contract_refresh_minutes: int = Field(default=30, ge=0, le=240)
+    contract_inactive_minutes: int = Field(default=15, ge=1, le=240)
+    contract_refresh_max_steps: float = Field(default=2.0, gt=0, le=20)
     # Stock options leave a series on its last day: this many trading sessions before expiry (T-2 for a
     # Tuesday expiry is the Friday). From that day new risk goes to the next series and anything still held
     # is closed by expiry_flatten_ist (at once if the day has passed). Index options are unaffected. 0 = off.

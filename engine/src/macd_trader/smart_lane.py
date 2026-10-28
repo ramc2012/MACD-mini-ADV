@@ -20,7 +20,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .rollover import stock_exit_due
-from . import market_calendar
+from . import market_calendar, sessions
 from .blast_engine import LaneEvents, OrderOnlyBroker
 from .execution import ExecutionManager
 from .models import Signal, Trade
@@ -481,7 +481,7 @@ class SmartLane:
             return self._record(item, NO_PRICE if item.detail.get('quote_retries') else STALE, now, cut=cut,
                                 detail={'reason': 'Original admission deadline elapsed; no stale fill'})
         local = now.astimezone(IST)
-        if not market_calendar.is_trading_day(local.date()) or not time(9,15) <= local.time() < time(15,30):
+        if not sessions.in_session(symbol, now):          # F&O continuous to 15:40 since Aug 2026 (sessions.py)
             return self._record(item, SESSION_CLOSED, now, cut=cut)
         if symbol not in execution.tradable_symbols or execution.lot_sizes.get(symbol, 0) < 1:
             return self._record(item, NOT_TRADABLE, now, cut=cut)

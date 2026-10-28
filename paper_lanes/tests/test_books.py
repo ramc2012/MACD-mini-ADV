@@ -174,6 +174,8 @@ def test_exact_broker_timestamp_parser_and_closed_market(tmp_path):
     assert m.snapshot('cbe')['status']['state']=='market_closed'
     assert next_session(datetime(2026,10,30).date()).isoformat()=='2026-11-02'
     assert session_open(OPEN) and not session_open(ACT)
+    late=OPEN.replace(hour=15,minute=35)                     # F&O trades to 15:40 since Aug 2026; the cash book stops at 15:30
+    assert session_open(late,'vanguard') and not session_open(late,'cbe') and not session_open(late.replace(minute=40),'vanguard')
 
 
 def test_manager_account_epoch_metadata_horizon_and_restart(tmp_path):

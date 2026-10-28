@@ -39,6 +39,7 @@ class OptionContract:
     lot_size: int = 0
     moneyness: str = "ATM"
     analysis_only: bool = False
+    selected_on: str = ""            # IST day its ladder was chosen; "" for a holding restored from elsewhere
 
 
 def contract_from_row(row: dict) -> OptionContract:
@@ -145,6 +146,11 @@ class ContractSelector:
         # Which path settled each spot on the last build, and why any fell back.
         self.master_errors: dict[str, str] = {}
         self.selection_source: dict = {}
+        # The day this selection was made. Saving the file (a retained holding, an intraday refresh) keeps it, so a
+        # pre-open tick on a held contract can no longer re-date yesterday's ladders as today's (28 Oct 2026: the
+        # whole library had been carried since 26 Oct, centred on stale prices, with the index weeklies expired).
+        self.selection_date: str | None = None
+        self.refreshes: list[dict] = []
 
     def retained_contracts(self, symbols: set[str]) -> list[OptionContract]:
         """Restore open contracts even when their selection day has passed."""
@@ -225,6 +231,7 @@ class ContractSelector:
         retained_by_symbol = {row.symbol: row for row in (retained or [])}
         saved_payload = self._load_today()
         saved_contracts = saved_payload.get("contracts") or []
+        self.refreshes = list(saved_payload.get("refreshes") or [])
         selected = [
             contract_from_row(row)
             for row in saved_contracts
@@ -232,14 +239,15 @@ class ContractSelector:
             and is_tradable(row.get("expiry"), self.min_days_to_expiry, stock=is_stock_spot(str(row.get("spot_symbol") or "")))
         ]
         previously_selected = {row.symbol for row in selected}
-        ladder_roles = {
-            row.spot_symbol: {
-                (row.option_type, row.moneyness)
-                for row in selected
-                if not row.retained
-            }
-            for row in selected
-        }
+        self.selection_date = datetime.now(IST).date().isoformat()
+        # Each spot's OWN ladder: pooling every spot's roles let a spot whose front legs had expired (only its
+        # NEXT- series left) pass as covered and never be selected again.
+        ladder_roles: dict[str, set] = {}
+        today = self.selection_date
+        for row in selected:
+            # A leg chosen today still fills its role once a position in it makes it "retained".
+            if not row.retained or row.selected_on == today:
+                ladder_roles.setdefault(row.spot_symbol, set()).add((row.option_type, row.moneyness))
         required_roles = {(side, role) for side in ("CE", "PE") for role in ("ITM", "ATM", "OTM")}
         next_roles = {(side, NEXT_PREFIX + "ATM") for side in ("CE", "PE")}
         covered = {
@@ -258,7 +266,9 @@ class ContractSelector:
         # ladder. Drop that stale selection before appending its six fresh
         # rows, otherwise the snapshot accumulates duplicate ATM records.
         selected = [row for row in selected if row.spot_symbol in covered]
-        saved = saved_payload.get("spots") or {}
+        # A spot being selected again has no usable ladder, so its saved reference is no better than its old legs:
+        # take a fresh quote. Covered spots keep theirs, so a same-day restart does not move their ladders.
+        saved = {spot: row for spot, row in (saved_payload.get("spots") or {}).items() if spot in covered}
         semaphore = asyncio.Semaphore(1)
 
         async def one(spot_symbol: str) -> list[OptionContract]:
@@ -313,6 +323,9 @@ class ContractSelector:
             "seconds": round(time.monotonic() - started, 1),
             "fallbacks": dict(self.master_errors),
         }
+        for group in groups:
+            for row in group:
+                row.selected_on = self.selection_date
         selected.extend(row for group in groups for row in group)
         selected.extend(row for symbol, row in retained_by_symbol.items() if symbol not in {item.symbol for item in selected})
         # Persist the expensive chain selection before the separate instrument
@@ -485,9 +498,70 @@ class ContractSelector:
                 self.errors[row.symbol] = "Fyers instrument master did not provide a valid lot size; trading is blocked"
 
     def retain(self, symbol: str) -> None:
-        if symbol in self.contracts:
-            self.contracts[symbol].retained = True
+        # Called on every tick of a held contract: write only when the flag changes.
+        row = self.contracts.get(symbol)
+        if row is not None and not row.retained:
+            row.retained = True
             self._save(list(self.contracts.values()))
+
+    async def refresh(self, spot_prices: dict[str, float], last_trade: dict[str, datetime], now: datetime,
+                      inactive_seconds: int = 900, max_steps: float = 2.0) -> dict[str, dict]:
+        """Re-select a spot's ladder when its ATM contract is not trading or spot has left it (owner, 28 Oct 2026).
+
+        A spot qualifies when either ATM leg has had no traded volume for ``inactive_seconds`` or the live spot is
+        ``max_steps`` strikes or more from the ATM strike. Its ladder is then chosen again exactly as the morning
+        one is (instrument master, live quotes for the strikes around the CURRENT spot, side-rounded ATM with the
+        1.5x liquidity tie-break), and replaces the old ladder only if an ATM leg changes. Held contracts stay.
+        Returns {spot: {"reasons": [...], "from": {...}, "to": {...}}} for every replaced ladder.
+        """
+        ladders: dict[str, dict[str, dict[str, OptionContract]]] = {}
+        # Today's ladder legs; a held leg counts too (it is replaced for new entries, and stays subscribed).
+        for row in sorted(self.contracts.values(), key=lambda r: not r.retained):
+            if row.moneyness in ("ITM", "ATM", "OTM") and (not row.retained or row.selected_on == self.selection_date):
+                ladders.setdefault(row.spot_symbol, {}).setdefault(row.option_type, {})[row.moneyness] = row
+        due: dict[str, list[str]] = {}
+        for spot, sides in ladders.items():
+            price = spot_prices.get(spot) or 0.0
+            if price <= 0:
+                continue
+            reasons = []
+            for side, legs in sides.items():
+                atm = legs.get("ATM")
+                if atm is None:
+                    continue
+                traded = last_trade.get(atm.symbol)
+                if traded is None or (now - traded).total_seconds() >= inactive_seconds:
+                    idle = "no trade today" if traded is None else f"no trade for {int((now - traded).total_seconds() // 60)} min"
+                    reasons.append(f"{side} ATM {atm.strike:g} {idle}")
+                steps = [abs(atm.strike - leg.strike) for key, leg in legs.items() if key != "ATM" and leg.strike != atm.strike]
+                step = min(steps) if steps else 0.0
+                if step > 0 and abs(price - atm.strike) >= max_steps * step:
+                    reasons.append(f"{side} ATM {atm.strike:g} is {abs(price - atm.strike) / step:.1f} strikes from spot {price:g}")
+            if reasons:
+                due[spot] = reasons
+        if not due:
+            return {}
+        fresh = await self._select_from_master(sorted(due), {spot: {"selection_price": spot_prices[spot]} for spot in due})
+        changed: dict[str, dict] = {}
+        for spot, rows in fresh.items():
+            old_atm = {side: legs["ATM"].symbol for side, legs in ladders[spot].items() if "ATM" in legs}
+            new_atm = {row.option_type: row.symbol for row in rows if row.moneyness == "ATM"}
+            if new_atm and new_atm != old_atm:
+                changed[spot] = {"reasons": due[spot], "from": old_atm, "to": new_atm, "rows": rows}
+        if not changed:
+            return {}
+        kept = [row for row in self.contracts.values() if row.spot_symbol not in changed or row.retained]
+        kept_symbols = {row.symbol for row in kept}
+        added = [row for item in changed.values() for row in item["rows"] if row.symbol not in kept_symbols]
+        for row in added:
+            row.selected_on = self.selection_date or now.astimezone(IST).date().isoformat()
+        self.contracts = {row.symbol: row for row in [*kept, *added]}
+        self.new_symbols = {row.symbol for row in added}
+        at = now.astimezone(IST).isoformat(timespec="seconds")
+        self.refreshes = [*self.refreshes, *({"at": at, "spot": spot, "reasons": item["reasons"],
+                                               "from": item["from"], "to": item["to"]} for spot, item in changed.items())][-200:]
+        self._save(list(self.contracts.values()))
+        return {spot: {k: v for k, v in item.items() if k != "rows"} for spot, item in changed.items()}
 
     def _load_today(self) -> dict:
         try:
@@ -499,7 +573,7 @@ class ContractSelector:
     def _save(self, rows: list[OptionContract]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "date": datetime.now(IST).date().isoformat(),
+            "date": self.selection_date or datetime.now(IST).date().isoformat(),
             "selected_at": datetime.now(IST).isoformat(),
             # Today's ladder rows set each spot's reference. A held contract
             # carried from an earlier day keeps ITS selection price, and
@@ -511,6 +585,7 @@ class ContractSelector:
                 for row in sorted(rows, key=lambda row: not row.retained)
             },
             "contracts": [asdict(row) for row in rows],
+            "refreshes": self.refreshes,
         }
         self.path.write_text(json.dumps(payload, indent=2))
         self.path.chmod(0o600)
