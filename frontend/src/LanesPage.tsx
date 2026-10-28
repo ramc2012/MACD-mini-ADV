@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import { curvePath, rupees, tone } from "./agentMath";
 import type { Tick } from "./types";
 import { API_TOKEN, API_URL } from "./runtime";
-import {LocalModelPanel} from './LocalModelPanel';
 
 type Stats = { trades: number; wins: number; win_rate: number | null; net: number; gross_profit: number; gross_loss: number; profit_factor: number | null; avg_win: number | null; avg_loss: number | null };
 type Summary = {
@@ -16,6 +15,7 @@ type Position = {
   hold_until: string | null; score: number | null; dispersion: number | null; unrealized_pnl: number;
 };
 type Health = { pending: number; cutoff: number; rolling_scores: number; error: string | null; last_batch_at: string | null;
+  intelligence?:{policy:string;mode:string;qwen_required:boolean;validation:string;last_allocation?:{priority:number;observed_at:string}};
   rules: { entry_delay_seconds: number; skip_fraction: number; ticket_fraction: number; liquidity_share_pct: number;
     macd: { hard: number; act: number; trail: number; target: number | null; hold: number }; blast: { hard: number; act: number; trail: number } | null } };
 type Snapshot = { lane: string; capital: number; portfolio: { cash: number; equity: number; positions: Position[] }; health: Health };
@@ -33,13 +33,12 @@ async function call<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-const TIME = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
-const when = (iso: string | null | undefined) => (iso ? TIME.format(new Date(iso)) : "—");
+const when = (iso: string | null | undefined) => {if(!iso)return '—';const p=Object.fromEntries(new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(iso)).map(x=>[x.type,x.value]));return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second} IST`;};
 const short = (symbol: string) => symbol.replace(/^(NSE|BSE):/, "");
 const percent = (value: number | null | undefined, digits = 1) => value == null || !Number.isFinite(value) ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(digits)}%`;
 const money = (value: number) => `₹${value >= 100_000 ? `${(value / 100_000).toFixed(2)} L` : `${(value / 1000).toFixed(1)}k`}`;
 const label = (lane: string) => lane.replace("smart_", "₹").toUpperCase();
-const DECISIONS = ["", "TAKEN", "QWEN_REJECTED", "QWEN_UNAVAILABLE", "QWEN_STALE", "SKIPPED_LOW_SCORE", "MACD_FADED", "LOT_ABOVE_TICKET", "NO_CASH", "TOO_ILLIQUID", "ALREADY_HELD", "STALE", "NO_PRICE", "NOT_TRADABLE", "ENTRY_REJECTED"];
+const DECISIONS = ["", "TAKEN", "WAITING_PRICE", "NO_PRICE", "SESSION_CLOSED", "QWEN_REJECTED", "QWEN_UNAVAILABLE", "QWEN_STALE", "SKIPPED_LOW_SCORE", "MACD_FADED", "LOT_ABOVE_TICKET", "NO_CASH", "TOO_ILLIQUID", "ALREADY_HELD", "STALE", "NOT_TRADABLE", "ENTRY_REJECTED"];
 
 function LaneCard({ summary, active, curve, onSelect }: { summary: Summary; active: boolean; curve: number[]; onSelect: () => void }) {
   const all = summary.all;
@@ -105,16 +104,17 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
   const positions = snapshot?.portfolio.positions || [];
   return <div className="agent-page lanes-page">
     <div className="agent-head panel-row">
-      <div><b>Smart lanes</b><span className="agent-sub">The research's best rules at two capitals — MACD signals re-checked after {rules ? rules.entry_delay_seconds / 60 : 5} min, ranked (weakest {rules ? Math.round(rules.skip_fraction * 100) : 30}% skipped), sized {rules ? Math.round(rules.ticket_fraction * 100) : 10}% of equity × dispersion; blast-screen passes as a second source</span></div>
+      <div><b>Smart lanes · local intelligence</b><span className="agent-sub">MACD signals · paper only · Qwen independent</span></div>
       {health && <div className="agent-actions">
-        <span className="agent-chip">cut {health.cutoff.toFixed(3)} ({health.rolling_scores} recent scores)</span>
+        <span className="agent-chip">Local ranking · no score veto</span>
         <span className="agent-chip">{health.pending} waiting</span>
         {rules && <span className="agent-chip">MACD: stop {Math.round(rules.macd.hard * 100)}% · trail {Math.round(rules.macd.trail * 100)}% from +{Math.round(rules.macd.act * 100)}% · target +{Math.round((rules.macd.target || 0) * 100)}% · hold {rules.macd.hold} sessions</span>}
         {rules?.blast && <span className="agent-chip">Blast: stop {Math.round(rules.blast.hard * 100)}% · trail {Math.round(rules.blast.trail * 100)}% from +{Math.round(rules.blast.act * 100)}%</span>}
       </div>}
     </div>
-    <LocalModelPanel/>
+    <section className="panel agent-panel" aria-label="Local allocation status"><div className="panel-title">{health?.intelligence?.policy??'Checking allocation policy…'}</div><div className="agent-actions"><span className="agent-chip">{snapshot?`${Math.max(0,(1-snapshot.portfolio.cash/Math.max(1,snapshot.portfolio.equity))*100).toFixed(1)}%`:'—'} capital deployed</span><span className="agent-chip">{health?.pending??0} queued</span><span className="agent-chip">Last batch {when(health?.last_batch_at)}</span></div><details><summary>ⓘ Allocation policy and limits</summary><p>Same MACD BUY signals, rechecked after {rules?rules.entry_delay_seconds/60:5} minutes. Local research rank, current premium MACD, side breadth, fresh spot alignment and existing exposure determine priority. Rank and breadth size whole-lot tickets within {rules?Math.round(rules.ticket_fraction*100):10}% of equity and available cash. Missing quotes retry within the original three-minute admission deadline. No Qwen call is required. Flow is recorded as context, without a directional veto. Existing exits are retained. Priority is a heuristic, not a calibrated profit probability; prospective improvement is unproven.</p></details></section>
     {(error || health?.error) && <div className="agent-error">{error || health?.error}</div>}
+    <small>Retained book history · totals below include earlier policies and do not measure the new allocation policy.</small>
     <div className="lane-cards">{lanes.map((lane) => <LaneCard key={lane.lane} summary={lane} active={lane.lane === selected} curve={curves[lane.lane] || []} onSelect={() => setSelected(lane.lane)} />)}
       {lanes.length === 0 && !error && <div className="agent-empty">No smart lanes configured.</div>}</div>
 
@@ -157,11 +157,11 @@ export function LanesPage({ ticks }: { ticks: Record<string, Tick> }) {
           </div>
           {journal.length === 0 ? <div className="agent-empty">No decisions journalled{day ? ` on ${day}` : ""} yet.</div> :
             <div className="live-table-wrap lane-scroll"><table className="live-table agent-table"><thead><tr>
-              <th>Time</th><th>Source</th><th>Contract</th><th>Decision</th><th>Score / cut</th><th>Size×</th><th>Ticket</th><th>Lots</th><th>Signal → check</th>
+              <th>Time</th><th>Source</th><th>Contract</th><th>Decision</th><th>Priority / research score</th><th>Size×</th><th>Ticket</th><th>Lots</th><th>Signal → check</th>
             </tr></thead><tbody>{journal.map((row) => <tr key={row.id}>
               <td>{when(row.at)}</td><td>{row.source}</td><td>{short(row.symbol)}</td>
               <td className={row.decision === "TAKEN" ? "positive" : ""}>{row.decision.replace(/_/g, " ").toLowerCase()}</td>
-              <td>{row.score == null ? "—" : row.score.toFixed(3)}{row.cutoff != null && <small> / {row.cutoff.toFixed(3)}</small>}</td>
+              <td>{typeof (row.detail.allocation as {priority?:number}|undefined)?.priority==='number'?(row.detail.allocation as {priority:number}).priority.toFixed(3):'—'}<small> / {row.score == null ? '—' : row.score.toFixed(3)}</small><details><summary>ⓘ Inputs</summary><pre>{JSON.stringify(row.detail,null,2)}</pre></details></td>
               <td>{row.dispersion == null ? "—" : row.dispersion.toFixed(2)}</td><td>{row.ticket == null ? "—" : money(row.ticket)}</td><td>{row.lots ?? "—"}</td>
               <td>{row.signal_price?.toFixed(2) ?? "—"}{row.check_price != null && <small> → {row.check_price.toFixed(2)}</small>}</td>
             </tr>)}</tbody></table></div>}

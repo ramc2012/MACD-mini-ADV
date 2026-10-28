@@ -248,14 +248,14 @@ class Settings(BaseSettings):
     blast_journal_max_watchers: int = Field(default=2_000, ge=0, le=50_000)
     blast_database_path: str = str(RUNTIME_DIR / "blast_trader.sqlite3")
 
-    # Smart lanes (smart_lane.py): two paper books running the best rules the
-    # 2 Oct 2026 research found, one per capital in smart_lane_capitals_csv.
+    # Smart lanes: independent paper books, one per capital. No Qwen dependency.
     # MACD-lane signals: re-checked smart_entry_delay_seconds after the cross,
-    # ranked by the exported ranker (weakest smart_skip_fraction skipped),
+    # prioritized locally using research rank and current shared market context,
     # sized at smart_ticket_fraction of equity scaled by dispersion; exits at a
     # 40% stop, a 30% trail from +40%, all out at +100%, staged exits, MACD
     # invalidation and a 4-session hold limit. Blast-screen candidates are the
-    # second source, managed with the blast lane's own stop and trail.
+    # optional second source, disabled by default. smart_skip_fraction is a
+    # historical reference only; weak scores size down rather than veto entries.
     smart_lanes_enabled: bool = True
     # Book profitable index-option positions in the MACD and smart lanes on extreme index moves
     # (extreme_booking.py; research/extreme_moves_20261014).

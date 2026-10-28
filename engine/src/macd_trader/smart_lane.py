@@ -1,30 +1,10 @@
-"""Smart lanes: paper books that trade the best rules the 2 Oct 2026 research found.
+"""Independent paper books consuming MACD BUY signals, without a Qwen dependency.
 
-Where the rules come from
--------------------------
-A signal-level replay of the MACD lane (3,298 signals, 25 Aug - 1 Oct 2026, minute bars,
-current rules, unlimited cash) and a 72-combination lever grid chosen on one half of the
-period and tested on the other. In a cash-limited book over 19 out-of-sample sessions:
-
-* allocation mattered most -- first-come lost Rs 10.9 L of Rs 50 L; ranking signals and
-  skipping the weakest 30% made Rs 38.6 L; sizing the weaker side down by the CE/PE MACD
-  breadth (dispersion) made Rs 63.5 L;
-* entering 5 minutes after the cross, only if MACD is still above zero, removed about a
-  third of the trades -- the crosses that did not hold -- and roughly doubled P&L per trade;
-* wider exits kept the tail that pays for the lane: 40% stop, 30% trail once +40%, all out
-  at +100%, the +30/+50/+75 staged exits, MACD invalidation, a 4-session hold limit.
-  With the allocation above: Rs 86.1 L, max drawdown Rs 10.9 L.
-* small accounts: whole lots, no pyramiding, 10% of equity per position (about ten open);
-  the study's minimum for a sustained profit was about Rs 1 L.
-
-The blast lane contributes its best: candidates that pass its 30-minute screen (premium at
-most 1.2% of spot, own-side breadth >= 50%, at least 25% off the recent high) enter as a
-second source and keep the blast lane's exits (50% stop, 40% trail from +30%, no ladder).
-Its liquidity cap (a share of the contract's own turnover) bounds every entry here.
-
-Two lanes, one per capital (``smart_lane_capitals_csv``), run identical rules so the effect
-of capital alone is visible. Every decision -- taken or why not -- is journalled with the
-inputs it was made on.
+Local allocation combines a retained research ranker with current shared market
+context. Rank/breadth scale tickets; low scores do not veto signals. Existing
+whole-lot, cash, expiry, liquidity and MACD confirmation gates remain. Missing
+quotes retry within the original deadline. Existing source-specific exits and
+books are preserved. Historical research is not proof of prospective edge.
 """
 from __future__ import annotations
 
@@ -47,7 +27,7 @@ from .models import Signal, Trade
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
 from .smart_model import MODEL
-from . import local_model
+from . import smart_intelligence
 
 IST = ZoneInfo("Asia/Kolkata")
 MACD_SOURCE = "macd"
@@ -84,10 +64,12 @@ ENTRY_REJECTED = "ENTRY_REJECTED"
 QWEN_REJECTED = "QWEN_REJECTED"
 QWEN_UNAVAILABLE = "QWEN_UNAVAILABLE"
 QWEN_STALE = "QWEN_STALE"
+WAITING_PRICE = "WAITING_PRICE"
+SESSION_CLOSED = "SESSION_CLOSED"
 
 
 def score(features: dict) -> float:
-    """Probability the signal's position closes in profit, from the exported trees."""
+    """Retained exported research score; calibration and prospective edge are unproven."""
     values = [features.get(name) for name in MODEL["features"]]
     raw = MODEL["baseline"]
     for tree in MODEL["trees"]:
@@ -169,6 +151,7 @@ class Pending:
     score: float | None = None
     features: dict = field(default_factory=dict)
     detail: dict = field(default_factory=dict)
+    retry_at: datetime | None = None
 
 
 class SmartExecutionManager(ExecutionManager):
@@ -282,9 +265,10 @@ class SmartLane:
         self.recent: list[dict] = []
         self.error: str | None = None
         self.last_batch_at: str | None = None
-        self.local_review: dict | None = None
+        self.local_allocation: dict | None = None
         self._macd_confirm = lambda symbol, bucket, price: None
         self._dispersion = lambda: None
+        self._entry_context = lambda item, now: {}
         self._last_equity = 0.0
         self._last_equity_write = -1e9
         self._last_equity_value = float("nan")
@@ -293,6 +277,8 @@ class SmartLane:
     def execution_settings(self, settings):
         """ExecutionManager's fields for this lane: whole-lot entries, no pyramid, no position cap."""
         return settings.model_copy(update={
+            "execution_mode": "paper",
+            "allow_live_orders": False,
             "initial_capital": self.capital,
             "hard_stop_pct": settings.smart_hard_stop_pct,
             "trailing_activation_pct": settings.smart_trail_activation_pct,
@@ -343,6 +329,11 @@ class SmartLane:
         for symbol, position in self.portfolio.positions.items():
             row = excursions.get(position.position_id)
             if row:
+                position.entry_anchor = float(row.get('entry_anchor') or position.entry_anchor or position.average_price)
+                position.entry_stage = int(row.get('entry_stage') or 0)
+                position.exit_stage = int(row.get('exit_stage') or 0)
+                if not position.entry_fees:
+                    position.entry_fees = float(row.get('entry_fees') or 0.)
                 position.max_price = max(position.max_price, float(row["max_price"]))
                 position.min_price = min(position.min_price or float(row["min_price"]), float(row["min_price"]))
                 position.max_return_pct = max(position.max_return_pct, float(row["max_return_pct"]))
@@ -370,11 +361,13 @@ class SmartLane:
             symbol: row.get("expiry") for symbol, row in self._contracts.items()
         })
 
-    def set_resolvers(self, *, macd_confirm=None, dispersion=None) -> None:
+    def set_resolvers(self, *, macd_confirm=None, dispersion=None, entry_context=None) -> None:
         if macd_confirm is not None:
             self._macd_confirm = macd_confirm
         if dispersion is not None:
             self._dispersion = dispersion
+        if entry_context is not None:
+            self._entry_context = entry_context
 
     def held_symbols(self) -> list[str]:
         return [symbol for symbol, position in self.portfolio.positions.items() if position.quantity > 0]
@@ -385,6 +378,12 @@ class SmartLane:
                        now: datetime | None = None) -> None:
         """A MACD-lane BUY: scored now, re-checked smart_entry_delay_seconds later."""
         now = now or datetime.now(UTC)
+        if signal.side != 'BUY' or option_type not in ('CE', 'PE'):
+            return
+        if any(p.source == MACD_SOURCE and p.symbol == signal.symbol and
+               (p.signal.signal_id == signal.signal_id or p.bucket == signal.evaluated_candle_timestamp
+                and p.bucket is not None) for p in self._pending):
+            return
         value = None
         if features:
             try:
@@ -422,23 +421,46 @@ class SmartLane:
     async def step(self, now: datetime | None = None) -> int:
         """Act on every due entry; MACD-sourced ones best-first within the rank window."""
         now = now or datetime.now(UTC)
-        due = [p for p in self._pending if p.due <= now]
+        due = [p for p in self._pending if p.due <= now and (p.retry_at is None or p.retry_at <= now)]
         if not due:
             return 0
         if (now - min(p.due for p in due)).total_seconds() < self.settings.smart_rank_seconds:
             return 0
-        self._pending = [p for p in self._pending if p.due > now]
-        ordered = ([p for p in due if p.source == BLAST_SOURCE]
-                   + sorted((p for p in due if p.source == MACD_SOURCE), key=lambda p: -(p.score or 0.0)))
+        self._pending = [p for p in self._pending if p not in due]
+        for item in due:
+            item.retry_at = None
+            self._allocate(item, now)
+        ordered = sorted(due, key=lambda p: (p.source != MACD_SOURCE,
+            -p.detail['allocation']['priority'], p.created, p.symbol))
         cut = self.cutoff()
         for item in ordered:
             try:
                 await self._decide(item, now, cut)
+                if item.retry_at is not None:
+                    self._pending.append(item)
             except Exception as exc:  # noqa: BLE001 -- one bad entry must not stop the batch
                 self.error = f"{item.symbol}: {type(exc).__name__}: {exc}"[:300]
                 self._record(item, ENTRY_REJECTED, now, cut=cut, detail={"error": str(exc)[:200]})
         self.last_batch_at = now.isoformat()
         return len(ordered)
+
+    def _allocate(self, item: Pending, now: datetime) -> None:
+        """Read shared live context once per attempt; never regenerate a MACD signal/crowd tally."""
+        try:
+            context = self._entry_context(item, now) or {}
+        except Exception as exc:
+            context = {'error': type(exc).__name__}
+        equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
+        underlying = (self._contracts.get(item.symbol) or {}).get('spot_symbol')
+        exposure = sum(p.last_price * p.quantity for symbol, p in self.portfolio.positions.items()
+                       if underlying and (self._contracts.get(symbol) or self.meta.get(symbol) or {}).get('spot_symbol') == underlying)
+        allocation = smart_intelligence.evaluate(
+            research_percentile=score_percentile(item.score, self._scores) if item.score is not None else None,
+            option_type=item.option_type, breadth=self._dispersion(), live=context.get('live'),
+            exposure_fraction=exposure / equity if equity > 0 else 0.)
+        allocation.update(observed_at=now.isoformat(), context=context)
+        item.detail['allocation'] = allocation
+        self.local_allocation = allocation
 
     def _liquidity_lots(self, symbol: str, lot_size: int) -> int | None:
         contract = self._contracts.get(symbol) or {}
@@ -447,19 +469,30 @@ class SmartLane:
             return None
         return int(liquidity * (self.settings.blast_max_volume_share_pct / 100.0) // lot_size)
 
-    async def _decide(self, item: Pending, now: datetime, cut: float, local_review=None) -> None:
+    async def _decide(self, item: Pending, now: datetime, cut: float) -> None:
         symbol = item.symbol
         execution = self.execution
         if symbol in self.portfolio.positions:
             return self._record(item, ALREADY_HELD, now, cut=cut)
         if (now - item.due).total_seconds() > STALE_SECONDS:
-            return self._record(item, STALE, now, cut=cut)
+            return self._record(item, NO_PRICE if item.detail.get('quote_retries') else STALE, now, cut=cut,
+                                detail={'reason': 'Original admission deadline elapsed; no stale fill'})
+        local = now.astimezone(IST)
+        if not market_calendar.is_trading_day(local.date()) or not time(9,15) <= local.time() < time(15,30):
+            return self._record(item, SESSION_CLOSED, now, cut=cut)
         if symbol not in execution.tradable_symbols or execution.lot_sizes.get(symbol, 0) < 1:
             return self._record(item, NOT_TRADABLE, now, cut=cut)
         try:
             price = execution._fresh_price(symbol)
         except RuntimeError:
-            return self._record(item, NO_PRICE, now, cut=cut)
+            item.retry_at = now + timedelta(seconds=5)
+            item.detail['quote_retries'] = item.detail.get('quote_retries', 0) + 1
+            if item.detail['quote_retries'] == 1:
+                self._record(item, WAITING_PRICE, now, cut=cut,
+                             detail={'reason': 'Waiting for a fresh shared quote; original deadline unchanged'})
+            return
+        if 'allocation' not in item.detail:
+            self._allocate(item, now)
         size = 1.0
         if item.source == MACD_SOURCE:
             if self._macd_confirm(symbol, item.bucket, price) is not True:
@@ -471,7 +504,16 @@ class SmartLane:
         else:
             base = size
         lot = execution.lot_sizes[symbol]
-        per_lot = price * lot * (1 + self.settings.slippage_bps / 10_000)
+        # Reserve the larger of adverse LTP slippage and the shared quoted ask.
+        # Budgeting only LTP used to reject otherwise affordable fills at the ask.
+        estimated = price * (1 + self.settings.slippage_bps / 10_000)
+        tick = execution.quote_source(symbol) if execution.quote_source and self.settings.paper_cross_spread else None
+        bid, ask = getattr(tick, 'bid', None), getattr(tick, 'ask', None)
+        if (tick and abs(float(tick.ltp) - price) <= 1e-9 and bid and ask and
+                math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
+            estimated = max(estimated, min(ask, price * (1 + self.settings.paper_max_half_spread_pct / 100)))
+        per_lot = estimated * lot
+        item.detail['estimated_buy_price'] = estimated
         equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
         ticket = self.settings.smart_ticket_fraction * equity * size
         lots = int(min(ticket, self.portfolio.cash) // per_lot)
@@ -486,28 +528,6 @@ class SmartLane:
             decision = TOO_SMALL if per_lot > ticket and self.portfolio.cash >= per_lot else NO_CASH
             return self._record(item, decision, now, price=price, cut=cut, size=size, ticket=ticket,
                                 detail={"one_lot": round(per_lot, 2)})
-        mode,_ = local_model.configuration()
-        if mode != 'off' and local_review is None:
-            try:
-                review=await local_model.review_smart(item,price,execution.last_price_at[symbol])
-                self.local_review=review
-                item.detail['local_review']=review
-            except Exception as exc:
-                self.local_review={'verdict':'unavailable','reason':type(exc).__name__}
-                item.detail['local_review']=self.local_review
-                if mode=='filter':
-                    return self._record(item,QWEN_UNAVAILABLE,datetime.now(UTC),price=price,cut=cut)
-                review={'verdict':'unavailable','reference_price':price}
-            if mode=='filter' and review['verdict']!='approve':
-                return self._record(item,QWEN_REJECTED,datetime.now(UTC),price=price,cut=cut)
-            # Every original gate, cash/lot calculation and quote is checked again after inference.
-            return await self._decide(item,datetime.now(UTC),self.cutoff(),local_review=review)
-        if mode=='filter' and local_review is not None:
-            try:
-                stale=(datetime.fromisoformat(local_review['expires_at'])<=datetime.now(UTC)
-                       or abs(price/local_review['reference_price']-1)>.02)
-            except (KeyError,ValueError,ZeroDivisionError):stale=True
-            if stale:return self._record(item,QWEN_STALE,now,price=price,cut=cut)
         try:
             order = await execution.submit(symbol, "BUY", lots=lots, signal=item.signal)
         except (ValueError, RuntimeError, PermissionError) as exc:
@@ -706,7 +726,12 @@ class SmartLane:
                 "cutoff": round(self.cutoff(), 4), "rolling_scores": len(self._scores),
                 "counts": dict(self.counts), "recent": self.recent[-12:], "error": self.error,
                 "last_batch_at": self.last_batch_at, "open_positions": len(self.held_symbols()),
-                "local_model": {"mode":local_model.configuration()[0],"model":"qwen3.5:9b","last_review":self.local_review},
+                "local_model": {"mode":"off","model":None,"required":False},
+                "intelligence": {"policy":smart_intelligence.VERSION,"mode":"local","qwen_required":False,
+                    "last_allocation":self.local_allocation,"weights":smart_intelligence.WEIGHTS,
+                    "quote_retry_seconds":5,"admission_deadline_seconds":STALE_SECONDS,
+                    "score_cutoff_active":False,"size_policy":"research rank × side breadth; whole lots within ticket and cash",
+                    "validation":"prospective profitability not proven"},
                 "rules": {
                     "entry_delay_seconds": self.settings.smart_entry_delay_seconds,
                     "skip_fraction": self.settings.smart_skip_fraction,

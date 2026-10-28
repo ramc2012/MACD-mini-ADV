@@ -874,7 +874,8 @@ class TradingEngine(DeskMixin):
             for lane in _smart_lanes(self):
                 lane.set_tradable_contracts(tradable)
                 lane.set_contract_context(lane_context)
-                lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point)
+                lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
+                                   entry_context=self._smart_entry_context)
             if getattr(self, "agentic", None) is not None:
                 # The agentic lane may pick any selected index strike or roll to the next expiry.
                 self.agentic.set_index_universe({
@@ -1867,6 +1868,39 @@ class TradingEngine(DeskMixin):
         if indicator is None or not price or price <= 0:
             return None
         return indicator.preview(price).macd > 0
+
+    def _smart_entry_context(self, item, now: datetime) -> dict:
+        """Read existing quotes/indicators/flow; no broker request or signal/crowd recomputation."""
+        from .entry_scorer import NIFTY
+        contract = self.contract_selector.contracts.get(item.symbol)
+        live, sources = {}, {}
+        def tick(symbol):
+            row = self.latest_ticks.get(symbol)
+            age = (now - row.timestamp).total_seconds() if row else None
+            if row and age is not None and 0 <= age <= self.settings.order_quote_max_age_seconds:
+                sources[symbol] = row.timestamp.isoformat()
+                return row
+            return None
+        def ret(a, b):
+            return a / b - 1 if a and b and a > 0 and b > 0 else None
+        option = tick(item.symbol)
+        indicator = self.strategy.indicators.get(item.symbol)
+        if option and indicator:
+            point = indicator.preview(option.ltp)
+            live['macd_pct'] = point.macd / option.ltp
+        if contract:
+            side = 1 if contract.option_type == 'CE' else -1
+            spot, nifty = tick(contract.spot_symbol), tick(NIFTY)
+            opened, _, _ = self.entry_gate.days.get(contract.spot_symbol)
+            for key, value in (
+                ('u_ret_open', ret(spot.ltp, opened) if spot else None),
+                ('u_vwap', ret(spot.ltp, spot.avg_trade_price) if spot else None),
+                ('nifty_ret_prev', ret(nifty.ltp, nifty.prev_close) if nifty else None)):
+                live[key] = side * value if value is not None else None
+        flow = self.entry_flow.context(item.symbol, now=now,
+            use_snapshots=getattr(self.settings, 'entry_flow_source', 'desk') == 'desk')
+        return {'live': live, 'quote_sources': sources, 'observed_at': now.isoformat(),
+                'flow': flow, 'flow_use': 'diagnostic_only; not an entry veto or direction predictor'}
 
     def _entry_features(self, signal, contract) -> dict:
         from .entry_scorer import NIFTY, build_features
