@@ -62,6 +62,7 @@ import EquityChallenger from "./EquityChallenger";
 import ObservationFollowup from "./ObservationFollowup";
 import VanguardPerformance from "./VanguardPerformance";
 import { DecisionFlowTab } from "./DecisionFlow";
+import { LiveDecisionFlow, LiveModels } from "./LiveDecision";
 import { MarketTab } from "./MarketTab";
 import { ResearchTab } from "./ResearchTab";
 import { MpTab } from "./MpTab";
@@ -270,15 +271,25 @@ export default function VanguardDesk() {
             onPickSymbol={openSymbol}
           />
         ))}
+      {activeTab === "decision" && dataScope() === "shadow" && <LiveDecisionFlow />}
       {activeTab === "decision" && (
-        <DecisionFlowTab
-          funnel={funnel.data}
-          selection={selection.data}
-          market={market.data}
-          onPickSymbol={openSymbol}
-        />
+        <details className="mt-4" open={dataScope() === "retained"}>
+          <summary className="cursor-pointer text-xs text-text-secondary">Legacy M6 conviction-gate funnel (historical diagnostic; it no longer chooses the list)</summary>
+          <DecisionFlowTab
+            funnel={funnel.data}
+            selection={selection.data}
+            market={market.data}
+            onPickSymbol={openSymbol}
+          />
+        </details>
       )}
-      {activeTab === "model" && <ModelTab data={model.data} />}
+      {activeTab === "model" && dataScope() === "shadow" && <LiveModels />}
+      {activeTab === "model" && (
+        <details className="mt-4" open={dataScope() === "retained"}>
+          <summary className="cursor-pointer text-xs text-text-secondary">Retired research model (mlp_quantile_v3, trained May–Aug 2026; not used for selection)</summary>
+          <ModelTab data={model.data} />
+        </details>
+      )}
       {activeTab === "followup" && <ObservationFollowup />}
       {activeTab === "performance" && (
         <VanguardPerformance

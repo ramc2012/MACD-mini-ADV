@@ -86,11 +86,70 @@ def legacy_cbe_diagnostic(connection, now):
 
 
 def vanguard(connection, now):
+    day = source_session(now, "vanguard")
+    # A preview of an old session is diagnostic only. The worker never freezes it outside today's window.
+    ranked = rank_bar(connection, datetime.combine(day, time(14, 15), IST), now)
+    if ranked.get("status") == "blocked":
+        return ranked
+    selected = ranked.pop("selected")
+    for key in ("rows", "status", "source_session"):
+        ranked.pop(key, None)
+    for row in selected:
+        row.update(actionable=False, actionable_reason="Fresh paper candidate; current ATM, local review and risk checks required")
+    return dict(status="ok" if selected else "blocked", blockers=[] if selected else ["No eligible exact ATM contracts"],
+                source_session=str(day), policy=POLICIES["vanguard"], watchlist=selected, **ranked,
+                inputs="Inherited M2 flow, M3 regime, M4 sector RS/lead-lag, M5 timing, frozen direction/payoff rankers and shared local-model context",
+                model_status="Research only; no promotion or expected-profit claim")
+
+
+# Decision filter (owner, 28 Oct 2026: "filtered best trade candidates; filtering logical and not too restrictive").
+# Hard filters only where a pick could not be traded as intended; the evidence legs vote, they do not veto one by one
+# (the old M6 chain of flow >= 60 AND sector RS AND regime AND timing ignition left 0 of 213 stocks most days).
+MAX_ATM_DISTANCE = 0.03      # an "ATM" leg further than 3% from spot is not at the money
+MIN_TRADED_LOTS = 2          # lots traded in the session by the decision bar
+EVIDENCE_FLOOR = -2          # dropped only when the evidence, net, argues clearly for the other side
+OWN_SIDE_OI = {"long_buildup": 1, "short_covering": 1, "long_unwind": -1, "short_buildup": -1}
+
+
+def evidence(inputs, side):
+    """Votes (+1 for, -1 against, 0 neutral) of the five inherited legs for buying this side's option."""
+    s = 1 if side == "CE" else -1
+    flow, rs = inputs.get("flow_score"), inputs.get("rs_z20")
+    votes = {
+        "flow": 0 if flow is None else (1 if flow * s >= 20 else -1 if flow * s <= -20 else 0),
+        "sector_rs": 0 if rs is None else (1 if rs * s >= 0.5 else -1 if rs * s <= -0.5 else 0),
+        "own_side_oi": OWN_SIDE_OI.get(inputs.get("ce_state" if side == "CE" else "pe_state"), 0),
+        # GEX regime is not directional: negative gamma lets moves extend (good for a bought option), positive pins.
+        "regime": {"STRONG_NEG": 1, "NEG": 1, "POS": -1, "STRONG_POS": -1}.get(inputs.get("regime"), 0),
+        "timing": 0,
+    }
+    if inputs.get("timing_state") == "IGNITION" and (inputs.get("timing_score") or 0) >= 60 and inputs.get("va_position") is not None:
+        votes["timing"] = 1 if (inputs["va_position"] - 0.5) * s > 0 else -1
+    return votes, sum(votes.values())
+
+
+def screen(row, inputs, spot):
+    votes, net = evidence(inputs, row["option_type"])
+    distance = abs(float(row["strike"]) / spot - 1) if spot else None
+    lots = (row.get("option_volume") or 0) / max(1, int(row.get("lot_size") or 1))
+    reasons = []
+    if distance is None or distance > MAX_ATM_DISTANCE:
+        reasons.append("strike %s is %.1f%% from spot: not at the money" % (row["strike"], (distance or 0) * 100))
+    if lots < MIN_TRADED_LOTS:
+        reasons.append("only %.1f lots traded by the decision bar" % lots)
+    if net <= EVIDENCE_FLOOR:
+        against = [k for k, v in votes.items() if v < 0]
+        reasons.append("evidence against this side (net %+d: %s)" % (net, ", ".join(against)))
+    row.update(evidence=votes, evidence_net=net, atm_distance=distance, traded_lots=round(lots, 1),
+               filter_reasons=reasons, filtered=bool(reasons))
+    return row
+
+
+def rank_bar(connection, bar, now):
+    """Every exact ATM candidate at ``bar``, screened and ranked, with the stage counts that explain the list."""
     from fusion.m6_select import evaluate_bar, funnel_counts
     from model import preclose_swing as swing
-    day = source_session(now, "vanguard")
-    bar = datetime.combine(day, time(14, 15), IST)
-    # A preview of an old session is diagnostic only. The worker never freezes it outside today's window.
+    day = bar.astimezone(IST).date()
     with connection.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("SELECT symbol FROM fo_underlying_catalog WHERE kind='STOCK' AND fno_active IS TRUE ORDER BY symbol")
         universe = [r["symbol"] for r in cur.fetchall()]
@@ -102,8 +161,8 @@ def vanguard(connection, now):
         spots = {r["underlying"]: r for r in cur.fetchall()}
     expected = len(universe)
     if expected < 10 or len(spots) < .8 * expected:
-        return blocked("vanguard", day, "14:15 broker spot-bar breadth below 80% of the active catalog",
-                       expected=expected, current_complete=len(spots))
+        return blocked("vanguard", day, "Broker spot-bar breadth below 80% of the active catalog at %s" % bar.strftime("%H:%M"),
+                       expected=expected, current_complete=len(spots), bar=bar.isoformat())
     direction, payoff = swing._model(connection, "direction"), swing._model(connection, "contract")
     if direction is None or payoff is None:
         return blocked("vanguard", day, "Both inherited direction and option-payoff model artifacts are required")
@@ -115,7 +174,8 @@ def vanguard(connection, now):
              and e.inputs["rs_age_sessions"] <= 3 and e.inputs.get("regime_age_bars") is not None
              and e.inputs["regime_age_bars"] <= 1 and (e.inputs.get("flow_n_ingredients") or 0) >= 2]
     diagnostics = {"expected": expected, "current_complete": len(spots), "fresh_feature_symbols": len(fresh),
-                   "funnel": funnel_counts(evaluations), "direction_model": direction.version, "contract_model": payoff.version}
+                   "funnel": funnel_counts(evaluations), "direction_model": direction.version, "contract_model": payoff.version,
+                   "bar": bar.isoformat()}
     if len(fresh) < .8 * expected:
         return blocked("vanguard", day, "Flow/sector/regime/timing inputs do not cover 80% with current-session freshness", **diagnostics)
     inputs = [{**e.inputs, "symbol": e.symbol, "ts": e.ts, "sector20": e.sector20,
@@ -124,20 +184,84 @@ def vanguard(connection, now):
     if coverage.get("universe_rows", 0) < swing.MIN_UNIVERSE_ROWS:
         return blocked("vanguard", day, "Exact-contract chain universe is too thin to rank", **diagnostics, chain=coverage)
     # The maintained paper lane trades ATM only, with one direction per stock.
-    # The retained research selector may still compare wings and both sides.
     from .contracts import verify_candidates
-    candidates=verify_candidates(candidates)
-    selected = select_atm(swing.performer_candidates(candidates))
-    by_symbol={e.symbol:e for e in fresh}
-    for row in selected:
-        evaluation=by_symbol[row['symbol']]
-        row.update(sector20=evaluation.sector20,conviction=evaluation.conviction,
-                   underlying_signal_close=float(spots[row['symbol']]['close']))
-        row.update(actionable=False, actionable_reason="Fresh paper candidate; current ATM, local review and risk checks required")
-    return dict(status="ok" if selected else "blocked", blockers=[] if selected else ["No eligible exact ATM contracts"],
-                source_session=str(day), policy=POLICIES["vanguard"], watchlist=selected, **diagnostics, chain=coverage,
-                inputs="Inherited M2 flow, M3 regime, M4 sector RS/lead-lag, M5 timing, frozen direction/payoff rankers and shared local-model context",
-                model_status="Research only; no promotion or expected-profit claim")
+    by_symbol = {e.symbol: e for e in fresh}
+    best = {}
+    for row in swing.performer_candidates(verify_candidates(candidates)):
+        if row.get("contract_kind") != "ATM":
+            continue
+        key = (row["symbol"], row["option_type"])
+        if key not in best or (row["combined_score"], row["direction_score"]) > (best[key]["combined_score"], best[key]["direction_score"]):
+            best[key] = row
+    rows = []
+    for row in best.values():
+        evaluation = by_symbol[row["symbol"]]
+        spot = float(spots[row["symbol"]]["close"])
+        row.update(sector20=evaluation.sector20, conviction=evaluation.conviction, underlying_signal_close=spot)
+        rows.append(screen(row, evaluation.inputs, spot))
+    selected = select_atm([r for r in rows if not r["filtered"]])
+    chosen = {(r["symbol"], r["option_type"]) for r in selected}
+    for row in rows:
+        row["selected"] = (row["symbol"], row["option_type"]) in chosen
+    rows.sort(key=lambda r: (r["filtered"], -r["combined_score"], -r["evidence_net"], r["symbol"]))
+    sides = {side: [r for r in rows if r["option_type"] == side] for side in ("CE", "PE")}
+    stages = [
+        {"stage": "F&O stocks in the active catalog", "surviving": expected},
+        {"stage": "spot bar at the decision bar", "surviving": len(spots)},
+        {"stage": "flow, sector, regime and timing inputs fresh", "surviving": len(fresh)},
+        {"stage": "exact ATM contract on the chain (stocks: CE / PE)", "surviving": len({r["symbol"] for r in rows}),
+         "ce": len(sides["CE"]), "pe": len(sides["PE"])},
+        {"stage": "really at the money (within %d%% of spot)" % round(MAX_ATM_DISTANCE * 100),
+         "ce": sum(1 for r in sides["CE"] if r["atm_distance"] is not None and r["atm_distance"] <= MAX_ATM_DISTANCE),
+         "pe": sum(1 for r in sides["PE"] if r["atm_distance"] is not None and r["atm_distance"] <= MAX_ATM_DISTANCE)},
+        {"stage": "traded at least %d lots" % MIN_TRADED_LOTS,
+         "ce": sum(1 for r in sides["CE"] if r["traded_lots"] >= MIN_TRADED_LOTS),
+         "pe": sum(1 for r in sides["PE"] if r["traded_lots"] >= MIN_TRADED_LOTS)},
+        {"stage": "evidence not clearly against (net > %d)" % EVIDENCE_FLOOR,
+         "ce": sum(1 for r in sides["CE"] if r["evidence_net"] > EVIDENCE_FLOOR),
+         "pe": sum(1 for r in sides["PE"] if r["evidence_net"] > EVIDENCE_FLOOR)},
+        {"stage": "pass every filter", "ce": sum(1 for r in sides["CE"] if not r["filtered"]),
+         "pe": sum(1 for r in sides["PE"] if not r["filtered"])},
+        {"stage": "selected: best %d per side by the payoff ranker" % PER_SIDE,
+         "ce": sum(1 for r in selected if r["option_type"] == "CE"), "pe": sum(1 for r in selected if r["option_type"] == "PE")},
+    ]
+    return dict(status="ok", source_session=str(day), **diagnostics, chain=coverage, stages=stages,
+                filters={"max_atm_distance": MAX_ATM_DISTANCE, "min_traded_lots": MIN_TRADED_LOTS, "evidence_floor": EVIDENCE_FLOOR},
+                rows=rows, selected=selected)
+
+
+def latest_bar(connection, now):
+    """The newest 30-minute spot bar that has closed by ``now`` (bars are stamped with their start)."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT max(time) FROM underlying_spot_candles WHERE interval='30minute' AND time <= %s",
+                    (now - timedelta(minutes=30),))
+        row = cur.fetchone()
+    return row[0].astimezone(IST) if row and row[0] else None
+
+
+def ranker_models(connection):
+    """The direction and option-payoff rankers the lane uses, with their training windows and stored metrics."""
+    with connection.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""SELECT DISTINCT ON (role) version,role,family,status,training_start,training_end,validation_start,
+                         validation_end,test_start,test_end,n_train,n_validation,n_test,metrics,created_at,
+                         cardinality(feature_names) features
+                       FROM vanguard_rank_model_versions WHERE status IN ('paper_active','shadow')
+                       ORDER BY role,(status='paper_active') DESC,created_at DESC""")
+        return [dict(r) for r in cur.fetchall()]
+
+
+def decision_view(connection, now, bar=None):
+    """Decision flow for the latest closed bar: every exact ATM candidate screened, ranked and explained."""
+    bar = bar or latest_bar(connection, now)
+    if bar is None:
+        return blocked("vanguard", now.date(), "No closed 30-minute spot bar stored yet")
+    ranked = rank_bar(connection, bar, now)
+    ranked["models"] = ranker_models(connection)
+    ranked["as_of"] = now.isoformat()
+    ranked["decision_bar"] = bar.isoformat()
+    ranked["list_bar"] = "14:15 IST (the 14:47 list); this view re-runs the same ranking on the latest closed bar"
+    ranked.pop("selected", None)
+    return ranked
 
 
 PER_SIDE = 10      # owner, 28 Oct 2026: 10 CE and 10 PE every day, whatever is already held
@@ -146,7 +270,7 @@ HOLD_SESSIONS = 3  # each pick is held up to 3 sessions or until its stop, and m
 
 def select_atm(candidates, per_side=PER_SIDE):
     ranked = sorted([r for r in candidates if r.get('contract_kind')=='ATM'],
-                    key=lambda r:(-r['combined_score'],-r['direction_score'],-r['contract_score'],r['symbol'],r['option_type']))
+                    key=lambda r:(-r['combined_score'],-r.get('evidence_net',0),-r['direction_score'],-r['contract_score'],r['symbol'],r['option_type']))
     selected=[];seen=set();count={'CE':0,'PE':0}
     for row in ranked:
         side=row.get('option_type')

@@ -74,3 +74,18 @@ def test_atm_selection_fills_ten_calls_and_ten_puts():
     assert all(r['horizon_sessions']==3 for r in selected)
     assert {r['model_horizon_sessions'] for r in selected}=={1,2}
     assert [r['side_rank'] for r in selected if r['option_type']=='PE']==list(range(1,11))
+
+
+def test_evidence_votes_and_the_screen_drop_only_untradable_or_clearly_opposed_picks():
+    bullish={'flow_score':45,'rs_z20':1.2,'ce_state':'long_buildup','pe_state':'long_unwind','regime':'NEG',
+             'timing_state':'IGNITION','timing_score':72,'va_position':0.8}
+    votes,net=source.evidence(bullish,'CE')
+    assert votes=={'flow':1,'sector_rs':1,'own_side_oi':1,'regime':1,'timing':1} and net==5
+    assert source.evidence(bullish,'PE')[1]==-3          # the same tape argues against buying the put
+    quiet={'flow_score':5,'rs_z20':0.1,'regime':'NEUTRAL','timing_state':'BALANCED'}
+    assert source.evidence(quiet,'PE')==({'flow':0,'sector_rs':0,'own_side_oi':0,'regime':0,'timing':0},0)
+    row=lambda **kw:{'option_type':'CE','strike':100,'option_volume':5000,'lot_size':1000,**kw}
+    assert not source.screen(row(),quiet,101)['filtered']                      # neutral evidence still passes
+    assert 'not at the money' in source.screen(row(strike=110),quiet,100)['filter_reasons'][0]
+    assert 'lots traded' in source.screen(row(option_volume=1000),quiet,100)['filter_reasons'][0]
+    assert 'evidence against' in source.screen(row(option_type='PE'),bullish,100)['filter_reasons'][0]

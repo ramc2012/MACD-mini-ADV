@@ -564,17 +564,17 @@ def _smart_lane(name: str):
     return lane
 
 
-async def _shadow_lane_read(lane: str, archive: bool = False):
+async def _shadow_lane_read(lane: str, archive: bool = False, view: str = ""):
     """Read the isolated shadow process; no execution or arbitrary upstream path can be proxied."""
-    if lane not in ("vanguard", "cbe"):
+    if lane not in ("vanguard", "cbe") or view not in ("", "decision"):
         raise HTTPException(404, "Unknown shadow lane")
     url = os.environ.get("MACD_SHADOW_LANES_URL", "").rstrip("/")
     if not url:
         raise HTTPException(503, "Shadow lanes are not configured")
     import httpx
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(f"{url}/api/shadow-lanes/{lane}" + ("/archive" if archive else ""),
+        async with httpx.AsyncClient(timeout=60 if view else 15) as client:
+            response = await client.get(f"{url}/api/shadow-lanes/{lane}" + ("/archive" if archive else f"/{view}" if view else ""),
                 headers={"X-Macd-Token": engine.settings.api_token} if engine.settings.api_token else {})
             response.raise_for_status()
             return response.json()
@@ -585,6 +585,11 @@ async def _shadow_lane_read(lane: str, archive: bool = False):
 @app.get("/api/shadow-lanes/{lane}", dependencies=[Depends(authorize)])
 async def shadow_lane_snapshot(lane: str):
     return await _shadow_lane_read(lane)
+
+
+@app.get("/api/shadow-lanes/vanguard/decision", dependencies=[Depends(authorize)])
+async def shadow_lane_vanguard_decision():
+    return await _shadow_lane_read("vanguard", view="decision")
 
 
 @app.get("/api/shadow-lanes/{lane}/archive", dependencies=[Depends(authorize)])

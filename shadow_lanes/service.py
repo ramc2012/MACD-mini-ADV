@@ -253,6 +253,25 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
         paper.books[lane].control(body['action']=='pause',datetime.now(source.IST))
         return {'ok':True,'paused':body['action']=='pause','exits_remain_managed':True}
 
+    decision_cache = {}
+
+    @api.get("/api/shadow-lanes/vanguard/decision", dependencies=[Depends(authorize)])
+    def vanguard_decision():
+        # Owner, 28 Oct 2026: the decision flow should show the filtered best candidates for the current market.
+        # The same ranking and screen as the 14:47 list, re-run on the newest closed bar; cached for a minute.
+        now = datetime.now(source.IST)
+        hit = decision_cache.get("view")
+        if hit and (now - hit[0]).total_seconds() < 60:
+            return hit[1]
+        connection = source.connect(readonly=True)
+        try:
+            view = source.decision_view(connection, now)
+        finally:
+            connection.close()
+        view = json.loads(json.dumps(view, default=str))
+        decision_cache["view"] = (now, view)
+        return view
+
     @api.get("/api/shadow-lanes/{lane}", dependencies=[Depends(authorize)])
     def snapshot(lane: str):
         if lane not in LANES:

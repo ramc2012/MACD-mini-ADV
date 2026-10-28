@@ -29,4 +29,4 @@ def test_default_universe_covers_current_stock_derivatives():
     assert {"ATHERENERG", "MAHABANK", "SAGILITY"} <= set(FNO_STOCKS)
     assert "DALBHARAT" not in FNO_STOCKS
     assert set(Settings(symbols_csv="").symbols) == set(INDEX_SPOTS.values()) | set(STOCK_SPOTS.values())
-    assert len(Settings(symbols_csv="").symbols) == 214
+    assert len(Settings(symbols_csv="").symbols) == 217          # 210 stocks + 7 derivative indices (28 Oct 2026)

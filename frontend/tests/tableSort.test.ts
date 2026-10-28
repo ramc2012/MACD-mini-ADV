@@ -16,3 +16,7 @@ test('IST timestamps sort chronologically and blanks stay last both ways',()=>{
 test('text sorts naturally, case-insensitively',()=>{
  assert.deepEqual(order(['sbin · PE','RELIANCE · CE','KEI 10 CE','KEI 9 CE']),['KEI 9 CE','KEI 10 CE','RELIANCE · CE','sbin · PE']);
 });
+test('a rupee change with its percentage sorts by the percentage',()=>{
+ assert.deepEqual(order(['-765.00 (-2.21%)','-210.40 (-6.28%)','+25.40 (+1.94%)','−440.00 (−4.04%)']),
+  ['-210.40 (-6.28%)','−440.00 (−4.04%)','-765.00 (-2.21%)','+25.40 (+1.94%)']);
+});

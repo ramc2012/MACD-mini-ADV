@@ -7,6 +7,9 @@ export function sortKey(raw: string): SortKey {
   const text = raw.replace(/\s+/g, ' ').trim();
   if (BLANK.test(text)) return {kind: 3, num: 0, text: ''};
   if (/^\d{4}-\d{2}-\d{2}/.test(text)) return {kind: 1, num: 0, text};
+  // "−765.00 (−2.21%)": a rupee move with its percentage sorts by the percentage, which compares across prices.
+  const share = text.replace(/[,\s]/g, '').replace(/−/g, '-').match(/\(([+-]?\d+(?:\.\d+)?)%\)/);
+  if (share) return {kind: 0, num: Number(share[1]), text};
   const m = text.replace(/[₹,]/g, '').replace(/−/g, '-').match(/^[#(]?\s*([+-]?\s*\d+(?:\.\d+)?)/);
   if (m) {
     const n = Number(m[1].replace(/\s/g, ''));

@@ -11,6 +11,10 @@ INDEX_SPOTS = {
     "SENSEX": "BSE:SENSEX-INDEX",
     "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
     "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
+    # Owner, 28 Oct 2026: the remaining derivative indices.
+    "FINNIFTY": "NSE:FINNIFTY-INDEX",
+    "NIFTYNXT50": "NSE:NIFTYNXT50-INDEX",
+    "BANKEX": "BSE:BANKEX-INDEX",
 }
 
 FNO_STOCKS = tuple("""
