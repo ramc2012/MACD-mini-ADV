@@ -18,7 +18,7 @@ type Metric = { test_days: number; excess: number | null; ce_excess: number | nu
 type Model = { version: number; trained_at: string; config: { name: string }; train_from: string; train_to: string; samples: number; status: string; note: string; metrics: Record<string, Metric>; weights: Record<string, number> & { rule?: string[] } };
 type Models = { models: Model[]; index_models?: IndexModel[]; constants: { as_of: string; top_n: number; min_premium: number; min_turnover: number; max_moneyness: number; validation_days: number; promote_margin: number } };
 type IndexTrade = {
-  prediction_kind?: "scorecard" | "return";
+  prediction_kind?: "scorecard" | "return" | "rule_score";
   underlying: string; side: number; symbol: string | null; strike: number | null; expiry: string | null; entry_price: number | null;
   predicted: number | null; conviction: number | null; spot: number | null; atr: number | null; stop_spot: number | null; target_spot: number | null;
   premium_stop: number | null; premium_target: number | null; iv: number | null; lot: number | null; drivers: [string, number][];
@@ -153,6 +153,7 @@ export function AgentPage({ ticks = {} }: { ticks?: Ticks }) {
         </div>
         {run && <span className="agent-chip">{run.day} · run #{run.run_id} · {run.candidates.toLocaleString("en-IN")} candidates · {run.model_version != null ? `model v${run.model_version}` : "no stored model"} · {run.source}</span>}
         {champion && <span className="agent-chip">champion v{champion.version} {champion.config.name}</span>}
+        {!champion&&models?.models.some(m=>m.status==='baseline')&&<span className="agent-chip">Local paper baseline · untrained</span>}
         <button disabled={!!busy} onClick={() => void act("emit", "/api/agent/run")}>{busy === "emit" ? "Emitting…" : "Emit now"}</button>
         <button disabled={!!busy} onClick={() => void act("train", "/api/agent/train")}>{busy === "train" ? "Training…" : "Retrain"}</button>
       </div>
@@ -183,7 +184,7 @@ function PickTable({ title, rows, ticks, emitAt }: { title: string; rows: Pick[]
   const liveCount = rows.filter((p) => ticks[p.symbol]?.ltp).length;
   return <section className="panel agent-panel">
     <div className="panel-title">{title}{rows.length > 0 && <span className="agent-live-count">{liveCount}/{rows.length} live</span>}</div>
-    {!rows.length ? <div className="agent-empty">No picks yet — the first emission comes at {emitAt ?? "14:45:15"} once a model is trained.</div> :
+    {!rows.length ? <div className="agent-empty">Awaiting fresh candidates at {emitAt ?? "14:47:00"}. A local paper baseline can collect observations before a trained model is available.</div> :
       <div className="live-table-wrap"><table className="live-table agent-table">
         <thead><tr><th>#</th><th>Contract</th><th>Entry</th><th>LTP</th><th>Chg</th><th>Since entry</th><th title="Profit or loss for one lot at the current price">₹ / lot</th><th>D+1</th><th>D+2</th><th>D+3</th><th>Best / worst</th><th title="Volatility-sized: a one-sigma day moves the position about ₹1,500">Size</th><th>Why</th></tr></thead>
         <tbody>{rows.map((p) => { const mark = markOf(ticks, p.symbol, p.last_price); const m = sinceEntry(p.entry_price, mark.ltp, p.size?.lot_size); return <tr key={p.symbol}>
@@ -240,7 +241,7 @@ function ModelsPanel({ models, status }: { models?: Models; status?: Status }) {
     ? Object.entries(champion.weights).sort((a, b) => Math.abs(b[1] as number) - Math.abs(a[1] as number)).slice(0, 8) : [];
   return <section className="panel agent-panel">
     <div className="panel-title">Learning loop — walk-forward validation, champion / challenger</div>
-    {latest && <p className="agent-note">Last judged {latest.trained_at.slice(0, 16).replace("T", " ")} UTC on {configs[0]?.[1].test_days ?? 0} held-out sessions (train {latest.train_from} → {latest.train_to}, {latest.samples.toLocaleString("en-IN")} labelled contracts). A challenger replaces the champion only when it beats it by {((models?.constants.promote_margin ?? 0) * 100).toFixed(1)} pts of excess return. {latest.note}</p>}
+    {latest && <p className="agent-note">{latest.status==='baseline'?'Untrained cold-start paper baseline. No held-out performance or calibrated profit forecast.':`Judged on ${configs[0]?.[1].test_days??0} held-out sessions (${latest.samples.toLocaleString('en-IN')} labelled contracts).`} A challenger replaces the champion only when it beats it by {((models?.constants.promote_margin ?? 0) * 100).toFixed(1)} pts of excess return. {latest.note}</p>}
     <div className="live-table-wrap"><table className="live-table">
       <thead><tr><th>Config</th><th>Excess</th><th>CE excess (t)</th><th>PE excess (t)</th><th>IC CE / PE</th><th>Top-quintile CE / PE</th></tr></thead>
       <tbody>{configs.map(([name, m]) => <tr key={name} className={champion?.config.name === name ? "agent-champion" : ""}>

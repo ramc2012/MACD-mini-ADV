@@ -90,6 +90,6 @@ def test_new_cbe_cohort_flows_into_only_its_new_account(tmp_path,monkeypatch):
     worker.check(now);worker.check(now)
     pub=store.publications('cbe')[0]
     assert pub['paper_account_id']==m.books['cbe'].account_id
-    assert 'fresh next-session Qwen' in pub['watchlist'][0]['actionable_reason']
+    assert 'fresh next-session local review' in pub['watchlist'][0]['actionable_reason']
     assert len(m.snapshot('cbe')['orders'])==1 and not m.snapshot('vanguard')['orders']
     assert not m.snapshot('cbe')['fills'] and pub['shadow_only'] # selection journal is not an execution journal

@@ -344,7 +344,7 @@ export default function CbeDesk() {
   return (
     <DeskShell
       title="CBE Paper Trader"
-      description={isShadow ? "Daily long-only cash-equity paper trading · Qwen-reviewed entries, cash accounting and managed exits." : "Retained Nomad CBE account · recorded positions and history, read only."}
+      description={isShadow ? "Daily long-only cash-equity paper trading · Locally reviewed entries, cash accounting and managed exits." : "Retained Nomad CBE account · recorded positions and history, read only."}
       asOf={scan?.source_as_of ?? scan?.created_at ?? scan?.scan_date ?? undefined}
       asOfLabel={isShadow ? "completed daily session" : "Updated"}
       // CBE scans land once per session (EOD alpha-engine pass) — freshness

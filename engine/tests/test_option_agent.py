@@ -478,6 +478,51 @@ def _capture_candidate(day, premium):
             "entry_price": premium, "features": features}
 
 
+def test_cold_start_captures_fresh_candidates_without_a_trained_champion(tmp_path,monkeypatch):
+    from macd_trader import index_trades
+    day='2026-09-18';h=sqlite3.connect(tmp_path/'cold-start.sqlite3')
+    class Clock(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            t=datetime(2026,9,18,14,47,tzinfo=oa.IST)
+            return t.astimezone(tz) if tz else t.replace(tzinfo=None)
+    monkeypatch.setattr(oa,'datetime',Clock)
+    oa.ensure_schema(h)
+    monkeypatch.setattr(oa,'train',lambda *a,**kw:pytest.fail('Live cold start must not block on training'))
+    monkeypatch.setattr(oa,'trading_days',lambda *a:[day])
+    monkeypatch.setattr(oa,'prepare',lambda *a:oa.History())
+    monkeypatch.setattr(oa,'summarise_day',lambda *a,**kw:{})
+    monkeypatch.setattr(oa,'build_candidates',lambda *a:[_capture_candidate(day,10)])
+    monkeypatch.setattr(index_trades,'emit',lambda *a,**kw:[])
+    r=oa.emit(h,day,source='scheduled')
+    assert r['status']=='emitted' and r['ce']
+    assert h.execute("select count(*) from agent_models where status='baseline' and samples=0").fetchone()[0]==1
+    assert oa.active_model(h)==(None,None,None)
+    assert h.execute('select count(*) from agent_candidates where y is null').fetchone()[0]==1
+    assert oa.emit(h,day,source='scheduled')['status']=='already_emitted'
+    assert h.execute('select count(*) from agent_runs').fetchone()[0]==1
+    h.close()
+
+
+def test_cold_start_after_the_window_does_not_create_a_retrospective_run(tmp_path,monkeypatch):
+    h=sqlite3.connect(tmp_path/'missed-window.sqlite3')
+    monkeypatch.setattr(oa,'train',lambda *a,**kw:pytest.fail('No historical training in live admission'))
+    out=oa.emit(h,'2026-09-18',source='scheduled')
+    assert out['status']=='awaiting_live_window'
+    assert h.execute('select count(*) from agent_runs').fetchone()[0]==0
+    assert h.execute('select count(*) from agent_picks').fetchone()[0]==0
+    h.close()
+
+
+def test_index_cold_start_baseline_is_not_a_trained_champion(tmp_path):
+    from macd_trader import index_trades
+    h=sqlite3.connect(tmp_path/'index-baseline.sqlite3')
+    a=index_trades.baseline_model(h);b=index_trades.baseline_model(h)
+    assert a==b and a[1]['rule']=='trend' and index_trades.active_model(h)==(None,None,None)
+    assert h.execute('select samples,status from agent_index_models').fetchone()==(0,'baseline')
+    h.close()
+
+
 def _stub_capture_context(monkeypatch, day):
     from macd_trader import index_trades
     monkeypatch.setattr(oa, "active_model", lambda _h: (1, {"rule": True, "features": ["u_ret_1d", "o_ret_intraday"]}, "momentum-rule"))

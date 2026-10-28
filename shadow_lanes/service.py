@@ -53,10 +53,8 @@ class ShadowWorker:
                 result = getattr(source, lane)(connection, now)
                 if lane == "vanguard" and self.feature_error:
                     result.update(status="blocked", blockers=[f"Market feature refresh failed: {self.feature_error}"], watchlist=[])
-                if self.paper and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='filter':
-                    result.update(status='blocked',blockers=['Paper cohorts require Qwen filter mode'],watchlist=[])
                 # Vanguard paper candidates go straight to their SAME-session
-                # entry queue. One Qwen review uses the fresh executable quote;
+                # entry queue. One local review uses the fresh executable quote;
                 # a second planning pass would consume the short entry window.
                 needs_plan_review=lane=='vanguard' and not self.paper
                 if needs_plan_review and not diagnostic and result.get('status')=='ok' and os.environ.get('LOCAL_DECISION_MODE','off')!='off':
@@ -69,7 +67,7 @@ class ShadowWorker:
                 if self.paper:
                     result['paper_account_id']=self.paper.books[lane].account_id
                     result['policy']=result.get('policy',source.POLICIES[lane])+'-paper-candidates-v1'
-                    result['watchlist']=[{**row,'actionable':False,'actionable_reason':('Same-session ATM paper candidate; fresh Qwen, spot, quote and risk checks required' if lane=='vanguard' else 'Paper candidate only; fresh next-session Qwen, quote and risk checks required')} for row in result.get('watchlist',[])]
+                    result['watchlist']=[{**row,'actionable':False,'actionable_reason':('Same-session ATM paper candidate; fresh local review, spot, quote and risk checks required' if lane=='vanguard' else 'Paper candidate only; fresh next-session local review, quote and risk checks required')} for row in result.get('watchlist',[])]
                 result.update(shadow_only=True, execution_enabled=False, diagnostic=diagnostic)
                 result.pop('results',None)
                 self.store.status(lane, now.isoformat(), result)

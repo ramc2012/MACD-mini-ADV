@@ -41,3 +41,8 @@ test("the live mark reads against the entry, per lot where the lot is known", as
   assert.deepEqual(sinceEntry(null, 90), { points: null, fraction: null, perLot: null });
   assert.deepEqual(sinceEntry(100, 0), { points: null, fraction: null, perLot: null });
 });
+
+test('cold-start trend scores are not displayed as expected option returns',async()=>{
+ const {indexPrediction}=await import('../src/agentMath.ts');
+ assert.deepEqual(indexPrediction('rule_score',.04),{label:'Underlying trend',value:'+4.0%',detail:'local rule score; not expected premium return'});
+});

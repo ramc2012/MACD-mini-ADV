@@ -17,7 +17,7 @@ sys.path.insert(0, str(VG_ROOT))
 from model.market_calendar import is_session, previous_session
 
 IST = ZoneInfo("Asia/Kolkata")
-POLICIES = {"vanguard": "macd-vanguard-atm-qwen-paper-v2", "cbe": "cbe-daily-cash-mp-v2-20261027"}
+POLICIES = {"vanguard": "macd-vanguard-atm-local-paper-v3", "cbe": "cbe-daily-cash-mp-local-v3"}
 
 
 def source_session(now, lane):
@@ -133,10 +133,10 @@ def vanguard(connection, now):
         evaluation=by_symbol[row['symbol']]
         row.update(sector20=evaluation.sector20,conviction=evaluation.conviction,
                    underlying_signal_close=float(spots[row['symbol']]['close']))
-        row.update(actionable=False, actionable_reason="Fresh paper candidate; current ATM, Qwen and risk checks required")
+        row.update(actionable=False, actionable_reason="Fresh paper candidate; current ATM, local review and risk checks required")
     return dict(status="ok" if selected else "blocked", blockers=[] if selected else ["No eligible exact ATM contracts"],
                 source_session=str(day), policy=POLICIES["vanguard"], watchlist=selected, **diagnostics, chain=coverage,
-                inputs="Inherited M2 flow, M3 regime, M4 sector RS/lead-lag, M5 timing, frozen direction/payoff rankers and full shared Qwen context",
+                inputs="Inherited M2 flow, M3 regime, M4 sector RS/lead-lag, M5 timing, frozen direction/payoff rankers and shared local-model context",
                 model_status="Research only; no promotion or expected-profit claim")
 
 

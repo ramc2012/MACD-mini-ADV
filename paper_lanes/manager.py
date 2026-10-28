@@ -1,4 +1,4 @@
-"""Market-data-only hub adapter and independent marking/exit and Qwen-entry loops."""
+"""Market-data-only hub adapter and independent marking/exit and local-entry loops."""
 from __future__ import annotations
 
 import asyncio
@@ -129,6 +129,7 @@ class Manager:
         capital=float(capital if capital is not None else os.environ.get('PAPER_LANE_CAPITAL','1000000'))
         self.books={lane:Book(folder/(lane+'.sqlite3'),lane,capital,now) for lane in ('vanguard','cbe')}
         self.market=market or MarketData();self.last_quotes={};self.last_error=None;self.last_poll=None
+        self.last_review={}
 
     def offer(self,publication,metadata=None):
         lane=publication['lane'];book=self.books[lane]
@@ -189,17 +190,17 @@ class Manager:
     def review_once(self):
         if not session_open(datetime.now(IST)):return
         for lane,book in self.books.items():
-            now=datetime.now(IST);orders=book.review_candidates(dict(self.last_quotes),now,limit=1)
+            now=datetime.now(IST);orders=book.review_candidates(dict(self.last_quotes),now,limit=10,local=True)
             if not orders:continue
             candidates=[]
             for o in orders:
                 row=json.loads(o['payload']);facts={'phase':'fresh_entry_review','source_session':o['source_session'],
                     'underlying':row.get('symbol') or row.get('instrument'),'strike':row.get('strike'),'expiry':row.get('expiry'),
-                    'rank':row.get('rank') or row.get('side_rank'),'planned_quantity':o['planned_quantity'],
+                    'rank':row.get('rank') or row.get('side_rank') or len(candidates)+1,'planned_quantity':o['planned_quantity'],
                     'spread_pct':(o['quote']['ask']/o['quote']['bid']-1)*100,
                     'position_limit_pct':book.terms['position_fraction']*100,
                     'hard_stop_pct':book.terms['hard_stop']*100,'target_pct':book.terms['target']*100,
-                    'horizon_sessions':row.get('horizon_sessions',1),'exit_due':o['exit_due']}
+                    'horizon_sessions':row.get('horizon_sessions',1),'exit_due':o['exit_due'],'signal_close':row.get('source_mark')}
                 for key in ('direction_score','contract_score','combined_score','momentum_fast','momentum_slow','relative_momentum','score',
                             'expected_net_return','option_volume','option_oi','conviction',
                             'ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14','underlying_signal_close'):
@@ -213,16 +214,30 @@ class Manager:
                 candidates.append({'id':o['id'],'instrument':o['instrument'],'side':row.get('option_type') or 'LONG',
                                    'reference_price':o['quote']['ask'],'source_at':o['quote']['at'],'facts':facts})
             try:
-                url=os.environ.get('LOCAL_DECISION_URL','http://local-decisions:8435')
-                if url not in ('http://local-decisions:8435','http://127.0.0.1:8435'):raise ValueError('Invalid local model endpoint')
-                r=httpx.post(url+'/review',json={'lane':lane,'snapshot_at':now.isoformat(),'candidates':candidates},
-                             headers={'X-Macd-Token':os.environ.get('MACD_API_TOKEN','')},timeout=80,trust_env=False,follow_redirects=False)
-                r.raise_for_status();book.apply_reviews(orders,r.json(),datetime.now(IST))
-            except Exception:book.review_failed(orders,datetime.now(IST))
+                from . import local_intelligence
+                response=local_intelligence.review(lane,candidates,self.contexts(candidates,now),datetime.now(IST))
+                book.apply_reviews(orders,response,datetime.now(IST));self.last_review[lane]=response
+            except Exception as exc:
+                book.review_failed(orders,datetime.now(IST),local=True)
+                self.last_review[lane]={'error':type(exc).__name__,'reason':'Local context unavailable; no entry'}
+
+    def contexts(self,candidates,now):
+        from shadow_lanes import source
+        from shadow_lanes.decision_context import build
+        c=source.connect(readonly=True)
+        try:
+            result=build(c,candidates,now,'fresh_entry_review')
+            live=getattr(self.market,'live',None)
+            if live:
+                for key,fields in live.contexts(candidates).items():result[key].update(fields)
+            return result
+        finally:c.close()
 
     def snapshot(self,lane):
+        from .local_intelligence import status
         return {**self.books[lane].snapshot(datetime.now(IST)),'market_error':self.last_error,'market_checked_at':self.last_poll,
-                'model_required':True,'live_orders_possible':False,'legacy_history_preserved':True}
+                'model_required':True,'qwen_required':False,'intelligence':{**status(lane),'last_review':self.last_review.get(lane)},
+                'live_orders_possible':False,'legacy_history_preserved':True}
 
     async def run_marks(self,store):
         while True:

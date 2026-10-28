@@ -207,7 +207,7 @@ def decide(day_rows: list[dict], model: dict, front: dict[str, str] | None = Non
                     "drivers": parts[:4], "row": row, "benchmark": [_atm(rows, 1), _atm(rows, -1)],
                     "series": series, "front_expiry": front.get(root)}
         if value <= MIN_EDGE:
-            out[root] = {**decision, "side": 0, "reason": "expected 1-3 day premium return is not positive on either side"}
+            out[root] = {**decision, "side": 0, "reason": "underlying trend is not positive on either side" if model.get('rule')=='trend' else "expected 1-3 day premium return is not positive on either side"}
         else:
             out[root] = {**decision, "side": side, "reason": ""}
     return out
@@ -392,6 +392,21 @@ def active_model(history: sqlite3.Connection) -> tuple[int | None, dict | None, 
     return (row[0], json.loads(row[1]), json.loads(row[2])["name"]) if row else (None, None, None)
 
 
+def baseline_model(history: sqlite3.Connection) -> tuple[int, dict, str]:
+    """Existing trend rule as an untrained paper control, never a champion."""
+    ensure_schema(history)
+    history.execute('BEGIN IMMEDIATE')
+    with history:
+        row=history.execute("SELECT version,weights,config FROM agent_index_models WHERE status='baseline' ORDER BY version DESC LIMIT 1").fetchone()
+        if row:return row[0],json.loads(row[1]),json.loads(row[2])['name']
+        name='trend-rule';model=fit([],CONFIGS[name])
+        cursor=history.execute('''INSERT INTO agent_index_models(trained_at,config,train_from,train_to,samples,weights,stats,metrics,status,note)
+            VALUES(?,?,NULL,NULL,0,?,?,?,'baseline',?)''',
+            (datetime.now(UTC).isoformat(),json.dumps({'name':name,**CONFIGS[name]}),json.dumps(model),'{}','{}',
+             'Untrained cold-start paper baseline; not calibrated return or evidence of edge.'))
+        return cursor.lastrowid,model,name
+
+
 # ---------------------------------------------------------------------------
 # Emission and views
 # ---------------------------------------------------------------------------
@@ -404,10 +419,7 @@ def emit(history: sqlite3.Connection, run_id: int, day: str, rows: list[dict], h
     if model is None:
         version, model, _name = active_model(history)
         if model is None:
-            train(history, note="first index model")
-            version, model, _name = active_model(history)
-    if model is None:
-        return []
+            version, model, _name = baseline_model(history)
     stored = []
     if front is None:
         front = front_expiries((hist.by_day.get(day) or {}).keys(), day)
@@ -499,7 +511,8 @@ def view(history: sqlite3.Connection, run_id: int | None) -> list[dict]:
         day, trade = raw[0], dict(zip(_COLUMNS, raw[1:]))
         model = history.execute("SELECT config FROM agent_index_models WHERE version = ?",
                                 (trade.get("model_version"),)).fetchone()
-        trade["prediction_kind"] = "scorecard" if model and json.loads(model[0]).get("name") == "scorecard" else "return"
+        config=json.loads(model[0]) if model else {}
+        trade["prediction_kind"] = "scorecard" if config.get("name") == "scorecard" else "rule_score" if config.get('rule')=='trend' else "return"
         trade["drivers"] = json.loads(trade["drivers"] or "[]")
         trade["alternative"] = json.loads(trade["alternative"] or "null")
         if trade.get("symbol"):

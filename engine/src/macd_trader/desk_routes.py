@@ -289,6 +289,8 @@ async def agent_status():
     from . import option_agent
     from .desk import AGENT_EMIT_AT, AGENT_PREPARE_AT
     return {**status, "emit_at": ":".join(f"{part:02d}" for part in AGENT_EMIT_AT),
+            "cold_start_policy":"Untrained local baseline collects fresh candidates until a trained champion is available",
+            "qwen_required":False,
             "prepare_at": ":".join(f"{part:02d}" for part in AGENT_PREPARE_AT[:2]),
             "as_of": option_agent.AS_OF.strftime("%H:%M"),
             "busy": _agent_lock.locked()}

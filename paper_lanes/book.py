@@ -24,7 +24,7 @@ def price(value,tick,buy):
 
 
 def policy(lane):
-    return {'version':f'macd-{lane}-qwen-paper-v1','position_fraction':.05 if lane=='vanguard' else .10,
+    return {'version':f'macd-{lane}-local-paper-v2','position_fraction':.05 if lane=='vanguard' else .10,
             'gross_fraction':.40 if lane=='vanguard' else 1.,'sector_fraction':.20 if lane=='vanguard' else .30,
             'max_positions':10,'hard_stop':.15 if lane=='vanguard' else .05,
             'target':.30 if lane=='vanguard' else .10,'slippage_bps':15 if lane=='vanguard' else 5,
@@ -107,7 +107,7 @@ class Book:
                 if not decided_at<entry_after<deadline or r['exit_due']<=entry_after:raise ValueError('Invalid prospective windows')
                 identity=hashlib.sha256(f"{self.account_id}:{cohort}:{r['instrument']}:{r['exit_due'].isoformat()}".encode()).hexdigest()[:32]
                 n=db.execute('''INSERT OR IGNORE INTO orders(id,cohort,instrument,symbol,sector,lot_size,tick,expiry,source_session,
-                    created_at,entry_after,deadline,exit_due,payload,state,reason,rank) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING_AI','Awaiting entry window and fresh Qwen review',?)''',
+                    created_at,entry_after,deadline,exit_due,payload,state,reason,rank) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING_AI','Awaiting entry window and fresh local review',?)''',
                     (identity,cohort,r['instrument'],r['symbol'],r.get('sector') or 'UNKNOWN',r['lot_size'],r['tick'],r.get('expiry'),
                      source_session,decided_at.isoformat(),entry_after.isoformat(),deadline.isoformat(),r['exit_due'].isoformat(),json.dumps(r['candidate'],default=str),int(r['candidate'].get('rank') or r['candidate'].get('side_rank') or 999))).rowcount
                 if n:self.event(db,decided_at,'QUEUED',identity,{'instrument':r['instrument'],'cohort':cohort,'policy':self.terms['version']});inserted+=1
@@ -153,13 +153,13 @@ class Book:
         if qty<lot:return 0,'Cash, exposure or displayed-liquidity budget cannot fund one lot'
         return qty,''
 
-    def review_candidates(self,quotes,now,limit=3):
+    def review_candidates(self,quotes,now,limit=3,local=False):
         result=[]
         with self.transaction() as db:
             for row in db.execute("SELECT * FROM orders WHERE state='PENDING_AI' ORDER BY created_at,rank,coalesce(CAST(json_extract(payload,'$.score') AS REAL),0) DESC,id").fetchall():
                 o=dict(row)
                 if now>=datetime.fromisoformat(o['deadline']):self.set_state(db,o['id'],'EXPIRED','Entry window missed; no historical fill',now);continue
-                if o['attempts']>=self.terms['review_attempts']:self.set_state(db,o['id'],'REJECTED','Qwen retry limit reached',now);continue
+                if not local and o['attempts']>=self.terms['review_attempts']:self.set_state(db,o['id'],'REJECTED','Qwen retry limit reached',now);continue
                 if o['retry_after'] and now<datetime.fromisoformat(o['retry_after']):continue
                 atm_reason=self.atm_reason(o,quotes,now)
                 if atm_reason:db.execute('UPDATE orders SET reason=? WHERE id=?',(atm_reason,o['id']));continue
@@ -193,20 +193,23 @@ class Book:
                 if not current or current[0]!='PENDING_AI':continue
                 record={**r,**{k:response[k] for k in ('model','digest','context_hash','created_at','expires_at')},'reference_price':o['quote']['ask'],'reviewed_quantity':o['planned_quantity']}
                 db.execute('INSERT INTO decisions VALUES(?,?,?,?,?)',(uuid4().hex,o['id'],now.isoformat(),r['verdict'],json.dumps(record)))
-                db.execute('UPDATE orders SET attempts=attempts+1,retry_after=?,approval=? WHERE id=?',
-                           ((now+timedelta(seconds=60)).isoformat(),json.dumps(record),o['id']))
+                increment=0 if response.get('decision_engine')=='local' and r['verdict']=='wait' else 1
+                delay=(5 if r['verdict']=='approve' else 30) if response.get('decision_engine')=='local' else 60
+                db.execute('UPDATE orders SET attempts=attempts+?,retry_after=?,approval=? WHERE id=?',
+                           (increment,(now+timedelta(seconds=delay)).isoformat(),json.dumps(record),o['id']))
                 state={'approve':'APPROVED','reject':'REJECTED','wait':'PENDING_AI'}[r['verdict']]
                 if now>=datetime.fromisoformat(o['deadline']):state='EXPIRED'
                 self.set_state(db,o['id'],state,r['reason'],now)
 
-    def review_failed(self,orders,now):
+    def review_failed(self,orders,now,local=False):
         with self.transaction() as db:
             for o in orders:
                 failures=db.execute('SELECT service_failures FROM orders WHERE id=?',(o['id'],)).fetchone()[0]+1
                 delay=min(120,15*2**min(failures-1,3))
-                db.execute("UPDATE orders SET service_failures=service_failures+1,retry_after=?,reason='Qwen service unavailable; no verdict or entry' WHERE id=? AND state='PENDING_AI'",
-                           ((now+timedelta(seconds=delay)).isoformat(),o['id']))
-                self.event(db,now,'QWEN_UNAVAILABLE',o['id'],{'reason':'Local review failed; no deterministic fallback entry'})
+                reason='Local market context unavailable; no entry' if local else 'Qwen service unavailable; no verdict or entry'
+                db.execute("UPDATE orders SET service_failures=service_failures+1,retry_after=?,reason=? WHERE id=? AND state='PENDING_AI'",
+                           ((now+timedelta(seconds=delay)).isoformat(),reason,o['id']))
+                self.event(db,now,'LOCAL_CONTEXT_UNAVAILABLE' if local else 'QWEN_UNAVAILABLE',o['id'],{'reason':reason})
 
     def cycle(self,quotes,now,session_open,settle_at):
         with self.transaction() as db:
@@ -242,7 +245,7 @@ class Book:
         # Exit fills are committed before any entry processing can fail.
         with self.transaction() as db:
             if session_open:
-                for row in db.execute("SELECT * FROM orders WHERE state='APPROVED' ORDER BY created_at,rank,coalesce(CAST(json_extract(payload,'$.score') AS REAL),0) DESC,id").fetchall():
+                for row in db.execute("SELECT * FROM orders WHERE state='APPROVED' ORDER BY CASE WHEN json_valid(approval) THEN coalesce(CAST(json_extract(approval,'$.priority') AS REAL),-1) ELSE -1 END DESC,created_at,rank,coalesce(CAST(json_extract(payload,'$.score') AS REAL),0) DESC,id").fetchall():
                     o=dict(row);q=quotes.get(o['instrument']);review=json.loads(o['approval'])
                     atm_reason=self.atm_reason(o,quotes,now)
                     if atm_reason:db.execute('UPDATE orders SET reason=? WHERE id=?',(atm_reason,o['id']));continue

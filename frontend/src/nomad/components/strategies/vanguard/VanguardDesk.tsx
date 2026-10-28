@@ -216,7 +216,7 @@ export default function VanguardDesk() {
   return (
     <DeskShell
       title="Vanguard"
-      description="ATM option paper trading over 1–3 sessions. Current-session candidates require fresh Qwen approval, a fresh ATM check and executable quotes before fills. Stops, targets, expiry and scheduled exits are managed independently."
+      description="ATM option paper trading over 1–3 sessions. Current-session candidates require local model approval, a fresh ATM check and executable quotes before fills. Stops, targets, expiry and scheduled exits are managed independently."
       asOf={s?.latest_timing_bar ?? null}
       asOfLabel="latest timing bar"
       paperMode

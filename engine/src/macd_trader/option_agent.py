@@ -845,6 +845,25 @@ def active_model(history: sqlite3.Connection) -> tuple[int | None, dict | None, 
     return row[0], json.loads(row[1]), json.loads(row[2])["name"]
 
 
+def baseline_model(history: sqlite3.Connection) -> tuple[int, dict, str]:
+    """Untrained existing rule, explicitly separate from a trained champion.
+
+    Without candidate capture there can never be forward labels or training.
+    A baseline is an observable paper control, not a promotion or edge claim.
+    """
+    ensure_schema(history)
+    history.execute('BEGIN IMMEDIATE')
+    with history:
+        row=history.execute("SELECT version,weights,config FROM agent_models WHERE status='baseline' ORDER BY version DESC LIMIT 1").fetchone()
+        if row:return row[0],json.loads(row[1]),json.loads(row[2])['name']
+        name='momentum-rule';model=fit([],CONFIGS[name])
+        cursor=history.execute('''INSERT INTO agent_models(trained_at,config,train_from,train_to,samples,weights,stats,metrics,status,note)
+            VALUES(?,?,NULL,NULL,0,?,?,?,'baseline',?)''',
+            (datetime.now(UTC).isoformat(),json.dumps({'name':name,**CONFIGS[name]}),json.dumps(model),'{}','{}',
+             'Untrained cold-start paper baseline. Collects fresh candidates/labels; not a validated champion or profit forecast.'))
+        return cursor.lastrowid,model,name
+
+
 SPOT_SET = frozenset(INDEX_SPOTS.values()) | frozenset(STOCK_SPOTS.values()) | {BENCHMARK}
 LOOKBACK_CALENDAR_DAYS = 45
 OPTION_LOOKBACK_SESSIONS = 5
@@ -886,10 +905,12 @@ def emit(history: sqlite3.Connection, day: str | None = None, source: str = "sch
             return {"status": "already_emitted", "day": day, "run_id": existing[0]}
     version, model, name = active_model(history)
     if model is None:
-        train(history, note="first model")
-        version, model, name = active_model(history)
-    if model is None:
-        return {"status": "no_model", "day": day}
+        # A cold start may collect a genuinely current scheduled snapshot; a
+        # delayed/restarted service must not invent yesterday's decision.
+        moment=datetime.now(IST)
+        if source=='scheduled' and (moment.date().isoformat()!=day or moment.timestamp()>_as_of_epoch(day)+600):
+            return {'status':'awaiting_live_window','day':day,'model_status':'baseline_available'}
+        version, model, name = baseline_model(history)
     if day not in trading_days(history, day, day):
         return {"status": "no_bars_today", "day": day}
     prior = prepare(history, day)

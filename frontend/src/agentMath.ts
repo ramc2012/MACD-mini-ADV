@@ -37,6 +37,7 @@ export function pct(value: number | null | undefined, digits = 1): string {
 
 /** Scorecard votes and predicted returns use different units. */
 export function indexPrediction(kind: string | undefined, value: number | null | undefined, conviction?: number | null) {
+  if (kind === 'rule_score')return {label:'Underlying trend',value:pct(value),detail:'local rule score; not expected premium return'};
   if (kind === "scorecard") {
     const score = value == null || !Number.isFinite(value) ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(0)}`;
     return { label: "Net score", value: score, detail: "conditions; trade requires at least 2 net votes" };

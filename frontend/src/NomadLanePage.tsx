@@ -7,7 +7,7 @@ import {dataScope} from './nomad/lib/api';
 import type {Tick} from './types';
 import './nomad/nomad.generated.css';
 import './lane-data.css';
-import {LocalModelPanel} from './LocalModelPanel';
+import {LaneIntelligencePanel} from './LaneIntelligencePanel';
 import {FeaturePipelinePanel} from './FeaturePipelinePanel';
 import {InfoNote} from './nomad/components/desk-ui/InfoNote';
 import {useLaneLiveConnection} from './nomad/hooks/useLaneLive';
@@ -23,7 +23,7 @@ export function NomadLanePage({lane,ticks,connected}:{lane:'vanguard'|'cbe';tick
  useEffect(()=>{setNotices([]);return()=>client.clear();},[client]);
  const choose=(next:'shadow'|'retained')=>{const p=new URLSearchParams();if(next==='retained')p.set('scope',next);window.history.replaceState(null,'',`#/${lane.toUpperCase()}${p.size?'?'+p:''}`);window.dispatchEvent(new HashChangeEvent('hashchange'));};
  return <div className="nomad-port"><div className="lane-ledger-toolbar"><label>Ledger <select aria-label="Lane ledger" value={scope} onChange={e=>choose(e.target.value as 'shadow'|'retained')}><option value="shadow">Fresh {lane==='vanguard'?'Vanguard':'CBE'}</option><option value="retained">Retained Nomad history</option></select></label><InfoNote title="Ledger information">Fresh paper cash and entries are separate from the retained Nomad book. Historical market data remains available in either view. Retained positions and returns are read only.</InfoNote>
- {scope==='shadow'&&<span className="lane-diagnostics">Qwen &amp; data <InfoNote title="Qwen and data status"><LocalModelPanel lane={lane}/><FeaturePipelinePanel lane={lane}/></InfoNote></span>}</div>
+ {scope==='shadow'&&<span className="lane-diagnostics">Local model &amp; data <InfoNote title="Local intelligence and data status"><LaneIntelligencePanel lane={lane}/><FeaturePipelinePanel lane={lane}/></InfoNote></span>}</div>
  {!!notices.length&&<div className="nomad-gap" role="status">Some retained datasets were outside the recovery backup. Unavailable views: {notices.map(n=>n.split('/').pop()).join(', ')}. Missing values are not new observations.</div>}
  <QueryClientProvider client={client}><DeskBoundary key={view}><div key={`${lane}-${scope}`}>{lane==='vanguard'?<VanguardDesk/>:<CbeDesk/>}</div></DeskBoundary></QueryClientProvider></div>;
 }
