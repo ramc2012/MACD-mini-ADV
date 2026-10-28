@@ -203,7 +203,7 @@ export default function OiFuturesTab({ data }: { data?: any }) {
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[900px] border-separate border-spacing-0 text-[11.5px]">
+            <table data-own-sort className="w-full min-w-[900px] border-separate border-spacing-0 text-[11.5px]">
               <thead>
                 <tr>
                   {header("symbol", "Symbol", "text-left")}

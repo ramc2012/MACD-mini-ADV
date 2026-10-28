@@ -27,7 +27,7 @@ import { memo, useSyncExternalStore } from "react";
 import { formatIST, formatNumber } from "@/components/desk-ui";
 import { useQuote } from "@/hooks/useQuoteStore";
 import { usePriceFlash } from "@/hooks/usePriceFlash";
-import {useLaneLive} from '@/hooks/useLaneLive';
+import {useLaneLiveValue} from '@/hooks/useLaneLive';
 
 /**
  * ONE shared 1s ticker for every mark cell on the page. A per-cell
@@ -95,7 +95,7 @@ export const LiveMarkCell = memo(function LiveMarkCell({
   staleAfterSeconds?: number;
 }) {
   const q = useQuote(symbol || undefined);
-  const market=useLaneLive();
+  const sessionOpen=useLaneLiveValue(l=>symbol?.endsWith('-EQ')?l.cash_open:l.market_open);
   const live = q?.ltp != null;
   const flash = usePriceFlash(live ? q?.ltp : undefined);
   const value = live ? (q?.ltp as number) : fallback;
@@ -143,7 +143,7 @@ export const LiveMarkCell = memo(function LiveMarkCell({
         className={`inline-flex items-center justify-end gap-1 rounded px-1 font-mono tabular-nums transition-colors ${flashBg} ${!live||ageMs==null||ageMs>staleAfterSeconds*1000?ageTone:""}`}
       >
         {value != null ? `${prefix}${formatNumber(value, decimals)}` : "—"}
-        {live ? <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${ageMs!=null&&ageMs<=staleAfterSeconds*1000&&(symbol?.endsWith('-EQ')?market.cash_open:market.market_open)?'bg-accent-green':'bg-text-muted'}`} /> : null}
+        {live ? <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${ageMs!=null&&ageMs<=staleAfterSeconds*1000&&sessionOpen?'bg-accent-green':'bg-text-muted'}`} /> : null}
       </span>
       {showAge && value != null ? (
         <span className={`px-1 font-mono text-[9.5px] ${ageTone}`}>

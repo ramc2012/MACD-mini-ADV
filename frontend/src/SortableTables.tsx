@@ -3,7 +3,7 @@ import {compareKeys, sortKey} from './tableSort';
 
 // Makes every table inside it sortable: click a header to sort ascending, click it again for descending. Rows are reordered within their own tbody (React tolerates sibling moves), and the
 // chosen order is re-applied whenever live data re-renders the rows. A full-width row (one cell spanning the table,
-// e.g. an expanded detail) travels with the row above it.
+// e.g. an expanded detail) travels with the row above it. Used by the Vanguard and CBE desks.
 type State = {col: number; dir: 1 | -1};
 
 function logicalCell(row: HTMLTableRowElement, col: number): HTMLTableCellElement | null {
@@ -65,6 +65,8 @@ export function SortableTables({children}: {children: ReactNode}) {
       const th = (event.target as HTMLElement).closest('th');
       const table = th?.closest('table');
       if (!th || !table || !el.contains(table) || !th.closest('thead')) return;
+      // Tables with their own React sort (data-own-sort, or header buttons) keep it.
+      if (table.hasAttribute('data-own-sort') || table.querySelector('thead th button')) return;
       if ((event.target as HTMLElement).closest('button,a,input,select,label')) return;
       const col = headerColumn(th);
       const now = states.get(table);
