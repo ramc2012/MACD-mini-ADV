@@ -4,13 +4,14 @@ import {api} from '../../../lib/api';
 import {Section, formatIST, formatNumber} from '../../desk-ui';
 import {usePaper} from '../../../PaperLanePanel';
 import {useShadow} from '../../../ShadowPanels';
+import {AttritionRibbon} from './DecisionFlow';
 
 // Owner, 28 Oct 2026: the decision flow shows the filtered best trade candidates for the current market, with
 // logical filters that are not too restrictive. It re-runs the 14:47 list's own ranking and screen on the latest
 // closed 30-minute bar (shadow_lanes/source.py rank_bar): hard filters only for tradability, evidence legs vote.
 type Row = {symbol: string; option_type: 'CE' | 'PE'; strike: number; expiry: string; sector20?: string; source_mark: number;
   underlying_signal_close: number; combined_score: number; direction_score: number; atm_distance: number | null;
-  traded_lots: number; option_oi?: number; evidence: Record<string, number>; evidence_net: number; filter_reasons: string[];
+  traded_lots: number; premium_pct?: number | null; option_oi?: number; evidence: Record<string, number>; evidence_net: number; filter_reasons: string[];
   filtered: boolean; selected: boolean; horizon_sessions: number};
 type Stage = {stage: string; surviving?: number; ce?: number; pe?: number};
 type Model = {version: string; role: string; status: string; training_start?: string; training_end?: string; test_start?: string;
@@ -40,7 +41,7 @@ function vote(v: number) {
 function SideTable({side, rows, published, showFiltered}: {side: 'CE' | 'PE'; rows: Row[]; published: Set<string>; showFiltered: boolean}) {
   const shown = rows.filter((r) => r.option_type === side && (showFiltered || !r.filtered));
   return <div className="overflow-auto"><table className="w-full whitespace-nowrap text-left text-xs">
-    <thead><tr>{['#', 'Stock', 'Sector', 'ATM contract', 'Premium', 'Spot · distance', 'Lots traded', 'Payoff rank', 'Direction',
+    <thead><tr>{['#', 'Stock', 'Sector', 'ATM contract', 'Premium', 'Premium % of spot', 'Spot · distance', 'Lots traded', 'Payoff rank', 'Direction',
       ...LEGS.map(([, label]) => label), 'Net', 'Status'].map((h) => <th className="p-2" key={h} title={LEGS.find(([, l]) => l === h) ? LEG_HELP[LEGS.find(([, l]) => l === h)![0]] : undefined}>{h}</th>)}</tr></thead>
     <tbody>{shown.map((r, i) => <tr className={`border-t border-bg-border ${r.filtered ? 'opacity-60' : ''}`} key={r.symbol + side}>
       <td className="p-2">{i + 1}</td>
@@ -48,6 +49,7 @@ function SideTable({side, rows, published, showFiltered}: {side: 'CE' | 'PE'; ro
       <td className="p-2">{r.sector20 ?? '—'}</td>
       <td className="p-2">{formatNumber(r.strike)} {side} · {String(r.expiry).slice(0, 10)}</td>
       <td className="p-2">₹{formatNumber(r.source_mark)}</td>
+      <td className="p-2">{r.premium_pct == null ? '—' : `${(r.premium_pct * 100).toFixed(2)}%`}</td>
       <td className="p-2">{formatNumber(r.underlying_signal_close)} · {r.atm_distance == null ? '—' : `${(r.atm_distance * 100).toFixed(1)}%`}</td>
       <td className="p-2">{formatNumber(r.traded_lots)}</td>
       <td className="p-2">{(r.combined_score * 100).toFixed(1)}</td>
@@ -59,6 +61,26 @@ function SideTable({side, rows, published, showFiltered}: {side: 'CE' | 'PE'; ro
     </tr>)}
     {!shown.length && <tr><td className="p-3 text-text-secondary" colSpan={20}>No {side} candidates at this bar.</td></tr>}</tbody>
   </table></div>;
+}
+
+// Short labels for the ribbon; the full stage text is in the table above it.
+const RIBBON_LABELS = ['Universe', 'Spot bar', 'Fresh inputs', 'ATM listed', 'At the money', 'Liquid', 'Evidence ok', 'Pass all', 'Selected'];
+
+function ribbonStages(stages: Stage[], side: 'ce' | 'pe') {
+  const counts = stages.map((s) => s[side] ?? s.surviving ?? 0);
+  return stages.map((s, i) => ({leg: `${side}-${i}`, stage: RIBBON_LABELS[i] ?? s.stage, surviving: counts[i],
+    lost_here: i ? Math.max(0, counts[i - 1] - counts[i]) : 0, gate: s.stage}));
+}
+
+function DecisionMap({stages}: {stages: Stage[]}) {
+  return <div className="grid gap-4 xl:grid-cols-2">
+    {(['ce', 'pe'] as const).map((side) => {
+      const rows = ribbonStages(stages, side);
+      const worst = rows.slice(1, -1).reduce((a, b) => (b.lost_here > a.lost_here ? b : a), rows[1]);
+      return <div key={side}><p className="mb-1 text-xs text-text-secondary">{side === 'ce' ? 'Calls' : 'Puts'}: {rows[0].surviving} → {rows[rows.length - 1].surviving} · most lost at “{worst?.gate}” (−{worst?.lost_here})</p>
+        <AttritionRibbon stages={rows} binding={worst?.leg}/></div>;
+    })}
+  </div>;
 }
 
 export function LiveDecisionFlow() {
@@ -79,7 +101,8 @@ export function LiveDecisionFlow() {
     <Section title="Decision flow · best trade candidates now" description={`Decision bar ${formatIST(d.decision_bar)} · checked ${formatIST(d.as_of)}. The 14:47 list runs this same ranking and screen on the 14:15 bar.`}>
       <div className="overflow-auto"><table className="text-left text-xs"><thead><tr><th className="p-2">Stage</th><th className="p-2">Stocks</th><th className="p-2">CE</th><th className="p-2">PE</th></tr></thead>
         <tbody>{(d.stages ?? []).map((s) => <tr className="border-t border-bg-border" key={s.stage}><td className="p-2">{s.stage}</td><td className="p-2">{s.surviving ?? '—'}</td><td className="p-2">{s.ce ?? '—'}</td><td className="p-2">{s.pe ?? '—'}</td></tr>)}</tbody></table></div>
-      {f && <p className="mt-3 text-xs text-text-secondary">Hard filters, tradability only: the ATM leg within {Math.round(f.max_atm_distance * 100)}% of spot and at least {f.min_traded_lots} lots traded by the bar. Evidence legs vote (+1 / −1 / 0) instead of vetoing one by one; a pick is dropped only when the net is {f.evidence_floor} or worse. The rest are ranked by the option-payoff ranker and the best 10 per side are taken, one side per stock.</p>}
+      <div className="mt-4"><DecisionMap stages={d.stages ?? []}/></div>
+      {f && <p className="mt-3 text-xs text-text-secondary">Hard filters, tradability only: the ATM leg within {Math.round(f.max_atm_distance * 100)}% of spot and at least {f.min_traded_lots} lots traded by the bar. Evidence legs vote (+1 / −1 / 0) instead of vetoing one by one; a pick is dropped only when the net is {f.evidence_floor} or worse. The rest are ranked by the cheapest premium as a share of spot, the rule trained on October 2026: it caught 14% of each day's top-10 performers over 1–3 sessions (random 4%) with a paper result of +14.5% a pick, in both halves of the month and on both sides. The payoff ranker and the votes break ties. One month is not proof; the List tests keep scoring it.</p>}
       <label className="mt-2 flex items-center gap-2 text-xs"><input type="checkbox" checked={showFiltered} onChange={(e) => setShowFiltered(e.target.checked)}/> Show filtered candidates with their reasons</label>
     </Section>
     <Section title="Calls · CE" description={`${rows.filter((r) => r.option_type === 'CE' && !r.filtered).length} pass the screen`}><SideTable side="CE" rows={rows} published={published} showFiltered={showFiltered}/></Section>

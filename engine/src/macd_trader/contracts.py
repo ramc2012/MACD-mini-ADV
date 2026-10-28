@@ -88,20 +88,36 @@ def liquidity_window(
     return anchor, side[max(0, index - 2): index + 3]
 
 
-def select_liquid_contract(entries: list[OptionChainEntry], spot: float, option_type: str) -> OptionChainEntry | None:
-    """Use the original app's side-rounded ATM plus 1.5x liquidity rule."""
+PREFER_STREAMED_SHARE = 2 / 3    # a streamed strike within this share of the best liquidity keeps the ATM slot
+
+
+def select_liquid_contract(entries: list[OptionChainEntry], spot: float, option_type: str,
+                           prefer: set[str] | frozenset[str] = frozenset()) -> OptionChainEntry | None:
+    """Use the original app's side-rounded ATM plus 1.5x liquidity rule.
+
+    ``prefer`` (an intraday refresh: the contracts already on the feed) keeps a strike that already has a
+    premium history when its liquidity is comparable, so the momentum series is not restarted for nothing.
+    """
     anchor, nearby = liquidity_window(entries, spot, option_type)
     if anchor is None:
         return None
     liquidity = lambda e: max(e.volume, e.oi / 100)
     if liquidity(anchor) <= 0:
-        return max(nearby, key=liquidity)
-    better = [e for e in nearby if liquidity(e) >= liquidity(anchor) * 1.5]
-    return max(better, key=liquidity) if better else anchor
+        choice = max(nearby, key=liquidity)
+    else:
+        better = [e for e in nearby if liquidity(e) >= liquidity(anchor) * 1.5]
+        choice = max(better, key=liquidity) if better else anchor
+    if prefer and choice.symbol not in prefer:
+        known = [e for e in nearby if e.symbol in prefer and liquidity(e) > 0
+                 and liquidity(e) >= liquidity(choice) * PREFER_STREAMED_SHARE]
+        if known:
+            choice = min(known, key=lambda e: (abs(e.strike - spot), -liquidity(e)))
+    return choice
 
 
 def select_contract_ladder(
     entries: list[OptionChainEntry], spot: float, option_type: str,
+    prefer: set[str] | frozenset[str] = frozenset(),
 ) -> list[tuple[str, OptionChainEntry]]:
     """Return one ITM, ATM and OTM contract around the selected ATM strike.
 
@@ -113,7 +129,7 @@ def select_contract_ladder(
         (entry for entry in entries if entry.option_type == option_type and entry.symbol),
         key=lambda entry: entry.strike,
     )
-    atm = select_liquid_contract(entries, spot, option_type)
+    atm = select_liquid_contract(entries, spot, option_type, prefer)
     if atm is None:
         return []
     index = next((idx for idx, entry in enumerate(side) if entry.symbol == atm.symbol), -1)
@@ -340,7 +356,8 @@ class ContractSelector:
         self._save(selected)
         return selected
 
-    async def _select_from_master(self, spot_symbols: list[str], saved: dict) -> dict[str, list[OptionContract]]:
+    async def _select_from_master(self, spot_symbols: list[str], saved: dict,
+                                  prefer: set[str] | frozenset[str] = frozenset()) -> dict[str, list[OptionContract]]:
         """The same ladders as the chain path, from the instrument master and two quote sweeps.
 
         The chain path spent two to four REST calls per underlying -- a chain,
@@ -440,7 +457,7 @@ class ContractSelector:
                 if day is None:
                     continue
                 for side in ("CE", "PE"):
-                    for moneyness, pick in select_contract_ladder(listed_series[day], reference, side):
+                    for moneyness, pick in select_contract_ladder(listed_series[day], reference, side, prefer):
                         rows.append(OptionContract(
                             name, spot_symbol, side, pick.symbol, pick.strike, day, reference,
                             pick.volume, pick.oi, lot_size=lots.get(pick.symbol, 0),
@@ -541,7 +558,8 @@ class ContractSelector:
                 due[spot] = reasons
         if not due:
             return {}
-        fresh = await self._select_from_master(sorted(due), {spot: {"selection_price": spot_prices[spot]} for spot in due})
+        fresh = await self._select_from_master(sorted(due), {spot: {"selection_price": spot_prices[spot]} for spot in due},
+                                               prefer=set(self.contracts))
         changed: dict[str, dict] = {}
         for spot, rows in fresh.items():
             old_atm = {side: legs["ATM"].symbol for side, legs in ladders[spot].items() if "ATM" in legs}
@@ -550,7 +568,17 @@ class ContractSelector:
                 changed[spot] = {"reasons": due[spot], "from": old_atm, "to": new_atm, "rows": rows}
         if not changed:
             return {}
-        kept = [row for row in self.contracts.values() if row.spot_symbol not in changed or row.retained]
+        # The replaced ladder stays on the feed until the close, as context only (no new entries): its premium
+        # history carries on, so the strike is ready again if spot comes back. Held legs stay as they are.
+        new_symbols = {row.symbol for item in changed.values() for row in item["rows"]}
+        kept = []
+        for row in self.contracts.values():
+            if row.spot_symbol in changed and not row.retained and row.symbol not in new_symbols:
+                if not row.moneyness.startswith(("NEXT-", "PREV-")):
+                    row.moneyness = "PREV-" + row.moneyness
+                row.analysis_only = True
+            if row.symbol not in new_symbols:
+                kept.append(row)
         kept_symbols = {row.symbol for row in kept}
         added = [row for item in changed.values() for row in item["rows"] if row.symbol not in kept_symbols]
         for row in added:

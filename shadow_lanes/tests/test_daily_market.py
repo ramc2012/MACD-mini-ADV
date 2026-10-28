@@ -88,4 +88,12 @@ def test_evidence_votes_and_the_screen_drop_only_untradable_or_clearly_opposed_p
     assert not source.screen(row(),quiet,101)['filtered']                      # neutral evidence still passes
     assert 'not at the money' in source.screen(row(strike=110),quiet,100)['filter_reasons'][0]
     assert 'lots traded' in source.screen(row(option_volume=1000),quiet,100)['filter_reasons'][0]
-    assert 'evidence against' in source.screen(row(option_type='PE'),bullish,100)['filter_reasons'][0]
+    assert not source.screen(row(option_type='PE'),{**bullish,'timing_state':'BALANCED'},100)['filtered']   # net -2 passes now
+    assert 'evidence against' in source.screen(row(option_type='PE'),bullish,100)['filter_reasons'][0]    # net -3 does not
+    assert source.screen(row(source_mark=2),quiet,100)['premium_pct']==0.02
+
+
+def test_cheapest_premium_share_leads_the_ranking():
+    rows=[dict(symbol=s,option_type='CE',contract_kind='ATM',combined_score=score,direction_score=0,contract_score=0,premium_pct=share)
+          for s,score,share in [('RICHBEST',1.0,0.05),('CHEAP',0.2,0.012),('MID',0.9,0.02)]]
+    assert [r['symbol'] for r in source.select_atm(rows)]==['CHEAP','MID','RICHBEST']

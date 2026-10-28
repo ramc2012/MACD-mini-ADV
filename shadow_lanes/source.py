@@ -107,7 +107,12 @@ def vanguard(connection, now):
 # (the old M6 chain of flow >= 60 AND sector RS AND regime AND timing ignition left 0 of 213 stocks most days).
 MAX_ATM_DISTANCE = 0.03      # an "ATM" leg further than 3% from spot is not at the money
 MIN_TRADED_LOTS = 2          # lots traded in the session by the decision bar
-EVIDENCE_FLOOR = -2          # dropped only when the evidence, net, argues clearly for the other side
+EVIDENCE_FLOOR = -3          # dropped only when nearly every leg argues for the other side (was -2; on October data
+                             # every momentum veto tried cost captured top performers, research/vanguard_decision_20261028)
+# Ranking, trained on October 2026 (15 labelled sessions, walk-forward checked by halves and sides): among tradable
+# ATM legs, the cheapest premium as a share of spot caught 14% of each day's top-10 performers over 1-3 sessions
+# (random 4%) with a paper result of +14.5% a pick (random ~0%), in both halves and on both sides. The payoff ranker
+# and the momentum votes did not add to it out of sample, so they break ties and inform; they do not lead.
 OWN_SIDE_OI = {"long_buildup": 1, "short_covering": 1, "long_unwind": -1, "short_buildup": -1}
 
 
@@ -134,13 +139,15 @@ def screen(row, inputs, spot):
     lots = (row.get("option_volume") or 0) / max(1, int(row.get("lot_size") or 1))
     reasons = []
     if distance is None or distance > MAX_ATM_DISTANCE:
-        reasons.append("strike %s is %.1f%% from spot: not at the money" % (row["strike"], (distance or 0) * 100))
+        reasons.append(f"strike {row['strike']:g} is {(distance or 0) * 100:.1f}% from spot: not at the money")
     if lots < MIN_TRADED_LOTS:
-        reasons.append("only %.1f lots traded by the decision bar" % lots)
+        reasons.append(f"only {lots:.1f} lots traded by the decision bar")
     if net <= EVIDENCE_FLOOR:
         against = [k for k, v in votes.items() if v < 0]
-        reasons.append("evidence against this side (net %+d: %s)" % (net, ", ".join(against)))
+        reasons.append(f"evidence against this side (net {net:+d}: {', '.join(against)})")
+    premium = float(row.get("source_mark") or 0)
     row.update(evidence=votes, evidence_net=net, atm_distance=distance, traded_lots=round(lots, 1),
+               premium_pct=premium / spot if spot and premium > 0 else None,
                filter_reasons=reasons, filtered=bool(reasons))
     return row
 
@@ -161,7 +168,7 @@ def rank_bar(connection, bar, now):
         spots = {r["underlying"]: r for r in cur.fetchall()}
     expected = len(universe)
     if expected < 10 or len(spots) < .8 * expected:
-        return blocked("vanguard", day, "Broker spot-bar breadth below 80% of the active catalog at %s" % bar.strftime("%H:%M"),
+        return blocked("vanguard", day, f"Broker spot-bar breadth below 80% of the active catalog at {bar:%H:%M}",
                        expected=expected, current_complete=len(spots), bar=bar.isoformat())
     direction, payoff = swing._model(connection, "direction"), swing._model(connection, "contract")
     if direction is None or payoff is None:
@@ -203,7 +210,7 @@ def rank_bar(connection, bar, now):
     chosen = {(r["symbol"], r["option_type"]) for r in selected}
     for row in rows:
         row["selected"] = (row["symbol"], row["option_type"]) in chosen
-    rows.sort(key=lambda r: (r["filtered"], -r["combined_score"], -r["evidence_net"], r["symbol"]))
+    rows.sort(key=lambda r: (r["filtered"], rank_key(r), r["symbol"]))
     sides = {side: [r for r in rows if r["option_type"] == side] for side in ("CE", "PE")}
     stages = [
         {"stage": "F&O stocks in the active catalog", "surviving": expected},
@@ -222,7 +229,7 @@ def rank_bar(connection, bar, now):
          "pe": sum(1 for r in sides["PE"] if r["evidence_net"] > EVIDENCE_FLOOR)},
         {"stage": "pass every filter", "ce": sum(1 for r in sides["CE"] if not r["filtered"]),
          "pe": sum(1 for r in sides["PE"] if not r["filtered"])},
-        {"stage": "selected: best %d per side by the payoff ranker" % PER_SIDE,
+        {"stage": f"selected: {PER_SIDE} cheapest per side (premium as % of spot)",
          "ce": sum(1 for r in selected if r["option_type"] == "CE"), "pe": sum(1 for r in selected if r["option_type"] == "PE")},
     ]
     return dict(status="ok", source_session=str(day), **diagnostics, chain=coverage, stages=stages,
@@ -268,9 +275,15 @@ PER_SIDE = 10      # owner, 28 Oct 2026: 10 CE and 10 PE every day, whatever is 
 HOLD_SESSIONS = 3  # each pick is held up to 3 sessions or until its stop, and measured at D1/D2/D3
 
 
+def rank_key(r):
+    """Cheapest premium as a share of spot first (October-trained), then the payoff ranker and the evidence."""
+    share = r.get('premium_pct')
+    return (share if share is not None else 9.0, -r['combined_score'], -r.get('evidence_net', 0), -r['direction_score'])
+
+
 def select_atm(candidates, per_side=PER_SIDE):
     ranked = sorted([r for r in candidates if r.get('contract_kind')=='ATM'],
-                    key=lambda r:(-r['combined_score'],-r.get('evidence_net',0),-r['direction_score'],-r['contract_score'],r['symbol'],r['option_type']))
+                    key=lambda r:(*rank_key(r),-r['contract_score'],r['symbol'],r['option_type']))
     selected=[];seen=set();count={'CE':0,'PE':0}
     for row in ranked:
         side=row.get('option_type')

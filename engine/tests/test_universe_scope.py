@@ -24,9 +24,10 @@ def test_the_five_underlying_test_universe():
 
 
 def test_default_universe_covers_current_stock_derivatives():
-    assert len(FNO_STOCKS) == 210
+    assert len(FNO_STOCKS) == 218
     assert len(set(FNO_STOCKS)) == len(FNO_STOCKS)
-    assert {"ATHERENERG", "MAHABANK", "SAGILITY"} <= set(FNO_STOCKS)
+    assert {"ATHERENERG", "MAHABANK", "SAGILITY", "ICICILIFE", "UJJIVANSFB"} <= set(FNO_STOCKS)
+    assert not {"BAJAJHLDNG", "ICICIPRULI"} & set(FNO_STOCKS)                # left F&O / renamed (28 Oct 2026)
     assert "DALBHARAT" not in FNO_STOCKS
     assert set(Settings(symbols_csv="").symbols) == set(INDEX_SPOTS.values()) | set(STOCK_SPOTS.values())
-    assert len(Settings(symbols_csv="").symbols) == 217          # 210 stocks + 7 derivative indices (28 Oct 2026)
+    assert len(Settings(symbols_csv="").symbols) == 225          # 218 stocks + 7 derivative indices (28 Oct 2026)

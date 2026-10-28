@@ -13,11 +13,13 @@ _GROUPS: dict[str, list[str]] = {
         "AUBANK", "AXISBANK", "BANDHANBNK", "BANKBARODA", "BANKINDIA", "CANBK",
         "FEDERALBNK", "HDFCBANK", "ICICIBANK", "IDFCFIRSTB", "INDIANB",
         "INDUSINDBK", "KOTAKBANK", "PNB", "RBLBANK", "SBIN", "UNIONBANK", "YESBANK",
+        "CUB", "KARURVYSYA", "UJJIVANSFB",
+        "MAHABANK",
     ],
     "Financial Services": [
         "360ONE", "ABCAPITAL", "ANGELONE", "BAJAJFINSV", "BAJFINANCE",
         "BAJAJHLDNG", "BSE", "CAMS", "CDSL", "CHOLAFIN", "HDFCAMC", "HDFCLIFE",
-        "ICICIGI", "ICICIPRULI", "IEX", "IREDA", "IRFC", "JIOFIN", "KFINTECH",
+        "ICICIGI", "ICICILIFE", "ANANDRATHI", "IEX", "IREDA", "IRFC", "JIOFIN", "KFINTECH",
         "LICHSGFIN", "LICI", "LTF", "MANAPPURAM", "MCX", "MFSL", "MOTILALOFS",
         "MUTHOOTFIN", "NAM-INDIA", "PAYTM", "PFC", "PNBHOUSING", "POLICYBZR",
         "RECLTD", "SBICARD", "SBILIFE", "SHRIRAMFIN",
@@ -25,11 +27,13 @@ _GROUPS: dict[str, list[str]] = {
     "IT": [
         "COFORGE", "HCLTECH", "INFY", "KPITTECH", "LTM", "MPHASIS", "OFSS",
         "PERSISTENT", "TATAELXSI", "TCS", "TECHM", "WIPRO",
+        "SAGILITY",
     ],
     "Auto & Components": [
         "ASHOKLEY", "BAJAJ-AUTO", "BHARATFORG", "BOSCHLTD", "EICHERMOT",
         "FORCEMOT", "HEROMOTOCO", "HYUNDAI", "M&M", "MARUTI", "MOTHERSON",
         "SONACOMS", "TIINDIA", "TMPV", "TVSMOTOR", "UNOMINDA",
+        "ATHERENERG",
     ],
     "Pharma & Healthcare": [
         "ALKEM", "APOLLOHOSP", "AUROPHARMA", "BIOCON", "CIPLA", "DIVISLAB",
@@ -51,6 +55,7 @@ _GROUPS: dict[str, list[str]] = {
         "ABB", "BDL", "BEL", "BHEL", "CGPOWER", "COCHINSHIP", "CUMMINSIND",
         "GVT&D", "HAL", "INOXWIND", "KAYNES", "KEI", "MAZDOCK", "POLYCAB",
         "POWERINDIA", "SIEMENS", "SOLARINDS",
+        "DATAPATTNS", "ENRIN", "SYRMA",
     ],
     "Consumer Durables": [
         "AMBER", "BLUESTARCO", "CROMPTON", "DIXON", "HAVELLS", "PGEL", "VOLTAS",
@@ -77,6 +82,7 @@ _GROUPS: dict[str, list[str]] = {
     ],
     "Chemicals": [
         "PIDILITIND", "PIIND", "SRF", "UPL",
+        "COROMANDEL", "NAVINFLUOR",
     ],
     "Telecom": [
         "BHARTIARTL", "IDEA", "INDUSTOWER",

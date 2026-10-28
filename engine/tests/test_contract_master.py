@@ -209,7 +209,9 @@ def test_refresh_moves_an_idle_or_distant_atm_to_the_active_strike_near_spot(tmp
     changed = asyncio.run(selector.refresh({SBIN: 1094.0}, active, now))
     assert changed[SBIN]["to"] == {"CE": "NSE:SBIN" + FRONT + "1100CE", "PE": "NSE:SBIN" + FRONT + "1090PE"}
     assert "strikes from spot" in changed[SBIN]["reasons"][0]
-    assert atm["CE"].symbol not in selector.contracts and "NSE:SBIN" + FRONT + "1100CE" in selector.new_symbols
+    old = selector.contracts[atm["CE"].symbol]                          # the replaced leg keeps streaming ...
+    assert old.moneyness == "PREV-ATM" and old.analysis_only             # ... as context only, no new entries
+    assert "NSE:SBIN" + FRONT + "1100CE" in selector.new_symbols
     saved = json.loads((tmp_path / "contracts.json").read_text())
     assert saved["refreshes"][-1]["spot"] == SBIN
     assert saved["spots"][SBIN]["selection_price"] == 1094.0
@@ -243,3 +245,11 @@ def test_a_held_leg_chosen_today_keeps_its_spot_covered_on_restart(tmp_path):
     restarted = ContractSelector(broker, str(path))
     asyncio.run(restarted.build([SBIN]))
     assert len(broker.quote_calls) == calls                             # no re-selection, ladder unchanged
+
+
+def test_a_streamed_strike_with_comparable_liquidity_keeps_the_atm_slot():
+    from macd_trader.contracts import select_liquid_contract
+    entries = [OptionChainEntry(k, "CE", f"S{k}", volume=v) for k, v in ((1040, 900), (1050, 1100), (1060, 1600), (1070, 100))]
+    assert select_liquid_contract(entries, 1053.0, "CE").symbol == "S1060"                       # the side-rounded ATM
+    assert select_liquid_contract(entries, 1053.0, "CE", prefer={"S1050"}).symbol == "S1050"     # 1100 >= 2/3 of 1600
+    assert select_liquid_contract(entries, 1053.0, "CE", prefer={"S1070"}).symbol == "S1060"     # too thin to keep
