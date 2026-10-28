@@ -30,4 +30,4 @@ def test_default_universe_covers_current_stock_derivatives():
     assert not {"BAJAJHLDNG", "ICICIPRULI"} & set(FNO_STOCKS)                # left F&O / renamed (28 Oct 2026)
     assert "DALBHARAT" not in FNO_STOCKS
     assert set(Settings(symbols_csv="").symbols) == set(INDEX_SPOTS.values()) | set(STOCK_SPOTS.values())
-    assert len(Settings(symbols_csv="").symbols) == 225          # 218 stocks + 7 derivative indices (28 Oct 2026)
+    assert len(Settings(symbols_csv="").symbols) == 227          # 218 stocks + 9 derivative indices (28 Oct 2026)

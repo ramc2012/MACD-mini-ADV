@@ -86,7 +86,7 @@ def first_tradable(expiries: list[Expiry], min_days: int = 1, today: date | None
 # expiry-flatten time (15:10) on T-2, at once if T-2 has already passed. Index
 # options are cash-settled and keep the expiry-day rules. 0 disables.
 STOCK_EXIT_SESSIONS = 2
-_INDEX_OPTION = re.compile(r"^(?:NSE|BSE):(?:NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|NIFTYNXT50|SENSEX|BANKEX)\d{2}")
+_INDEX_OPTION = re.compile(r"^(?:NSE|BSE):(?:NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|NIFTYNXT50|NIFTYFPI|SENSEX|BANKEX|FOCIT)\d{2}")
 
 
 def set_stock_exit_sessions(sessions: int) -> None:

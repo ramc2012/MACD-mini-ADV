@@ -18,6 +18,9 @@ INDEX_SPOTS = {
     "FINNIFTY": "NSE:FINNIFTY-INDEX",
     "NIFTYNXT50": "NSE:NIFTYNXT50-INDEX",
     "BANKEX": "BSE:BANKEX-INDEX",
+    # Index derivatives found in the Fyers F&O master on 28 Oct 2026 (owner: add them).
+    "FOCIT": "BSE:FOCIT-INDEX",
+    "NIFTYFPI": "NSE:NIFTYFPI150-INDEX",
 }
 
 FNO_STOCKS = tuple("""

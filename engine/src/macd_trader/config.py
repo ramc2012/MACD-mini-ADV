@@ -300,7 +300,7 @@ class Settings(BaseSettings):
     # volume-profile facts a candle cannot reproduce.
     # Live OI (oi_capture.py): the minute chain snapshots cover these index roots beside NIFTY/BANKNIFTY, and
     # every F&O stock's chain is swept once per window (0 turns the stock sweep off).
-    chain_extra_roots: list[str] = ["SENSEX", "MIDCPNIFTY", "FINNIFTY", "NIFTYNXT50", "BANKEX"]
+    chain_extra_roots: list[str] = ["SENSEX", "MIDCPNIFTY", "FINNIFTY", "NIFTYNXT50", "BANKEX", "FOCIT", "NIFTYFPI"]
     stock_chain_sweep_minutes: int = Field(default=15, ge=0, le=120)
     # The permanent market-data archive (archive.py): a host folder mounted into the containers, so a Docker
     # reset cannot take it. Raw ticks are kept there tick_archive_retention_days; every other dataset forever.
