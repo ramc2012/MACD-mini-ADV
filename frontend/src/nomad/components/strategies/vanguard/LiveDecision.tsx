@@ -11,7 +11,7 @@ import {AttritionRibbon} from './DecisionFlow';
 // closed 30-minute bar (shadow_lanes/source.py rank_bar): hard filters only for tradability, evidence legs vote.
 type Row = {symbol: string; option_type: 'CE' | 'PE'; strike: number; expiry: string; sector20?: string; source_mark: number;
   underlying_signal_close: number; combined_score: number; direction_score: number; atm_distance: number | null;
-  traded_lots: number; premium_pct?: number | null; option_oi?: number; evidence: Record<string, number>; evidence_net: number; filter_reasons: string[];
+  traded_lots: number; premium_pct?: number | null; otm?: number | null; option_oi?: number; evidence: Record<string, number>; evidence_net: number; filter_reasons: string[];
   filtered: boolean; selected: boolean; horizon_sessions: number};
 type Stage = {stage: string; surviving?: number; ce?: number; pe?: number};
 type Model = {version: string; role: string; status: string; training_start?: string; training_end?: string; test_start?: string;
@@ -41,7 +41,7 @@ function vote(v: number) {
 function SideTable({side, rows, published, showFiltered}: {side: 'CE' | 'PE'; rows: Row[]; published: Set<string>; showFiltered: boolean}) {
   const shown = rows.filter((r) => r.option_type === side && (showFiltered || !r.filtered));
   return <div className="overflow-auto"><table className="w-full whitespace-nowrap text-left text-xs">
-    <thead><tr>{['#', 'Stock', 'Sector', 'ATM contract', 'Premium', 'Premium % of spot', 'Spot · distance', 'Lots traded', 'Payoff rank', 'Direction',
+    <thead><tr>{['#', 'Stock', 'Sector', 'ATM contract', 'Premium', 'Premium % of spot', 'Out of the money', 'Spot · distance', 'Lots traded', 'Payoff rank', 'Direction',
       ...LEGS.map(([, label]) => label), 'Net', 'Status'].map((h) => <th className="p-2" key={h} title={LEGS.find(([, l]) => l === h) ? LEG_HELP[LEGS.find(([, l]) => l === h)![0]] : undefined}>{h}</th>)}</tr></thead>
     <tbody>{shown.map((r, i) => <tr className={`border-t border-bg-border ${r.filtered ? 'opacity-60' : ''}`} key={r.symbol + side}>
       <td className="p-2">{i + 1}</td>
@@ -50,6 +50,7 @@ function SideTable({side, rows, published, showFiltered}: {side: 'CE' | 'PE'; ro
       <td className="p-2">{formatNumber(r.strike)} {side} · {String(r.expiry).slice(0, 10)}</td>
       <td className="p-2">₹{formatNumber(r.source_mark)}</td>
       <td className="p-2">{r.premium_pct == null ? '—' : `${(r.premium_pct * 100).toFixed(2)}%`}</td>
+      <td className="p-2">{r.otm == null ? '—' : `${r.otm >= 0 ? '+' : ''}${(r.otm * 100).toFixed(2)}%`}</td>
       <td className="p-2">{formatNumber(r.underlying_signal_close)} · {r.atm_distance == null ? '—' : `${(r.atm_distance * 100).toFixed(1)}%`}</td>
       <td className="p-2">{formatNumber(r.traded_lots)}</td>
       <td className="p-2">{(r.combined_score * 100).toFixed(1)}</td>
@@ -102,7 +103,7 @@ export function LiveDecisionFlow() {
       <div className="overflow-auto"><table className="text-left text-xs"><thead><tr><th className="p-2">Stage</th><th className="p-2">Stocks</th><th className="p-2">CE</th><th className="p-2">PE</th></tr></thead>
         <tbody>{(d.stages ?? []).map((s) => <tr className="border-t border-bg-border" key={s.stage}><td className="p-2">{s.stage}</td><td className="p-2">{s.surviving ?? '—'}</td><td className="p-2">{s.ce ?? '—'}</td><td className="p-2">{s.pe ?? '—'}</td></tr>)}</tbody></table></div>
       <div className="mt-4"><DecisionMap stages={d.stages ?? []}/></div>
-      {f && <p className="mt-3 text-xs text-text-secondary">Hard filters, tradability only: the ATM leg within {Math.round(f.max_atm_distance * 100)}% of spot and at least {f.min_traded_lots} lots traded by the bar. Evidence legs vote (+1 / −1 / 0) instead of vetoing one by one; a pick is dropped only when the net is {f.evidence_floor} or worse. The rest are ranked by the cheapest premium as a share of spot, the rule trained on October 2026: it caught 14% of each day's top-10 performers over 1–3 sessions (random 4%) with a paper result of +14.5% a pick, in both halves of the month and on both sides. The payoff ranker and the votes break ties. One month is not proof; the List tests keep scoring it.</p>}
+      {f && <p className="mt-3 text-xs text-text-secondary">Hard filters, tradability only: the ATM leg within {Math.round(f.max_atm_distance * 100)}% of spot and at least {f.min_traded_lots} lots traded by the bar. Evidence legs vote (+1 / −1 / 0) instead of vetoing one by one; a pick is dropped only when the net is {f.evidence_floor} or worse. The rest are ranked furthest out of the money first (still within the ATM band), then cheapest premium as a share of spot. Found on October 2026 and checked on September: it caught 16.7% / 12.9% of each day's top-10 performers over 1–3 sessions (random 6.7% / 9.2%), paper +19.6% / +31.8% a pick. Cheap options win through leverage per rupee, not low implied volatility (low IV alone was no better than random). The payoff ranker and the votes break ties; the List tests keep scoring it.</p>}
       <label className="mt-2 flex items-center gap-2 text-xs"><input type="checkbox" checked={showFiltered} onChange={(e) => setShowFiltered(e.target.checked)}/> Show filtered candidates with their reasons</label>
     </Section>
     <Section title="Calls · CE" description={`${rows.filter((r) => r.option_type === 'CE' && !r.filtered).length} pass the screen`}><SideTable side="CE" rows={rows} published={published} showFiltered={showFiltered}/></Section>

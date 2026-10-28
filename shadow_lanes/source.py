@@ -109,10 +109,11 @@ MAX_ATM_DISTANCE = 0.03      # an "ATM" leg further than 3% from spot is not at 
 MIN_TRADED_LOTS = 2          # lots traded in the session by the decision bar
 EVIDENCE_FLOOR = -3          # dropped only when nearly every leg argues for the other side (was -2; on October data
                              # every momentum veto tried cost captured top performers, research/vanguard_decision_20261028)
-# Ranking, trained on October 2026 (15 labelled sessions, walk-forward checked by halves and sides): among tradable
-# ATM legs, the cheapest premium as a share of spot caught 14% of each day's top-10 performers over 1-3 sessions
-# (random 4%) with a paper result of +14.5% a pick (random ~0%), in both halves and on both sides. The payoff ranker
-# and the momentum votes did not add to it out of sample, so they break ties and inform; they do not lead.
+# Ranking (research/vanguard_decision_20261028, found on October 2026 and checked on September out of sample):
+# among the tradable near-ATM legs, the one furthest out of the money -- more leverage per rupee, the reason "cheap"
+# options win; implied-vol level itself did not separate winners -- caught 16.7% (Oct) / 12.9% (Sep) of each day's
+# top-10 performers over 1-3 sessions against random 6.7% / 9.2%, with paper results of +19.6% / +31.8% a pick
+# (random +6.5% / +5.5%). Cheapness breaks ties; the payoff ranker and the votes inform, they do not lead.
 OWN_SIDE_OI = {"long_buildup": 1, "short_covering": 1, "long_unwind": -1, "short_buildup": -1}
 
 
@@ -146,8 +147,10 @@ def screen(row, inputs, spot):
         against = [k for k, v in votes.items() if v < 0]
         reasons.append(f"evidence against this side (net {net:+d}: {', '.join(against)})")
     premium = float(row.get("source_mark") or 0)
+    side = 1 if row["option_type"] == "CE" else -1
     row.update(evidence=votes, evidence_net=net, atm_distance=distance, traded_lots=round(lots, 1),
                premium_pct=premium / spot if spot and premium > 0 else None,
+               otm=side * (float(row["strike"]) / spot - 1) if spot else None,     # > 0: out of the money
                filter_reasons=reasons, filtered=bool(reasons))
     return row
 
@@ -229,7 +232,7 @@ def rank_bar(connection, bar, now):
          "pe": sum(1 for r in sides["PE"] if r["evidence_net"] > EVIDENCE_FLOOR)},
         {"stage": "pass every filter", "ce": sum(1 for r in sides["CE"] if not r["filtered"]),
          "pe": sum(1 for r in sides["PE"] if not r["filtered"])},
-        {"stage": f"selected: {PER_SIDE} cheapest per side (premium as % of spot)",
+        {"stage": f"selected: {PER_SIDE} per side, furthest out of the money first",
          "ce": sum(1 for r in selected if r["option_type"] == "CE"), "pe": sum(1 for r in selected if r["option_type"] == "PE")},
     ]
     return dict(status="ok", source_session=str(day), **diagnostics, chain=coverage, stages=stages,
@@ -276,9 +279,10 @@ HOLD_SESSIONS = 3  # each pick is held up to 3 sessions or until its stop, and m
 
 
 def rank_key(r):
-    """Cheapest premium as a share of spot first (October-trained), then the payoff ranker and the evidence."""
-    share = r.get('premium_pct')
-    return (share if share is not None else 9.0, -r['combined_score'], -r.get('evidence_net', 0), -r['direction_score'])
+    """Furthest out of the money first, then the cheapest premium share of spot, then the payoff ranker and evidence."""
+    otm, share = r.get('otm'), r.get('premium_pct')
+    return (-otm if otm is not None else 9.0, share if share is not None else 9.0, -r['combined_score'],
+            -r.get('evidence_net', 0), -r['direction_score'])
 
 
 def select_atm(candidates, per_side=PER_SIDE):

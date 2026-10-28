@@ -93,7 +93,8 @@ def test_evidence_votes_and_the_screen_drop_only_untradable_or_clearly_opposed_p
     assert source.screen(row(source_mark=2),quiet,100)['premium_pct']==0.02
 
 
-def test_cheapest_premium_share_leads_the_ranking():
-    rows=[dict(symbol=s,option_type='CE',contract_kind='ATM',combined_score=score,direction_score=0,contract_score=0,premium_pct=share)
-          for s,score,share in [('RICHBEST',1.0,0.05),('CHEAP',0.2,0.012),('MID',0.9,0.02)]]
-    assert [r['symbol'] for r in source.select_atm(rows)]==['CHEAP','MID','RICHBEST']
+def test_the_most_out_of_the_money_leg_leads_and_cheapness_breaks_ties():
+    rows=[dict(symbol=s,option_type='CE',contract_kind='ATM',combined_score=score,direction_score=0,contract_score=0,otm=otm,premium_pct=share)
+          for s,score,otm,share in [('ITM',1.0,-0.01,0.03),('OTM',0.2,0.012,0.02),('ATM_CHEAP',0.5,0.0,0.015),('ATM_RICH',0.9,0.0,0.025)]]
+    assert [r['symbol'] for r in source.select_atm(rows)]==['OTM','ATM_CHEAP','ATM_RICH','ITM']
+    assert source.screen({'option_type':'PE','strike':98,'option_volume':5000,'lot_size':1000,'source_mark':2},{},100)['otm']==0.020000000000000018
