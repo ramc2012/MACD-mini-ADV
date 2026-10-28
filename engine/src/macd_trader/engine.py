@@ -1675,9 +1675,11 @@ class TradingEngine(DeskMixin):
         _, minute_closed = self.minute_candles.on_tick(tick)
         if minute_closed and in_session(minute_closed.symbol, minute_closed_moment(minute_closed)):
             self.candle_writer.add(minute_closed, resolve_expiry(minute_closed.symbol, self.contract_selector.contracts))
-            if not analysis_only:
+            if not analysis_only or minute_closed.symbol in self.blast.portfolio.positions:
                 # The blast lane screens one-minute bars whatever the strategy
                 # timeframe is; that is the resolution its screen was measured at.
+                # A holding that left today's ladder still needs its bars: its
+                # HMA-below-KAMA exit is judged on them.
                 await self.blast.on_minute_bar(minute_closed, tick.timestamp)
         if analysis_only:
             await self._manage_analysis_holdings(tick, exchange_at)

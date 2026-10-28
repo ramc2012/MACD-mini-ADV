@@ -178,6 +178,10 @@ class Settings(BaseSettings):
     # blast_auto_trade defaults OFF: the lane journals every candidate and
     # trades none until the owner turns it on.
     blast_enabled: bool = True
+    # Owner, 28 Oct 2026: "convert blast lane with this strategy" -- HMA(20) crossing above KAMA(10,2,30) on 30-minute
+    # premium bars enters; HMA back below KAMA on a closed bar, a blast_hard_stop_pct stop or the 4th session's 15:00
+    # exits; no trail (research/hma_premium_20261028). "macd_screen" restores the original screen and trail.
+    blast_strategy: Literal["hma_kama", "macd_screen"] = "hma_kama"
     blast_auto_trade: bool = False
     blast_initial_capital: float = 1_000_000.0
     # Raise (with blast_initial_capital) to run the lane unbounded, taking

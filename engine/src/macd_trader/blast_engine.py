@@ -83,7 +83,8 @@ from .brokers import Broker
 from .config import Settings
 from .events import EventHub, json_value
 from .execution import ExecutionManager
-from .indicators import IncrementalMACD
+from .indicators import IncrementalHMA, IncrementalKAMA, IncrementalMACD
+from . import market_calendar
 from .models import Candle, IndicatorPoint, Signal, Trade
 from .option_greeks import greeks, years_to_expiry
 from .rollover import stock_exit_due
@@ -125,6 +126,18 @@ TOO_ILLIQUID = "TOO_ILLIQUID"
 ALREADY_HELD = "ALREADY_HELD"
 AUTO_TRADE_OFF = "AUTO_TRADE_OFF"
 TAKEN = "TAKEN"
+
+# HMA x KAMA strategy (blast_strategy = "hma_kama"; owner, 28 Oct 2026; research/hma_premium_20261028). On 30-minute
+# premium bars over 8,018 live-streamed contracts (1 Sep - 28 Oct 2026): +4.3% / +4.8% a trade (Sep / Oct) net of a
+# 1.5% round trip, +3.5% a day, median day +1.0%, 21 of 39 days positive, worst day -11.3% with a 30% stop. Two
+# months: not proven.
+HMA_KAMA = "hma_kama"
+HMA_PERIOD = 20
+KAMA_PARAMS = (10, 2, 30)
+HOLD_SESSIONS = 4                    # out at 15:00 on the 4th session after entry
+HOLD_EXIT_AT = (15, 0)
+SIGNAL_KIND_HK = "BLAST_HMA20_CROSS_KAMA_UP"
+EXIT_HK = "BLAST_HMA_BELOW_KAMA"
 
 
 def vix_entry_policy(settings: Settings, quote=None, now: datetime | None = None) -> dict:
@@ -244,6 +257,20 @@ def blast_execution_settings(settings: Settings) -> Settings:
     })
 
 
+def held_sessions(opened_at: datetime | None, now: datetime | None = None) -> int:
+    """Trading sessions completed since entry, counting today once it reaches HOLD_EXIT_AT (0 before that)."""
+    if opened_at is None:
+        return 0
+    local = (now if now is not None and now.tzinfo is not None else datetime.now(UTC)).astimezone(IST)
+    day = (opened_at if opened_at.tzinfo is not None else opened_at.replace(tzinfo=UTC)).astimezone(IST).date()
+    count = 0
+    while day < local.date():
+        day = market_calendar.next_trading_day(day)
+        if day < local.date() or (local.hour, local.minute) >= HOLD_EXIT_AT:
+            count += 1
+    return count
+
+
 class BlastExecutionManager(ExecutionManager):
     """Stop-and-trail only. No ladder, no pyramid.
 
@@ -274,6 +301,20 @@ class BlastExecutionManager(ExecutionManager):
                         self.events.publish("order", order)
         position = self.portfolio.positions.get(symbol)
         if not position or position.quantity <= 0:
+            return
+        if getattr(self.settings, "blast_strategy", "macd_screen") == HMA_KAMA:
+            # HMA x KAMA: a fixed stop and a session cap here; the HMA-below-KAMA exit runs on each closed bar.
+            position.peak_price = max(position.peak_price, price)
+            position.trailing_stop = None
+            position.hard_stop = round(position.average_price * (1 - self.settings.hard_stop_pct), 4)
+            reason = None
+            if price <= position.hard_stop:
+                reason = f"BLAST_HARD_STOP_{round(self.settings.hard_stop_pct * 100)}_PCT"
+            elif held_sessions(position.opened_at, timestamp) >= HOLD_SESSIONS:
+                reason = f"BLAST_HOLD_{HOLD_SESSIONS}_SESSIONS"
+            if reason:
+                self.arm_exit(symbol, reason)
+                await self.submit(symbol, "SELL", position.quantity)
             return
         if price > position.peak_price:
             position.peak_price = price
@@ -330,6 +371,10 @@ class BlastEngine:
         # The lane's own one-minute MACD per symbol, and its newest value.
         self._macd: dict[str, IncrementalMACD] = {}
         self._points: dict[str, IndicatorPoint] = {}
+        # HMA(20) and KAMA(10,2,30) per symbol on the same closed bars, with their newest and previous values.
+        self._hk: dict[str, tuple[IncrementalHMA, IncrementalKAMA]] = {}
+        self._hk_value: dict[str, tuple[float | None, float | None]] = {}
+        self._hk_previous: dict[str, tuple[float | None, float | None]] = {}
         # Longer signal bars: the forming bar per symbol, and the minute each
         # high in the recent-high window belongs to (so the bar being judged
         # can be left out of its own "recent high").
@@ -464,7 +509,8 @@ class BlastEngine:
             position.hard_stop = round(position.average_price * (1 - risk.hard_stop_pct), 4)
             position.entry_anchor = position.entry_anchor or position.average_price
             position.entry_stage = max(position.entry_stage, position.lots)
-            if position.quantity > 0 and position.peak_price >= position.average_price * (1 + risk.trailing_activation_pct):
+            if (position.quantity > 0 and getattr(risk, "blast_strategy", "macd_screen") != HMA_KAMA
+                    and position.peak_price >= position.average_price * (1 + risk.trailing_activation_pct)):
                 floor = breakeven_exit_price(position.average_price, position.quantity, risk.slippage_bps)
                 trail = position.peak_price * (1 - risk.trailing_stop_pct)
                 position.trailing_stop = round(max(trail, floor), 4)
@@ -559,6 +605,9 @@ class BlastEngine:
         self._points.clear()
         self._forming.clear()
         self._high_times.clear()
+        self._hk.clear()
+        self._hk_value.clear()
+        self._hk_previous.clear()
 
     def _indicator(self, candle: Candle) -> IndicatorPoint:
         macd = self._macd.get(candle.symbol)
@@ -567,6 +616,12 @@ class BlastEngine:
         value = macd.update(candle.close)
         point = IndicatorPoint(candle.symbol, candle.timestamp, value.macd, value.signal, value.histogram)
         self._points[candle.symbol] = point
+        pair = self._hk.get(candle.symbol)
+        if pair is None:
+            pair = self._hk[candle.symbol] = (IncrementalHMA(HMA_PERIOD), IncrementalKAMA(*KAMA_PARAMS))
+        self._hk_previous[candle.symbol] = self._hk_value.get(candle.symbol, (None, None))
+        self._hk_value[candle.symbol] = (pair[0].update(candle.close), pair[1].update(candle.close))
+        point.kama = self._hk_value[candle.symbol][1]
         return point
 
     def _remember(self, candle: Candle, point: IndicatorPoint | None = None) -> tuple[bool, IndicatorPoint | None]:
@@ -604,6 +659,16 @@ class BlastEngine:
         if self.signal_seconds > BAR_SECONDS:
             lateness = closed_at.timestamp() - (candle.timestamp + BAR_SECONDS)
             closed, previous, point, recent_high, bars = self._fold_minute(candle)
+            if self.settings.blast_strategy == HMA_KAMA:
+                if closed is None or point is None:
+                    return None
+                late = (lateness > SIGNAL_BAR_GRACE_SECONDS
+                        or self._session_day(closed.timestamp) != self._session_day(candle.timestamp))
+                try:
+                    return await self._hma_kama_bar(closed, point, late)
+                except Exception as exc:  # noqa: BLE001 -- a lane fault must not kill the feed
+                    self.error = f"{type(exc).__name__}: {exc}"
+                    return None
             if closed is None or point is None or previous is None:
                 return None
             if lateness > SIGNAL_BAR_GRACE_SECONDS or self._session_day(closed.timestamp) != self._session_day(candle.timestamp):
@@ -704,6 +769,72 @@ class BlastEngine:
         except Exception as exc:  # noqa: BLE001 -- a lane fault must not kill the feed
             self.error = f"{type(exc).__name__}: {exc}"
             return None
+
+    async def _hma_kama_bar(self, closed: Candle, point: IndicatorPoint, late: bool) -> dict | None:
+        """One closed signal bar under the HMA x KAMA strategy: exit a holding whose HMA is below KAMA, then enter on
+        a fresh cross of HMA above KAMA. A bar that closed late (or overnight) can still exit but never enters."""
+        symbol = closed.symbol
+        hma, kama = self._hk_value.get(symbol, (None, None))
+        before_hma, before_kama = self._hk_previous.get(symbol, (None, None))
+        position = self.portfolio.positions.get(symbol)
+        if position is not None and position.quantity > 0:
+            if hma is not None and kama is not None and hma < kama:
+                await self.flatten(symbol, EXIT_HK)
+            return None
+        if late:
+            self.late_bars_skipped += 1
+            return None
+        if not self.settings.blast_enabled or None in (hma, kama, before_hma, before_kama):
+            return None
+        if not (before_hma <= before_kama and hma > kama):
+            return None
+        return await self._evaluate_hk(closed, point, hma, kama)
+
+    async def _evaluate_hk(self, candle: Candle, point: IndicatorPoint, hma: float, kama: float) -> dict | None:
+        symbol = candle.symbol
+        premium = candle.close
+        contract = self._contracts.get(symbol)
+        if contract is None or premium <= 0:
+            return None
+        option_type = contract.get("option_type") or ("CE" if symbol.endswith("CE") else "PE")
+        spot_symbol = self._spot_symbols.get(symbol)
+        spot = self._spot_price(spot_symbol) if spot_symbol else None
+        reason = None
+        if symbol in self.portfolio.positions:
+            reason = ALREADY_HELD
+        elif self._liquidity_lots(symbol) == 0:
+            reason = TOO_ILLIQUID
+        elif not self.settings.blast_auto_trade:
+            reason = AUTO_TRADE_OFF
+        row = {
+            "id": uuid4().hex, "at": datetime.now(UTC).isoformat(), "day": datetime.now(IST).date().isoformat(),
+            "symbol": symbol, "bar_timestamp": candle.timestamp, "spot_symbol": spot_symbol,
+            "option_type": option_type, "premium": premium, "spot": spot,
+            "premium_pct": (premium / spot * 100.0) if spot else None, "breadth": None, "off_high_pct": None,
+            "macd": point.macd, "signal": point.signal, "histogram": point.histogram,
+            "hma": hma, "kama": kama, "strategy": HMA_KAMA, "signal_kind": SIGNAL_KIND_HK,
+            "taken": 0, "reason": reason or TAKEN, "order_id": None,
+            "strike": contract.get("strike"), "expiry": contract.get("expiry"),
+            "planned_target_notional": self.settings.blast_target_notional,
+        }
+        if reason is None:
+            signal = Signal(symbol, "BUY", SIGNAL_KIND_HK, premium, point.macd, point.signal, point.histogram,
+                            evaluated_candle_timestamp=candle.timestamp)
+            self.repository.save_signal(signal)
+            detail: dict = {}
+            order = await self._enter(signal, detail=detail)       # fixed ticket: no premium-share repricing
+            row.update(detail)
+            if order is None:
+                row["reason"] = "ENTRY_REJECTED"
+            else:
+                row["taken"], row["order_id"] = 1, order.order_id
+                self.taken += 1
+        self.evaluated += 1
+        self.rejections[row["reason"]] = self.rejections.get(row["reason"], 0) + 1
+        self.last_candidate_at = row["at"]
+        self._journal(row)
+        self.events.publish("candidate", row)
+        return row
 
     async def _evaluate(self, candle: Candle, point: IndicatorPoint,
                         recent_high: float | None, bars: int) -> dict | None:
@@ -1119,12 +1250,15 @@ class BlastEngine:
         self.execution.settings = risk
         for position in self.portfolio.positions.values():
             position.hard_stop = round(position.average_price * (1 - risk.hard_stop_pct), 4)
+            if settings.blast_strategy == HMA_KAMA:
+                position.trailing_stop = None
 
     def settings_view(self) -> dict:
         """The editable settings, keyed exactly as PUT /api/blast/settings accepts them."""
         current = self.settings
         return {
             "enabled": current.blast_enabled,
+            "strategy": current.blast_strategy,
             "auto_trade": current.blast_auto_trade,
             "initial_capital": current.blast_initial_capital,
             "max_positions": current.blast_max_positions,
@@ -1146,6 +1280,12 @@ class BlastEngine:
         return {
             "enabled": self.settings.blast_enabled,
             "auto_trade": self.settings.blast_auto_trade,
+            "strategy": self.settings.blast_strategy,
+            "strategy_rules": ({"entry": f"HMA({HMA_PERIOD}) crosses above KAMA{KAMA_PARAMS} on {self.signal_seconds // 60}-minute premium bars",
+                                "exit": f"HMA below KAMA on a closed bar, {round(self.settings.blast_hard_stop_pct * 100)}% stop, "
+                                        f"or {HOLD_SESSIONS} sessions (15:00); expiry and stock T-2 exits; no trail",
+                                "ticket": self.settings.blast_target_notional}
+                               if self.settings.blast_strategy == HMA_KAMA else None),
             "evaluated_since_start": self.evaluated,
             "taken_since_start": self.taken,
             "watching": len(self._watchers),
@@ -1162,15 +1302,19 @@ class BlastEngine:
         }
 
     def snapshot(self) -> dict:
+        health = self.health()
         return json_value({
             "lane": LANE,
             "enabled": self.settings.blast_enabled,
             "auto_trade": self.settings.blast_auto_trade,
             "settings": self.settings_view(),
-            "health": self.health(),
+            "health": health,
+            "strategy": self.settings.blast_strategy,
+            "strategy_rules": health.get("strategy_rules"),
             "screen": {
                 "vix_policy": self.entry_policy(),
-                "entry": f"MACD(12,26,9) crosses its signal line on a closed {self.signal_seconds // 60}-minute premium bar (zero-cross NOT required)",
+                "entry": (health["strategy_rules"]["entry"] if health.get("strategy_rules") else
+                          f"MACD(12,26,9) crosses its signal line on a closed {self.signal_seconds // 60}-minute premium bar (zero-cross NOT required)"),
                 "bar_seconds": BAR_SECONDS, "signal_bar_seconds": self.signal_seconds,
                 "max_premium_pct_of_spot": self.settings.blast_max_premium_pct,
                 "min_side_breadth": self.settings.blast_min_breadth,

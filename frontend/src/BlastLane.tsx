@@ -50,7 +50,7 @@ const short = (symbol: string) => symbol.split(":")[1] ?? symbol;
 const LOW = Number.NEGATIVE_INFINITY;
 const errorText = (reason: unknown) => (reason instanceof Error ? reason.message : "Request failed");
 const FUNNEL_LABEL: Record<FunnelKey, string> = {
-  evaluated: "Signal-line crosses judged",
+  evaluated: "Entry signals judged",
   judged: "Not held, with spot, breadth and history",
   premium: "Cleared premium vs spot",
   breadth: "Cleared side breadth",
@@ -167,7 +167,9 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
   return <section className="ledger-page blast-page">
     <div className="page-heading blast-heading">
       <div><h1>Blast lane</h1>
-        <p>Premium MACD signal-line crosses, screened by premium ÷ spot, own-side breadth and distance below the recent high · its own paper book</p></div>
+        <p>{snapshot.settings.strategy === "hma_kama"
+          ? "HMA(20) × KAMA(10, 2, 30) crossovers on 30-minute option premium · exit on the cross back, a hard stop or the 4th session · its own paper book"
+          : "Premium MACD signal-line crosses, screened by premium ÷ spot, own-side breadth and distance below the recent high · its own paper book"}</p></div>
       <div className="blast-badges">
         {!snapshot.enabled && <span className="mode alert" title="The screen is off. Open positions keep their stop and trail.">Disabled</span>}
         {snapshot.enabled && (snapshot.auto_trade
@@ -226,7 +228,17 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
   const breadthFloor = policy?.min_side_breadth ?? settings.min_breadth;
   const funnel = screenFunnel(summary);
   const cleared = (key: FunnelKey) => funnel.find((step) => step.key === key)?.count ?? 0;
-  const gates: { key: string; title: string; rule: string; detail: string; count?: number }[] = [
+  const hk = settings.strategy === "hma_kama";
+  const gates: { key: string; title: string; rule: string; detail: string; count?: number }[] = hk ? [
+    { key: "event", title: "Entry", rule: "HMA(20) crosses above KAMA(10, 2, 30)",
+      detail: snapshot.strategy_rules?.entry ?? "On a closed 30-minute premium bar. HMA is the fast, low-lag line; KAMA flattens in chop and follows a clean trend." },
+    { key: "exit", title: "Exit", rule: `HMA below KAMA · −${trim(settings.hard_stop_pct * 100)}% stop · 4 sessions`,
+      detail: snapshot.strategy_rules?.exit ?? "On a closed bar, at the hard stop, or at 15:00 on the 4th session; expiry and stock T-2 exits still apply. No trailing stop." },
+    { key: "liquid", title: "Liquidity", rule: `≤ ${trim(snapshot.screen.max_volume_share_pct)}% of its own volume`,
+      detail: "The entry is sized down to this share of what the contract itself trades, and declined when even one lot exceeds it." },
+    { key: "evidence", title: "Why this rule", rule: "Sep–Oct 2026 replay, 8,018 contracts",
+      detail: "+4.3% / +4.8% a trade (Sep / Oct) after a 1.5% round trip; median day +1.0%; 21 of 39 days positive; worst day −11.3%. Two months: not proven." },
+  ] : [
     { key: "event", title: "Entry event", rule: "MACD crosses its signal line",
       detail: snapshot.screen.entry },
     { key: "premium", title: "Premium vs spot", rule: `Normal ≤ ${trim(normalPremium)}% · maximum ${trim(hardPremium)}%`, count: cleared("premium"),
@@ -256,8 +268,8 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
   ];
   return <div className="blast-grid">
     <section className="panel blast-screen">
-      <div className="panel-title"><span>Screen</span><span>{cleared("judged")} judged today</span></div>
-      <p className="blast-note">{policy?.active
+      <div className="panel-title"><span>{hk ? "Strategy" : "Screen"}</span><span>{cleared("judged")} judged today</span></div>
+      <p className="blast-note">{hk ? "Fixed ticket per entry; premium ÷ spot, breadth and VIX are recorded for the journal but do not gate entries." : policy?.active
         ? `India VIX ${number.format(policy.vix ?? 0)} · premium and breadth limits adjusted`
         : `VIX ${policy?.vix_status ?? "unavailable"} · fixed premium and breadth limits apply`}</p>
       <div className="blast-gates">{gates.map((gate) => <div className="blast-gate" key={gate.key}>
@@ -267,7 +279,7 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
     </section>
 
     <section className="panel blast-funnel">
-      <div className="panel-title"><span>Today's funnel</span><span>{summary?.evaluated ?? 0} crosses</span></div>
+      <div className="panel-title"><span>Today's funnel</span><span>{summary?.evaluated ?? 0} signals</span></div>
       <div className="blast-steps">{funnel.map((step) => <div key={step.key} className={`blast-step${step.key === "taken" ? " final" : ""}`}>
         <span>{FUNNEL_LABEL[step.key]}</span><b>{step.count}</b>
         <div className="blast-meter" aria-hidden="true"><i style={{ width: `${Math.round(step.share * 100)}%` }} /></div>
@@ -279,14 +291,15 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
       <div className="panel-title"><span>Book and risk</span><span>{snapshot.auto_trade ? "auto-trade" : "shadow"}</span></div>
       <div className="blast-kv">
         <span>Hard stop</span><b>−{trim(settings.hard_stop_pct * 100)}%</b>
-        <span>Trailing stop</span><b>{trim(settings.trail_pct * 100)}% from peak, from +{trim(settings.trail_activation_pct * 100)}%</b>
+        {hk ? <><span>Trailing stop</span><b>None · exit when HMA falls below KAMA</b><span>Hold limit</span><b>15:00 on the 4th session</b></>
+          : <><span>Trailing stop</span><b>{trim(settings.trail_pct * 100)}% from peak, from +{trim(settings.trail_activation_pct * 100)}%</b></>}
         <span>Scale-outs · pyramiding</span><b>None · none</b>
         <span>Size per entry</span><b>{currency(settings.target_notional)}</b>
         <span>Max open positions</span><b>{settings.max_positions}</b>
         <span>Capital</span><b>{currency(settings.initial_capital)}</b>
         <span>Market data</span><b>Engine memory only</b>
       </div>
-      <p className="blast-note">The trail never arms below the round-trip breakeven. An expiring contract is flattened at 15:20 IST from the lane's own contract record.</p>
+      <p className="blast-note">{hk ? "An expiring contract is flattened from the lane's own contract record; stock options leave on their T-2 day." : "The trail never arms below the round-trip breakeven. An expiring contract is flattened at 15:20 IST from the lane's own contract record."}</p>
     </section>
 
     <section className="panel blast-verdicts">
@@ -518,7 +531,14 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: BlastSnapshot; onSaved: 
   return <section className="panel blast-settings">
     <div className="settings-section">
       <h3>Lane</h3>
-      <label className="toggle"><input type="checkbox" checked={form.enabled} onChange={(event) => setField("enabled", event.target.checked)} />Screen and journal signal-line crosses</label>
+      <label>Strategy
+        <select value={form.strategy} onChange={(event) => setField("strategy", event.target.value as BlastForm["strategy"])}>
+          <option value="hma_kama">HMA(20) × KAMA crossover · 30-minute premium (since 28 Oct 2026)</option>
+          <option value="macd_screen">Original screen · MACD signal-line cross, premium ÷ spot, breadth, off-high, trail</option>
+        </select>
+        <p className="field-help">Applies from the next closed bar. Open positions move to the chosen strategy's exits.</p>
+      </label>
+      <label className="toggle"><input type="checkbox" checked={form.enabled} onChange={(event) => setField("enabled", event.target.checked)} />Judge and journal entry signals</label>
       <p className="field-help">Off stops new candidates only. Open positions keep their stop, trail and expiry exit.</p>
       <label className="toggle"><input type="checkbox" checked={form.auto_trade}
         onChange={(event) => { if (event.target.checked && !form.auto_trade) setConfirmAuto(true); else setField("auto_trade", event.target.checked); }} />

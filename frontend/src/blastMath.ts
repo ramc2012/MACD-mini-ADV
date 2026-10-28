@@ -108,7 +108,7 @@ export const RISK_KEYS = ["hard_stop_pct", "trail_activation_pct", "trail_pct"] 
 // Form values are text so a half-typed number is not coerced mid-edit, and the
 // three fractions are shown as percentages: "50" is a 50% stop, never 0.5.
 export type BlastForm = {
-  enabled: boolean; auto_trade: boolean;
+  enabled: boolean; auto_trade: boolean; strategy: "hma_kama" | "macd_screen";
   initial_capital: string; max_positions: string; target_notional: string;
   max_premium_pct: string; min_breadth_pct: string; min_off_high_pct: string;
   vix_adaptive_enabled: boolean; vix_reference: string; vix_breadth_adjustment_pct: string;
@@ -122,6 +122,7 @@ export function toForm(settings: BlastSettings): BlastForm {
   return {
     enabled: settings.enabled,
     auto_trade: settings.auto_trade,
+    strategy: settings.strategy ?? "macd_screen",
     initial_capital: asText(settings.initial_capital),
     max_positions: asText(settings.max_positions),
     target_notional: asText(settings.target_notional),
@@ -157,6 +158,7 @@ export function fromForm(form: BlastForm): { payload?: BlastSettings; error?: st
   const payload: BlastSettings = {
     enabled: form.enabled,
     auto_trade: form.auto_trade,
+    strategy: form.strategy,
     initial_capital: read(form.initial_capital, "Capital", 1, 1_000_000_000_000),
     max_positions: read(form.max_positions, "Max open positions", 1, 1000, { integer: true }),
     target_notional: read(form.target_notional, "Size per entry", 0, 5_000_000),

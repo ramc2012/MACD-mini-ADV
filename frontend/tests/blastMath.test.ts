@@ -17,7 +17,7 @@ const candidate = (over: Partial<BlastCandidate> = {}): BlastCandidate => ({
 });
 
 const SETTINGS: BlastSettings = {
-  enabled: true, auto_trade: false, initial_capital: 1_000_000, max_positions: 10, target_notional: 100_000,
+  enabled: true, auto_trade: false, strategy: "hma_kama", initial_capital: 1_000_000, max_positions: 10, target_notional: 100_000,
   max_premium_pct: 1.2, min_breadth: 0.5, min_off_high_pct: 25, hard_stop_pct: 0.5, trail_activation_pct: 0.3, trail_pct: 0.4,
   vix_adaptive_enabled: true, vix_reference: 20, vix_breadth_adjustment: -0.10,
   vix_max_age_seconds: 900, rich_premium_max_multiple: 2,

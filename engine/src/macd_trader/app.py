@@ -129,6 +129,7 @@ class SettingsInput(BaseModel):
     # Blast lane. Bounds mirror BlastSettingsInput so the two write paths
     # cannot disagree about what is acceptable.
     blast_enabled: bool | None = None
+    blast_strategy: Literal["hma_kama", "macd_screen"] | None = None
     blast_auto_trade: bool | None = None
     blast_initial_capital: float | None = Field(default=None, ge=1)
     blast_max_positions: int | None = Field(default=None, ge=1, le=100)
@@ -391,6 +392,7 @@ async def signal_diagnostics():
 
 class BlastSettingsInput(BaseModel):
     enabled: bool | None = None
+    strategy: Literal["hma_kama", "macd_screen"] | None = None
     auto_trade: bool | None = None
     initial_capital: float | None = Field(default=None, ge=1)
     # Up to 1000 so the lane can be run unbounded, taking every signal the

@@ -61,6 +61,7 @@ def build(tmp_path: Path, **overrides) -> BlastEngine:
         "blast_min_breadth_cohort": 1,
         "blast_target_notional": 100_000,
         "blast_signal_bar_seconds": 60,          # these tests pin the one-minute screen as built
+        "blast_strategy": "macd_screen",         # ... and its MACD screen and trail (HMA x KAMA: test_blast_hma_kama.py)
         **overrides,
     })
     lane = BlastEngine(str(tmp_path / "blast.sqlite3"), settings, BrokerThatMustNotReceiveOrders(), EventHub())
@@ -609,7 +610,8 @@ def build_on(tmp_path: Path, events, broker, **overrides) -> BlastEngine:
     settings = Settings(**{
         "execution_mode": "paper", "symbols_csv": SPOT, "slippage_bps": 0,
         "blast_auto_trade": True, "blast_min_lookback_bars": 10, "blast_high_lookback_bars": 30,
-        "blast_min_breadth_cohort": 1, "blast_target_notional": 100_000, "blast_signal_bar_seconds": 60, **overrides,
+        "blast_min_breadth_cohort": 1, "blast_target_notional": 100_000, "blast_signal_bar_seconds": 60,
+        "blast_strategy": "macd_screen", **overrides,
     })
     lane = BlastEngine(str(tmp_path / "blast.sqlite3"), settings, broker, events)
     lane.set_tradable_contracts({SYMBOL: 100})

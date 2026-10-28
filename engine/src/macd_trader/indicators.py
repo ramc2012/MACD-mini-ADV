@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from collections import deque
 from math import sqrt
 
@@ -93,6 +94,39 @@ class IncrementalBollingerBands:
         upper, lower = middle + spread, middle - spread
         width = (upper - lower) / middle if middle else None
         return BollingerValue(middle, upper, lower, width)
+
+
+class IncrementalHMA:
+    """Hull moving average: WMA(2 x WMA(price, n/2) - WMA(price, n), sqrt(n)). Low lag at a fixed speed.
+
+    Weights rise linearly to the newest value. None until n + sqrt(n) - 1 prices have been seen.
+    """
+
+    def __init__(self, period: int = 20):
+        if period < 2:
+            raise ValueError("HMA requires period >= 2")
+        self.period = period
+        self.half = max(1, period // 2)
+        self.root = max(1, int(math.sqrt(period)))
+        self.prices: deque[float] = deque(maxlen=period)
+        self.diffs: deque[float] = deque(maxlen=self.root)
+        self.value: float | None = None
+
+    @staticmethod
+    def _wma(values: list[float]) -> float:
+        n = len(values)
+        return sum(value * (index + 1) for index, value in enumerate(values)) / (n * (n + 1) / 2)
+
+    def update(self, price: float) -> float | None:
+        self.prices.append(price)
+        if len(self.prices) < self.period:
+            return None
+        prices = list(self.prices)
+        self.diffs.append(2 * self._wma(prices[-self.half:]) - self._wma(prices))
+        if len(self.diffs) < self.root:
+            return None
+        self.value = self._wma(list(self.diffs))
+        return self.value
 
 
 class IncrementalKAMA:

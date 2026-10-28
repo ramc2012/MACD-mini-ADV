@@ -340,7 +340,9 @@ export type VaByBracket = { bracket: number; letter: string; poc: number | null;
    stream frame for it is namespaced blast_*, so none of this can collide with
    the MACD lane's orders, trades or portfolio. */
 export type BlastSettings = {
-  enabled: boolean; auto_trade: boolean; initial_capital: number; max_positions: number; target_notional: number;
+  enabled: boolean; auto_trade: boolean;
+  // "hma_kama" (since 28 Oct 2026): HMA(20) x KAMA(10,2,30) on 30-minute premium; "macd_screen": the original screen.
+  strategy?: "hma_kama" | "macd_screen"; initial_capital: number; max_positions: number; target_notional: number;
   // Percent of spot, fraction of contracts, percent below the recent high.
   max_premium_pct: number; min_breadth: number; min_off_high_pct: number;
   vix_adaptive_enabled: boolean; vix_reference: number; vix_breadth_adjustment: number;
@@ -375,6 +377,7 @@ export type BlastCandidate = {
 };
 export type BlastSnapshot = {
   lane: "blast"; enabled: boolean; auto_trade: boolean; settings: BlastSettings; health: BlastHealth;
+  strategy?: "hma_kama" | "macd_screen"; strategy_rules?: { entry: string; exit: string; ticket: number } | null;
   screen: { entry: string; max_premium_pct_of_spot: number; min_side_breadth: number; min_off_recent_high_pct: number;
             vix_policy?: BlastEntryPolicy;
             recent_high_lookback_bars: number; max_volume_share_pct: number;
