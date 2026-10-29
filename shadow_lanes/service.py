@@ -37,6 +37,7 @@ class ShadowWorker:
 
     def check(self, now, diagnostic=False):
         """No missed-session publication, legacy write, or order interface exists here."""
+        if self.paper and not diagnostic:self.paper.review_daily_positions(now)
         existing = {(p["lane"], p["source_session"]) for p in self.store.publications()}
         for lane in LANES:
             day = source.source_session(now, lane)
@@ -45,6 +46,14 @@ class ShadowWorker:
                     source_session=str(day), policy=source.POLICIES[lane], feature_error=self.feature_error))
                 continue
             if (lane, str(day)) in existing:
+                if lane=='cbe' and self.paper and self.paper.books[lane].terms.get('holding_mode')=='daily_trend':
+                    from paper_lanes.daily_swing import VERSION
+                    prior=next(p for p in self.store.publications(lane) if p['source_session']==str(day))
+                    if prior.get('version')!=VERSION:
+                        self.store.status(lane,now.isoformat(),dict(status='awaiting_next_daily_cohort',
+                            blockers=['Earlier intraday cohort remains frozen; unfilled plans superseded. Await next completed-session daily strategy cohort.'],
+                            source_session=str(day),policy=VERSION))
+                        continue
                 self.store.status(lane, now.isoformat(), dict(status="frozen", blockers=[], source_session=str(day), policy=source.POLICIES[lane]))
                 continue
             connection = None

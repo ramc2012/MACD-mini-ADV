@@ -63,6 +63,8 @@ def install(api, store, authorize,paper=None):
     @router.get('/{lane}/market-context')
     def market_context(lane: str, session: str | None=None):
         from .daily_market import view
+        if lane=='vanguard':
+            from .daily_context import view
         if lane not in ('vanguard','cbe'):raise HTTPException(404,'Unknown lane')
         try:return view(date.fromisoformat(session) if session else None)
         except ValueError:raise HTTPException(422,'Choose an available completed session') from None
@@ -90,6 +92,8 @@ def install(api, store, authorize,paper=None):
         snap=store.snapshot('cbe')
         publications=[p for p in snap.get('publications',[]) if not paper or p.get('paper_account_id')==paper.books['cbe'].account_id]
         latest=(publications or [None])[0]
+        from paper_lanes.daily_swing import VERSION
+        if latest and latest.get('version')!=VERSION:latest=None
         if scope=='retained':
             raise HTTPException(503,'The original CBE scan dataset was outside the recovery backup; its paper book remains available')
         from .daily_market import view

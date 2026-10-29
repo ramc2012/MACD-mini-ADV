@@ -14,7 +14,7 @@ from psycopg2 import sql
 from . import source
 from .vendor.daily_stock_selection import signal, ema
 
-VERSION = 'cbe-daily-cash-mp-v2-20261027'
+from paper_lanes.daily_swing import signal as swing_signal, VERSION
 # Thirteen aligned bars, including the exchange's final 15-minute closing bar.
 # An incomplete 15:15 session slice is never treated as a completed daily candle.
 DAILY_SQL = """
@@ -69,12 +69,12 @@ def scan(connection,now,day=None):
     day=day or completed
     if day>completed:raise ValueError('A completed session is required')
     with connection.cursor(cursor_factory=RealDictCursor) as q:
-        q.execute(DAILY_SQL,(datetime.combine(day-timedelta(days=300),time(0),source.IST),now,now,day))
+        q.execute(DAILY_SQL,(datetime.combine(day-timedelta(days=700),time(0),source.IST),now,now,day))
         history=[dict(r) for r in q.fetchall() if source.is_session(r['session'])]
         q.execute('''SELECT symbol AS underlying,dt AS session,open::float,high::float,low::float,close::float,
           volume::float,synced_at AS available_at FROM bhavcopy_delivery WHERE dt>=%s AND dt<=%s AND synced_at<=%s
           AND close>0 AND open>0 AND low>0 AND high>=greatest(open,close) AND low<=least(open,close)''',
-                  (day-timedelta(days=300),day,now))
+                  (day-timedelta(days=700),day,now))
         combined={(r['underlying'],r['session']):{**r,'price_basis':'complete_broker_session'} for r in history}
         for r in q.fetchall():
             if source.is_session(r['session']):combined[(r['underlying'],r['session'])]={**dict(r),'price_basis':'NSE_daily_report'}
@@ -102,9 +102,9 @@ def scan(connection,now,day=None):
     series=defaultdict(list)
     for r in history:series[r['underlying']].append(r)
     benchmark={r['session']:r for r in series['NIFTY']}
-    dates=sorted(benchmark)[-100:]
+    dates=sorted(benchmark)[-260:]
     recent=[];cursor_day=day
-    while len(recent)<50:
+    while len(recent)<64:
         if source.is_session(cursor_day):recent.append(cursor_day)
         cursor_day-=timedelta(days=1)
     results=[]
@@ -113,10 +113,10 @@ def scan(connection,now,day=None):
         aligned=[d for d in dates if d in stock]
         gaps=[d for d in dates if d not in stock]
         # Momentum uses exact benchmark sessions. Older missing seed observations
-        # are disclosed; no price is filled or interpolated. The last 50 must be complete.
-        ready=len(aligned)>=60 and all(d in stock and d in benchmark for d in recent) and dates[-1]==day
-        row=signal([stock[d]['close'] for d in aligned],[benchmark[d]['close'] for d in aligned]) if ready else {
-            'eligible':False,'direction':'NEUTRAL','score':0,'reason':'Need 60 observed daily closes and 50 aligned recent sessions'}
+        # are disclosed; no price is filled or interpolated. The latest 64 closes must be complete; older seed gaps remain disclosed.
+        ready=len(aligned)>=250 and all(d in stock and d in benchmark for d in recent) and dates[-1]==day
+        row=swing_signal([stock[d] for d in aligned],[benchmark[d]['close'] for d in aligned]) if ready else {
+            'eligible':False,'direction':'NEUTRAL','score':0,'reason':'Need 250 aligned completed daily sessions'}
         latest=bars[-1] if bars else {}
         profile=profiles.get(symbol,{})
         mp={k:(float(v) if type(v).__name__=='Decimal' else v)
@@ -124,29 +124,29 @@ def scan(connection,now,day=None):
         # A historical fallback stays visible but cannot qualify a fresh CBE plan.
         mp_current=profile.get('dt')==day
         metrics=indicators([stock[d]['close'] for d in aligned])
-        eligible=bool(row.get('eligible') and row.get('direction')=='LONG' and mp_current and metrics)
+        eligible=bool(row.get('eligible') and row.get('direction')=='LONG' and metrics)
         reason=row.get('reason','Missing aligned complete daily history')
         if row.get('direction')=='SHORT':reason='Bearish trend; cash lane is long only'
-        if row.get('eligible') and row.get('direction')=='LONG' and not mp_current:reason='Current completed-session MP unavailable'
-        results.append({**row,**metrics,'instrument':symbol,'symbol':symbol,'sector':item['sector20'] or 'UNKNOWN',
+        # MP is visible context, never an intraday admission or exit gate for this daily book.
+        results.append({**metrics,**row,'instrument':symbol,'symbol':symbol,'sector':item['sector20'] or 'UNKNOWN',
             'latest_close':latest.get('close'),'price_session':str(latest['session']) if latest else None,
             'source_session':str(day),'source_mark':latest.get('close'),'price_basis':latest.get('price_basis'),
-            'aligned_daily_observations':len(aligned),'older_seed_gaps':len(gaps),'horizon_sessions':1,
+            'daily_history_complete':ready,'aligned_daily_observations':len(aligned),'older_seed_gaps':len(gaps),'horizon_sessions':None,'holding_mode':'daily_trend','strategy_version':VERSION,
             'source_mark_ts':datetime.combine(day,time(15,30),source.IST).isoformat(),
             'eligible':eligible,'reason':reason,'profile':mp,'mp_current':mp_current,'features':features[symbol],
-            'history':[{k:(str(v) if k=='session' else v) for k,v in r.items() if k in ('session','open','high','low','close','volume')} for r in bars[-100:]]})
+            'history':[{k:(str(v) if k=='session' else v) for k,v in r.items() if k in ('session','open','high','low','close','volume')} for r in bars[-300:]]})
     results.sort(key=lambda r:(not r['eligible'],-float(r.get('score') or 0),r['symbol']))
-    current=sum(r.get('price_session')==str(day) for r in results)
+    current=sum(r.get('price_session')==str(day) and r.get('daily_history_complete') for r in results)
     expected=len(universe)
     complete=expected>=10 and current>=.8*expected and day==completed
     return dict(version=VERSION,policy=VERSION,source_session=str(day),completed_session=str(completed),
         observed_at=now.isoformat(),sessions=[str(d) for d in available[:100]],expected=expected,current_complete=current,
         mp_complete=sum(r['mp_current'] for r in results),status='ok' if complete else 'blocked',
-        blockers=[] if complete else ['Latest completed-session daily breadth below 80% or benchmark is stale'],
+        blockers=[] if complete else ['250 aligned daily observations and 64 complete recent closes required across 80% of universe; no synthetic bars'],
         results=results,watchlist=[{**{k:v for k,v in r.items() if k!='history'},'rank':i+1}
             for i,r in enumerate(r for r in results if r['eligible'])][:10],
         benchmark_recent_gaps=[str(d) for d in recent if d not in benchmark],
-        long_only=True,inputs='Completed cash daily OHLCV, EMA20/50, 5/20 momentum, relative strength, MACD12/26/9, RSI14 and market profile',
+        long_only=True,inputs='Completed daily EMA20/50/200, rising EMA50, 63-session relative momentum, 55-session breakout; 3 ATR20 daily trail, no time cap',
         provenance='Recomputed from locally retained broker bars and MP features. Historical receipt availability is unverified; these rows are not original decisions or fills.')
 
 

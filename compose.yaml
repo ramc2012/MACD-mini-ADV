@@ -205,6 +205,7 @@ services:
       SHADOW_DATABASE_PATH: /runtime/shadow_lanes/observations.sqlite3
       SHADOW_WORKER_ENABLED: ${SHADOW_WORKER_ENABLED:-false}
       PAPER_LANES_ENABLED: "true"
+      CBE_DAILY_SWING_ENABLED: "true"
       PAPER_LANE_CAPITAL: ${PAPER_LANE_CAPITAL:-5000000}
       PAPER_LANES_DIR: /runtime/paper_lanes
       # Owner overrides 28 Oct 2026 (paper_lanes/book.py OVERRIDE_SERIES, applied in order up to this tag): CBE Rs 2 lakh per position;

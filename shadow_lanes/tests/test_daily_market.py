@@ -15,7 +15,7 @@ def fixture(monkeypatch,gap=None,mp_current=True):
     monkeypatch.setattr(source,'is_session',lambda d:d.weekday()<5)
     now=datetime(2026,10,27,8,tzinfo=source.IST)
     days=[];d=date(2026,10,26)
-    while len(days)<100:
+    while len(days)<300:
         if d.weekday()<5:days.append(d)
         d-=timedelta(days=1)
     days.reverse();history=[]
@@ -38,15 +38,15 @@ def fixture(monkeypatch,gap=None,mp_current=True):
 
 
 def test_full_universe_with_old_seed_gap_disclosed(monkeypatch):
-    c,now=fixture(monkeypatch,gap=10)
+    c,now=fixture(monkeypatch,gap=49)
     r=scan(c,now)
     assert len(r['results'])==10 and len(r['watchlist'])==10
     assert r['current_complete']==10 and r['mp_complete']==10
-    assert all(x['older_seed_gaps']==1 and x['aligned_daily_observations']==99 for x in r['results'])
+    assert all(x['older_seed_gaps']==1 and x['aligned_daily_observations']==259 for x in r['results'])
     assert all(x['source_mark_ts'].startswith('2026-10-26T15:30') for x in r['watchlist'])
 
 
-@pytest.mark.parametrize('gap,mp_current',[(90,True),(None,False)])
+@pytest.mark.parametrize('gap,mp_current',[(290,True)])
 def test_recent_price_gap_or_stale_mp_blocks_candidates_but_keeps_visible_data(monkeypatch,gap,mp_current):
     c,now=fixture(monkeypatch,gap,mp_current)
     r=scan(c,now)
@@ -98,3 +98,9 @@ def test_the_most_out_of_the_money_leg_leads_and_cheapness_breaks_ties():
           for s,score,otm,share in [('ITM',1.0,-0.01,0.03),('OTM',0.2,0.012,0.02),('ATM_CHEAP',0.5,0.0,0.015),('ATM_RICH',0.9,0.0,0.025)]]
     assert [r['symbol'] for r in source.select_atm(rows)]==['OTM','ATM_CHEAP','ATM_RICH','ITM']
     assert source.screen({'option_type':'PE','strike':98,'option_volume':5000,'lot_size':1000,'source_mark':2},{},100)['otm']==0.020000000000000018
+
+
+def test_daily_swing_does_not_require_intraday_market_profile(monkeypatch):
+    c,now=fixture(monkeypatch,mp_current=False)
+    r=scan(c,now)
+    assert len(r['watchlist'])==10 and all(x['holding_mode']=='daily_trend' for x in r['watchlist'])

@@ -1,0 +1,80 @@
+{
+  "cbe": {
+    "quick_check": "ok",
+    "positions_unchanged": true,
+    "fills_unchanged": true,
+    "settlements_unchanged": true,
+    "account_identity_cash_preserved": true,
+    "policy": {
+      "version": "macd-cbe-qwen-paper-v1",
+      "position_fraction": 0.1,
+      "gross_fraction": 1.0,
+      "sector_fraction": 0.3,
+      "max_positions": 10,
+      "hard_stop": 0.12,
+      "target": null,
+      "slippage_bps": 5,
+      "fee_bps": 10,
+      "max_spread": 0.01,
+      "volume_fraction": 0.01,
+      "quote_age_seconds": 10,
+      "daily_loss_stop": 0.03,
+      "review_attempts": 3,
+      "fill_basis": "all_or_none_displayed_L1_with_adverse_slippage",
+      "stock_settlement": "next_session_open",
+      "position_amount": 200000,
+      "liquidity_basis": "session_volume",
+      "owner_override": "owner-20261028-list-test",
+      "owner_overrides": [
+        "owner-20261028",
+        "owner-20261028-list-test"
+      ],
+      "strategy_version": "cbe-daily-trend-v1-20261029",
+      "holding_mode": "daily_trend",
+      "risk_fraction": 0.005,
+      "max_hold_sessions": null,
+      "strategy_activated_at": "2026-10-29T18:30:58.492553+05:30"
+    },
+    "order_states": {
+      "CLOSED": 20,
+      "SUPERSEDED": 10
+    },
+    "activation_events": 1
+  },
+  "vanguard": {
+    "quick_check": "ok",
+    "positions_unchanged": true,
+    "fills_unchanged": true,
+    "settlements_unchanged": true,
+    "account_identity_cash_preserved": true,
+    "policy": {
+      "version": "macd-vanguard-qwen-paper-v1",
+      "position_fraction": 0.016667,
+      "gross_fraction": 1.0,
+      "sector_fraction": 1.0,
+      "max_positions": 60,
+      "hard_stop": 0.15,
+      "target": null,
+      "slippage_bps": 15,
+      "fee_bps": 10,
+      "max_spread": 0.05,
+      "volume_fraction": 0.01,
+      "quote_age_seconds": 10,
+      "daily_loss_stop": null,
+      "review_attempts": 3,
+      "fill_basis": "all_or_none_displayed_L1_with_adverse_slippage",
+      "stock_settlement": "next_session_open",
+      "model_gate": false,
+      "atm_recheck": false,
+      "liquidity_basis": "session_volume",
+      "owner_override": "owner-20261028-list-test",
+      "min_one_lot": true,
+      "stale_mark_block": false,
+      "owner_overrides": [
+        "owner-20261028",
+        "owner-20261028-list-test"
+      ]
+    },
+    "orders_unchanged": true
+  }
+}

@@ -17,7 +17,7 @@ sys.path.insert(0, str(VG_ROOT))
 from model.market_calendar import is_session, previous_session
 
 IST = ZoneInfo("Asia/Kolkata")
-POLICIES = {"vanguard": "macd-vanguard-atm-local-paper-v3", "cbe": "cbe-daily-cash-mp-local-v3"}
+POLICIES = {"vanguard": "macd-vanguard-atm-local-paper-v3", "cbe": "cbe-daily-trend-v1-20261029"}
 
 
 def source_session(now, lane):

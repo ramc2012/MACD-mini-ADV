@@ -1,0 +1,12 @@
+{
+  "policy": "cbe-daily-trend-v1-20261029",
+  "source_session": "2026-10-29",
+  "expected": 213,
+  "current_complete": 0,
+  "status": "blocked",
+  "blockers": [
+    "250 aligned daily observations and 64 complete recent closes required across 80% of universe; no synthetic bars"
+  ],
+  "benchmark_recent_gaps": [],
+  "qualified": 0
+}

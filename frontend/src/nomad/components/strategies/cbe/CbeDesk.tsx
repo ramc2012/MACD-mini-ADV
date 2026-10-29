@@ -345,7 +345,7 @@ export default function CbeDesk() {
     <DeskShell
       showStatus={!isShadow}
       title="CBE Paper Trader"
-      description={isShadow ? "Daily long-only cash-equity paper trading · Locally reviewed entries, cash accounting and managed exits." : "Retained Nomad CBE account · recorded positions and history, read only."}
+      description={isShadow ? "Daily trend cash-equity book · Hold for weeks to months; no same-day time exit, profit target or maximum holding period." : "Retained Nomad CBE account · recorded positions and history, read only."}
       asOf={scan?.source_as_of ?? scan?.created_at ?? scan?.scan_date ?? undefined}
       asOfLabel={isShadow ? "completed daily session" : "Updated"}
       // CBE scans land once per session (EOD alpha-engine pass) — freshness
@@ -1084,11 +1084,11 @@ function QuadrantCard({ q, n, note }: { q: string; n: number; note: string }) {
 function CandidateTable({ rows }: { rows: ScanResult[] }) {
   if (rows.some(row => row.details?.stock_selection)) {
     return <div className="overflow-x-auto"><table className="w-full text-left text-xs"><thead><tr>
-      <th>Stock</th><th>Direction</th><th>5-session move</th><th>20-session move</th><th>20-session excess vs Nifty</th><th>Strength</th><th>Selection reason</th>
+      <th>Stock</th><th>Direction</th><th>EMA50</th><th>EMA200</th><th>63-session excess vs Nifty</th><th>Strength</th><th>Selection reason</th>
     </tr></thead><tbody>{rows.map(row => {
-      const signal = row.details?.stock_selection;
+      const signal:any = row.details?.stock_selection;
       return <tr key={row.instrument}><td className="py-2">{row.instrument}{row.is_watchlist ? " ★" : ""}</td><td>{signal?.direction ?? "NEUTRAL"}</td>
-        <td>{formatPct(signal?.momentum_fast, 2)}</td><td>{formatPct(signal?.momentum_slow, 2)}</td><td>{formatPct(signal?.relative_momentum, 2)}</td>
+        <td>{signal?.ema50?.toFixed(2) ?? "—"}</td><td>{signal?.ema200?.toFixed(2) ?? "—"}</td><td>{formatPct(signal?.relative_63, 2)}</td>
         <td>{row.composite_alpha_score?.toFixed(1) ?? "—"}</td><td>{signal?.reason ?? "Unavailable inputs"}</td></tr>;
     })}</tbody></table><p className="mt-2 text-xs text-text-muted">Strength is an ordinal research score, not a probability or expected return. Only qualified long directions can fund new CBE positions.</p></div>;
   }

@@ -12,8 +12,11 @@ def test_market_and_cbe_scan_show_underlying_data_without_old_cohort_or_false_fr
         results=[dict(instrument='ABC',symbol='ABC',score=80,direction='LONG',eligible=True,sector='TEST',
         history=[dict(close=100)],latest_close=100)])
     monkeypatch.setattr(daily_market,'view',lambda *args,**kw:market)
+    from shadow_lanes import daily_context
+    old_context={**market,'context_policy':'retained-vanguard-context'}
+    monkeypatch.setattr(daily_context,'view',lambda *args,**kw:old_context)
     client=TestClient(create_app(ShadowStore(tmp_path/'shadow.sqlite3'),False))
-    assert client.get('/api/nomad/vanguard/market-context').json()==market
+    assert client.get('/api/nomad/vanguard/market-context').json()==old_context
     r=client.get('/api/nomad/cbe/latest')
     assert r.status_code==200
     d=r.json()

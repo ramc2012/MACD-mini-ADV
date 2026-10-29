@@ -89,6 +89,8 @@ class Book:
             CREATE TABLE IF NOT EXISTS equity(at TEXT PRIMARY KEY,day TEXT NOT NULL,equity_paise INTEGER NOT NULL,cash_paise INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS settlements(order_id TEXT PRIMARY KEY,due TEXT NOT NULL,amount_paise INTEGER NOT NULL,settled INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS status(id INTEGER PRIMARY KEY CHECK(id=1),at TEXT NOT NULL,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS daily_management(id TEXT PRIMARY KEY REFERENCES orders(id),last_session TEXT NOT NULL,
+              trail REAL NOT NULL,exit_after TEXT,exit_reason TEXT);
             CREATE TABLE IF NOT EXISTS marks(id TEXT NOT NULL REFERENCES orders(id),day TEXT NOT NULL,bid REAL NOT NULL,at TEXT NOT NULL,
               PRIMARY KEY(id,day));
             ''')
@@ -113,6 +115,44 @@ class Book:
                                json.dumps({'tag':tag,'before':before,'after':override})))
             if not db.execute('SELECT 1 FROM equity LIMIT 1').fetchone():
                 db.execute('INSERT INTO equity VALUES(?,?,?,?)',(now.isoformat(),str(now.date()),a['initial_paise'],a['cash_paise']))
+
+    def enable_daily_swing(self, now):
+        from .daily_swing import VERSION
+        with self.transaction() as db:
+            if self.terms.get('strategy_version') == VERSION:return
+            if db.execute('SELECT 1 FROM positions WHERE closed_at IS NULL').fetchone():
+                raise ValueError('CBE daily migration requires flat legacy book; preserve open terms')
+            before=dict(self.terms)
+            self.terms={**self.terms,'strategy_version':VERSION,'holding_mode':'daily_trend',
+                        'target':None,'hard_stop':.12,'risk_fraction':.005,'max_hold_sessions':None,
+                        'position_amount':200000,'liquidity_basis':'session_volume','strategy_activated_at':now.isoformat()}
+            db.execute('UPDATE account SET policy=?',(json.dumps(self.terms),))
+            for row in db.execute("SELECT id FROM orders WHERE state IN ('PENDING_AI','APPROVED')").fetchall():
+                self.set_state(db,row['id'],'SUPERSEDED','Owner replaced intraday CBE with daily trend strategy',now)
+            self.event(db,now,'DAILY_STRATEGY_ACTIVATED',None,{'before':before,'after':self.terms,
+                'history_preserved':True,'old_publications_remain_frozen':True})
+
+    def apply_daily(self, view, now, exit_after):
+        from .daily_swing import VERSION,exit_rule
+        if self.terms.get('strategy_version')!=VERSION:return
+        day=view.get('source_session')
+        if not day or day!=view.get('completed_session') or day>str(now.date()):return
+        if day==str(now.date()) and (now.hour,now.minute)<(15,31):return
+        if exit_after<=now:raise ValueError('Daily signals require prospective execution')
+        rows={r['symbol']:r for r in view.get('results',[])}
+        with self.transaction() as db:
+            for p in self.rows(db):
+                if p['closed_at'] or json.loads(p['payload']).get('strategy_version')!=VERSION:continue
+                old=db.execute('SELECT * FROM daily_management WHERE id=?',(p['id'],)).fetchone()
+                if not old or old['exit_reason'] or old['last_session']>=day or day<p['opened_at'][:10]:continue
+                row=rows.get(p['symbol'],{})
+                if row.get('price_session')!=day or row.get('aligned_daily_observations',0)<250 or 'atr20' not in row:
+                    self.event(db,now,'DAILY_EXIT_INPUTS_MISSING',p['id'],{'session':day});continue
+                trail,reason=exit_rule(row,old['trail'])
+                db.execute('UPDATE daily_management SET last_session=?,trail=?,exit_after=?,exit_reason=? WHERE id=?',
+                           (day,trail,exit_after.isoformat() if reason else None,reason,p['id']))
+                self.event(db,now,'DAILY_REVIEW',p['id'],{'session':day,'close':row['latest_close'],
+                    'previous_trail':old['trail'],'trail':trail,'exit_reason':reason,'execute_after':exit_after.isoformat() if reason else None})
 
     def db(self):
         db=sqlite3.connect(self.path,timeout=5);db.row_factory=sqlite3.Row
@@ -193,7 +233,19 @@ class Book:
         else:
             qty=min(qty,int(q['ask_qty'])//lot*lot,int(q['bid_qty'])//lot*lot,int(q['volume']*self.terms['volume_fraction'])//lot*lot)
         while qty>0 and money(fill*qty)+self.fee(money(fill*qty))>a['cash_paise']:qty-=lot
-        if qty<lot:return 0,'Cash, exposure or displayed-liquidity budget cannot fund one lot'
+        if self.lane=='cbe' and self.terms.get('holding_mode')=='daily_trend':
+            from .daily_swing import VERSION
+            candidate=json.loads(o['payload']);atr=candidate.get('atr20')
+            if candidate.get('strategy_version')!=VERSION or not isinstance(atr,(float,int)) or not math.isfinite(atr) or atr<=0:
+                return 0,'Current daily strategy and ATR evidence required'
+            source=candidate.get('source_mark');ema50=candidate.get('ema50')
+            if not all(isinstance(v,(float,int)) and math.isfinite(v) and v>0 for v in (source,ema50)):
+                return 0,'Frozen daily price and EMA50 evidence required'
+            if fill<=ema50 or abs(fill-source)>atr:
+                return 0,'Opening quote outside daily trend or more than one ATR from signal; wait within entry window'
+            distance=min(3*atr,fill*self.terms['hard_stop'])
+            qty=min(qty,int((equity/100*self.terms['risk_fraction'])/distance)//lot*lot)
+        if qty<lot:return 0,'Cash, exposure or liquidity/risk budget cannot fund one lot'
         return qty,''
 
     def review_candidates(self,quotes,now,limit=3,local=False):
@@ -273,8 +325,11 @@ class Book:
                     db.execute('UPDATE positions SET last_bid=?,last_at=? WHERE id=?',(q['bid'],q['at'],p['id']))
                     db.execute('INSERT INTO marks VALUES(?,?,?,?) ON CONFLICT(id,day) DO UPDATE SET bid=excluded.bid,at=excluded.at',
                                (p['id'],str(now.date()),q['bid'],q['at']))
+                    daily=json.loads(p['payload']).get('holding_mode')=='daily_trend'
+                    instruction=db.execute('SELECT * FROM daily_management WHERE id=?',(p['id'],)).fetchone() if daily else None
                     reason=('STOP' if q['bid']<=p['stop'] else 'TARGET' if p['target']>0 and q['bid']>=p['target'] else
-                            'TIME_EXIT' if now>=datetime.fromisoformat(p['exit_due']) else None)
+                            instruction['exit_reason'] if instruction and instruction['exit_after'] and now>=datetime.fromisoformat(instruction['exit_after']) else
+                            'TIME_EXIT' if not daily and now>=datetime.fromisoformat(p['exit_due']) else None)
                     if not reason:continue
                     if q['bid_qty']<p['quantity'] and self.terms.get('liquidity_basis')!='session_volume':
                         self.event(db,now,'EXIT_WAITING_DEPTH',p['id'],{'required':p['quantity'],'available':q['bid_qty']});continue
@@ -308,6 +363,10 @@ class Book:
                         (o['id'],qty,fill,fee,now.isoformat(),fill*(1-self.terms['hard_stop']),fill*(1+self.terms['target']) if self.terms.get('target') else 0,q['bid'],q['at']))
                     db.execute('INSERT INTO fills VALUES(?,?,?,?,?,?,?,?,?,?)',
                         (uuid4().hex,o['id'],'BUY',qty,fill,notional,fee,now.isoformat(),q['at'],json.dumps(q)))
+                    candidate=json.loads(o['payload'])
+                    if self.lane=='cbe' and candidate.get('holding_mode')=='daily_trend':
+                        db.execute('INSERT INTO daily_management VALUES(?,?,?,NULL,NULL)',
+                            (o['id'],o['source_session'],max(fill*(1-self.terms['hard_stop']),fill-3*candidate['atr20'])))
                     self.set_state(db,o['id'],'FILLED','Fresh displayed ask, adverse slippage and costs',now)
             a,positions,equity,unsettled=self.valuation(db)
             if a['cash_paise']<0:raise ValueError('Negative paper cash')
@@ -381,12 +440,19 @@ class Book:
             state=db.execute('SELECT * FROM status').fetchone()
             stale=sum((now-datetime.fromisoformat(p['last_at'])).total_seconds()>self.terms['quote_age_seconds'] for p in held)
             tests=self.list_tests(db) if self.lane=='vanguard' else []
+            if self.lane=='cbe':
+                for r in positions+orders:
+                    if json.loads(r['payload']).get('holding_mode')=='daily_trend':
+                        r['exit_due']=None
+                        management=db.execute('SELECT * FROM daily_management WHERE id=?',(r['id'],)).fetchone()
+                        r['daily_management']=dict(management) if management else None
             return {'lane':self.lane,'account_id':self.account_id,'activated_at':a['activated_at'],'mode':'paper','execution_enabled':True,
                     'initial_capital':a['initial_paise']/100,'cash':a['cash_paise']/100,'unsettled_cash':unsettled/100,'equity':equity/100,
                     'realized_pnl':realized/100,'unrealized_pnl':unrealized/100,'return_pct':(equity/a['initial_paise']-1)*100,
                     'max_drawdown_pct':a['max_drawdown']*100,'closed_count':len(closed),'open_count':len(held),
                     'win_rate':sum(p['pnl_paise']>0 for p in closed)/len(closed) if closed else None,
                     'expectancy':realized/100/len(closed) if closed else None,'paused':bool(a['paused']),'stale_positions':stale,
+                    'strategy_closed_count':sum(json.loads(p['payload']).get('strategy_version')==self.terms.get('strategy_version') for p in closed) if self.terms.get('strategy_version') else len(closed),
                     'policy':self.terms,'positions':held,'closed':closed[-300:],'orders':orders,'equity_curve':curves,
                     'events':events,'decisions':decisions,'fills':fills,'list_tests':tests,'fees_paid':total_fees/100,'checked_at':state['at'] if state else None,
                     'status':json.loads(state['payload']) if state else {'state':'awaiting_first_check'}}

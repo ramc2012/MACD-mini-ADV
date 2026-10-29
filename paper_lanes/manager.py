@@ -133,8 +133,9 @@ class Manager:
         folder=Path(folder or os.environ.get('PAPER_LANES_DIR','/runtime/paper_lanes'))
         capital=float(capital if capital is not None else os.environ.get('PAPER_LANE_CAPITAL','1000000'))
         self.books={lane:Book(folder/(lane+'.sqlite3'),lane,capital,now) for lane in ('vanguard','cbe')}
+        if os.environ.get('CBE_DAILY_SWING_ENABLED')=='true':self.books['cbe'].enable_daily_swing(now)
         self.market=market or MarketData();self.last_quotes={};self.last_error=None;self.last_poll=None
-        self.last_review={}
+        self.last_review={};self.daily_review_at=None
 
     def offer(self,publication,metadata=None):
         lane=publication['lane'];book=self.books[lane]
@@ -147,6 +148,10 @@ class Manager:
             key=candidate['instrument'] if lane=='vanguard' else candidate.get('symbol') or candidate['instrument']
             meta=metadata.get(key)
             if not meta:continue
+            daily=lane=='cbe' and book.terms.get('holding_mode')=='daily_trend'
+            if daily:
+                from .daily_swing import VERSION
+                if candidate.get('strategy_version')!=VERSION:continue
             horizon=int(candidate.get('horizon_sessions') or 1)
             if not 1<=horizon<=3:continue
             due_day=next_session(day,horizon)
@@ -159,7 +164,7 @@ class Manager:
             if lane=='vanguard' and (candidate.get('contract_kind')!='ATM' or not meta.get('atm_guard')):continue
             prepared.append({**meta,'sector':candidate.get('sector20') or candidate.get('sector') or meta.get('sector') or 'UNKNOWN',
                              'candidate':{**candidate,**({'atm_guard':meta['atm_guard']} if lane=='vanguard' else {})},
-                             'exit_due':datetime.combine(due_day,time(15,10) if expiry==str(due_day) else time(15,15),IST)})
+                             'exit_due':datetime(9999,12,31,tzinfo=IST) if daily else datetime.combine(due_day,time(15,10) if expiry==str(due_day) else time(15,15),IST)})
         entry_after=decided+timedelta(seconds=1) if lane=='vanguard' else datetime.combine(entry_day,time(9,20),IST)
         deadline=datetime.combine(day,time(15,15),IST) if lane=='vanguard' else datetime.combine(entry_day,time(9,55),IST)
         if entry_after>=deadline:return 0
@@ -250,6 +255,14 @@ class Manager:
                         underlying_quote_at=spot['at'],atm_strike=guard['strike'])
                 candidates.append({'id':o['id'],'instrument':o['instrument'],'side':row.get('option_type') or 'LONG',
                                    'reference_price':o['quote']['ask'],'source_at':o['quote']['at'],'facts':facts})
+            if lane=='cbe' and book.terms.get('holding_mode')=='daily_trend':
+                from .daily_swing import VERSION
+                t=datetime.now(IST)
+                response={'reviews':[{'id':o['id'],'verdict':'approve','reason':'Frozen completed daily breakout; fresh cash/quote/risk checks','priority':json.loads(o['payload']).get('score',0)} for o in orders],
+                          'model':VERSION,'digest':VERSION,'context_hash':None,'created_at':t.isoformat(),
+                          'expires_at':(t+timedelta(seconds=30)).isoformat(),'decision_engine':'daily_rules'}
+                book.apply_reviews(orders,response,t);self.last_review[lane]=response
+                continue
             gate=book.terms.get('model_gate',True)
             try:
                 from . import local_intelligence
@@ -272,6 +285,20 @@ class Manager:
                 book.review_failed(orders,datetime.now(IST),local=True)
                 self.last_review[lane]={'error':type(exc).__name__,'reason':'Local context unavailable; no entry'}
 
+    def review_daily_positions(self, now):
+        book=self.books['cbe']
+        if book.terms.get('holding_mode')!='daily_trend' or not is_session(now.date()) or now.time()<time(15,31):return
+        with book.db() as db:
+            if not db.execute('SELECT 1 FROM positions WHERE closed_at IS NULL').fetchone():return
+        if self.daily_review_at and (now-self.daily_review_at).total_seconds()<300:return
+        self.daily_review_at=now
+        try:
+            from shadow_lanes.daily_market import view
+            data=view(as_of=now)
+            book.apply_daily(data,now,datetime.combine(next_session(now.date()),time(9,15),IST))
+        except Exception as exc:
+            self.last_error='Daily exit inputs unavailable: '+type(exc).__name__
+
     def contexts(self,candidates,now):
         from shadow_lanes import source
         from shadow_lanes.decision_context import build
@@ -286,8 +313,11 @@ class Manager:
 
     def snapshot(self,lane):
         from .local_intelligence import status
+        daily=self.books[lane].terms.get('holding_mode')=='daily_trend'
+        intelligence={'policy':self.books[lane].terms['strategy_version'],'mode':'completed_daily_rules','qwen_required':False,
+                      'validation':'Prospective daily trend policy; profitability unproven'} if daily else status(lane)
         return {**self.books[lane].snapshot(datetime.now(IST)),'market_error':self.last_error,'market_checked_at':self.last_poll,
-                'model_required':True,'qwen_required':False,'intelligence':{**status(lane),'last_review':self.last_review.get(lane)},
+                'model_required':not daily,'qwen_required':False,'intelligence':{**intelligence,'last_review':self.last_review.get(lane)},
                 'live_orders_possible':False,'legacy_history_preserved':True}
 
     async def run_marks(self,store):

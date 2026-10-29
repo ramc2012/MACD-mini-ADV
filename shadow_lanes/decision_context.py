@@ -176,7 +176,7 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
                 '.available_at','.age_hours','.age_days','.receipt_basis')) for k in result[c['id']])
     # The same local completed-session indicators are visible to the trader and
     # to Qwen. These are current observations, not historical decision evidence.
-    from .daily_market import view
+    from .daily_context import view
     daily=view(as_of=as_of)
     daily_by={r['symbol']:r for r in daily['results']}
     for c in candidates:
@@ -187,7 +187,7 @@ def build(connection,candidates,as_of,phase='next_session_watchlist',persist=Tru
         result[c['id']].update({'daily.source_session':daily['source_session'],
             'daily.status':'completed_session_context','daily.price_basis':row['price_basis'],
             'daily.units':'Cash prices and EMA/MACD in INR; RSI14 0-100; momentum and relative momentum are fractions (0.01 = 1%). Completed daily context is not an executable quote.',
-            'daily.history_basis':'Actual closes; no interpolation. CBE needs 60 observations and 50 complete recent exchange sessions. Older seed gaps are disclosed.',
+            'daily.history_basis':'Actual closes; no interpolation. Retained context uses 60 observations and 50 complete recent exchange sessions; CBE daily-trend admission is separate. Older seed gaps are disclosed.',
             'daily.aligned_observations':row['aligned_daily_observations'],'daily.older_seed_gaps':row['older_seed_gaps']})
         for field in ('latest_close','ema20','ema50','macd_line','macd_signal','macd_hist','rsi_14','momentum_fast','momentum_slow','relative_momentum'):
             result[c['id']]['daily.'+field]=row.get(field)
