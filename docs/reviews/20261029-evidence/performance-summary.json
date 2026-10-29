@@ -1,0 +1,833 @@
+{
+  "as_of": "2026-10-29 17:57:31 IST",
+  "window": {
+    "from": "2026-10-29 00:00:00 IST",
+    "until_exclusive": "2026-10-30 00:00:00 IST"
+  },
+  "live": {
+    "blast": {
+      "initial_capital": 5000000,
+      "cash": -64971.008900000015,
+      "market_value": 5468822.15,
+      "equity": 5403851.141100001,
+      "realized_pnl": -88131.7842,
+      "unrealized_pnl": 491982.9253,
+      "open_positions": 52,
+      "open_ce": 46,
+      "open_pe": 6,
+      "largest_open": [
+        {
+          "symbol": "NSE:ADANIENT26NOV2500CE",
+          "market_value": 150174,
+          "unrealized_pnl": 42734.7,
+          "opened_at": "2026-10-29T06:16:15.096035+00:00"
+        },
+        {
+          "symbol": "NSE:BLUESTARCO26NOV1600CE",
+          "market_value": 149500,
+          "unrealized_pnl": 53967.29,
+          "opened_at": "2026-10-29T06:19:45.256737+00:00"
+        },
+        {
+          "symbol": "NSE:BANDHANBNK26NOV160CE",
+          "market_value": 145620,
+          "unrealized_pnl": 39959.99999999999,
+          "opened_at": "2026-10-29T05:16:51.885551+00:00"
+        },
+        {
+          "symbol": "NSE:360ONE26NOV1000CE",
+          "market_value": 145350,
+          "unrealized_pnl": 52200.00000000001,
+          "opened_at": "2026-10-29T04:47:04.042420+00:00"
+        },
+        {
+          "symbol": "NSE:MUTHOOTFIN26NOV2400CE",
+          "market_value": 142023.75,
+          "unrealized_pnl": 34361.25000000001,
+          "opened_at": "2026-10-29T04:48:42.829761+00:00"
+        }
+      ],
+      "open_unrealized_top": [
+        {
+          "symbol": "NSE:BLUESTARCO26NOV1600CE",
+          "unrealized_pnl": 53967.29
+        },
+        {
+          "symbol": "NSE:360ONE26NOV1000CE",
+          "unrealized_pnl": 52200.00000000001
+        },
+        {
+          "symbol": "NSE:ADANIENT26NOV2500CE",
+          "unrealized_pnl": 42734.7
+        }
+      ],
+      "open_unrealized_bottom": [
+        {
+          "symbol": "NSE:NAUKRI26NOV1200PE",
+          "unrealized_pnl": -17159.999999999996
+        },
+        {
+          "symbol": "NSE:HINDPETRO26NOV350CE",
+          "unrealized_pnl": -11542.500000000002
+        },
+        {
+          "symbol": "NSE:IOC26NOV130PE",
+          "unrealized_pnl": -10529.999999999996
+        }
+      ]
+    },
+    "macd": {
+      "initial_capital": 10000000,
+      "cash": 4915561.118499999,
+      "market_value": 10412025.15,
+      "equity": 15327586.2685,
+      "realized_pnl": 4198614.1247499995,
+      "unrealized_pnl": 1128972.14375,
+      "open_positions": 117,
+      "open_ce": 105,
+      "open_pe": 12,
+      "largest_open": [
+        {
+          "symbol": "NSE:PAYTM26NOV1660CE",
+          "market_value": 237800,
+          "unrealized_pnl": 31573.750000000007,
+          "opened_at": "2026-10-29T04:46:34.453540+00:00"
+        },
+        {
+          "symbol": "NSE:ADANIGREEN26NOV1200CE",
+          "market_value": 231480,
+          "unrealized_pnl": 67882.49999999999,
+          "opened_at": "2026-10-26T09:26:50.713277+00:00"
+        },
+        {
+          "symbol": "NSE:APLAPOLLO26NOV2000CE",
+          "market_value": 222967.5,
+          "unrealized_pnl": 34481.34374999999,
+          "opened_at": "2026-10-26T10:05:40.244469+00:00"
+        },
+        {
+          "symbol": "NSE:BANDHANBNK26NOV150CE",
+          "market_value": 218736,
+          "unrealized_pnl": 25056.000000000004,
+          "opened_at": "2026-10-27T05:46:01.066827+00:00"
+        },
+        {
+          "symbol": "NSE:RBLBANK26NOV350CE",
+          "market_value": 207010,
+          "unrealized_pnl": 17145.00000000002,
+          "opened_at": "2026-10-29T08:55:31.369078+00:00"
+        }
+      ],
+      "open_unrealized_top": [
+        {
+          "symbol": "NSE:ADANIGREEN26NOV1200CE",
+          "unrealized_pnl": 67882.49999999999
+        },
+        {
+          "symbol": "NSE:NYKAA26NOV320CE",
+          "unrealized_pnl": 60585.93750000001
+        },
+        {
+          "symbol": "NSE:INDHOTEL26NOV800CE",
+          "unrealized_pnl": 51399.99999999999
+        }
+      ],
+      "open_unrealized_bottom": [
+        {
+          "symbol": "NSE:MAZDOCK26NOV1900PE",
+          "unrealized_pnl": -46311.75000000001
+        },
+        {
+          "symbol": "NSE:POLYCAB26NOV7800CE",
+          "unrealized_pnl": -29731.24999999999
+        },
+        {
+          "symbol": "NSE:PETRONET26NOV280PE",
+          "unrealized_pnl": -26504.999999999996
+        }
+      ]
+    }
+  },
+  "books": {
+    "blast": {
+      "database": "blast_trader.sqlite3",
+      "total_fills": 78,
+      "first_fill": "2026-10-29T04:16:02.328388+00:00",
+      "last_fill": "2026-10-29T09:50:43.467709+00:00",
+      "today_fills": 78,
+      "today_buys": 65,
+      "today_sells": 13,
+      "today_fill_fees": 0,
+      "today_buy_notional": 6251234.7847,
+      "today_sell_notional": 1186263.7758,
+      "today_orders": 79,
+      "today_order_status": {
+        "FILLED": 78,
+        "REJECTED": 1
+      },
+      "today_closing_slices": 13,
+      "today_closed_position_ids": 13,
+      "today_full_close_slices": 13,
+      "today_gross_closed_pnl": -88131.7842,
+      "today_closed_fees": 0,
+      "today_net_closed_pnl": -88131.7842,
+      "today_winners": 4,
+      "today_losers": 9,
+      "today_breakeven": 0,
+      "today_avg_win": 15203.1627,
+      "today_avg_loss": -16549.381666666668,
+      "today_profit_factor": 0.40829085557980066,
+      "today_exit_reasons": {
+        "BLAST_HARD_STOP_30_PCT": 4,
+        "BLAST_HMA_BELOW_KAMA": 9
+      },
+      "equity_sample_count": 0,
+      "today_equity_sample_count": 0,
+      "last_equity": null,
+      "day_equity_anchor": null,
+      "day_equity_anchor_is_prior_day": false,
+      "capital_added_after_anchor": 0,
+      "today_journal_count": 89,
+      "today_journal_reasons": {
+        "TAKEN": 65,
+        "ENTRY_REJECTED": 24
+      },
+      "today_journal_strategy": {
+        "hma_kama": 89
+      },
+      "today_taken_by_strategy": {
+        "hma_kama": 65
+      }
+    },
+    "blast_before_reset": {
+      "database": "blast_trader.before-hmakama-reset-20261029.sqlite3",
+      "total_fills": 240,
+      "first_fill": "2026-09-29T04:06:09.047769+00:00",
+      "last_fill": "2026-10-29T09:50:43.467709+00:00",
+      "today_fills": 80,
+      "today_buys": 65,
+      "today_sells": 15,
+      "today_fill_fees": 0,
+      "today_buy_notional": 6251234.7847,
+      "today_sell_notional": 1207522.5258,
+      "today_orders": 81,
+      "today_order_status": {
+        "FILLED": 80,
+        "REJECTED": 1
+      },
+      "today_closing_slices": 15,
+      "today_closed_position_ids": 15,
+      "today_full_close_slices": 15,
+      "today_gross_closed_pnl": -94704.2842,
+      "today_closed_fees": 0,
+      "today_net_closed_pnl": -94704.2842,
+      "today_winners": 4,
+      "today_losers": 11,
+      "today_breakeven": 0,
+      "today_avg_win": 15203.1627,
+      "today_avg_loss": -14137.903181818181,
+      "today_profit_factor": 0.39103555378068633,
+      "today_exit_reasons": {
+        "BLAST_HMA_BELOW_KAMA": 11,
+        "BLAST_HARD_STOP_30_PCT": 4
+      },
+      "equity_sample_count": 240,
+      "today_equity_sample_count": 80,
+      "last_equity": {
+        "timestamp": "2026-10-29T09:50:43.560125+00:00",
+        "equity": 501046725.44409996,
+        "cash": 495642510.09409994,
+        "realized_pnl": 619349.3188000001,
+        "unrealized_pnl": 427376.1253
+      },
+      "day_equity_anchor": {
+        "timestamp": "2026-10-27T08:47:12.673069+00:00",
+        "equity": 500709763.6029998,
+        "cash": 500686222.3529998,
+        "realized_pnl": 714053.6030000001,
+        "unrealized_pnl": -4289.999999999998
+      },
+      "day_equity_anchor_is_prior_day": true,
+      "capital_added_after_anchor": 0,
+      "old_strategy_today_closed_count": 2,
+      "old_strategy_today_closed_pnl": -6572.499999999998,
+      "today_same_hma_fills": 78,
+      "today_old_non_hma_fills": 2,
+      "today_journal_count": 89,
+      "today_journal_reasons": {
+        "TAKEN": 65,
+        "ENTRY_REJECTED": 24
+      },
+      "today_journal_strategy": {
+        "hma_kama": 89
+      },
+      "today_taken_by_strategy": {
+        "hma_kama": 65
+      }
+    },
+    "macd": {
+      "database": "macd_trader.sqlite3",
+      "total_fills": 2401,
+      "first_fill": "2026-09-29T03:45:10.536884+00:00",
+      "last_fill": "2026-10-29T10:09:27.569646+00:00",
+      "today_fills": 261,
+      "today_buys": 150,
+      "today_sells": 111,
+      "today_fill_fees": 0,
+      "today_buy_notional": 7686152.6875,
+      "today_sell_notional": 4801223.3125,
+      "today_orders": 19763,
+      "today_order_status": {
+        "REJECTED": 19502,
+        "FILLED": 261
+      },
+      "today_closing_slices": 111,
+      "today_closed_position_ids": 85,
+      "today_full_close_slices": 60,
+      "today_gross_closed_pnl": 123816.6000000001,
+      "today_closed_fees": 0,
+      "today_net_closed_pnl": 123816.6000000001,
+      "today_winners": 59,
+      "today_losers": 52,
+      "today_breakeven": 0,
+      "today_avg_win": 10368.71313559322,
+      "today_avg_loss": -9383.41298076923,
+      "today_profit_factor": 1.2537550533498172,
+      "today_exit_reasons": {
+        "HARD_STOP_30_PCT": 13,
+        "STAGED_PROFIT_EXIT_1": 28,
+        "STAGED_PROFIT_EXIT_2": 13,
+        "STAGED_PROFIT_EXIT_3": 10,
+        "TRAILING_STOP_25_PCT": 8,
+        "MACD_INVALIDATED": 39
+      },
+      "equity_sample_count": 74891,
+      "today_equity_sample_count": 4900,
+      "last_equity": {
+        "timestamp": "2026-10-29T10:53:21.011301+00:00",
+        "equity": 15327586.2685,
+        "cash": 4915561.118499999,
+        "realized_pnl": 4198614.1247499995,
+        "unrealized_pnl": 1128972.14375
+      },
+      "day_equity_anchor": {
+        "timestamp": "2026-10-28T18:27:14.730018+00:00",
+        "equity": 14565760.243499998,
+        "cash": 7800490.493499998,
+        "realized_pnl": 4074797.52475,
+        "unrealized_pnl": 490962.71875
+      },
+      "day_equity_anchor_is_prior_day": true,
+      "capital_added_after_anchor": 0,
+      "day_equity_change": 761826.0250000022,
+      "day_equity_change_pct": 5.23025240196418
+    }
+  },
+  "cbe_paper": {
+    "checked_at": "2026-10-29T17:55:33.740838+05:30",
+    "today": "2026-10-29",
+    "closed_trades": 10,
+    "wins": 4,
+    "losses": 6,
+    "net_realized_pnl": 6855.48,
+    "fees": 4000.95,
+    "pnl_before_fees": 10856.43,
+    "entry_notional": 1995044.16,
+    "exit_notional": 2005900.59,
+    "win_rate": 0.4,
+    "profit_factor": 1.9428809563760698,
+    "avg_win": 3531.565,
+    "avg_loss": -1211.7966666666666,
+    "equity_start": 5001396.03,
+    "equity_end": 5008251.51,
+    "session_return_pct": 0.13707132886255913,
+    "day_min_equity": 4989878.87,
+    "day_max_equity": 5011202.29,
+    "baseline_at": "2026-10-29T09:15:01.079621+05:30",
+    "last_curve_at": "2026-10-29T15:15:04.818373+05:30",
+    "exit_reasons": {
+      "TIME_EXIT": 10
+    },
+    "orders_for_today": [
+      {
+        "id": "71358688d243d8241f35e0867a248fe1",
+        "symbol": "INDHOTEL",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 1
+      },
+      {
+        "id": "7dfda5fde716e9b7c87aa41868d79ff0",
+        "symbol": "BHARTIARTL",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 2
+      },
+      {
+        "id": "521a834ed2cfa42019a166a44c7d2323",
+        "symbol": "KOTAKBANK",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 3
+      },
+      {
+        "id": "a19fd850a343da736227686ed7b1b737",
+        "symbol": "DRREDDY",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 4
+      },
+      {
+        "id": "db8a004494c6e40223867ceec4ef0d08",
+        "symbol": "LAURUSLABS",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 5
+      },
+      {
+        "id": "160b76c2ca28a5fd902088989fcefa9c",
+        "symbol": "SONACOMS",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 6
+      },
+      {
+        "id": "ba9597fffd6bfdd5a7fe90135b8ceb59",
+        "symbol": "COFORGE",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 7
+      },
+      {
+        "id": "c347358c7e1f07752e8c54732ed3362a",
+        "symbol": "FEDERALBNK",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 8
+      },
+      {
+        "id": "88d690acdee8c33c0cbe020329d3197a",
+        "symbol": "UNIONBANK",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 9
+      },
+      {
+        "id": "c7927e15b496ccae83f51bac4a8a718f",
+        "symbol": "NYKAA",
+        "state": "CLOSED",
+        "reason": "TIME_EXIT",
+        "created_at": "2026-10-28T15:51:14.946340+05:30",
+        "entry_after": "2026-10-29T09:20:00+05:30",
+        "deadline": "2026-10-29T09:55:00+05:30",
+        "exit_due": "2026-10-29T15:15:00+05:30",
+        "rank": 10
+      }
+    ],
+    "next_orders": [
+      {
+        "symbol": "LAURUSLABS",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 1
+      },
+      {
+        "symbol": "MPHASIS",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 2
+      },
+      {
+        "symbol": "KOTAKBANK",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 3
+      },
+      {
+        "symbol": "INDHOTEL",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 4
+      },
+      {
+        "symbol": "BHARTIARTL",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 5
+      },
+      {
+        "symbol": "PERSISTENT",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 6
+      },
+      {
+        "symbol": "UNIONBANK",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 7
+      },
+      {
+        "symbol": "COFORGE",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 8
+      },
+      {
+        "symbol": "PNB",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 9
+      },
+      {
+        "symbol": "DRREDDY",
+        "state": "PENDING_AI",
+        "reason": "Awaiting entry window and fresh local review",
+        "created_at": "2026-10-29T15:51:23.560822+05:30",
+        "entry_after": "2026-10-30T09:20:00+05:30",
+        "deadline": "2026-10-30T09:55:00+05:30",
+        "exit_due": "2026-10-30T15:15:00+05:30",
+        "rank": 10
+      }
+    ],
+    "positions": [
+      {
+        "symbol": "BHARTIARTL",
+        "entry": 1966.1,
+        "exit": 1964.1,
+        "quantity": 101,
+        "entry_fee": 198.58,
+        "exit_fee": 198.37,
+        "net_pnl": -598.95,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Telecom",
+        "gross_return_pct": -0.10172422562433336,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "LAURUSLABS",
+        "entry": 2194,
+        "exit": 2235,
+        "quantity": 91,
+        "entry_fee": 199.65,
+        "exit_fee": 203.39,
+        "net_pnl": 3327.96,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Pharmaceuticals",
+        "gross_return_pct": 1.8687329079307258,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "INDHOTEL",
+        "entry": 812.55,
+        "exit": 808.25,
+        "quantity": 246,
+        "entry_fee": 199.89,
+        "exit_fee": 198.83,
+        "net_pnl": -1456.52,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Banking + 4 more",
+        "gross_return_pct": -0.5291982031874864,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "COFORGE",
+        "entry": 1968.1,
+        "exit": 1959,
+        "quantity": 101,
+        "entry_fee": 198.78,
+        "exit_fee": 197.86,
+        "net_pnl": -1315.74,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "IT Services",
+        "gross_return_pct": -0.4623748793252336,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "FEDERALBNK",
+        "entry": 349.05,
+        "exit": 347.8,
+        "quantity": 572,
+        "entry_fee": 199.66,
+        "exit_fee": 198.94,
+        "net_pnl": -1113.6,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Banking + 4 more",
+        "gross_return_pct": -0.35811488325454555,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "NYKAA",
+        "entry": 347.15,
+        "exit": 350.75,
+        "quantity": 576,
+        "entry_fee": 199.96,
+        "exit_fee": 202.03,
+        "net_pnl": 1671.61,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Banking + 4 more",
+        "gross_return_pct": 1.0370156992654644,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "SONACOMS",
+        "entry": 880.45,
+        "exit": 874.55,
+        "quantity": 227,
+        "entry_fee": 199.86,
+        "exit_fee": 198.52,
+        "net_pnl": -1737.68,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Auto Ancillary + 1 more",
+        "gross_return_pct": -0.6701118746095802,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "UNIONBANK",
+        "entry": 183.59,
+        "exit": 186.26,
+        "quantity": 1089,
+        "entry_fee": 199.93,
+        "exit_fee": 202.84,
+        "net_pnl": 2504.86,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Banking + 4 more",
+        "gross_return_pct": 1.454327577754766,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "KOTAKBANK",
+        "entry": 442.2,
+        "exit": 457.75,
+        "quantity": 452,
+        "entry_fee": 199.87,
+        "exit_fee": 206.9,
+        "net_pnl": 6621.83,
+        "opened_at": "2026-10-29T09:20:07.549130+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Banking + 4 more",
+        "gross_return_pct": 3.516508367254634,
+        "source_session": "2026-10-28"
+      },
+      {
+        "symbol": "DRREDDY",
+        "entry": 1343.7,
+        "exit": 1339.3,
+        "quantity": 148,
+        "entry_fee": 198.87,
+        "exit_fee": 198.22,
+        "net_pnl": -1048.29,
+        "opened_at": "2026-10-29T09:20:12.646409+05:30",
+        "closed_at": "2026-10-29T15:15:04.818373+05:30",
+        "exit_reason": "TIME_EXIT",
+        "sector": "Pharmaceuticals",
+        "gross_return_pct": -0.3274540448016783,
+        "source_session": "2026-10-28"
+      }
+    ],
+    "integrity": "ok",
+    "session_max_drawdown_pct": 0.23027890474811574,
+    "fill_check_errors": [],
+    "quote_age_seconds_min": 0.66413,
+    "quote_age_seconds_max": 8.045373,
+    "fills_exceeding_displayed_qty": [
+      {
+        "symbol": "BHARTIARTL",
+        "side": "SELL",
+        "qty": 101,
+        "displayed_qty": 49
+      },
+      {
+        "symbol": "INDHOTEL",
+        "side": "SELL",
+        "qty": 246,
+        "displayed_qty": 100
+      },
+      {
+        "symbol": "COFORGE",
+        "side": "SELL",
+        "qty": 101,
+        "displayed_qty": 6
+      },
+      {
+        "symbol": "FEDERALBNK",
+        "side": "SELL",
+        "qty": 572,
+        "displayed_qty": 20
+      },
+      {
+        "symbol": "SONACOMS",
+        "side": "SELL",
+        "qty": 227,
+        "displayed_qty": 70
+      },
+      {
+        "symbol": "DRREDDY",
+        "side": "SELL",
+        "qty": 148,
+        "displayed_qty": 1
+      },
+      {
+        "symbol": "LAURUSLABS",
+        "side": "BUY",
+        "qty": 91,
+        "displayed_qty": 66
+      },
+      {
+        "symbol": "INDHOTEL",
+        "side": "BUY",
+        "qty": 246,
+        "displayed_qty": 9
+      },
+      {
+        "symbol": "NYKAA",
+        "side": "BUY",
+        "qty": 576,
+        "displayed_qty": 360
+      },
+      {
+        "symbol": "UNIONBANK",
+        "side": "BUY",
+        "qty": 1089,
+        "displayed_qty": 734
+      }
+    ],
+    "today_net_without_kotak": 233.64999999999964,
+    "fees_as_pct_of_pnl_before_fees": 36.85327497160669
+  },
+  "blast_funding_rebase": {
+    "before_initial_capital": 500000000,
+    "after_initial_capital": 5000000,
+    "active_settings_mtime": "2026-10-29 16:23:09 IST",
+    "active_db_mtime": "2026-10-29 16:23:00 IST",
+    "retained_buy_notional": 6251234.7847,
+    "retained_sell_notional": 1186263.7758,
+    "retained_net_cash_outflow": 5064971.0089,
+    "resulting_cash": -64971.0089,
+    "equity_curve_rows": 0,
+    "interpretation": "Retained HMA fills re-funded at lower capital; cash deficit is arithmetically explained by rebase, not evidence that original fills bypassed then-current cash checks."
+  },
+  "mark_quality": {
+    "blast": {
+      "all_open_marks_equal_current_snapshot_tick_ltp": true,
+      "count": 52,
+      "earliest_tick": "2026-10-29 15:29:40 IST",
+      "latest_tick": "2026-10-29 15:39:59 IST",
+      "missing_ticks": 0,
+      "preopen_timestamp_count": 0
+    },
+    "macd": {
+      "all_open_marks_equal_current_snapshot_tick_ltp": true,
+      "count": 117,
+      "earliest_tick": "2026-10-29 05:30:00 IST",
+      "latest_tick": "2026-10-29 15:39:59 IST",
+      "missing_ticks": 0,
+      "preopen_timestamp_count": 1,
+      "preopen_marks": [
+        {
+          "symbol": "NSE:BOSCHLTD26NOV44500CE",
+          "tick": "2026-10-29 05:30:00 IST",
+          "market_value": 87242.5,
+          "unrealized_pnl": 46527.5
+        }
+      ]
+    }
+  },
+  "limits": [
+    "Blast and MACD recorded fill fees are zero; spread crossing/5bp fallback is implemented but statutory/exchange charges are not deducted.",
+    "Blast active equity history was removed at the funding rebase; +8.08% is retained HMA book equity over new capital, not continuously funded full-day return.",
+    "Blast archive and current book share fill identities; never sum their P&L.",
+    "MACD today MTM includes change in carried positions, whereas current open unrealized P&L is lifetime cost-basis P&L.",
+    "CBE quote-to-quote shadow returns are distinct from funded paper fills and are not financial P&L.",
+    "One positive or negative session does not establish strategy edge."
+  ]
+}

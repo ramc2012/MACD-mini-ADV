@@ -4,15 +4,13 @@ import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPosition
 
 import { bookFillCounts } from "./ledgerMath";
 import { LedgerCounts } from "./LedgerCounts";
+import { istDay, istStamp } from "./istTime";
+export { istDay } from "./istTime";
 
 const number = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
 const currency = (value: number) => `₹${number.format(value)}`;
-const fullStamp = (value: string) => new Date(value).toLocaleString("en-IN", {
-  timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-});
-const entryStamp = (value: string) => new Date(value).toLocaleString("en-IN", {
-  timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false,
-});
+const fullStamp = istStamp;
+const entryStamp = istStamp;
 // "08:00 IST" while the book started today; "Fri 08:00 IST" over a weekend.
 const bookStartLabel = (start: number, now: number) => {
   const sameDay = new Date(start).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }) === new Date(now).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" });
@@ -23,7 +21,6 @@ const priceTitle = (price?: number | null) => price === undefined || price === n
 const lotsLabel = (row: { lots: number; lot_size: number }) => row.lot_size > 0 ? `${row.lots} × ${row.lot_size}` : "—";
 const heldLabel = (ms: number) => { const m = Math.round(ms / 60_000); return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`; };
 /** The IST calendar day (YYYY-MM-DD) of a timestamp. */
-export const istDay = (value: string | number | Date) => new Date(value).toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
 const dayHeading = (day: string) => new Date(`${day}T12:00:00+05:30`).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", year: "numeric" });
 
 export type LedgerTab = "ORDERS" | "TRADES" | "PORTFOLIO" | "STATISTICS" | "SIGNALS";

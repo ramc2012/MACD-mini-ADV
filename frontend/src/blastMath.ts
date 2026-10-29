@@ -1,4 +1,5 @@
 import type { BlastCandidate, BlastJournalSummary, BlastSettings, Position } from "./types";
+export { istDay } from "./istTime.ts";
 
 // Pure arithmetic for the Blast lane page. Type-only imports, no JSX and no
 // runtime imports from other modules, so `node --test` can load it directly
@@ -82,13 +83,6 @@ function overlay<Row extends object>(base: Row, update: Row): Row {
     if (value !== null && value !== undefined) next[key] = value;
   }
   return next as Row;
-}
-
-const IST_DAY = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" });
-
-/** The IST session date, in the backend journal's YYYY-MM-DD form. */
-export function istDay(at: number | string | Date = Date.now()): string {
-  return IST_DAY.format(new Date(at));
 }
 
 export type ActiveStop = { kind: "hard" | "trail"; price: number; distancePct: number };

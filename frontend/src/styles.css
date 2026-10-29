@@ -632,17 +632,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .blast-metrics > div { min-width: 0; padding: 9px 12px; background: #0c111a; }
 .blast-metrics span { display: block; color: #687990; font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
 .blast-metrics b { display: block; margin-top: 4px; overflow: hidden; font-size: 13px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
-.blast-tabs { position: static; flex: none; grid-template-columns: repeat(6, minmax(0, 1fr)); border: 1px solid #202a38; border-radius: 5px; overflow: hidden; }
+.blast-tabs { position: static; flex: none; grid-template-columns: repeat(8, minmax(0, 1fr)); border: 1px solid #202a38; border-radius: 5px; overflow: hidden; }
 .blast-tabs button { display: flex; align-items: center; justify-content: center; gap: 6px; }
 .blast-body { flex: 1; min-height: 0; margin-top: 8px; }
+.blast-body > .ledger-page { height: 100%; min-height: 0; padding: 0; }
+.blast-status, .blast-performance { height: 100%; overflow: auto; }
+.blast-performance { display: flex; flex-direction: column; gap: 8px; }
+.blast-performance-curve { flex: 1; min-height: 300px; display: flex; flex-direction: column; }
+.blast-realized-chart { flex: 1; min-height: 240px; }
 .blast-grid { height: 100%; display: grid; gap: 8px; overflow: auto;
-  grid-template-columns: minmax(280px, 1fr) minmax(260px, .9fr) minmax(320px, 1.1fr);
+  grid-template-columns: minmax(280px, 1.2fr) minmax(260px, 1fr);
   grid-template-rows: min-content minmax(280px, 1fr); }
 .blast-screen { grid-column: 1; grid-row: 1; }
 .blast-funnel { grid-column: 2; grid-row: 1; }
 .blast-risk { grid-column: 3; grid-row: 1; }
-.blast-verdicts { grid-column: 1 / span 2; grid-row: 2; }
-.blast-recent { grid-column: 3; grid-row: 2; }
+.blast-verdicts { grid-column: 1; grid-row: 2; }
+.blast-recent { grid-column: 2; grid-row: 2; }
 .blast-verdicts, .blast-recent, .blast-panel-fill, .blast-split > .panel { min-height: 0; display: flex; flex-direction: column; }
 .blast-verdicts .ledger-table-wrap, .blast-recent .ledger-table-wrap, .blast-panel-fill .ledger-table-wrap, .blast-split .ledger-table-wrap { flex: 1; min-height: 0; height: auto; }
 .blast-gates { padding: 4px 12px 10px; }
@@ -700,6 +705,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @media (max-width: 700px) {
   .blast-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .blast-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .blast-status, .blast-performance { height: auto; }
+  .blast-performance-curve { min-height: 340px; }
   .blast-badges { justify-content: flex-start; }
   .blast-count { flex-basis: 100%; margin-left: 0; }
   .blast-settings { padding: 0 12px 12px; }

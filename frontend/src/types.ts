@@ -354,7 +354,7 @@ export type BlastHealth = {
   entry_policy?: BlastEntryPolicy;
   enabled: boolean; auto_trade: boolean; evaluated_since_start: number; taken_since_start: number; watching: number;
   open_positions: number; symbols_with_history: number; last_candidate_at: string | null; broker_access: string; error: string | null;
-  bar_seconds?: number; warmed_symbols?: number; last_warm_at?: string | null; late_bars_skipped?: number;
+  bar_seconds?: number; signal_bar_seconds?: number; warmed_symbols?: number; last_warm_at?: string | null; late_bars_skipped?: number;
 };
 export type BlastEntryPolicy = {
   version: string; active: boolean; vix_status: string; vix: number | null; vix_age_seconds: number | null;
@@ -363,6 +363,7 @@ export type BlastEntryPolicy = {
 export type BlastVerdictSummary = { reason: string; count: number; resolved: number; mean_mfe_pct: number | null; mean_mae_pct: number | null };
 export type BlastJournalSummary = { day: string | null; evaluated: number; taken: number; verdicts: BlastVerdictSummary[] };
 export type BlastCandidate = {
+  strategy?: "hma_kama" | "macd_screen"; hma?: number | null; kama?: number | null;
   id: string; at: string; day: string; symbol: string; bar_timestamp: number | null;
   spot_symbol: string | null; option_type: string; strike: number | null; expiry: string | null;
   premium: number; spot: number | null; premium_pct: number | null; breadth: number | null;

@@ -1,15 +1,17 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
-import { SortableTable, type Column, type FocusRow, type SortState } from "./Ledger";
-import { BOOK_ROLL_LABEL, observedExcursion, visibleClosedRows } from "./ledgerMath";
+import { SortableTable, TradingLedger, type Column, type FocusRow, type SortState } from "./Ledger";
+import { BlastPerformance, BlastStatus } from "./BlastBookViews";
+import { istStamp } from "./istTime";
+import { visibleClosedRows } from "./ledgerMath";
 import {
   RISK_KEYS, VERDICT_ORDER, activeStop, changedSettings, fromForm, istDay, mergeCandidates, screenFunnel, toForm, verdictMeta,
   type BlastForm, type FunnelKey,
 } from "./blastMath";
 import type {
   BlastBook, BlastCandidate, BlastEntryPolicy, BlastJournalResponse, BlastJournalSummary, BlastSnapshot, BlastVerdictSummary,
-  ClosedPosition, Order, Portfolio, Position, Trade,
+  Order, Trade,
 } from "./types";
 
 /** The blast lane: a third paper book with its own screen, journal and risk overlay.
@@ -19,13 +21,15 @@ import type {
  * which is why App keeps this state apart from theirs.
  */
 
-type Tab = "OVERVIEW" | "JOURNAL" | "POSITIONS" | "ORDERS" | "TRADES" | "SETTINGS";
+type Tab = "OVERVIEW" | "JOURNAL" | "POSITIONS" | "STATUS" | "PERFORMANCE" | "ORDERS" | "TRADES" | "SETTINGS";
 const TABS: { key: Tab; label: string }[] = [
-  { key: "OVERVIEW", label: "Overview" },
-  { key: "JOURNAL", label: "Journal" },
-  { key: "POSITIONS", label: "Positions" },
+  { key: "OVERVIEW", label: "Terminal" },
+  { key: "POSITIONS", label: "Portfolio" },
+  { key: "STATUS", label: "Status" },
   { key: "ORDERS", label: "Orders" },
   { key: "TRADES", label: "Trades" },
+  { key: "PERFORMANCE", label: "Performance" },
+  { key: "JOURNAL", label: "Journal" },
   { key: "SETTINGS", label: "Settings" },
 ];
 const TAB_STORE = "macd.blastTab";
@@ -36,10 +40,8 @@ const authHeaders = (): Record<string, string> => (API_TOKEN ? { "x-macd-token":
 
 const number = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
 const currency = (value: number) => `₹${number.format(value)}`;
-const STAMP = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
-const CLOCK = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
-const stamp = (value?: string | null) => (value ? STAMP.format(new Date(value)) : "—");
-const clock = (value?: string | null) => (value ? CLOCK.format(new Date(value)) : "—");
+const stamp = istStamp;
+const clock = istStamp;
 const finite = (value?: number | null): value is number => typeof value === "number" && Number.isFinite(value);
 const pct = (value?: number | null, digits = 2) => (finite(value) ? `${value.toFixed(digits)}%` : "—");
 const signed = (value?: number | null, digits = 1) => (finite(value) ? `${value >= 0 ? "+" : ""}${value.toFixed(digits)}%` : "—");
@@ -59,7 +61,7 @@ const FUNNEL_LABEL: Record<FunnelKey, string> = {
   taken: "Taken",
 };
 
-export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, revision, onSnapshot, onOpenPosition }: {
+export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, revision, onSnapshot, onOpenPosition, holidays }: {
   snapshot?: BlastSnapshot;
   policy?: BlastEntryPolicy;
   /** Candidates pushed over the stream since the last snapshot. */
@@ -70,6 +72,7 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
   revision: number;
   onSnapshot: (next: BlastSnapshot) => void;
   onOpenPosition?: (position: FocusRow, list: FocusRow[]) => void;
+  holidays?: string[];
 }) {
   const ready = !!snapshot;
   const [tab, setTab] = useState<Tab>(() => {
@@ -125,7 +128,7 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
 
   const [book, setBook] = useState<BlastBook>();
   const [bookError, setBookError] = useState("");
-  const wantsBook = tab === "ORDERS" || tab === "TRADES";
+  const wantsBook = ready;
   useEffect(() => {
     if (!wantsBook || !ready) return;
     const controller = new AbortController();
@@ -133,7 +136,7 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
       .then((data) => { setBook(data); setBookError(""); })
       .catch((error) => { if (!controller.signal.aborted) setBookError(errorText(error)); });
     return () => controller.abort();
-  }, [wantsBook, ready, revision, liveOrders.length, liveTrades.length]);
+  }, [wantsBook, ready, revision, liveOrders.length, liveTrades.length, minute]);
 
   const journalRows = useMemo(() => mergeCandidates(
     journal?.rows ?? [],
@@ -154,13 +157,12 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
   const portfolio = snapshot.portfolio;
   const summary: BlastJournalSummary | undefined = todayData?.summary
     ?? (snapshot.journal_summary.day === today ? snapshot.journal_summary : undefined);
-  const funnel = screenFunnel(summary);
-  const passed = funnel.find((step) => step.key === "offHigh")?.count ?? 0;
-  const closed = visibleClosedRows(portfolio.closed_positions ?? snapshot.closed_positions ?? [], now);
+  const closed = visibleClosedRows(portfolio.closed_positions ?? snapshot.closed_positions ?? [], now, new Set(holidays ?? []));
   const counts: Partial<Record<Tab, number>> = {
     JOURNAL: summary?.evaluated ?? 0,
     POSITIONS: portfolio.positions.length,
-    ...(book ? { ORDERS: orders.length, TRADES: trades.length } : {}),
+    ...(book ? { ORDERS: orders.filter((row) => istDay(row.created_at) === today).length,
+      TRADES: trades.filter((row) => istDay(row.timestamp) === today).length } : {}),
   };
   const days = [today, ...(todayData?.days ?? journal?.days ?? []).filter((row) => row !== today)];
 
@@ -171,7 +173,7 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
           ? "HMA(20) × KAMA(10, 2, 30) crossovers on 30-minute option premium · exit on the cross back, a hard stop or the 4th session · its own paper book"
           : "Premium MACD signal-line crosses, screened by premium ÷ spot, own-side breadth and distance below the recent high · its own paper book"}</p></div>
       <div className="blast-badges">
-        {!snapshot.enabled && <span className="mode alert" title="The screen is off. Open positions keep their stop and trail.">Disabled</span>}
+        {!snapshot.enabled && <span className="mode alert" title="The lane is disabled. Tick-driven stops and marks are paused; use shadow mode to stop entries while retaining risk management.">Disabled · tick exits paused</span>}
         {snapshot.enabled && (snapshot.auto_trade
           ? <span className="feed-badge" title="Candidates that pass the screen are bought in the lane's paper book.">Auto-trade · paper</span>
           : <span className="mode" title="Every candidate is journalled and tracked forward. Nothing is bought.">Shadow · journal only</span>)}
@@ -182,26 +184,28 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
 
     <section className="blast-metrics" aria-label="Blast lane book">
       <Metric label="Equity" value={currency(portfolio.equity)} />
-      <Metric label="Realized" value={currency(portfolio.realized_pnl)} tone={portfolio.realized_pnl} />
-      <Metric label="Unrealized" value={currency(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl} />
+      <Metric label="Realized · active book lifetime" value={currency(portfolio.realized_pnl)} tone={portfolio.realized_pnl} />
+      <Metric label="Open P&L · current marks" value={currency(portfolio.unrealized_pnl)} tone={portfolio.unrealized_pnl} />
       <Metric label="Open positions" value={`${portfolio.positions.length} · ${currency(portfolio.market_value)}`} />
-      <Metric label="Today · judged / passed / taken" value={`${summary?.evaluated ?? 0} / ${passed} / ${summary?.taken ?? 0}`} />
+      <Metric label="Today · signals / paper entries" value={`${summary?.evaluated ?? 0} / ${summary?.taken ?? 0}`} />
       <Metric label="Tracking forward" value={`${snapshot.health.watching} candidates`} />
     </section>
 
     <div className="watch-tabs blast-tabs" role="tablist" aria-label="Blast lane sections">
-      {TABS.map((row) => <button key={row.key} role="tab" aria-selected={tab === row.key} className={tab === row.key ? "active" : ""} onClick={() => pickTab(row.key)}>
+      {TABS.map((row) => <button key={row.key} id={`blast-tab-${row.key}`} type="button" role="tab" aria-controls="blast-tab-panel" aria-selected={tab === row.key} className={tab === row.key ? "active" : ""} onClick={() => pickTab(row.key)}>
         {row.label}{counts[row.key] !== undefined && <span className="mp-count">{counts[row.key]}</span>}
       </button>)}
     </div>
 
-    <div className="blast-body">
+    <div className="blast-body" id="blast-tab-panel" role="tabpanel" aria-labelledby={`blast-tab-${tab}`}>
       {tab === "OVERVIEW" && <Overview snapshot={snapshot} policy={policy} summary={summary} recent={recent} error={todayError} />}
       {tab === "JOURNAL" && <JournalTab rows={journalRows} days={days} day={day} reason={reason} today={today}
-        onDay={setDay} onReason={setReason} loading={journalLoading} error={journalError} />}
-      {tab === "POSITIONS" && <PositionsTab portfolio={portfolio} closed={closed} onOpenPosition={onOpenPosition} />}
-      {tab === "ORDERS" && <OrdersTab orders={orders} error={bookError} loaded={!!book} />}
-      {tab === "TRADES" && <TradesTab trades={trades} error={bookError} loaded={!!book} />}
+        onDay={setDay} onReason={setReason} loading={journalLoading} error={journalError} hmaKama={snapshot.settings.strategy === "hma_kama"} />}
+      {bookError && ["POSITIONS", "ORDERS", "TRADES", "STATUS", "PERFORMANCE"].includes(tab) && <div className="settings-error" role="alert">Book refresh failed: {bookError}. Showing the last received records.</div>}
+      {(tab === "POSITIONS" || tab === "ORDERS" || tab === "TRADES") && <TradingLedger tab={tab === "POSITIONS" ? "PORTFOLIO" : tab}
+        portfolio={portfolio} orders={orders} trades={trades} signals={book?.signals ?? []} onOpenPosition={onOpenPosition} holidays={holidays} ledgerReady={!!book && !bookError} />}
+      {tab === "STATUS" && <BlastStatus snapshot={snapshot} orders={orders} trades={trades} ready={!!book && !bookError} />}
+      {tab === "PERFORMANCE" && <BlastPerformance book={book} portfolio={portfolio} closed={closed} now={now} initialCapital={snapshot.settings.initial_capital} holidays={holidays} />}
       {tab === "SETTINGS" && <SettingsTab snapshot={snapshot} onSaved={onSnapshot} />}
     </div>
   </section>;
@@ -234,8 +238,8 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
       detail: snapshot.strategy_rules?.entry ?? "On a closed 30-minute premium bar. HMA is the fast, low-lag line; KAMA flattens in chop and follows a clean trend." },
     { key: "exit", title: "Exit", rule: `HMA below KAMA · −${trim(settings.hard_stop_pct * 100)}% stop · 4 sessions`,
       detail: snapshot.strategy_rules?.exit ?? "On a closed bar, at the hard stop, or at 15:00 on the 4th session; expiry and stock T-2 exits still apply. No trailing stop." },
-    { key: "liquid", title: "Liquidity", rule: `≤ ${trim(snapshot.screen.max_volume_share_pct)}% of its own volume`,
-      detail: "The entry is sized down to this share of what the contract itself trades, and declined when even one lot exceeds it." },
+    { key: "liquid", title: "Selection liquidity", rule: `Cap ${trim(snapshot.screen.max_volume_share_pct)}% × max(volume, OI / 100)`,
+      detail: "Uses selection-time contract data. Known liquidity caps whole lots; missing liquidity leaves this cap unavailable." },
     { key: "evidence", title: "Why this rule", rule: "Sep–Oct 2026 replay, 8,018 contracts",
       detail: "+4.3% / +4.8% a trade (Sep / Oct) after a 1.5% round trip; median day +1.0%; 21 of 39 days positive; worst day −11.3%. Two months: not proven." },
   ] : [
@@ -269,7 +273,7 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
   return <div className="blast-grid">
     <section className="panel blast-screen">
       <div className="panel-title"><span>{hk ? "Strategy" : "Screen"}</span><span>{cleared("judged")} judged today</span></div>
-      <p className="blast-note">{hk ? "Fixed ticket per entry; premium ÷ spot, breadth and VIX are recorded for the journal but do not gate entries." : policy?.active
+      <p className="blast-note">{hk ? "Closed 30-minute premium crossovers. Premium ratio is journal context; the legacy premium, breadth and VIX gates are inactive." : policy?.active
         ? `India VIX ${number.format(policy.vix ?? 0)} · premium and breadth limits adjusted`
         : `VIX ${policy?.vix_status ?? "unavailable"} · fixed premium and breadth limits apply`}</p>
       <div className="blast-gates">{gates.map((gate) => <div className="blast-gate" key={gate.key}>
@@ -280,31 +284,22 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
 
     <section className="panel blast-funnel">
       <div className="panel-title"><span>Today's funnel</span><span>{summary?.evaluated ?? 0} signals</span></div>
-      <div className="blast-steps">{funnel.map((step) => <div key={step.key} className={`blast-step${step.key === "taken" ? " final" : ""}`}>
-        <span>{FUNNEL_LABEL[step.key]}</span><b>{step.count}</b>
+      <div className="blast-steps">{(hk ? [
+        { key: "evaluated", label: "HMA/KAMA entry signals", count: summary?.evaluated ?? 0 },
+        { key: "taken", label: "Paper entries filled", count: summary?.taken ?? 0 },
+        { key: "rejected", label: "Paper entries refused", count: summary?.verdicts.find((row) => row.reason === "ENTRY_REJECTED")?.count ?? 0 },
+        { key: "shadow", label: "Journal only", count: summary?.verdicts.find((row) => row.reason === "AUTO_TRADE_OFF")?.count ?? 0 },
+      ].map((step) => ({ ...step, share: summary?.evaluated ? step.count / summary.evaluated : 0 }))
+        : funnel.map((step) => ({ ...step, label: FUNNEL_LABEL[step.key] }))).map((step) => <div key={step.key} className={`blast-step${step.key === "taken" ? " final" : ""}`}>
+        <span>{step.label}</span><b>{step.count}</b>
         <div className="blast-meter" aria-hidden="true"><i style={{ width: `${Math.round(step.share * 100)}%` }} /></div>
       </div>)}</div>
       {error && <p className="blast-note negative" role="status">{error}</p>}
     </section>
 
-    <section className="panel blast-risk">
-      <div className="panel-title"><span>Book and risk</span><span>{snapshot.auto_trade ? "auto-trade" : "shadow"}</span></div>
-      <div className="blast-kv">
-        <span>Hard stop</span><b>−{trim(settings.hard_stop_pct * 100)}%</b>
-        {hk ? <><span>Trailing stop</span><b>None · exit when HMA falls below KAMA</b><span>Hold limit</span><b>15:00 on the 4th session</b></>
-          : <><span>Trailing stop</span><b>{trim(settings.trail_pct * 100)}% from peak, from +{trim(settings.trail_activation_pct * 100)}%</b></>}
-        <span>Scale-outs · pyramiding</span><b>None · none</b>
-        <span>Size per entry</span><b>{currency(settings.target_notional)}</b>
-        <span>Max open positions</span><b>{settings.max_positions}</b>
-        <span>Capital</span><b>{currency(settings.initial_capital)}</b>
-        <span>Market data</span><b>Engine memory only</b>
-      </div>
-      <p className="blast-note">{hk ? "An expiring contract is flattened from the lane's own contract record; stock options leave on their T-2 day." : "The trail never arms below the round-trip breakeven. An expiring contract is flattened at 15:20 IST from the lane's own contract record."}</p>
-    </section>
-
     <section className="panel blast-verdicts">
       <div className="panel-title"><span>Verdicts and forward excursion</span><span>control group</span></div>
-      <p className="blast-note">Every candidate that clears the premium gate is tracked for {trim(snapshot.screen.journal_horizon_hours)} hours whether or not the lane bought it. Compare the passed rows' excursion with the declined ones to see whether each leg earns its place.</p>
+      <p className="blast-note">{hk ? "Entry signals" : "Candidates that clear the premium gate"} are tracked for {trim(snapshot.screen.journal_horizon_hours)} hours. Max gain and drawdown are observed premium excursions before costs; they are not booked trade returns. Open tracking windows are incomplete.</p>
       <SortableTable rows={verdictRows} columns={verdictColumns} sort={verdictSort}
         onSort={(key) => setVerdictSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
         empty="No candidates judged today yet" />
@@ -314,14 +309,15 @@ function Overview({ snapshot, policy: livePolicy, summary, recent, error }: {
       <div className="panel-title"><span>Latest candidates</span><span>{recent.length}</span></div>
       <SortableTable rows={recent} columns={recentColumns} sort={recentSort}
         onSort={(key) => setRecentSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
-        empty="No signal-line crosses judged yet today" />
+        empty={hk ? "No HMA/KAMA crossovers journalled today" : "No signal-line crosses judged yet today"} />
     </section>
   </div>;
 }
 
-function JournalTab({ rows, days, day, reason, today, onDay, onReason, loading, error }: {
+function JournalTab({ rows, days, day, reason, today, onDay, onReason, loading, error, hmaKama }: {
   rows: BlastCandidate[]; days: string[]; day: string; reason: string; today: string;
   onDay: (day: string) => void; onReason: (reason: string) => void; loading: boolean; error: string;
+  hmaKama: boolean;
 }) {
   const [sort, setSort] = useState<SortState>({ key: "at", direction: "desc" });
   const allSessions = !day;
@@ -339,7 +335,11 @@ function JournalTab({ rows, days, day, reason, today, onDay, onReason, loading, 
       render: (row) => { const scale = row.entry_size_multiplier ?? row.premium_size_multiplier;
         return <span title={row.entry_rejection ?? "Share of the usual entry ticket"}>{finite(scale) ? pct(scale * 100, 0) : "—"}</span>; } },
     { key: "off_high", label: "Off high", value: (row) => row.off_high_pct ?? LOW, render: (row) => signed(row.off_high_pct) },
-    { key: "macd", label: "MACD / signal", value: (row) => row.macd, render: (row) => `${row.macd.toFixed(3)} / ${row.signal.toFixed(3)}` },
+    { key: "macd", label: "Entry lines", value: (row) => row.strategy === "hma_kama" ? row.hma ?? LOW : row.macd,
+      render: (row) => row.strategy === "hma_kama"
+        ? `HMA ${finite(row.hma) ? row.hma.toFixed(3) : "—"} / KAMA ${finite(row.kama) ? row.kama.toFixed(3) : "—"}`
+        : `MACD ${row.macd.toFixed(3)} / signal ${row.signal.toFixed(3)}` },
+    { key: "entry_note", label: "Entry note", value: (row) => row.entry_rejection ?? "", render: (row) => row.entry_rejection ?? "—" },
     { key: "bars", label: "Bars", value: (row) => row.lookback_bars },
     { key: "mfe", label: "Max gain", value: (row) => row.mfe_pct ?? LOW, render: (row) => signed(row.mfe_pct), tone: (row) => tone(row.mfe_pct) },
     { key: "mae", label: "Max drawdown", value: (row) => row.mae_pct ?? LOW, render: (row) => signed(row.mae_pct), tone: (row) => (finite(row.mae_pct) && row.mae_pct < 0 ? "negative" : "") },
@@ -360,108 +360,10 @@ function JournalTab({ rows, days, day, reason, today, onDay, onReason, loading, 
       <span className="blast-count" role="status">{loading ? "Loading…" : `${rows.length} candidate${rows.length === 1 ? "" : "s"}`}</span>
     </div>
     {error && <div className="settings-error blast-inline-error" role="alert">{error}</div>}
-    <SortableTable rows={rows} columns={columns} sort={sort}
+    <SortableTable rows={rows} columns={hmaKama && rows.every((row) => row.strategy === "hma_kama")
+      ? columns.filter((column) => !["breadth", "vix", "off_high", "bars"].includes(column.key)) : columns} sort={sort}
       onSort={(key) => setSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
       empty={reason ? `No "${verdictMeta(reason).label}" candidates for this selection` : "No candidates journalled for this selection"} />
-  </section>;
-}
-
-function PositionsTab({ portfolio, closed, onOpenPosition }: {
-  portfolio: Portfolio; closed: ClosedPosition[]; onOpenPosition?: (position: FocusRow, list: FocusRow[]) => void;
-}) {
-  const [openSort, setOpenSort] = useState<SortState>({ key: "pnl", direction: "desc" });
-  const [closedSort, setClosedSort] = useState<SortState>({ key: "exit", direction: "desc" });
-  const openFocus = (row: Position): FocusRow => ({ symbol: row.symbol, entryTime: row.opened_at, entryPrice: row.average_price });
-  const closedFocus = (row: ClosedPosition): FocusRow => ({ symbol: row.symbol, entryTime: row.entry_time, entryPrice: row.entry_price });
-  const openList = portfolio.positions.map(openFocus);
-  const closedList = closed.map(closedFocus);
-  const excursion = (price?: number | null, value?: number | null) => observedExcursion(price, value);
-  const openColumns: Column<Position>[] = [
-    { key: "symbol", label: "Contract", value: (row) => row.symbol, render: (row) => <span title={row.symbol}>{short(row.symbol)}</span> },
-    { key: "opened", label: "Entry (IST)", value: (row) => Date.parse(row.opened_at), render: (row) => stamp(row.opened_at) },
-    { key: "lots", label: "Lots", value: (row) => row.lots, render: (row) => (row.lot_size > 0 ? `${row.lots} × ${row.lot_size}` : "—") },
-    { key: "average", label: "Average", value: (row) => row.average_price, render: (row) => currency(row.average_price) },
-    { key: "ltp", label: "LTP", value: (row) => row.last_price, render: (row) => currency(row.last_price) },
-    { key: "pnl", label: "P&L", value: (row) => row.unrealized_pnl, render: (row) => currency(row.unrealized_pnl), tone: (row) => tone(row.unrealized_pnl) },
-    { key: "return", label: "Return", value: (row) => row.return_pct ?? 0, render: (row) => signed(row.return_pct, 2), tone: (row) => tone(row.return_pct) },
-    { key: "max", label: "Max return", value: (row) => excursion(row.max_price, row.max_return_pct) ?? LOW, render: (row) => signed(excursion(row.max_price, row.max_return_pct), 2) },
-    { key: "min", label: "Min return", value: (row) => excursion(row.min_price, row.min_return_pct) ?? LOW, render: (row) => signed(excursion(row.min_price, row.min_return_pct), 2) },
-    { key: "stop", label: "Active stop", value: (row) => activeStop(row)?.price ?? LOW,
-      render: (row) => { const stop = activeStop(row); return stop ? `${stop.kind === "trail" ? "Trail" : "Hard"} ${currency(stop.price)}` : "—"; } },
-    { key: "room", label: "Room to stop", value: (row) => activeStop(row)?.distancePct ?? LOW, render: (row) => pct(activeStop(row)?.distancePct) },
-  ];
-  const closedColumns: Column<ClosedPosition>[] = [
-    { key: "symbol", label: "Contract", value: (row) => row.symbol,
-      render: (row) => <span title={row.partial ? `Partial exit · ${row.remaining_quantity} units still open` : row.symbol}>{short(row.symbol)}{row.partial ? " ·" : ""}</span> },
-    { key: "entry", label: "Entry (IST)", value: (row) => Date.parse(row.entry_time), render: (row) => stamp(row.entry_time) },
-    { key: "exit", label: "Exit (IST)", value: (row) => Date.parse(row.exit_time), render: (row) => stamp(row.exit_time) },
-    { key: "entry_price", label: "Entry", value: (row) => row.entry_price, render: (row) => currency(row.entry_price) },
-    { key: "exit_price", label: "Exit", value: (row) => row.exit_price, render: (row) => currency(row.exit_price) },
-    { key: "pnl", label: "Realized", value: (row) => row.realized_pnl, render: (row) => currency(row.realized_pnl), tone: (row) => tone(row.realized_pnl) },
-    { key: "return", label: "Return", value: (row) => row.return_pct, render: (row) => signed(row.return_pct, 2), tone: (row) => tone(row.return_pct) },
-    { key: "max", label: "Max return", value: (row) => excursion(row.max_price, row.max_return_pct) ?? LOW, render: (row) => signed(excursion(row.max_price, row.max_return_pct), 2) },
-    { key: "min", label: "Min return", value: (row) => excursion(row.min_price, row.min_return_pct) ?? LOW, render: (row) => signed(excursion(row.min_price, row.min_return_pct), 2) },
-    { key: "reason", label: "Exit reason", value: (row) => row.exit_reason || "", render: (row) => row.exit_reason || "—" },
-  ];
-  const openPnl = portfolio.positions.reduce((sum, row) => sum + row.unrealized_pnl, 0);
-  const realized = closed.reduce((sum, row) => sum + row.realized_pnl, 0);
-  return <div className="blast-split">
-    <section className="panel">
-      <div className="panel-title"><span>Open positions</span><span className={tone(openPnl)}>{portfolio.positions.length} · {currency(openPnl)}</span></div>
-      <SortableTable rows={portfolio.positions} columns={openColumns} sort={openSort}
-        onSort={(key) => setOpenSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
-        rowAction={onOpenPosition ? (row) => onOpenPosition(openFocus(row), openList) : undefined}
-        empty="The lane holds nothing" />
-    </section>
-    <section className="panel">
-      <div className="panel-title"><span>Closed since {BOOK_ROLL_LABEL}</span><span className={tone(realized)}>{closed.length} exit{closed.length === 1 ? "" : "s"} · {currency(realized)}</span></div>
-      <SortableTable rows={closed} columns={closedColumns} sort={closedSort}
-        onSort={(key) => setClosedSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
-        rowAction={onOpenPosition ? (row) => onOpenPosition(closedFocus(row), closedList) : undefined}
-        empty={`Nothing closed since ${BOOK_ROLL_LABEL}`} />
-    </section>
-  </div>;
-}
-
-function OrdersTab({ orders, error, loaded }: { orders: Order[]; error: string; loaded: boolean }) {
-  const [sort, setSort] = useState<SortState>({ key: "time", direction: "desc" });
-  const columns: Column<Order>[] = [
-    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.created_at), render: (row) => stamp(row.created_at) },
-    { key: "symbol", label: "Contract", value: (row) => row.symbol, render: (row) => <span title={row.symbol}>{short(row.symbol)}</span> },
-    { key: "side", label: "Side", value: (row) => row.side, tone: (row) => (row.side === "BUY" ? "positive" : "negative") },
-    { key: "lots", label: "Lots", value: (row) => row.lots || 0, render: (row) => `${row.lots || "—"} × ${row.lot_size || 1}` },
-    { key: "fill", label: "Fill", value: (row) => row.fill_price ?? LOW, render: (row) => (row.fill_price ? currency(row.fill_price) : "—") },
-    { key: "status", label: "Status", value: (row) => row.status },
-  ];
-  return <BookPanel title="Paper orders" count={orders.length} error={error} loaded={loaded}>
-    <SortableTable rows={orders} columns={columns} sort={sort}
-      onSort={(key) => setSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
-      empty={loaded ? "The lane has placed no orders" : "Loading orders…"} />
-  </BookPanel>;
-}
-
-function TradesTab({ trades, error, loaded }: { trades: Trade[]; error: string; loaded: boolean }) {
-  const [sort, setSort] = useState<SortState>({ key: "time", direction: "desc" });
-  const columns: Column<Trade>[] = [
-    { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.timestamp), render: (row) => stamp(row.timestamp) },
-    { key: "symbol", label: "Contract", value: (row) => row.symbol, render: (row) => <span title={row.symbol}>{short(row.symbol)}</span> },
-    { key: "side", label: "Side", value: (row) => row.side, tone: (row) => (row.side === "BUY" ? "positive" : "negative") },
-    { key: "lots", label: "Lots", value: (row) => row.lots || 0, render: (row) => `${row.lots || "—"} × ${row.lot_size || 1}` },
-    { key: "price", label: "Fill price", value: (row) => row.price, render: (row) => currency(row.price) },
-    { key: "value", label: "Value", value: (row) => row.price * row.quantity, render: (row) => currency(row.price * row.quantity) },
-  ];
-  return <BookPanel title="Paper fills" count={trades.length} error={error} loaded={loaded}>
-    <SortableTable rows={trades} columns={columns} sort={sort}
-      onSort={(key) => setSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }))}
-      empty={loaded ? "The lane has no fills" : "Loading fills…"} />
-  </BookPanel>;
-}
-
-function BookPanel({ title, count, error, loaded, children }: { title: string; count: number; error: string; loaded: boolean; children: ReactNode }) {
-  return <section className="panel blast-panel-fill">
-    <div className="panel-title"><span>{title}</span><span>{loaded ? count : "…"}</span></div>
-    {error && <div className="settings-error blast-inline-error" role="alert">{error}</div>}
-    {children}
   </section>;
 }
 
@@ -539,14 +441,16 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: BlastSnapshot; onSaved: 
         <p className="field-help">Applies from the next closed bar. Open positions move to the chosen strategy's exits.</p>
       </label>
       <label className="toggle"><input type="checkbox" checked={form.enabled} onChange={(event) => setField("enabled", event.target.checked)} />Judge and journal entry signals</label>
-      <p className="field-help">Off stops new candidates only. Open positions keep their stop, trail and expiry exit.</p>
+      <p className="field-help">Disabling the lane also pauses tick-driven stops and marks. To stop new entries while retaining risk management, keep the lane enabled and turn off paper buying below.</p>
       <label className="toggle"><input type="checkbox" checked={form.auto_trade}
         onChange={(event) => { if (event.target.checked && !form.auto_trade) setConfirmAuto(true); else setField("auto_trade", event.target.checked); }} />
         Buy candidates that pass the screen (paper)</label>
       <p className="field-help">Off is shadow mode: every candidate is still journalled and tracked forward, and nothing is bought.</p>
       {confirmAuto && <div className="blast-warning" role="alert">
         <b>Turn on auto-trade?</b>
-        <p>The walk-forward behind this screen established the direction, not the size. On eight unseen sessions it lifted the share of picks that doubled from 7.9% to 17.5%, but the return per pick was +5.7% with a 95% interval of −1.4% to +18.1%, on 57 picks. A few weeks of shadow journal is what would settle it.</p>
+        <p>{form.strategy === "hma_kama"
+          ? "HMA/KAMA replay results are research evidence. Prospective performance and executable costs remain unproven. This enables entries in the independent paper book using its current funding and risk settings."
+          : "The legacy screen's short walk-forward sample does not establish profitability or position size. This enables entries in the independent paper book using its current funding and risk settings."}</p>
         <div className="settings-actions">
           <button className="secondary" onClick={() => setConfirmAuto(false)}>Keep shadow mode</button>
           <button className="primary" onClick={() => { setField("auto_trade", true); setConfirmAuto(false); }}>Turn it on, then save</button>
@@ -554,7 +458,7 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: BlastSnapshot; onSaved: 
       </div>}
     </div>
 
-    <div className="settings-section">
+    {form.strategy !== "hma_kama" && <><div className="settings-section">
       <h3>Screen</h3>
       <div className="settings-grid three">
         {field("max_premium_pct", "Base premium limit · % of spot", "Normal premium limit at the reference VIX.", { step: "0.1" })}
@@ -573,14 +477,15 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: BlastSnapshot; onSaved: 
         {field("rich_premium_max_multiple", "Maximum rich premium · × normal limit", "Richer premiums receive smaller tickets; 2× premium means at most 25% of the usual ticket.", { step: "0.1" })}
         {field("vix_max_age_seconds", "Maximum VIX quote age · seconds", "Missing or older VIX quotes keep the fixed rules.", { step: "30" })}
       </div>
-    </div>
+    </div></>}
 
     <div className="settings-section">
       <h3>Risk overlay</h3>
+      {form.strategy === "hma_kama" && <p className="field-help">HMA/KAMA uses the hard stop, cross-back exit and session cap. Trailing-stop settings are inactive.</p>}
       <div className="settings-grid three">
         {field("hard_stop_pct", "Hard stop · %", held ? `Locked while ${held} position${held === 1 ? " is" : "s are"} open.` : "Loss from entry that closes the position.", { step: "1", disabled: held > 0 })}
-        {field("trail_activation_pct", "Trail arms at · % gain", held ? "Locked while positions are open." : "Gain from entry at which the trail starts.", { step: "1", disabled: held > 0 })}
-        {field("trail_pct", "Trail · % from peak", held ? "Locked while positions are open." : "Floored at the round-trip breakeven once armed.", { step: "1", disabled: held > 0 })}
+        {field("trail_activation_pct", "Trail arms at · % gain", held ? "Locked while positions are open." : "Gain from entry at which the trail starts.", { step: "1", disabled: held > 0 || form.strategy === "hma_kama" })}
+        {field("trail_pct", "Trail · % from peak", held ? "Locked while positions are open." : "Floored at the round-trip breakeven once armed.", { step: "1", disabled: held > 0 || form.strategy === "hma_kama" })}
       </div>
     </div>
 
