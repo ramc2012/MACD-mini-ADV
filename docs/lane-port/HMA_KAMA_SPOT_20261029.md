@@ -1,5 +1,7 @@
 # HMA20 / KAMA spot-index timeframe study
 
+Qualification at 2026-10-29 07:15:00 IST: an independent execution reference found that the earlier simulator could miss the new opposite-side entry after a final-bar cross closed at the next session open. Earlier carry figures and daily/timeframe rankings below are provisional until recalculated. Corrected continuous 30-minute results supersede the old 30-minute figures; read `HMA_KAMA_30M_MULTIDAY_20261029.md`. Source/results are retained, and the original research narrative was backed up before adding a qualification.
+
 Completed 2026-10-29 06:47:06 IST. User requested spot NIFTY, BANKNIFTY and SENSEX testing before further option-premium work. Research only: production code, lane rules, settings, books and services unchanged. No source downloads, broker calls, LLM calls or orders.
 
 Full reproducible findings: `/Users/ramachandran/MACD-mini-ADV/research/hma_kama_spot_20261028/FINDINGS.md`; frozen plan, read-only source export/preparation, source-conflict audit, six tests, fold/trade records, training-only audit and chart evidence retained. Research remains uncommitted under owner convention.
