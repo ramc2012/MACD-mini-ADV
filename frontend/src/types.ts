@@ -270,7 +270,7 @@ export type WhaleView = {
 // type-checks; the Ledger then derives the book from the trade log instead.
 // Terminal chart preferences, persisted by App under macd.chartLayers / macd.chartPanes.
 export type ChartLayers = { volume: boolean; legend: boolean; priorDay: boolean; week: boolean; nakedPocs: boolean; ib: boolean; sessions: boolean };
-export type PaneCollapse = { rsi: boolean; roc: boolean };
+export type PaneCollapse = { rsi: boolean };
 /* ---- Profile / Flow page: live OFI, tape speed, session badges, replay ----
    The per-BAR additions (confidence, marked prints) live in FootprintChart's
    own types beside the bars they qualify; these are the page-level shapes

@@ -56,7 +56,9 @@ It never asks the broker for data
 ---------------------------------
 Everything the screen reads is already in the process: one-minute bars from
 the engine's own tick aggregation, their history from the minute bars the
-candle writer has already stored locally, the underlying's price from the tick
+candle writer has already stored locally (on the HMA x KAMA strategy, plus the
+option-chain marks already on disk for the stretches a contract was not being
+streamed), the underlying's price from the tick
 stream, and breadth from the lane's own MACD state. The lane is handed an
 ``OrderOnlyBroker`` that raises on any attribute but ``place_order`` -- so a
 history or quote request from here is an error, not a quiet extra REST call --
@@ -80,6 +82,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .brokers import Broker
+from .chain_warmup import chain_minutes
 from .config import Settings
 from .events import EventHub, json_value
 from .execution import ExecutionManager
@@ -585,6 +588,11 @@ class BlastEngine:
         longer = self.signal_seconds > BAR_SECONDS
         limit = self.lookback_bars + (SIGNAL_WARM_MINUTES if longer else MACD_SEED_BARS)
         stored = await asyncio.to_thread(read_stored_minute_bars, database_path, since, limit)
+        if longer and getattr(self.settings, "blast_strategy", "macd_screen") == HMA_KAMA:
+            # A contract the feed did not carry (picked today, or re-picked after days away) has holes in its
+            # stored minutes. Folded as if contiguous, 30-minute HMA/KAMA miss whole moves and cross a day late
+            # (BLUESTARCO 1600CE, 29 Oct 2026: its 28 Oct rally was absent). The chain marks fill those stretches.
+            stored = await asyncio.to_thread(fill_unstreamed_minutes, database_path, since, stored, limit)
         for symbol in wanted:
             for candle in stored.get(symbol, ()):
                 if longer:
@@ -1361,6 +1369,34 @@ class BlastEngine:
             self.flush_watchers()
             self.repository.save_position_excursions(self.portfolio.positions.values())
         self.repository.close()
+
+
+def fill_unstreamed_minutes(database_path: str, since: dict[str, int], stored: dict[str, list[Candle]],
+                            limit: int) -> dict[str, list[Candle]]:
+    """``stored`` plus option-chain minutes for the stretches each contract was not streamed.
+
+    Not streamed means an IST day with no stored minute, or the part of a day before its first stored minute. A
+    stored day with no trade in some bucket stays empty, as it is on the exchange's own chart. The day of ``since``
+    was streamed, and a read cut short by ``limit`` is not extended backwards.
+    """
+    result = dict(stored)
+    for symbol, after in since.items():
+        rows = stored.get(symbol, [])
+        floor = after
+        if len(rows) >= limit:
+            floor = max(floor, rows[0].timestamp)
+        streamed_day = datetime.fromtimestamp(after, IST).date() if after > 0 else None
+        first_by_day: dict[date, int] = {}
+        for row in rows:
+            first_by_day.setdefault(datetime.fromtimestamp(row.timestamp, IST).date(), row.timestamp)
+        extra = []
+        for minute in chain_minutes(database_path, symbol):
+            day = datetime.fromtimestamp(minute.timestamp, IST).date()
+            if minute.timestamp > floor and day != streamed_day and minute.timestamp < first_by_day.get(day, math.inf):
+                extra.append(minute)
+        if extra:
+            result[symbol] = sorted([*rows, *extra], key=lambda candle: candle.timestamp)
+    return result
 
 
 def read_stored_minute_bars(database_path: str, since: dict[str, int], limit: int) -> dict[str, list[Candle]]:

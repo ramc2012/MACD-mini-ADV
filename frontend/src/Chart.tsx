@@ -4,16 +4,16 @@ import {
   type ISeriesMarkersPluginApi, type MouseEventParams, type PaneAttachedParameter, type Time,
 } from "lightweight-charts";
 import { useEffect, useRef } from "react";
-import { initialBalance, referenceLevels, sessionKey, sessionStarts, type ReferenceKind } from "./chartMath";
+import { initialBalance, referenceLevels, sessionKey, sessionStarts, type CloseStudy, type ReferenceKind } from "./chartMath";
 import type { AuctionContext, Candle, ChartLayers, ChartMarker, Indicator, PaneCollapse } from "./types";
 
 export const DEFAULT_LAYERS: ChartLayers = { volume: true, legend: true, priorDay: true, week: false, nakedPocs: false, ib: true, sessions: true };
-export const DEFAULT_PANES: PaneCollapse = { rsi: false, roc: false };
+export const DEFAULT_PANES: PaneCollapse = { rsi: false };
 export type PriceStyle = "candles" | "ohlc";
 export type ChartSource = { label: string; title: string; tone: "live" | "warn" | "muted" };
 
 type Props = {
-  candles: Candle[]; current?: Candle; indicators: Indicator[]; markers?: ChartMarker[]; error?: string; fitKey: string; rsiGate?: number; rocGate?: number;
+  candles: Candle[]; current?: Candle; indicators: Indicator[]; studies?: CloseStudy[]; markers?: ChartMarker[]; error?: string; fitKey: string;
   timeframe?: number; layers?: ChartLayers; references?: AuctionContext; paneCollapse?: PaneCollapse;
   priceStyle?: PriceStyle; source?: ChartSource;
 };
@@ -34,7 +34,7 @@ const DOWN = "#f15b6c";
 const volumeColor = (bar: Candle) => (bar.close >= bar.open ? "#22c89366" : "#f15b6c66");
 // Pane heights are proportional to stretch (minimum 2px), so a factor near
 // zero collapses a pane to a sliver whose separator stays draggable.
-const STRETCH = { price: 5.3, macd: 2.0, rsi: 1.5, roc: 1.2, collapsed: 0.0001 };
+const STRETCH = { price: 5.3, macd: 2.0, rsi: 1.5, collapsed: 0.0001 };
 
 type Target = Parameters<IPrimitivePaneRenderer["draw"]>[0];
 /** Dashed vertical line at the first bar of each session, drawn per pane so
@@ -90,16 +90,17 @@ type ChartHandles = {
   candleMarkers: ISeriesMarkersPluginApi<Time>; barMarkers: ISeriesMarkersPluginApi<Time>; volume: ISeriesApi<"Histogram">;
   bbUpper: ISeriesApi<"Line">; bbMiddle: ISeriesApi<"Line">; bbLower: ISeriesApi<"Line">; kama: ISeriesApi<"Line">; vwap: ISeriesApi<"Line">;
   line: ISeriesApi<"Line">; signal: ISeriesApi<"Line">; hist: ISeriesApi<"Histogram">;
-  kamaRsi: ISeriesApi<"Line">; kamaRoc: ISeriesApi<"Line">; separators: SessionSeparators[];
+  hma: ISeriesApi<"Line">; rsi: ISeriesApi<"Line">; separators: SessionSeparators[];
 };
 
-export function TradingChart({ candles, current, indicators, markers = [], error, fitKey, rsiGate = 65, rocGate = 0.5, timeframe, layers = DEFAULT_LAYERS, references, paneCollapse = DEFAULT_PANES, priceStyle = "candles", source }: Props) {
+export function TradingChart({ candles, current, indicators, studies = [], markers = [], error, fitKey, timeframe, layers = DEFAULT_LAYERS, references, paneCollapse = DEFAULT_PANES, priceStyle = "candles", source }: Props) {
   const element = useRef<HTMLDivElement>(null);
   const legend = useRef<HTMLDivElement>(null);
   const lastFit = useRef("");
   const rows = useRef<Candle[]>([]);
   const indexByTime = useRef(new Map<number, number>());
   const indicatorByTime = useRef(new Map<number, Indicator>());
+  const studyByTime = useRef(new Map<number, CloseStudy>());
   const vwapByTime = useRef(new Map<number, number>());
   // VWAP state after the last closed row, so the forming bar's VWAP can be
   // recomputed per tick without walking the session again.
@@ -137,6 +138,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     const changeTone = change >= 0 ? "up" : "down";
     const ind = indicatorByTime.current.get(bar.timestamp);
     const vwap = vwapByTime.current.get(bar.timestamp);
+    const study = studyByTime.current.get(bar.timestamp);
     const cell = (label: string, value: string, cls = "") => `<span>${label} <i class="${cls}">${value}</i></span>`;
     const html = `<b>${istDateTime.format(new Date(bar.timestamp * 1000))}${bar.closed ? "" : " · forming"}</b>`
       + cell("O", fmt(bar.open), tone) + cell("H", fmt(bar.high), tone) + cell("L", fmt(bar.low), tone) + cell("C", fmt(bar.close), tone)
@@ -144,7 +146,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
       + cell("Vol", bar.volume ? compact.format(bar.volume) : "—")
       + cell("VWAP≈", fmt(vwap))
       + cell("MACD", `${fmt(ind?.macd, 3)} / ${fmt(ind?.signal, 3)} / ${fmt(ind?.histogram, 3)}`, ind ? (ind.histogram >= 0 ? "up" : "down") : "")
-      + cell("KAMA", fmt(ind?.kama)) + cell("RSI", fmt(ind?.kama_rsi, 1)) + cell("ROC", `${fmt(ind?.kama_roc)}%`);
+      + cell("HMA 20", fmt(study?.hma)) + cell("KAMA", fmt(ind?.kama)) + cell("RSI 14", fmt(study?.rsi, 1));
     // Each series.update() re-fires crosshairMoved, so one tick asks for four
     // identical repaints of a hovered row; comparing before writing keeps it
     // to the one write that actually changes something.
@@ -179,9 +181,9 @@ export function TradingChart({ candles, current, indicators, markers = [], error
 
   useEffect(() => {
     if (!element.current) return;
-    // One chart, four panes (price / MACD / KAMA-RSI / KAMA-ROC). A single
+    // One chart, three panes (price / MACD / RSI). A single
     // time scale and a single crosshair make time alignment structural: the
-    // previous build ran four chart instances mirrored by visible-range and
+    // previous build ran separate chart instances mirrored by visible-range and
     // crosshair subscriptions, and panes with different data extents could
     // still place the same timestamp at different x pixels.
     const chart = createChart(element.current, {
@@ -220,6 +222,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     const bbMiddle = chart.addSeries(LineSeries, { color: "#7083a499", lineWidth: 1, title: "BB 20", lastValueVisible: false, priceLineVisible: false }, 0);
     const bbLower = chart.addSeries(LineSeries, { color: "#7083a455", lineWidth: 1, title: "BB Lower", lastValueVisible: false, priceLineVisible: false }, 0);
     const kama = chart.addSeries(LineSeries, { color: "#c084fc", lineWidth: 2, title: "KAMA", lastValueVisible: true, priceLineVisible: false }, 0);
+    const hma = chart.addSeries(LineSeries, { color: "#e8edf5", lineWidth: 2, title: "HMA 20", lastValueVisible: true, priceLineVisible: false }, 0);
     const vwap = chart.addSeries(LineSeries, { color: "#f5b84b", lineWidth: 2, title: "VWAP≈", lastValueVisible: true, priceLineVisible: false }, 0);
     // All three MACD series must share one price scale.  An empty scale id
     // creates an overlay scale, which made histogram zero render at a
@@ -228,14 +231,12 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     const line = chart.addSeries(LineSeries, { color: "#4da3ff", lineWidth: 2, title: "MACD", priceScaleId: "right" }, 1);
     const signal = chart.addSeries(LineSeries, { color: "#ffad42", lineWidth: 1, title: "Signal", priceScaleId: "right" }, 1);
     hist.createPriceLine({ price: 0, color: "#7083a477", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: "" });
-    const kamaRsi = chart.addSeries(LineSeries, { color: "#f5b84b", lineWidth: 2, title: "KAMA RSI" }, 2);
-    kamaRsi.createPriceLine({ price: rsiGate, color: "#f5b84b77", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "RSI gate" });
-    kamaRsi.createPriceLine({ price: 50, color: "#7083a455", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: "" });
-    const kamaRoc = chart.addSeries(LineSeries, { color: UP, lineWidth: 2, title: "KAMA ROC %" }, 3);
-    kamaRoc.createPriceLine({ price: rocGate, color: "#7083a477", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "ROC gate" });
-    kamaRsi.priceScale().applyOptions({ scaleMargins: { top: 0.12, bottom: 0.12 } });
+    const rsi = chart.addSeries(LineSeries, { color: "#f5b84b", lineWidth: 2, title: "RSI 14" }, 2);
+    for (const level of [70, 30]) rsi.createPriceLine({ price: level, color: "#7083a499", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "" });
+    rsi.createPriceLine({ price: 50, color: "#7083a455", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: "" });
+    rsi.priceScale().applyOptions({ scaleMargins: { top: 0.12, bottom: 0.12 } });
     const separators = chart.panes().map((pane) => { const primitive = new SessionSeparators(); pane.attachPrimitive(primitive); return primitive; });
-    charts.current = { chart, candle, bar, candleMarkers, barMarkers, volume, bbUpper, bbMiddle, bbLower, kama, vwap, line, signal, hist, kamaRsi, kamaRoc, separators };
+    charts.current = { chart, candle, bar, candleMarkers, barMarkers, volume, bbUpper, bbMiddle, bbLower, kama, hma, vwap, line, signal, hist, rsi, separators };
     const onCrosshair = (param: MouseEventParams<Time>) => {
       hovered.current = typeof param.time === "number" ? param.time : undefined;
       paintLegend();
@@ -276,6 +277,9 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     api.bbMiddle.setData(indicatorsByTime.filter((p) => p.bb_middle != null).map((p) => ({ time: p.timestamp as Time, value: p.bb_middle as number })));
     api.bbLower.setData(indicatorsByTime.filter((p) => p.bb_lower != null).map((p) => ({ time: p.timestamp as Time, value: p.bb_lower as number })));
     api.kama.setData(indicatorsByTime.filter((p) => p.kama != null).map((p) => ({ time: p.timestamp as Time, value: p.kama as number })));
+    // HMA and RSI come from the closed bars' own closes, so they cover exactly the candles drawn.
+    const studyRows = [...new Map(studies.map((row) => [row.timestamp, row])).values()].sort((a, b) => a.timestamp - b.timestamp);
+    api.hma.setData(studyRows.filter((p) => p.hma != null).map((p) => ({ time: p.timestamp as Time, value: p.hma as number })));
     // VWAP resets at each IST session.  A zero-volume candle contributes no
     // invented volume, so the line remains a true traded-volume average.
     let session = Number.NaN;
@@ -297,11 +301,11 @@ export function TradingChart({ candles, current, indicators, markers = [], error
     api.line.setData(indicatorsByTime.map((p) => ({ time: p.timestamp as Time, value: p.macd })));
     api.signal.setData(indicatorsByTime.map((p) => ({ time: p.timestamp as Time, value: p.signal })));
     api.hist.setData(indicatorsByTime.map((p) => ({ time: p.timestamp as Time, value: p.histogram, color: p.histogram >= 0 ? "#22c89399" : "#f15b6c99" })));
-    api.kamaRsi.setData(indicatorsByTime.filter((p) => p.kama_rsi != null).map((p) => ({ time: p.timestamp as Time, value: p.kama_rsi as number })));
-    api.kamaRoc.setData(indicatorsByTime.filter((p) => p.kama_roc != null).map((p) => ({ time: p.timestamp as Time, value: p.kama_roc as number })));
+    api.rsi.setData(studyRows.filter((p) => p.rsi != null).map((p) => ({ time: p.timestamp as Time, value: p.rsi as number })));
     rows.current = base;
     indexByTime.current = new Map(base.map((c, i) => [c.timestamp, i]));
     indicatorByTime.current = new Map(indicatorsByTime.map((p) => [p.timestamp, p]));
+    studyByTime.current = new Map(studyRows.map((p) => [p.timestamp, p]));
     if (forming) applyCurrent(api, forming);
     api.separators.forEach((primitive) => primitive.setTimes(layers.sessions ? sessionStarts(all) : []));
     // Index symbols report volume 0; an empty histogram would only steal the
@@ -317,7 +321,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
       api.chart.timeScale().fitContent();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, indicators, markers, fitKey, layers.sessions, layers.volume]);
+  }, [candles, indicators, studies, markers, fitKey, layers.sessions, layers.volume]);
 
   useEffect(() => {
     const api = charts.current;
@@ -358,12 +362,11 @@ export function TradingChart({ candles, current, indicators, markers = [], error
   useEffect(() => {
     const api = charts.current;
     if (!api) return;
-    const stretch = [STRETCH.price, STRETCH.macd, paneCollapse.rsi ? STRETCH.collapsed : STRETCH.rsi, paneCollapse.roc ? STRETCH.collapsed : STRETCH.roc];
+    const stretch = [STRETCH.price, STRETCH.macd, paneCollapse.rsi ? STRETCH.collapsed : STRETCH.rsi];
     api.chart.panes().forEach((pane, index) => pane.setStretchFactor(stretch[index] ?? 1));
     // Hidden as well as collapsed, so nothing paints into the sliver.
-    api.kamaRsi.applyOptions({ visible: !paneCollapse.rsi });
-    api.kamaRoc.applyOptions({ visible: !paneCollapse.roc });
-  }, [paneCollapse.rsi, paneCollapse.roc]);
+    api.rsi.applyOptions({ visible: !paneCollapse.rsi });
+  }, [paneCollapse.rsi]);
 
   useEffect(() => {
     const api = charts.current;
@@ -374,7 +377,7 @@ export function TradingChart({ candles, current, indicators, markers = [], error
 
   const empty = candles.length === 0 && !current;
   return <div className="chart-stack">
-    <div ref={element} className="chart-panes" aria-label="Price, volume, MACD, KAMA RSI and KAMA ROC chart" />
+    <div ref={element} className="chart-panes" aria-label="Price, volume, HMA, KAMA, MACD and RSI chart" />
     {source && <div className={`chart-source ${source.tone}`} title={source.title} role="status">{source.label}</div>}
     <div ref={legend} className="chart-legend" hidden={!layers.legend} aria-live="off" />
     {empty && <div className={`chart-empty${error ? " error" : ""}`}>{error || "Loading broker candle history…"}</div>}

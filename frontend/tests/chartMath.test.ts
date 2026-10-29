@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  IST_OFFSET, initialBalance, mergeLiveCandles, referenceLevels, sessionCutoff, sessionKey, sessionOpen, sessionStarts,
+  IST_OFFSET, closeStudies, hma, initialBalance, mergeLiveCandles, referenceLevels, rsi, sessionCutoff, sessionKey, sessionOpen, sessionStarts,
 } from "../src/chartMath.ts";
 import type { AuctionContext, Candle, PeriodRow, ProfileRow } from "../src/types.ts";
 
@@ -104,4 +104,29 @@ test("reference levels follow the layer toggles, skip null levels and cap naked 
   const complete = referenceLevels(undefined, { ...ib, complete: true }, ALL_LAYERS);
   assert.deepEqual(complete.map((level) => [level.key, level.kind, level.title]), [["ib_high", "ib", "IB H"], ["ib_low", "ib", "IB L"]]);
   assert.deepEqual(referenceLevels(undefined, undefined, ALL_LAYERS), []);
+});
+
+test("hma matches the engine's IncrementalHMA, the Blast lane's signal line", () => {
+  const closes = Array.from({ length: 60 }, (_, i) => 10 + Math.sin(i / 3) + i * 0.05);
+  const out = hma(closes, 20);
+  assert.equal(out[21], undefined);                       // first value at the (n + sqrt(n) - 1)th close
+  assert.ok(Math.abs((out[22] as number) - 10.933855556290167) < 1e-9);
+  assert.ok(Math.abs((out[59] as number) - 12.53219412260684) < 1e-9);
+});
+
+test("rsi is a plain Wilder RSI of closes seeded with the first period's mean change", () => {
+  assert.deepEqual(rsi([1, 2, 3], 2), [undefined, undefined, 100]);
+  assert.deepEqual(rsi([3, 2, 1], 2), [undefined, undefined, 0]);
+  // period 2: changes +2, -1 -> avg gain 1, avg loss 0.5 -> 66.67; then +1 -> gain 1, loss 0.25 -> 80
+  const out = rsi([10, 12, 11, 12], 2);
+  assert.ok(Math.abs((out[2] as number) - 200 / 3) < 1e-9);
+  assert.ok(Math.abs((out[3] as number) - 80) < 1e-9);
+});
+
+test("closeStudies keeps one row per bar so the lower pane shares the price pane's time axis", () => {
+  const rows: Candle[] = Array.from({ length: 30 }, (_, i) => ({ symbol: "X", timestamp: 1_000 + i * 1800, open: 1, high: 1, low: 1, close: 1 + i, volume: 0, closed: true }));
+  const studies = closeStudies(rows);
+  assert.equal(studies.length, rows.length);
+  assert.equal(studies[29].rsi, 100);
+  assert.ok(studies[29].hma !== undefined && studies[20].hma === undefined);
 });

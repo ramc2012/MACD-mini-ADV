@@ -128,3 +128,57 @@ def test_held_sessions_counts_trading_days_and_the_exit_time():
     assert held_sessions(monday, datetime(2026, 10, 6, 9, 0, tzinfo=UTC)) == 0    # Tue 14:30 IST: not yet
     assert held_sessions(monday, datetime(2026, 10, 6, 9, 31, tzinfo=UTC)) == 1   # Tue 15:01 IST
     assert held_sessions(monday, datetime(2026, 10, 9, 9, 31, tzinfo=UTC)) == 4   # Fri 15:01 IST: out
+
+
+IST_ZONE = blast_engine.IST
+
+
+def minute(day: int, hour: int, minute_: int) -> int:
+    return int(datetime(2026, 10, day, hour, minute_, tzinfo=IST_ZONE).timestamp())
+
+
+def history_db(tmp_path: Path, stored, marks) -> str:
+    import sqlite3
+    path = str(tmp_path / "history.sqlite3")
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE historical_candles (symbol TEXT, timeframe_seconds INTEGER, timestamp INTEGER, open REAL,"
+                   " high REAL, low REAL, close REAL, volume INTEGER)")
+        db.execute("CREATE TABLE chain_snapshots (symbol TEXT, ts INTEGER, ltp REAL, volume INTEGER)")
+        db.executemany("INSERT INTO historical_candles VALUES (?, 60, ?, ?, ?, ?, ?, 10)",
+                       [(SYMBOL, ts, px, px, px, px) for ts, px in stored])
+        db.executemany("INSERT INTO chain_snapshots VALUES (?, ?, ?, 0)", [(SYMBOL, ts, px) for ts, px in marks])
+    return path
+
+
+def test_chain_marks_fill_only_the_stretches_the_contract_was_not_streamed(tmp_path):
+    """29 Oct 2026: BLUESTARCO 1600CE had no stored minutes for 26-28 Oct (not on the feed), so its 30-minute HMA/KAMA
+    skipped the 28 Oct rally and crossed a day after the exchange chart did."""
+    stored = [(minute(23, 10, m), 20.0) for m in range(0, 30)] + [(minute(28, 11, m), 60.0) for m in range(0, 10)]
+    marks = [(minute(23, 12, 0), 99.0),                       # a streamed day: never overwritten
+             (minute(26, 10, 0), 25.0), (minute(27, 13, 0), 30.0),   # days off the feed
+             (minute(28, 9, 30), 40.0),                       # before its first streamed minute that day
+             (minute(28, 14, 0), 99.0)]                       # after it: a quiet streamed bucket stays empty
+    path = history_db(tmp_path, stored, marks)
+    read = blast_engine.read_stored_minute_bars(path, {SYMBOL: -1}, 10_000)
+    filled = blast_engine.fill_unstreamed_minutes(path, {SYMBOL: -1}, read, 10_000)[SYMBOL]
+    added = sorted({c.timestamp: c.close for c in filled}.items())
+    assert [(ts, px) for ts, px in added if px != 20.0 and px != 60.0] == [
+        (minute(26, 10, 0), 25.0), (minute(27, 13, 0), 30.0), (minute(28, 9, 30), 40.0)]
+    assert [c.timestamp for c in filled] == sorted(c.timestamp for c in filled)
+    # Re-warm from a lane that already holds 28 Oct 11:05: that day was streamed, nothing is added to it.
+    later = blast_engine.read_stored_minute_bars(path, {SYMBOL: minute(28, 11, 5)}, 10_000)
+    assert blast_engine.fill_unstreamed_minutes(path, {SYMBOL: minute(28, 11, 5)}, later, 10_000)[SYMBOL] == later[SYMBOL]
+
+
+def test_warm_up_folds_the_chain_filled_days_on_the_hma_kama_strategy(tmp_path):
+    stored = [(minute(28, 9, 15) + i * 60, 50.0 + i * 0.01) for i in range(30)]
+    marks = [(minute(day, 9, 20) + k * 900, 10.0 + day + k * 0.1) for day in (26, 27) for k in range(25)]
+    path = history_db(tmp_path, stored, marks)
+    lane = build(tmp_path, blast_signal_bar_seconds=1800)
+    asyncio.run(lane.warm_from_store(path, [SYMBOL]))
+    hma, kama = lane._hk_value[SYMBOL]
+    assert hma is not None and kama is not None      # 26-27 Oct buckets came from the chain marks
+    (tmp_path / "macd").mkdir()
+    macd_lane = build(tmp_path / "macd", blast_signal_bar_seconds=1800, blast_strategy="macd_screen")
+    asyncio.run(macd_lane.warm_from_store(path, [SYMBOL]))
+    assert macd_lane._hk_value.get(SYMBOL, (None, None))[0] is None   # the MACD screen keeps reading stored minutes only

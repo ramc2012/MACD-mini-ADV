@@ -111,3 +111,51 @@ export function referenceLevels(context: AuctionContext | undefined, ib: Initial
   }
   return out;
 }
+
+export type CloseStudy = { timestamp: number; hma?: number; rsi?: number };
+
+const wma = (values: number[]) => values.reduce((sum, value, index) => sum + value * (index + 1), 0) / ((values.length * (values.length + 1)) / 2);
+
+/** Hull moving average of closes: WMA(2·WMA(n/2) − WMA(n), √n). Same definition as the engine's IncrementalHMA
+ * (the Blast lane's signal) and TradingView's ta.hma; undefined until n + √n − 1 values. */
+export function hma(values: number[], period = 20): (number | undefined)[] {
+  const half = Math.max(1, Math.floor(period / 2));
+  const root = Math.max(1, Math.floor(Math.sqrt(period)));
+  const diffs: number[] = [];
+  return values.map((_, index) => {
+    if (index + 1 < period) return undefined;
+    const window = values.slice(index + 1 - period, index + 1);
+    diffs.push(2 * wma(window.slice(-half)) - wma(window));
+    return diffs.length < root ? undefined : wma(diffs.slice(-root));
+  });
+}
+
+/** Plain RSI of closes, as TradingView's ta.rsi: Wilder averages seeded with the mean of the first `period` changes. */
+export function rsi(values: number[], period = 14): (number | undefined)[] {
+  let gain = 0;
+  let loss = 0;
+  return values.map((value, index) => {
+    if (index === 0) return undefined;
+    const change = value - values[index - 1];
+    const up = Math.max(change, 0);
+    const down = Math.max(-change, 0);
+    if (index <= period) {
+      gain += up / period;
+      loss += down / period;
+      if (index < period) return undefined;
+    } else {
+      gain = (gain * (period - 1) + up) / period;
+      loss = (loss * (period - 1) + down) / period;
+    }
+    return loss === 0 ? 100 : gain === 0 ? 0 : 100 - 100 / (1 + gain / loss);
+  });
+}
+
+/** HMA(20) and RSI(14) per bar. Computed over the whole loaded history, before any period cut, so the first
+ * visible bars are not still warming up. */
+export function closeStudies(rows: Candle[]): CloseStudy[] {
+  const closes = rows.map((row) => row.close);
+  const hull = hma(closes);
+  const strength = rsi(closes);
+  return rows.map((row, index) => ({ timestamp: row.timestamp, hma: hull[index], rsi: strength[index] }));
+}

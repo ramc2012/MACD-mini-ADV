@@ -2,7 +2,7 @@ import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState
 import { DEFAULT_LAYERS, DEFAULT_PANES, TradingChart, type PriceStyle } from "./Chart";
 import { chartSourceStatus } from "./chartSource";
 import { useChartReferences } from "./useChartReferences";
-import { mergeLiveCandles, sessionCutoff } from "./chartMath";
+import { closeStudies, mergeLiveCandles, sessionCutoff } from "./chartMath";
 import { PositionChartModal } from "./PositionChartModal";
 import { SettingsPanel } from "./SettingsPanel";
 import { TradingLedger, type LedgerTab } from "./Ledger";
@@ -384,6 +384,8 @@ export default function App() {
   }, [chartPeriod, historical]);
   const visibleCandles = useMemo(() => chartCutoff ? historical.filter((row) => row.timestamp >= chartCutoff) : historical, [historical, chartCutoff]);
   const visibleIndicators = useMemo(() => chartCutoff ? indicatorRows.filter((row) => row.timestamp >= chartCutoff) : indicatorRows, [indicatorRows, chartCutoff]);
+  const studyRows = useMemo(() => closeStudies(historical), [historical]);
+  const visibleStudies = useMemo(() => chartCutoff ? studyRows.filter((row) => row.timestamp >= chartCutoff) : studyRows, [studyRows, chartCutoff]);
   // Retained bars belong to one timeframe; after a reconfigure they would
   // append 30-minute bars to a 5-minute history.
   useEffect(() => { setClosedLive({}); lastCurrent.current = {}; }, [snapshot?.config.timeframe_seconds]);
@@ -410,7 +412,6 @@ export default function App() {
       else if (key === "i") toggleLayer("ib");
       else if (key === "s") toggleLayer("sessions");
       else if (key === "r") togglePane("rsi");
-      else if (key === "o") togglePane("roc");
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -590,20 +591,19 @@ export default function App() {
               })}
             </span>
             <span className="radar-filter chart-layers" aria-label="Lower panes">
-              <button className={paneCollapse.rsi ? "" : "active"} title="KAMA RSI pane (r)" onClick={() => togglePane("rsi")}>RSI</button>
-              <button className={paneCollapse.roc ? "" : "active"} title="KAMA ROC pane (o)" onClick={() => togglePane("roc")}>ROC</button>
+              <button className={paneCollapse.rsi ? "" : "active"} title="RSI(14) pane (r)" onClick={() => togglePane("rsi")}>RSI</button>
             </span>
             <span className="radar-filter">{CHART_PERIODS.map((row, index) => <button key={row.key} className={chartPeriod === row.key ? "active" : ""} title={`${row.key} (${index + 1})`} onClick={() => pickChartPeriod(row.key)}>{row.key}</button>)}</span>
             <button className="chart-fit" title="Fit all visible bars (f)" onClick={() => setFitNonce((n) => n + 1)}>Fit</button>
             <span>{(snapshot?.config.timeframe_seconds || 0) / 60}m</span>
           </span>
         </div>
-        <TradingChart candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]}
+        <TradingChart candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]}
           timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
           fitKey={`${selected}:${snapshot?.config.timeframe_seconds}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
     </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "AGENTIC" ? <AgenticPage /> : page === "LANES" ? <LanesPage ticks={ticks} portfolios={smartPortfolios} /> : page === "VANGUARD" || page === "CBE" ? <NomadLanePage lane={page === "VANGUARD" ? "vanguard" : "cbe"} ticks={ticks} connected={connected} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage />: marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "STRADDLE" ? <StraddlePage /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "WORKSTATION" ? <PlatformWorkstation /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</Suspense>}
-    {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} rsiGate={snapshot?.config.kama_rsi?.[1]} rocGate={snapshot?.config.kama_roc?.[1]} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
+    {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
     <SettingsPanel open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />
   </main>;
 }
