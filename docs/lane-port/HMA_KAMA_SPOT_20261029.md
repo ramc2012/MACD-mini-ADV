@@ -1,0 +1,19 @@
+# HMA20 / KAMA spot-index timeframe study
+
+Completed 2026-10-29 06:47:06 IST. User requested spot NIFTY, BANKNIFTY and SENSEX testing before further option-premium work. Research only: production code, lane rules, settings, books and services unchanged. No source downloads, broker calls, LLM calls or orders.
+
+Full reproducible findings: `/Users/ramachandran/MACD-mini-ADV/research/hma_kama_spot_20261028/FINDINGS.md`; frozen plan, read-only source export/preparation, source-conflict audit, six tests, fold/trade records, training-only audit and chart evidence retained. Research remains uncommitted under owner convention.
+
+HMA20 versus fixed KAMA(10,2,30), raw cross / aligned-slope entry / two-bar confirmation; intraday and carry modes, EMA20/50 and same-window long-only controls. LONG uses native30m spot to build30/60/120m/daily bars,12-month training/quarterly tests. FINE uses1m spot to build1/3/5/15/30/60/120m/daily,60-session training/20-session tests. Excluded28,673 futures rows and generic live/aggregate/cache sources from primary; retained9,958 duplicate-key close conflicts in audit. No data download or fabricated gap-fill.
+
+Source spans extend to2026-10-28 (LONG) /2026-10-21 (FINE), but complete-window OOS ends earlier: LONG2022-07-01–2026-03-30,15folds/922sessions; FINE2025-09-16–2026-06-11,9folds/180sessions. Later blocks lack trusted boundary prices and are explicitly unavailable. Incomplete October windows are separate diagnostics, not silently pooled into OOS.
+
+Metric is summed normalized1x directional trade moves per index-month, in percentage points, after5bps round-trip friction (stress10bps). It is not portfolio ROI, CAGR or executable option/futures P/L. Spot indices themselves are not directly tradable. Next expected source-open fills, completed-bar signals, shortened closing bars, gap resets and predeclared boundary liquidation were enforced.
+
+Fixed daily CROSS:97long-panel trades, PF1.61, capture+0.452pp/index-month; positive each index (NIFTY+0.437, BANKNIFTY+0.685, SENSEX+0.233). It lagged fixed daily EMA20/50 (+0.531) and same-window long-only control (+0.912); their exposure/risk differ. Fine1–5m raw crosses were negative after friction. Fine15m confirmation carry gave+0.592 at5bps but turned negative at10bps; retrospective best cells are descriptive.
+
+Training-only common-setting selector: LONG880trades, PF0.98, capture−0.054; FINE662trades, PF0.93, capture−0.481. Fold-bootstrap intervals span zero. LONG selected-policy long-side summed units+55.829pp, short-side−62.926pp; these are attribution, not separately selected long-only strategies. No stable universal timeframe or proven standalone pair emerged.
+
+Six targeted tests and131,547OOS-ticket chronology/nonoverlap checks passed. Saved training ranks reconciled, and four first/last folds re-simulated after removing all future bars matched selection/training sums. Audit corrected training-only eligibility flags and ensured missing-source exits occur at first recovery quote, not an earlier aggregate opening; full reruns left selected-policy figures unchanged. This audit reuses the simulator, not a separate execution implementation. Chart checked in light/dark at320px/736px; inline fragment is in the thread-scoped visualization directory to avoid the prior invalid-read error.
+
+Primary design sources: https://alanhull.com/the-hull-moving-average/ (Hull prefers turns and cautions against crossovers), https://www.tradingview.com/support/solutions/43000773012-kaufman-s-adaptive-moving-average-kama/ (efficiency-adaptive smoothing). HMA turning points with a KAMA regime/efficiency gate or higher-timeframe bias are future hypotheses, NOT combined policies tested here. Require fresh frozen evidence and exact decision-time ATM contract/quote/cost/capital simulation before any options-lane promotion. Previously studied historical data are reused; this is not fresh prospective confirmation.
