@@ -498,3 +498,83 @@ class TestMacdInvalidationExit:
         assert self.SYM in manager.portfolio.positions
         assert self.SYM not in manager.exit_reasons
         manager.repository.close()
+
+
+def test_exchange_lot_revision_relots_the_holding_and_it_still_exits(tmp_path: Path):
+    # 30 Oct 2026: NSE:OFSS26NOV10000CE was bought at 100 a lot; Fyers' master listed it at 50 from 29 Oct and
+    # every exit was refused ("Lot size changed for open position").
+    settings = Settings(execution_mode="paper", symbols_csv="NSE:SBIN-EQ", slippage_bps=0, max_trade_lots=4)
+    repository = TradeRepository(str(tmp_path / "book.sqlite3"))
+    manager = ExecutionManager(settings, LiveFeedBrokerThatMustNotReceiveOrders(), Portfolio(1_000_000), repository, EventHub())
+    symbol = "NSE:OFSS26NOV10000CE"
+    manager.set_tradable_contracts({symbol: 100})
+    manager.set_quote(symbol, 386)
+    asyncio.run(manager.submit(symbol, "BUY", lots=1))
+    manager.set_tradable_contracts({symbol: 50})
+    position = manager.portfolio.positions[symbol]
+    assert (position.quantity, position.lot_size, position.lots) == (100, 50, 2)
+    assert manager.lot_corrections[-1]["from"] == 100 and manager.lot_corrections[-1]["to"] == 50
+    manager.set_quote(symbol, 340)
+    order = asyncio.run(manager.submit(symbol, "SELL", 100))
+    assert order.status == "FILLED" and symbol not in manager.portfolio.positions
+    assert manager.portfolio.realized_pnl == approx(-4600)
+    repository.close()
+
+
+def test_lot_revision_off_the_grid_still_exits_the_whole_holding(tmp_path: Path):
+    settings = Settings(execution_mode="paper", symbols_csv="NSE:SBIN-EQ", slippage_bps=0, max_trade_lots=4)
+    repository = TradeRepository(str(tmp_path / "book.sqlite3"))
+    manager = ExecutionManager(settings, LiveFeedBrokerThatMustNotReceiveOrders(), Portfolio(1_000_000), repository, EventHub())
+    symbol = "NSE:ABC26NOV100CE"
+    manager.set_tradable_contracts({symbol: 100})
+    manager.set_quote(symbol, 10)
+    asyncio.run(manager.submit(symbol, "BUY", lots=1))
+    manager.correct_lot_sizes({symbol: 75})
+    assert manager.lot_corrections[-1]["odd_quantity"] is True
+    order = asyncio.run(manager.submit(symbol, "SELL", 100))
+    assert order.status == "FILLED" and order.quantity == 100
+    repository.close()
+
+
+def test_rollover_lot_audit_corrects_every_book_and_reports_the_next_series(tmp_path: Path):
+    from types import SimpleNamespace
+
+    class MasterBroker(LiveFeedBrokerThatMustNotReceiveOrders):
+        refreshed = None
+
+        async def current_lot_sizes(self, symbols, *, refresh=False):
+            MasterBroker.refreshed = refresh
+            return {"NSE:OFSS26NOV10000CE": 50, "NSE:SBIN26NOV800CE": 750}
+
+        async def series_lot_sizes(self, exchanges):
+            return {"NSE:OFSS": {"2026-11-23": 50, "2026-12-29": 50},
+                    "NSE:SBIN": {"2026-11-24": 750, "2026-12-29": 1500}}
+
+    settings = Settings(execution_mode="paper", symbols_csv="NSE:SBIN-EQ", slippage_bps=0, max_trade_lots=4)
+    books = []
+    for name in ("macd", "blast"):
+        repository = TradeRepository(str(tmp_path / f"{name}.sqlite3"))
+        manager = ExecutionManager(settings, MasterBroker(), Portfolio(1_000_000, lane=name), repository, EventHub())
+        books.append(manager)
+    macd, blast = books
+    macd.set_tradable_contracts({"NSE:OFSS26NOV10000CE": 100})
+    macd.set_quote("NSE:OFSS26NOV10000CE", 386)
+    asyncio.run(macd.submit("NSE:OFSS26NOV10000CE", "BUY", lots=1))
+    # Blast holds it off today's selection: only the audit can see the revision.
+    blast.set_tradable_contracts({"NSE:SBIN26NOV800CE": 750, "NSE:OFSS26NOV10000CE": 100})
+    blast.set_quote("NSE:OFSS26NOV10000CE", 386)
+    asyncio.run(blast.submit("NSE:OFSS26NOV10000CE", "BUY", lots=1))
+    blast.set_tradable_contracts({"NSE:SBIN26NOV800CE": 750})
+    engine = SimpleNamespace(
+        portfolio=macd.portfolio, execution=macd, desk_holdings=lambda: {},
+        blast=SimpleNamespace(portfolio=blast.portfolio, execution=blast), broker=MasterBroker(),
+        contract_selector=SimpleNamespace(contracts={"NSE:SBIN26NOV800CE": SimpleNamespace(
+            symbol="NSE:SBIN26NOV800CE", underlying="SBIN", expiry="2026-11-24", lot_size=750)}),
+        _lot_master_read_at=None, lot_audit=None)
+    report = asyncio.run(TradingEngine.audit_lot_sizes(engine, reason="test", refresh=True))
+    assert {(row["lane"], row["from"], row["to"]) for row in report["corrected"]} == {("macd", 100, 50), ("blast", 100, 50)}
+    assert blast.portfolio.positions["NSE:OFSS26NOV10000CE"].lots == 2
+    assert MasterBroker.refreshed is True and engine._lot_master_read_at is not None
+    assert report["next_series"] == [{"underlying": "NSE:SBIN", "expiry": "2026-11-24", "lot_size": 750,
+                                      "next_expiry": "2026-12-29", "next_lot_size": 1500}]
+    assert engine.lot_audit is report

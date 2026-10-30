@@ -373,6 +373,9 @@ class TradingEngine(DeskMixin):
         # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
         # priced them, and the blast journal reads the spread and IV inputs at each candidate.
         self.outage_repair: dict | None = None
+        # Pre-rollover lot-size check (audit_lot_sizes): the last report, and when the master was last re-read.
+        self.lot_audit: dict | None = None
+        self._lot_master_read_at: datetime | None = None
         self.context_indices: list[str] = []
         self.context_indices_status: dict = {}
         self.expired_settlements: list[dict] = []
@@ -773,6 +776,66 @@ class TradingEngine(DeskMixin):
                 trail = position.peak_price * (1 - self.settings.trailing_stop_pct)
                 position.trailing_stop = round(max(trail, floor), 4)
 
+    async def audit_lot_sizes(self, *, reason: str = "", refresh: bool | None = None) -> dict:
+        """Check every book's open contracts against the exchange's lot sizes and correct them; report the next series.
+
+        NSE revises F&O lot sizes. On 29 Oct 2026 Fyers' master listed NSE:OFSS26NOV10000CE at 50 while the MACD
+        book held it at the 100 it was bought in on 27 Oct, and the position could not be exited. Run at every
+        contract rollover (connect_feed: boot, the 08:45 daily roll, a ladder refresh). The first run of a session
+        from 08:30 IST re-downloads the master, so the 08:45 roll sees any revision Fyers published overnight.
+        Quantities never change; positions are re-expressed in the new lot (Portfolio.relot). ``next_series``
+        lists held and selected underlyings whose next expiry trades a different lot size than the current one,
+        so a change is known before the books roll into it.
+        """
+        from .option_agent import parse_option
+
+        now = datetime.now(IST)
+        if refresh is None:
+            last = self._lot_master_read_at
+            refresh = (now.hour, now.minute) >= (8, 30) and (
+                last is None or last.date() != now.date() or (last.hour, last.minute) < (8, 30))
+        held = _held_contract_lots(self)
+        report: dict = {"at": now.isoformat(timespec="seconds"), "reason": reason, "master_refreshed": refresh,
+                        "held": len(held), "corrected": [], "unresolved": [], "next_series": [], "error": None}
+        try:
+            current = await self.broker.current_lot_sizes(sorted(held), refresh=refresh) if held else {}
+            if refresh:
+                self._lot_master_read_at = now
+        except Exception as exc:  # noqa: BLE001 -- a failed check keeps the books as they are
+            report["error"] = f"{type(exc).__name__}: {exc}"[:300]
+            self.lot_audit = report
+            return report
+        report["unresolved"] = sorted(set(held) - current.keys())[:50]
+        books = [self.execution, *([self.blast.execution] if getattr(self, "blast", None) else []),
+                 *[lane.execution for lane in _smart_lanes(self)]]
+        for execution in books:
+            report["corrected"].extend(execution.correct_lot_sizes(current))
+        # Next series: the same root's following expiry, for held contracts and today's selection.
+        fronts: dict[str, tuple[str, int]] = {}
+        for row in self.contract_selector.contracts.values():
+            exchange = row.symbol.split(":", 1)[0]
+            key = f"{exchange}:{row.underlying}"
+            if row.lot_size > 0 and (key not in fronts or str(row.expiry) < fronts[key][0]):
+                fronts[key] = (str(row.expiry)[:10], int(row.lot_size))
+        for symbol in held:
+            parsed = parse_option(symbol)
+            if parsed and current.get(symbol):
+                key = f"{symbol.split(':', 1)[0]}:{parsed['root']}"
+                if key not in fronts or str(parsed["expiry"]) < fronts[key][0]:
+                    fronts[key] = (str(parsed["expiry"])[:10], int(current[symbol]))
+        try:
+            series = await self.broker.series_lot_sizes(sorted({key.split(":", 1)[0] for key in fronts}))
+        except Exception as exc:  # noqa: BLE001
+            series = {}
+            report["error"] = f"series: {type(exc).__name__}: {exc}"[:300]
+        for key, (expiry, size) in sorted(fronts.items()):
+            later = sorted(e for e in series.get(key, {}) if e > expiry)
+            if later and series[key][later[0]] != size:
+                report["next_series"].append({"underlying": key, "expiry": expiry, "lot_size": size,
+                                              "next_expiry": later[0], "next_lot_size": series[key][later[0]]})
+        self.lot_audit = report
+        return report
+
     async def connect_feed(self) -> None:
         self.status = "connecting"
         # A new connection attempt must not carry yesterday's rejection into
@@ -890,6 +953,13 @@ class TradingEngine(DeskMixin):
                                  "moneyness": row.moneyness}
                     for row in contracts if row.underlying in ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")})
             self.configure_desk(tradable)
+            # Before trading the new selection: every held contract's lot size against the exchange's
+            # current one (owner, 30 Oct 2026). Never blocks the feed.
+            try:
+                await self.audit_lot_sizes(reason="contract rollover")
+            except Exception as exc:  # noqa: BLE001
+                self.lot_audit = {"at": datetime.now(IST).isoformat(timespec="seconds"),
+                                  "error": f"{type(exc).__name__}: {exc}"[:300]}
             await self._refresh_position_marks()
 
             # Self-heal: download the session minutes the app did not capture (host down, feed dead) BEFORE
@@ -2791,7 +2861,8 @@ class TradingEngine(DeskMixin):
             "extreme_booking": self.extreme_booker.health() if self.settings.extreme_booking_enabled else {"enabled": False},
             "entry_flow": self.entry_flow.health(),
             "context_indices": self.context_indices_status,
-            "self_heal": {"outage_repair": self.outage_repair, "expired_settlements": self.expired_settlements[:10]},
+            "self_heal": {"outage_repair": self.outage_repair, "expired_settlements": self.expired_settlements[:10],
+                          "lot_audit": self.lot_audit},
             "boot": self_heal.boot_report(self.settings.database_path, self.settings.engine_role, self.warmup_status(),
                                           getattr(self, "warmup_report", None), getattr(self, "history_backfill", None),
                                           self.status),

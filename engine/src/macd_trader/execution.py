@@ -55,6 +55,8 @@ class ExecutionManager:
         self.tradable_symbols: set[str] = set(settings.symbols)
         self.lot_sizes: dict[str, int] = {symbol: 1 for symbol in settings.symbols}
         self.contract_expiries: dict[str, str | None] = {}
+        # Exchange lot revisions adopted for open positions (correct_lot_sizes), newest last.
+        self.lot_corrections: list[dict] = []
         self.exit_reasons: dict[str, str] = {}
         # Symbols whose next SELL was armed by an automated exit. A SELL that
         # arrives without one is a manual ticket and is labelled MANUAL, so a
@@ -106,6 +108,30 @@ class ExecutionManager:
             if order.status == "OPEN" and self.lot_sizes.get(order.symbol) != order.lot_size:
                 self._cancel(order)
         self.expire_previous_session_orders()
+        self.correct_lot_sizes(self.lot_sizes)
+
+    def correct_lot_sizes(self, lot_sizes: dict[str, int]) -> list[dict]:
+        """Re-express open positions in the exchange's current lot size (owner, 30 Oct 2026).
+
+        Fyers' master listed NSE:OFSS26NOV10000CE at 50 from 29 Oct while the
+        position bought on 27 Oct carried 100: every exit was sized in the new
+        lot, the book refused the fill and the lane logged 8,000+ errors a
+        session with the holding unexitable. The engine calls this at each
+        contract rollover with the master's sizes for every held contract;
+        today's selection calls it too.
+        """
+        held = {symbol: int(size) for symbol, size in lot_sizes.items()
+                if symbol in self.portfolio.positions and int(size or 0) > 0}
+        for symbol, size in held.items():
+            if symbol in self.lot_sizes:
+                self.lot_sizes[symbol] = size
+        changes = self.portfolio.relot(held)
+        stamp = datetime.now(IST).isoformat(timespec="seconds")
+        for change in changes:
+            change["at"] = stamp
+            self.events.publish("lot_size_corrected", change)
+        self.lot_corrections = [*self.lot_corrections, *changes][-50:]
+        return changes
 
     def set_contract_expiries(self, expiries: dict[str, str | None]) -> None:
         """Retain known metadata for entry checks, including carried contracts."""
@@ -189,9 +215,11 @@ class ExecutionManager:
             quantity = lots * lot_size
         if side not in {"BUY", "SELL"} or quantity is None or quantity < 1:
             raise ValueError("side must be BUY/SELL and quantity must be positive")
-        if quantity % lot_size:
+        # A held quantity left off the lot grid by an exchange lot revision still exits in full.
+        whole_exit = held_exit and quantity == position.quantity
+        if quantity % lot_size and not whole_exit:
             raise ValueError(f"Quantity for {symbol} must be a multiple of its {lot_size}-unit lot")
-        order_lots = quantity // lot_size
+        order_lots = max(1, quantity // lot_size) if whole_exit else quantity // lot_size
         if self.settings.execution_mode == "live" and not self.settings.allow_live_orders:
             raise PermissionError("Live orders are locked; set MACD_ALLOW_LIVE_ORDERS=true explicitly")
         if self.settings.execution_mode == "live" and symbol.endswith("-INDEX"):

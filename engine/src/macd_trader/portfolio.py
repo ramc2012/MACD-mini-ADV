@@ -85,8 +85,11 @@ class Portfolio:
             return None
 
         old_quantity = position.quantity
-        if position.lot_size != trade.lot_size:
-            raise ValueError(f"Lot size changed for open position {trade.symbol}")
+        if trade.lot_size > 0 and position.lot_size != trade.lot_size:
+            # An exchange lot revision: the fill carries the contract's current
+            # size. Raising here left NSE:OFSS26NOV10000CE (100 -> 50, 29 Oct
+            # 2026) unexitable, and restart replay skipped such a fill outright.
+            position.lot_size = trade.lot_size
         new_quantity = old_quantity + signed_quantity
         closes = old_quantity != 0 and (old_quantity > 0) != (signed_quantity > 0)
         closing_quantity = min(abs(old_quantity), abs(signed_quantity)) if closes else 0
@@ -159,6 +162,25 @@ class Portfolio:
         self.cash -= signed_quantity * trade.price + trade.fees
         self.realized_pnl -= trade.fees
         return closed
+
+    def relot(self, lot_sizes: dict[str, int]) -> list[dict]:
+        """Adopt the exchange's current lot size for open positions. Returns one row per correction.
+
+        NSE revises F&O lot sizes and the broker master then lists the new size
+        for a series already held. The quantity held is the truth and does not
+        change; only the lot count it is expressed in does, so staged exits and
+        sizing work in the lots the exchange now trades. A quantity that is no
+        longer a whole number of lots is flagged; it still exits in full.
+        """
+        changes = []
+        for symbol, position in self.positions.items():
+            size = int(lot_sizes.get(symbol) or 0)
+            if size > 0 and size != position.lot_size:
+                changes.append({"lane": self.lane, "symbol": symbol, "quantity": position.quantity,
+                                "from": position.lot_size, "to": size,
+                                "odd_quantity": abs(position.quantity) % size != 0})
+                position.lot_size = size
+        return changes
 
     def mark(self, symbol: str, price: float) -> bool:
         position = self.positions.get(symbol)

@@ -9,7 +9,7 @@ import os
 import random
 import time
 from abc import ABC, abstractmethod
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -158,6 +158,14 @@ class Broker(ABC):
         return {}
 
     async def option_contract_metadata(self, symbols: list[str]) -> dict[str, OptionContractMetadata]:
+        return {}
+
+    async def current_lot_sizes(self, symbols: list[str], *, refresh: bool = False) -> dict[str, int]:
+        """The exchange's lot size now for these (held) contracts; ``refresh`` re-reads the broker's master."""
+        return await self.lot_sizes(symbols)
+
+    async def series_lot_sizes(self, exchanges: list[str]) -> dict[str, dict[str, int]]:
+        """{"EXCHANGE:ROOT": {expiry: lot size}} for every listed option series; empty without a master."""
         return {}
 
     async def option_master(self, exchanges: list[str]) -> list[OptionContractMetadata]:
@@ -697,6 +705,49 @@ class FyersBroker(Broker):
             self._lot_cache_path.write_text(json.dumps({"date": today, "lot_sizes": cached}, indent=2))
             self._lot_cache_path.chmod(0o600)
         return {symbol: cached[symbol] for symbol in symbols if symbol in cached}
+
+    async def current_lot_sizes(self, symbols: list[str], *, refresh: bool = False) -> dict[str, int]:
+        """Held contracts' lot sizes from the master; ``refresh`` downloads it again first.
+
+        lot_sizes() answers from the day's cache, written from the first master
+        read of the day. The pre-rollover check (engine.audit_lot_sizes) wants
+        the exchange's word as of the rollover, so it refreshes, then writes
+        what it found back into the day's cache so both readers agree.
+        """
+        if not refresh:
+            return await self.lot_sizes(symbols)
+        requested = set(symbols)
+        found: dict[str, int] = {}
+        for exchange in sorted({symbol.split(":", 1)[0] for symbol in requested if ":" in symbol}):
+            if exchange not in self.instrument_master_urls:
+                continue
+            for row in self._master_options(await self._master(exchange, refresh=True)):
+                if row.symbol in requested:
+                    found[row.symbol] = row.lot_size
+        if found:
+            today = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+            cached: dict[str, int] = {}
+            try:
+                payload = json.loads(self._lot_cache_path.read_text())
+                if payload.get("date") == today:
+                    cached = {key: int(value) for key, value in payload.get("lot_sizes", {}).items()}
+            except (OSError, ValueError, TypeError):
+                pass
+            cached.update(found)
+            self._lot_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._lot_cache_path.write_text(json.dumps({"date": today, "lot_sizes": cached}, indent=2))
+            self._lot_cache_path.chmod(0o600)
+        return found
+
+    async def series_lot_sizes(self, exchanges: list[str]) -> dict[str, dict[str, int]]:
+        counts: dict[str, dict[str, Counter]] = {}
+        for exchange in dict.fromkeys(exchanges):
+            if exchange not in self.instrument_master_urls:
+                continue
+            for row in self._master_options(await self._master(exchange)):
+                counts.setdefault(f"{exchange}:{row.underlying}", {}).setdefault(row.expiry, Counter())[row.lot_size] += 1
+        return {root: {expiry: sizes.most_common(1)[0][0] for expiry, sizes in series.items()}
+                for root, series in counts.items()}
 
     async def _master(self, exchange: str, *, refresh: bool = False) -> str:
         """One exchange's FO instrument master, fetched at most once a day.

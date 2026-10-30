@@ -155,3 +155,22 @@ def test_closed_visible_until_is_0800_ist_next_weekday():
     # A close after 18:30 UTC is already the next IST date.
     late_utc = datetime(2026, 9, 1, 19, 0, tzinfo=UTC)
     assert closed_visible_until(late_utc) == datetime(2026, 9, 3, 8, 0, tzinfo=IST)
+
+
+def test_replay_across_a_lot_revision_keeps_the_exit():
+    # Restart replay used to skip the exit fill of a re-lotted contract, leaving a phantom open position.
+    portfolio = Portfolio(1_000_000)
+    portfolio.apply_trade(Trade("o1", SYMBOL, "BUY", 100, 386, lots=1, lot_size=100))
+    closed = portfolio.apply_trade(Trade("o2", SYMBOL, "SELL", 100, 340, lots=2, lot_size=50))
+    assert SYMBOL not in portfolio.positions
+    assert closed.lot_size == 50 and closed.lots == 2
+    assert portfolio.realized_pnl == approx(-4600)
+
+
+def test_relot_keeps_quantity_and_reports_the_change():
+    portfolio = Portfolio(1_000_000, lane="blast")
+    portfolio.apply_trade(Trade("o1", SYMBOL, "BUY", 100, 386, lots=1, lot_size=100))
+    changes = portfolio.relot({SYMBOL: 50, "NSE:OTHER": 25})
+    assert changes == [{"lane": "blast", "symbol": SYMBOL, "quantity": 100, "from": 100, "to": 50, "odd_quantity": False}]
+    assert portfolio.positions[SYMBOL].lots == 2
+    assert portfolio.relot({SYMBOL: 50}) == []
