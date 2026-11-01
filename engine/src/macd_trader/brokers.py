@@ -322,6 +322,25 @@ def _is_partial_subscription_notice(detail: object) -> bool:
     return bool(detail.get("invalid_symbols")) or detail.get("message") == _INDEX_DEPTH_NOTICE
 
 
+_SOCKET_AUTH_FAILURE_CODE = 11001
+# Rejections inside this window, with no tick since, before the stream gives up on the token.
+SOCKET_AUTH_FAILURE_LIMIT = 3
+SOCKET_AUTH_FAILURE_WINDOW = 120.0
+SOCKET_AUTH_MESSAGE = ("Fyers data socket rejected today's access token (11001 Authentication failed) although REST "
+                       "still accepts it: log in to Fyers again in MACD Settings")
+
+
+def _is_socket_auth_failure(detail: object) -> bool:
+    """The SDK's on_error payload for a refused socket login: {"type": "cn", "code": 11001, ...}."""
+    if not isinstance(detail, dict):
+        return False
+    try:
+        code = int(detail.get("code") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    return code == _SOCKET_AUTH_FAILURE_CODE or str(detail.get("message") or "").lower() == "authentication failed"
+
+
 class FyersBroker(Broker):
     name = "fyers"
     data_url = "https://api-t1.fyers.in/data"
@@ -342,6 +361,13 @@ class FyersBroker(Broker):
         # still held in a book). The rest of the subscription streams on.
         self.rejected_symbols: list[str] = []
         self.subscription_notices: list[str] = []
+        # 30 Oct 2026: from 08:05 every socket reconnect got 11001 while REST /profile took the same token, so
+        # validate_session() said "fine" and the watchdog rebuilt the socket 35 times for 2 h 40 min without
+        # anyone being told. Socket logins refused since the last tick, and the reason once that is decisive.
+        self._socket_auth_failures: deque[float] = deque(maxlen=20)
+        self.socket_auth_failures_total = 0
+        self.socket_auth_error: str | None = None
+        self.socket_auth_failed_at: datetime | None = None
         self._lot_cache_path = Path(settings.contract_snapshot_path).with_name("fyers_lot_sizes.json")
         self._master_dir = Path(settings.contract_snapshot_path).parent
         self._master_text: dict[str, tuple[str, str]] = {}
@@ -353,7 +379,29 @@ class FyersBroker(Broker):
         }
         return {**status, "handler_errors": self.handler_errors, "last_handler_error": self.last_handler_error,
                 "rejected_symbols": list(self.rejected_symbols),
-                "subscription_notices": list(self.subscription_notices)}
+                "subscription_notices": list(self.subscription_notices),
+                "socket_auth_failures": self.socket_auth_failures_total,
+                "socket_auth_error": self.socket_auth_error,
+                "socket_auth_failed_at": self.socket_auth_failed_at.isoformat() if self.socket_auth_failed_at else None}
+
+    def socket_auth_rejected(self) -> bool:
+        return self.socket_auth_error is not None
+
+    def _note_socket_auth_failure(self) -> None:
+        now = time.monotonic()
+        self._socket_auth_failures.append(now)
+        self.socket_auth_failures_total += 1
+        recent = [t for t in self._socket_auth_failures if now - t <= SOCKET_AUTH_FAILURE_WINDOW]
+        if len(recent) >= SOCKET_AUTH_FAILURE_LIMIT and self.socket_auth_error is None:
+            self.socket_auth_error = SOCKET_AUTH_MESSAGE
+            self.socket_auth_failed_at = datetime.now(UTC)
+
+    def _note_tick(self) -> None:
+        """A tick or a successful socket login proves the token works there: forget earlier refusals."""
+        if self._socket_auth_failures or self.socket_auth_error:
+            self._socket_auth_failures.clear()
+            self.socket_auth_error = None
+            self.socket_auth_failed_at = None
 
     def auth_url(self) -> str:
         if not self.settings.fyers_client_id or not self.settings.fyers_secret:
@@ -915,6 +963,11 @@ class FyersBroker(Broker):
         self.subscription_notices = []
 
         def on_message(message: dict) -> None:
+            if isinstance(message, dict) and message.get("type") == "cn" and message.get("s") == "ok":
+                # The socket's own login succeeded (code 200 "Authentication done"), which settles an earlier
+                # refusal before the first tick -- e.g. a fresh login at 08:30, an hour before any print.
+                loop.call_soon_threadsafe(self._note_tick)
+                return
             if not isinstance(message, dict) or "ltp" not in message:
                 return
             def _num(*keys, cast=float):
@@ -995,6 +1048,8 @@ class FyersBroker(Broker):
                 if message and message not in self.subscription_notices:
                     self.subscription_notices = [*self.subscription_notices, message][-5:]
                 return
+            if _is_socket_auth_failure(details[0] if details else None):
+                loop.call_soon_threadsafe(self._note_socket_auth_failure)
             # The SDK reconnects internally and used to have this callback
             # discarded. Wake the coroutine so it can distinguish a transient
             # socket fault from an expired REST session.
@@ -1023,6 +1078,9 @@ class FyersBroker(Broker):
                     raise RuntimeError("Fyers access token is invalid or expired")
                 if subscription_error:
                     raise RuntimeError(f"Fyers subscription failed: {subscription_error}")
+                if self.socket_auth_rejected():
+                    self.connected = False
+                    raise RuntimeError(self.socket_auth_error)
             if loop.time() >= deadline:
                 if not await self.validate_session():
                     self.connected = False
@@ -1042,10 +1100,15 @@ class FyersBroker(Broker):
                 if not authenticated:
                     self.connected = False
                     raise RuntimeError("Fyers access token is invalid or expired")
+                if self.socket_auth_rejected():
+                    # REST is fine but the socket will not log in: rebuilding it with this token cannot help.
+                    self.connected = False
+                    raise RuntimeError(self.socket_auth_error)
             try:
                 tick = await asyncio.wait_for(tick_buffer.get(), timeout=1)
             except TimeoutError:
                 continue
+            self._note_tick()
             try:
                 await handler(tick)
             except Exception as exc:  # noqa: BLE001 -- a handler bug must never end the market-data stream

@@ -90,6 +90,13 @@ class AlertManager:
                 "Fyers daily access token has EXPIRED — reconnect in Settings before the open, "
                 "the feed cannot authenticate.",
             ))
+        # Pre-open too: the 30 Oct refusals began at 08:05 and only a fresh login ended them.
+        if getattr(self.engine, "socket_auth_rejected", lambda: False)():
+            fired.append(await self._alert(
+                "socket_auth_failed",
+                "Fyers data socket REJECTS today's token (11001) although REST accepts it — no ticks will arrive. "
+                "Log in to Fyers again in MACD Settings.",
+            ))
         if in_session and health["status"] != "connected":
             fired.append(await self._alert(
                 "broker_down",

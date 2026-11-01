@@ -2556,9 +2556,16 @@ class TradingEngine(DeskMixin):
         checker = getattr(self.broker, "token_expired", None)
         return bool(checker()) if callable(checker) else False
 
+    def socket_auth_rejected(self) -> bool:
+        """The socket refuses a token REST still accepts (an expired token is reported as that instead)."""
+        checker = getattr(self.broker, "socket_auth_rejected", None)
+        return bool(checker()) if callable(checker) and not self.token_expired() else False
+
     def feed_alive(self) -> bool:
         """A connected socket that has stopped delivering is not a live feed."""
         if self.status != "connected":
+            return False
+        if self.socket_auth_rejected():
             return False
         if self.token_expired():
             # Quiet outside market hours is normal; an expired session is not.
@@ -2589,11 +2596,13 @@ class TradingEngine(DeskMixin):
             "name": self.broker.name,
             # Report what the feed is DOING, not what connect() once returned.
             "status": ("token_expired" if self.token_expired() and self.status == "connected"
+                       else "socket_auth_failed" if self.socket_auth_rejected()
                        else self.status if self.feed_alive()
                        else "stale" if self.status == "connected" else self.status),
             "token_expires_at": (lambda e: e.isoformat() if e else None)(
                 getattr(self.broker, "token_expiry", lambda: None)()),
             "token_expired": self.token_expired(),
+            "socket_auth_failed": self.socket_auth_rejected(),
             "error": self.error or skew_error,
             "clock_skew_seconds": skew,
             "future_ticks_ignored": getattr(self, "future_ticks_ignored", 0),
@@ -2854,6 +2863,7 @@ class TradingEngine(DeskMixin):
             "stream_clients": self.events.client_count,
             "feed_alive": self.feed_alive(),
             "token_expired": self.token_expired(),
+            "socket_auth_failed": self.socket_auth_rejected(),
             "feed_recoveries": self.feed_recoveries,
             "lane_errors": self.lane_errors,
             "entry_scoring": self.entry_gate.status(),
