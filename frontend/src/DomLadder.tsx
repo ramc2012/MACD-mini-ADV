@@ -65,6 +65,16 @@ const timeFmt = new Intl.DateTimeFormat("en-IN", {
 });
 
 const qty = (v: number | null | undefined): string => (v === null || v === undefined || !isFinite(v) ? "—" : qtyFmt.format(Math.round(v)));
+// Quantities in lots for a derivative (lot > 1), as the exchange and a trader count them; shares for cash. A part
+// lot (a sliced child order, an odd cluster) keeps one decimal rather than rounding to a misleading 0.
+const lotQty = (lot: number | null | undefined) => {
+  const unit = lot && lot > 1 ? lot : 1;
+  return (v: number | null | undefined): string => {
+    if (v === null || v === undefined || !isFinite(v)) return "—";
+    const x = v / unit;
+    return unit > 1 && Math.abs(x) < 10 && !Number.isInteger(x) ? x.toFixed(1) : qtyFmt.format(Math.round(x));
+  };
+};
 const clock = (t: number): string => timeFmt.format(new Date(t * 1000));
 const decimalsFor = (step: number): number => {
   const s = step.toString();
@@ -121,12 +131,14 @@ type Rung = {
   inValue: boolean;
 };
 
-export function DomLadder({ dom, profile, tickSize, lastPrice }: {
+export function DomLadder({ dom, profile, tickSize, lastPrice, lot }: {
   dom: DomQuote | null;
   profile: ProfileShape | null;
   tickSize: number;
   lastPrice?: number | null;
+  lot?: number | null;
 }) {
+  const qty = lotQty(lot);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const markerRef = useRef<HTMLDivElement | null>(null);
 
@@ -192,9 +204,9 @@ export function DomLadder({ dom, profile, tickSize, lastPrice }: {
     note={`${typeof dom.bid === "number" ? dom.bid.toFixed(view.dp) : "—"} × ${typeof dom.ask === "number" ? dom.ask.toFixed(view.dp) : "—"}${view.spread !== null ? `  spread ${view.spread.toFixed(view.dp)}` : ""}`}
   >
     <div style={{ display: "grid", gridTemplateColumns: grid, gap: 0, padding: "3px 6px", background: CANVAS, borderBottom: `1px solid ${BORDER}` }}>
-      <span style={{ ...head, textAlign: "right", paddingRight: 6 }}>Bid qty</span>
+      <span style={{ ...head, textAlign: "right", paddingRight: 6 }}>{lot && lot > 1 ? "Bid lots" : "Bid qty"}</span>
       <span style={{ ...head, textAlign: "center" }}>Price</span>
-      <span style={{ ...head, paddingLeft: 6 }}>Ask qty</span>
+      <span style={{ ...head, paddingLeft: 6 }}>{lot && lot > 1 ? "Ask lots" : "Ask qty"}</span>
       <span style={{ ...head, textAlign: "right" }}>Lvl</span>
     </div>
 
@@ -264,11 +276,13 @@ export function DomLadder({ dom, profile, tickSize, lastPrice }: {
 
 /* ---------------------------------------------------------- time & sales */
 
-export function TimeAndSales({ tape, tickSize, height = 300 }: {
+export function TimeAndSales({ tape, tickSize, height = 300, lot }: {
   tape: TapePrint[];
   tickSize: number;
   height?: number;
+  lot?: number | null;
 }) {
+  const qty = lotQty(lot);
   const dp = decimalsFor(tickSize > 0 ? tickSize : 0.05);
 
   const stats = useMemo(() => {
@@ -290,7 +304,7 @@ export function TimeAndSales({ tape, tickSize, height = 300 }: {
     <div style={{ display: "grid", gridTemplateColumns: grid, padding: "3px 8px", background: CANVAS, borderBottom: `1px solid ${BORDER}` }}>
       <span style={head}>Time</span>
       <span style={{ ...head, textAlign: "right" }}>Price</span>
-      <span style={{ ...head, textAlign: "right" }}>Size</span>
+      <span style={{ ...head, textAlign: "right" }}>{lot && lot > 1 ? "Lots" : "Size"}</span>
       <span style={{ ...head, textAlign: "right" }}>Side</span>
     </div>
 

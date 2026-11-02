@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DomLadder, TimeAndSales } from "./DomLadder";
-import type { FootprintBar, FootprintData, FootprintProfile } from "./FootprintChart";
+import { initiativeState, type FootprintBar, type FootprintData, type FootprintProfile, type InitiativePeriod } from "./FootprintChart";
 import { API_TOKEN, API_URL } from "./runtime";
 
 /* Auction workstation: TPO profile, footprint and cumulative delta on one shared, scrollable time axis, across
@@ -368,7 +368,14 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
       const f = hoverRef.current;
       if (!f) return "";
       const b = f.bar;
-      return `${dayLabel.format(new Date(b.t * 1000))} ${hm.format(new Date(b.t * 1000))}   O ${nf.format(b.o)}  H ${nf.format(b.h)}  L ${nf.format(b.l)}  C ${nf.format(b.c)}   V ${q(b.v)}   Δ ${signed(b.delta / unit)}${unit > 1 ? " lots" : ""}`;
+      const periods = (sessions[f.s]?.data.initiative_30m || []).filter((p) => b.t < p.end && b.t + tf > p.t).map(periodNote);
+      return `${dayLabel.format(new Date(b.t * 1000))} ${hm.format(new Date(b.t * 1000))}   O ${nf.format(b.o)}  H ${nf.format(b.h)}  L ${nf.format(b.l)}  C ${nf.format(b.c)}   V ${q(b.v)}   Δ ${signed(b.delta / unit)}${unit > 1 ? " lots" : ""}${periods.length ? `   ${periods.join(" | ")}` : ""}`;
+    }
+
+    function periodNote(p: InitiativePeriod): string {
+      const share = finite(p.share) ? `${p.share >= 0 ? "+" : "−"}${Math.round(Math.abs(p.share) * 100)}%` : "—";
+      const who = initiativeState(p);
+      return `${hm.format(new Date(p.t * 1000))} ${p.label ?? "no initiative"} ${share}${finite(p.oi_change) ? ` OI ${signed(p.oi_change / unit)}` : ""}${who ? ` ${who}` : ""}`;
     }
 
     function drawTpo(gc: CanvasRenderingContext2D, rect: Rect, pane: PaneView, yOf: (p: number) => number, pw: number) {
@@ -475,6 +482,35 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
           open = true; lastS = f.s;
         }
         gc.stroke(); gc.lineWidth = 1;
+      }
+      // IB30 / IS30: each 30-minute period from the open, along the foot of the pane, placed by time so a 1-hour
+      // column shows its two periods and a 5-minute chart shows one band over six columns.
+      {
+        const sy = top + h - 15, sh = 13;
+        gc.font = "700 9px ui-monospace, Menlo, monospace"; gc.textAlign = "center"; gc.textBaseline = "middle";
+        for (const s of [...new Set(visible.map((f) => f.s))]) {
+          for (const p of sessions[s].data.initiative_30m || []) {
+            let first = -1, last = -1;
+            for (let i = iFirst; i <= iLast; i++) {
+              const f = flat[i];
+              if (f && f.s === s && f.bar.t < p.end && f.bar.t + tf > p.t) { if (first < 0) first = i; last = i; }
+            }
+            if (first < 0) continue;
+            const xa = xOf(first) - barW / 2 + Math.min(1, Math.max(0, (p.t - flat[first].bar.t) / tf)) * barW;
+            const xb = xOf(last) - barW / 2 + Math.min(1, Math.max(0, (p.end - flat[last].bar.t) / tf)) * barW;
+            const strength = finite(p.share) ? Math.min(0.6, Math.abs(p.share)) / 0.6 : 0;
+            gc.globalAlpha = p.complete === false ? 0.6 : 1;
+            gc.fillStyle = p.label === "IB30" ? `rgba(34,197,139,${0.25 + 0.45 * strength})`
+              : p.label === "IS30" ? `rgba(240,86,106,${0.25 + 0.45 * strength})` : "rgba(111,125,146,0.12)";
+            gc.fillRect(xa + 1, sy, Math.max(1, xb - xa - 2), sh);
+            const share = finite(p.share) ? `${p.share >= 0 ? "+" : "−"}${Math.round(Math.abs(p.share) * 100)}%` : "";
+            const oi = finite(p.oi_change) ? `OI ${signed(p.oi_change / unit)}` : "";
+            const text = [[p.label, share, oi], [p.label, share], [p.label || share], [p.label ? p.label.slice(0, 2) : ""]]
+              .map((parts) => parts.filter(Boolean).join(" ")).find((t) => t && gc.measureText(t).width <= xb - xa - 6);
+            if (text) { gc.fillStyle = p.label ? "#e9edf5" : C.dim; gc.fillText(text, (xa + xb) / 2, sy + sh / 2 + 0.5); }
+            gc.globalAlpha = 1;
+          }
+        }
       }
       // visible-range volume profile on the right edge
       if (show.vp && visible.length) {
@@ -639,10 +675,10 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
       <aside className="ws-side">
         {/* Fyers streams the touch only: sizes at the best bid/ask, traded volume at every price */}
         <section className="ws-panel ws-bare">
-          <DomLadder dom={current?.live ? data?.dom || null : null} profile={data?.profile || null} tickSize={tick} lastPrice={lastBar?.c ?? null} />
+          <DomLadder dom={current?.live ? data?.dom || null : null} profile={data?.profile || null} tickSize={tick} lastPrice={lastBar?.c ?? null} lot={data?.lot_size} />
         </section>
         <section className="ws-panel ws-bare">
-          <TimeAndSales tape={(current?.live ? data?.tape : []) || []} tickSize={tick} height={180} />
+          <TimeAndSales tape={(current?.live ? data?.tape : []) || []} tickSize={tick} height={180} lot={data?.lot_size} />
         </section>
         <section className="ws-panel ws-levels">
           <header>Key Levels <small>row {layoutRef.current.rowSize || "auto"} pts</small></header>
@@ -656,11 +692,11 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
       <span className={connected ? "ok" : "bad"}>● {connected ? "Connected" : liveError || "Waiting"}</span>
       <span>Latency {live ? `${live.ms} ms` : "—"}</span>
       <span>Session 09:15–15:30 IST</span>
-      <span>Vol {compact(sessionVol / (data?.lot_size || 1))}{data?.lot_size ? " lots" : ""}</span>
+      <span>Vol {compact(sessionVol / (data?.lot_size || 1))}{(data?.lot_size || 1) > 1 ? " lots" : ""}</span>
       <span className={(data?.session_cumulative_delta ?? 0) >= 0 ? "positive" : "negative"}>Δ session {signed((current?.live ? data?.session_cumulative_delta ?? 0 : 0) / (data?.lot_size || 1))}</span>
       <span>History {sessions.filter((s) => !s.live).length} sessions</span>
       <span className="ws-spacer" />
-      {hover && <span>{hm.format(new Date(hover.bar.t * 1000))} · V {qf.format(hover.bar.v)} · Δ {signed(hover.bar.delta)}</span>}
+      {hover && <span>{hm.format(new Date(hover.bar.t * 1000))} · V {qf.format(hover.bar.v / (data?.lot_size || 1))} · Δ {signed(hover.bar.delta / (data?.lot_size || 1))}{(data?.lot_size || 1) > 1 ? " lots" : ""}</span>}
       <span>{renderMs} ms render · {flat.length} bars</span>
       <span>Tick {tick} · Row {layoutRef.current.rowSize} · {TIMEFRAMES.find((t) => t[0] === tf)?.[1]}</span>
     </footer>

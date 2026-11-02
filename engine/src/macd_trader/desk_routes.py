@@ -10,6 +10,8 @@ MP settings change is persisted.
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from datetime import datetime
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
@@ -551,6 +553,77 @@ async def mp_leaderboard(limit: int = Query(default=25, ge=1, le=200)):
 
 _seed_locks: dict[str, asyncio.Lock] = {}
 
+# --- order-flow volumes in lots, and the open interest behind IB30 / IS30 ------------------------------------------
+# The footprint book knows the lot only for NIFTY / BANKNIFTY (whale.lot_size); every other derivative counted in
+# shares. The broker's lot map (live, backed by its on-disk cache) gives the rest; a future takes the lot its options
+# carry. Cash equities stay in shares.
+_LOT_REFRESH_SECONDS = 300
+_lots: dict = {"at": -1e9, "lots": {}, "roots": {}}
+_FUTURE_ROOT = re.compile(r"^(?P<root>[A-Z0-9&\-]+?)\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)FUT$")
+
+
+def _contract_lot(symbol: str, book_lot: int | None) -> int | None:
+    if book_lot and book_lot > 1:
+        return book_lot
+    body = symbol.split(":", 1)[-1]
+    if body.endswith("-EQ") or body.endswith("-INDEX"):
+        return book_lot
+    if time.monotonic() - _lots["at"] > _LOT_REFRESH_SECONDS:
+        from .agent_equity import known_lots, lot_by_root
+        lots = known_lots(dict(engine.mp.lot_sizes), getattr(engine.settings, "contract_snapshot_path", None))
+        _lots.update(at=time.monotonic(), lots=lots, roots=lot_by_root(lots))
+    if _lots["lots"].get(symbol):
+        return int(_lots["lots"][symbol])
+    from .option_agent import parse_option
+    parsed = parse_option(symbol)
+    future = _FUTURE_ROOT.match(body)
+    root = parsed["root"] if parsed else future.group("root") if future else None
+    return int(_lots["roots"].get(root) or book_lot or 1) if root else book_lot
+
+
+_period_oi_cache: "dict[tuple, tuple[float, dict]]" = {}
+_PERIOD_OI_TTL_SECONDS = 30
+
+
+def _period_oi(symbol: str, day: str) -> dict:
+    """{period start: (oi_change, oi)} over the whole IST session ``day``, cached (30 s today, kept for past days)."""
+    key = (symbol, day)
+    hit = _period_oi_cache.get(key)
+    if hit and (day < _ist_today() or time.monotonic() - hit[0] < _PERIOD_OI_TTL_SECONDS):
+        return hit[1]
+    from .footprint import INITIATIVE_SECONDS, SESSION_ANCHOR_SECONDS
+    midnight = int(datetime.fromisoformat(day).replace(tzinfo=ZoneInfo("UTC")).timestamp())
+    first = midnight + SESSION_ANCHOR_SECONDS
+    grid = [{"t": first + k * INITIATIVE_SECONDS, "end": first + (k + 1) * INITIATIVE_SECONDS, "oi_change": None}
+            for k in range(13)]                                    # 09:15 .. 15:45 IST covers the 15:40 F&O close
+    filled = auction_views.initiative_oi(engine.settings.research_database_path, symbol, grid)
+    mapping = {row["t"]: (row.get("oi_change"), row.get("oi")) for row in filled if row.get("oi") is not None}
+    _period_oi_cache[key] = (time.monotonic(), mapping)
+    while len(_period_oi_cache) > 64:
+        _period_oi_cache.pop(next(iter(_period_oi_cache)))
+    return mapping
+
+
+def _with_period_oi(symbol: str, day: str, periods: list[dict], *, forming: bool) -> list[dict]:
+    """Copy the stored OI onto the book's periods. ``forming`` = also onto the unfinished one (live: OI so far;
+    a replay must not see the rest of the period)."""
+    if not periods:
+        return periods
+    try:
+        mapping = _period_oi(symbol, day)
+    except Exception:  # noqa: BLE001 -- OI is context; the marks still draw without it
+        return periods
+    for period in periods:
+        if period["t"] in mapping and (forming or period.get("complete")):
+            period["oi_change"], period["oi"] = mapping[period["t"]]
+    return periods
+
+
+def _in_lots(symbol: str, payload: dict, day: str, *, forming: bool) -> dict:
+    payload["lot_size"] = _contract_lot(symbol, payload.get("lot_size"))
+    payload["initiative_30m"] = _with_period_oi(symbol, day, payload.get("initiative_30m") or [], forming=forming)
+    return payload
+
 
 async def _watch_from_open(symbol: str) -> None:
     """Start detailed capture seeded with the whole session so far.
@@ -612,6 +685,7 @@ async def mp_footprint(symbol: str, bars: int = Query(default=60, ge=5, le=180),
     flow = engine.mp.flow.snapshot(symbol)
     payload = book.payload(symbol, bars, timeframe_seconds=timeframe_seconds, flow=flow)
     payload["subscribed_now"] = fresh
+    await asyncio.to_thread(_in_lots, symbol, payload, engine.mp.session_day or _ist_today(), forming=True)
     profile = engine.mp.profiles.get(symbol)
     # ONE profile snapshot, handed to both readers: it is the most expensive
     # thing on this route and session_view used to take a second one.
@@ -692,6 +766,7 @@ async def mp_replay(symbol: str, day: str,
             profile_scale, engine.settings.research_database_path, symbol, day, 0.05)
         payload = await asyncio.to_thread(
             session.payload, at or session.session_start, bars, timeframe_seconds, context, scale)
+        await asyncio.to_thread(_in_lots, symbol, payload, day, forming=False)
     payload["context"] = context
     return payload
 
@@ -717,6 +792,7 @@ def _build_session_payload(symbol: str, day: str, timeframe: int) -> dict | None
         # every level with its TPO letters, not the 90-row sample the live poll uses
         out["profile"] = profile.snapshot(max_levels=None, row_size=scale["row_size"] if scale else None, scale=scale)
     out["context"] = context
+    _in_lots(symbol, out, day, forming=False)
     for heavy in ("tape", "dom", "ofi", "tape_speed", "setup"):
         out.pop(heavy, None)
     out["day"] = day

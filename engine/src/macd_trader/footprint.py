@@ -101,6 +101,26 @@ MAX_BARS = 420
 MAX_DETAIL_SYMBOLS = 16
 TAPE_LENGTH = 200
 
+# Bars longer than 15 minutes are counted from the 09:15 open, as the TPO periods and the exchange's own charts are:
+# epoch-aligned 30-minute buckets began at 09:00 and 09:30 IST, so the first one held only 15 minutes. Shorter
+# timeframes that divide 15 minutes are unchanged (09:15 is a multiple of them).
+SESSION_ANCHOR_SECONDS = 9 * 3600 + 15 * 60 - 19_800     # 09:15 IST as UTC seconds of the day
+
+# IB30 / IS30 (Shai / Vtrender, x.com/Am_Shai, 23 Oct and 2 Nov 2026): a 30-minute period from the open in which
+# market orders on one side dominate, read here as classified delta / volume at or beyond +-INITIATIVE_SHARE. On the
+# desk's own classification the median 30-minute period reads about +-0.15 (index futures and cash, 29-30 Oct 2026),
+# so 0.20 marks roughly a third of them. research/shai_cot_20261024: a fair description of who acted, not a forward
+# signal on its own.
+INITIATIVE_SECONDS = 1800
+INITIATIVE_SHARE = 0.20
+
+
+def period_start(ts: int, seconds: int) -> int:
+    """Start of the ``seconds``-long period holding ``ts``: epoch-aligned up to 15 minutes, from 09:15 IST above."""
+    if seconds <= 900:
+        return ts - (ts % seconds)
+    return ts - ((ts - SESSION_ANCHOR_SECONDS) % seconds)
+
 # --- the price grid -------------------------------------------------------
 # Ladder storage quantum. Every price becomes an integer count of these, so
 # neighbour lookup is integer arithmetic and cannot drift.
@@ -1309,11 +1329,40 @@ class FootprintBook:
         else:
             grouped: OrderedDict[int, FootprintBar] = OrderedDict()
             for bar in source:
-                start = bar.start - (bar.start % requested)
+                start = period_start(bar.start, requested)
                 aggregate = grouped.setdefault(start, FootprintBar(start))
                 aggregate.merge(bar)
             self._agg_cache[key] = (stamp, grouped)
         return list(grouped.values())[-bars:]
+
+    def initiative(self, symbol: str) -> list[dict]:
+        """IB30 / IS30 for every 30-minute period of the session the book holds, from its one-minute bars.
+
+        ``complete`` is False for the period still forming. ``oi_change`` is filled by the caller where open
+        interest is stored (auction_views.initiative_oi); the book never sees OI.
+        """
+        periods: OrderedDict[int, list] = OrderedDict()
+        last = 0
+        for bar in self.bars.get(symbol, ()):
+            row = periods.setdefault(period_start(bar.start, INITIATIVE_SECONDS), [0.0, 0.0, 0.0])
+            row[0] += bar.volume
+            row[1] += bar.delta
+            row[2] += bar.unclassified
+            last = max(last, bar.start + self.timeframe)
+        out = []
+        newest = next(reversed(periods), None)
+        for start, (volume, delta, unclassified) in periods.items():
+            share = delta / volume if volume > 0 else None
+            label = None
+            if share is not None and share >= INITIATIVE_SHARE:
+                label = "IB30"
+            elif share is not None and share <= -INITIATIVE_SHARE:
+                label = "IS30"
+            out.append({"t": start, "end": start + INITIATIVE_SECONDS, "v": round(volume), "delta": round(delta),
+                        "u": round(unclassified), "share": round(share, 4) if share is not None else None,
+                        "label": label, "complete": start != newest or last >= start + INITIATIVE_SECONDS,
+                        "oi_change": None})
+        return out
 
     def payload(self, symbol: str, bars: int = 60,
                 timeframe_seconds: int | None = None,
@@ -1420,6 +1469,8 @@ class FootprintBook:
             # is a different statement from "the freeze quantity is zero".
             "freeze_quantity": self.freeze_qty.get(symbol) or None,
             "lot_size": self.lot_size.get(symbol),
+            "initiative_30m": self.initiative(symbol),
+            "initiative_share": INITIATIVE_SHARE,
             "cvd_band": cvd_band,
             "cvd_band_basis": band_basis,
             "divergence_bars": divergence,

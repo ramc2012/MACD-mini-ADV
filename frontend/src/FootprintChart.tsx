@@ -269,6 +269,22 @@ export type FootprintCoverage = {
 
 export type FootprintSetup = { setup: string | null; reason: string };
 
+/* IB30 / IS30: a 30-minute period counted from the 09:15 open, with classified delta / volume at or beyond the
+   server's initiative_share (Shai / Vtrender's read). oi_change is open interest added (+) or cut (-) over the period
+   where OI is stored: index futures, index option chains, stock option chains. */
+export type InitiativePeriod = {
+  t: number; end: number; v: number; delta: number; u?: number;
+  share: number | null; label: "IB30" | "IS30" | null; complete?: boolean;
+  oi_change?: number | null; oi?: number | null;
+};
+
+/* Who acted, read off the period's aggressor and its OI change (the COT read): OI added = positions opened. */
+export const initiativeState = (period: InitiativePeriod): string | null => {
+  if (!period.label || typeof period.oi_change !== "number" || !Number.isFinite(period.oi_change) || period.oi_change === 0) return null;
+  const added = period.oi_change > 0;
+  return period.label === "IB30" ? (added ? "longs opening" : "shorts covering") : (added ? "shorts opening" : "longs exiting");
+};
+
 export type FootprintData = {
   symbol: string;
   timeframe_seconds: number;
@@ -307,6 +323,8 @@ export type FootprintData = {
   // statement from "the freeze quantity is zero".
   freeze_quantity?: number | null;
   lot_size?: number | null;
+  initiative_30m?: InitiativePeriod[] | null;
+  initiative_share?: number | null;
   ofi?: FootprintOfi | null;
   tape_speed?: FootprintTapeSpeed | null;
   /* Page-level context the chart itself does not draw but the workspace hangs
@@ -342,6 +360,7 @@ const FOOT_H_MIN = 26;
 // verdict and the uncontested quote-rule one.
 const LOW_CONF_FALLBACK = 0.55;
 const CVD_H = 36;    // cumulative-delta sub-pane
+const INIT_H = 15;   // IB30 / IS30 strip under the ladder
 const TOP_H = 18;    // header readout line
 const MIN_BARS = 5;
 // Nine columns leave room for two readable quantities at the workspace's
@@ -361,15 +380,16 @@ const finite = (v: unknown): v is number => typeof v === "number" && Number.isFi
 
 // Indian market sizes get large fast; keep every cell label to <= 5 glyphs so a
 // column never has to be measured or clipped while drawing.
-const vol = (n: number): string => {
+const volText = (n: number): string => {
   const a = Math.abs(n);
   if (a >= 1e7) return `${(n / 1e7).toFixed(1)}C`;
   if (a >= 1e5) return `${(n / 1e5).toFixed(1)}L`;
   if (a >= 1e4) return `${Math.round(n / 1e3)}k`;
   if (a >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  if (a < 10 && !Number.isInteger(n)) return n.toFixed(1);     // a part lot, never a misleading 0
   return String(Math.round(n));
 };
-const signed = (n: number) => (n > 0 ? `+${vol(n)}` : n < 0 ? `-${vol(Math.abs(n))}` : "0");
+const signedText = (n: number) => (n > 0 ? `+${volText(n)}` : n < 0 ? `-${volText(Math.abs(n))}` : "0");
 const signedFixed = (n: number, dp = 1) => `${n > 0 ? "+" : n < 0 ? "−" : ""}${Math.abs(n).toFixed(dp)}`;
 const pct = (n: number) => `${Math.round(n * 100)}%`;
 const clockOf = (t: number) => (finite(t) ? istTime.format(new Date(t * 1000)) : "--:--");
@@ -482,6 +502,11 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     const src = dataRef.current;
     const all = Array.isArray(src?.bars) ? src.bars : [];
     if (!all.length) return;                       // empty state: bare canvas, caller shows the message
+    // Every quantity drawn below is in lots for a derivative (lot > 1) and in shares for cash.
+    const lot = finite(src.lot_size) && src.lot_size! > 1 ? src.lot_size! : 1;
+    const vol = (n: number) => volText(n / lot);
+    const signed = (n: number) => signedText(n / lot);
+    const periods = Array.isArray(src.initiative_30m) ? src.initiative_30m : [];
 
     /* ---- confidence: one grade, applied consistently -------------------- */
     const conf = src.confidence ?? null;
@@ -519,10 +544,11 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     const hasCvd = all.some((b) => finite(b.cvd));
     if (!hasCvd || h - TOP_H - TIME_H - footH - cvdH < 150) cvdH = 0;
     if (h - TOP_H - TIME_H - footH - cvdH < 120) footH = FOOT_H_MIN;
-    const plotBottom = h - TIME_H - footH - cvdH;
+    const initH = periods.length && h - TOP_H - TIME_H - footH - cvdH - INIT_H >= 110 ? INIT_H : 0;
+    const plotBottom = h - TIME_H - footH - cvdH - initH;
     const plotH = plotBottom - plotTop;
-    const footTop = plotBottom;
-    const cvdTop = plotBottom + footH;
+    const footTop = plotBottom + initH;
+    const cvdTop = footTop + footH;
     if (plotH < 24 || plotW < 40) return;
 
     const tick = finite(src.tick_size) && src.tick_size > 0 ? src.tick_size : 0.05;
@@ -713,6 +739,10 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     ctx.lineTo(plotW + 0.5, h - TIME_H);
     ctx.moveTo(plotLeft, plotBottom + 0.5);
     ctx.lineTo(w, plotBottom + 0.5);
+    if (initH > 0) {
+      ctx.moveTo(plotLeft, footTop + 0.5);
+      ctx.lineTo(w, footTop + 0.5);
+    }
     ctx.moveTo(plotLeft, h - TIME_H + 0.5);
     ctx.lineTo(w, h - TIME_H + 0.5);
     ctx.stroke();
@@ -752,7 +782,7 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
         ctx.strokeStyle = C.grid;
         ctx.beginPath();
         ctx.moveTo(Math.round(x0) + 0.5, plotTop);
-        ctx.lineTo(Math.round(x0) + 0.5, plotBottom + footH);
+        ctx.lineTo(Math.round(x0) + 0.5, footTop + footH);
         ctx.stroke();
       }
 
@@ -1313,10 +1343,64 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
       }
     }
 
+    /* ---- IB30 / IS30 strip ------------------------------------------------ */
+    // Each 30-minute period from the open spans the columns it overlaps, placed by TIME and never by index (a
+    // quiet minute has no bar, and a 1-hour column holds two periods). Text before colour: the label says IB30 or
+    // IS30, the share and the OI change; the tint only repeats it.
+    if (initH > 0) {
+      const tfSec = num(src.timeframe_seconds) || 60;
+      const sy = plotBottom + 2;
+      const sh = initH - 3;
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plotLeft, plotBottom + 1, plotW, initH - 1);
+      ctx.clip();
+      ctx.font = font(8, 700);
+      ctx.textBaseline = "middle";
+      for (const period of periods) {
+        let first = -1;
+        let last = -1;
+        for (let i = 0; i < bars.length; i += 1) {
+          const t = num(bars[i].t);
+          if (t < period.end && t + tfSec > period.t) { if (first < 0) first = i; last = i; }
+        }
+        if (first < 0) continue;
+        const xa = columnLeft + (first + clamp((period.t - num(bars[first].t)) / tfSec, 0, 1)) * colW;
+        const xb = columnLeft + (last + clamp((period.end - num(bars[last].t)) / tfSec, 0, 1)) * colW;
+        const share = finite(period.share) ? period.share : null;
+        const buy = period.label === "IB30";
+        const sell = period.label === "IS30";
+        const strength = share === null ? 0 : clamp(Math.abs(share), 0, 0.6) / 0.6;
+        ctx.globalAlpha = period.complete === false ? 0.6 : 1;
+        ctx.fillStyle = buy ? rgba(C.buy, 0.20 + 0.45 * strength) : sell ? rgba(C.sell, 0.20 + 0.45 * strength) : rgba(C.dimmer, 0.10);
+        ctx.fillRect(xa + 1, sy, Math.max(1, xb - xa - 2), sh);
+        const room = xb - xa - 6;
+        const shareTxt = share === null ? "" : `${share >= 0 ? "+" : "−"}${Math.round(Math.abs(share) * 100)}%`;
+        const oiTxt = finite(period.oi_change) ? `OI ${signed(period.oi_change)}` : "";
+        const name = period.label ?? "";
+        const options = [
+          [name, shareTxt, oiTxt].filter(Boolean).join(" "),
+          [name, shareTxt].filter(Boolean).join(" "),
+          name || shareTxt,
+          name ? name.slice(0, 2) : "",
+        ];
+        const text = options.find((o) => o && ctx.measureText(o).width <= room) ?? "";
+        if (text) {
+          ctx.textAlign = "center";
+          ctx.fillStyle = period.label ? C.text : C.dimmer;
+          ctx.fillText(text, (xa + xb) / 2, sy + sh / 2 + 0.5);
+        }
+        ctx.globalAlpha = 1;
+      }
+      ctx.restore();
+      ctx.textBaseline = "alphabetic";
+    }
+
     /* ---- footer gutter labels --------------------------------------------- */
     ctx.font = font(8);
     ctx.textAlign = "left";
     ctx.fillStyle = C.dimmer;
+    if (initH > 0) ctx.fillText("30m", plotW + 4, plotBottom + initH / 2 + 3);
     ctx.fillText("Δ est", plotW + 4, footTop + 11);
     if (footH >= FOOT_H) {
       ctx.fillText("vol", plotW + 4, footTop + 31);
@@ -1439,8 +1523,8 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
     const covT = src.coverage && finite(src.coverage.first_bar_t) ? src.coverage.first_bar_t! : null;
     const cov = covT !== null ? ` · from ${clockOf(covT)}${src.coverage?.seed_truncated ? "…" : ""}` : "";
     ctx.fillText(
-      headRight >= 400 ? `${sym} · ${tf} · ${rowTxt} · imb ${ratio.toFixed(1)}x · ${span}${cov}`
-        : headRight >= 220 ? `${sym} · ${tf} · ${span}${cov}`
+      headRight >= 400 ? `${sym} · ${tf} · ${lot > 1 ? `lots of ${lot} · ` : ""}${rowTxt} · imb ${ratio.toFixed(1)}x · ${span}${cov}`
+        : headRight >= 220 ? `${sym} · ${tf}${lot > 1 ? " · lots" : ""} · ${span}${cov}`
           : sym,
       4, 12,
     );
@@ -1641,9 +1725,20 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
         rows.push({
           label: mp.kind === "freeze" ? "Freeze cluster" : "Large cluster",
           value: mp.kind === "freeze"
-            ? `${vol(mp.s)} @ ${price(mp.p)}${finite(mp.lots) ? ` · ${mp.lots} lots` : ""}`
-            : `${vol(mp.s)} @ ${price(mp.p)}${finite(mp.ratio) ? ` · ${mp.ratio!.toFixed(1)}× median` : ""}`,
+            ? `${vol(mp.s)}${lot > 1 ? " lots" : ""} @ ${price(mp.p)}`
+            : `${vol(mp.s)}${lot > 1 ? " lots" : ""} @ ${price(mp.p)}${finite(mp.ratio) ? ` · ${mp.ratio!.toFixed(1)}× median` : ""}`,
           color: mp.kind === "freeze" ? C.poc : C.warn,
+        });
+      }
+      const tfBar = num(src.timeframe_seconds) || 60;
+      for (const period of periods.filter((pd) => num(bar.t) < pd.end && num(bar.t) + tfBar > pd.t).slice(0, 2)) {
+        const share = finite(period.share) ? `${period.share >= 0 ? "+" : "−"}${Math.round(Math.abs(period.share) * 100)}%` : "—";
+        const oi = finite(period.oi_change) ? ` · OI ${signed(period.oi_change)}` : "";
+        const who = initiativeState(period);
+        rows.push({
+          label: `30m ${clockOf(period.t)}${period.complete === false ? " (forming)" : ""}`,
+          value: `${period.label ?? "no initiative"} ${share}${oi}${who ? ` · ${who}` : ""}`,
+          color: period.label === "IB30" ? C.buy : period.label === "IS30" ? C.sell : C.dim,
         });
       }
       const barOfi = ofiCum.get(bar.t);

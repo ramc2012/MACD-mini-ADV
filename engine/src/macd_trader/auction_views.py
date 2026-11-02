@@ -12,6 +12,7 @@ render an empty panel rather than a 500.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -475,3 +476,54 @@ def whale_names(history_path: str, ticks_path: str | None, day: str, *,
         "thresholds": whale_layer.names_thresholds(),
         "feed_gaps": [{"from": clock(a), "to": clock(b), "seconds": round((b - a) / 1000)} for a, b in gaps],
     }
+
+
+_FUTURE = re.compile(r"^(?P<root>[A-Z0-9&\-]+?)\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)FUT$")
+OI_BASELINE_LOOKBACK_SECONDS = 4 * 86_400      # back over a weekend to the previous session's last reading
+
+
+def initiative_oi(history_path: str, symbol: str, periods: list[dict]) -> list[dict]:
+    """Fill each 30-minute period's ``oi_change`` (Shai's COT: + = OI added, - = OI cut) where OI is stored.
+
+    Futures read ``oi_minutes`` (index futures, every minute); options read ``chain_snapshots`` (index chains every
+    minute, stock chains every 15 minutes). The change is the last reading in the period against the last one before
+    it, so the first period of the day carries the overnight change. Cash equities and unstored contracts keep None.
+    """
+    if not periods:
+        return periods
+    from .option_agent import parse_option
+    body = symbol.split(":", 1)[-1]
+    option = parse_option(symbol)
+    if option:
+        table, extra, params = "chain_snapshots", "underlying = ? AND ", (option["root"],)
+    elif _FUTURE.match(body):
+        table, extra, params = "oi_minutes", "", ()
+    else:
+        return periods
+    first, last = periods[0]["t"], periods[-1]["end"]
+    try:
+        connection = _read(history_path)
+    except sqlite3.OperationalError:
+        return periods
+    try:
+        base = _rows(connection, f"SELECT oi FROM {table} WHERE {extra}symbol = ? AND ts < ? AND ts >= ? "
+                                 "AND oi IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                     (*params, symbol, first, first - OI_BASELINE_LOOKBACK_SECONDS))
+        rows = _rows(connection, f"SELECT ts, oi FROM {table} WHERE {extra}symbol = ? AND ts >= ? AND ts < ? "
+                                 "AND oi IS NOT NULL ORDER BY ts", (*params, symbol, first, last))
+    finally:
+        connection.close()
+    previous = base[0]["oi"] if base else None
+    index = 0
+    for period in periods:
+        latest = None
+        while index < len(rows) and rows[index]["ts"] < period["end"]:
+            latest = rows[index]["oi"]
+            index += 1
+        if latest is None:
+            continue
+        if previous is not None:
+            period["oi_change"] = int(latest - previous)
+        period["oi"] = int(latest)
+        previous = latest
+    return periods

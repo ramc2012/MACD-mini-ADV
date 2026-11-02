@@ -164,6 +164,9 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
     : paused ? `Paused · print ${printTime}` : error ? `Update failed · last print ${printTime}`
       : responseAge === null ? "Loading flow…" : `Response ${responseAge}s · print ${printTime}`;
   const responseAged = !replay && !paused && (!!error || (responseAge !== null && responseAge > 10));
+  // Derivatives count in lots (the chart, the stats, the DOM and the tape alike); cash equities in shares.
+  const lot = data?.lot_size && data.lot_size > 1 ? data.lot_size : 1;
+  const lotNote = lot > 1 ? " · lots" : "";
   const totals = useMemo(() => {
     const rows = data?.bars || [];
     const volume = rows.reduce((sum, b) => sum + b.v, 0);
@@ -224,17 +227,17 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
             volume — labelled "Volume" it read as the latter and never matched
             the exchange. The window is in the label so the two are not
             confused. */}
-        <Stat label={`Window vol · ${bars}×${timeframe < 60 ? `${timeframe}s` : `${timeframe / 60}m`}`}
-              value={data ? money.format(totals.volume) : "—"} />
-        <Stat label="Bar Δ sum" value={data ? money.format(totals.delta) : "—"}
+        <Stat label={`Window vol · ${bars}×${timeframe < 60 ? `${timeframe}s` : `${timeframe / 60}m`}${lotNote}`}
+              value={data ? money.format(totals.volume / lot) : "—"} />
+        <Stat label={`Bar Δ sum${lotNote}`} value={data ? money.format(totals.delta / lot) : "—"}
           tone={data ? totals.delta : undefined} />
-        <Stat label="Session CVD" value={Number.isFinite(flow?.cumulative_delta) ? money.format(flow!.cumulative_delta) : "—"}
+        <Stat label={`Session CVD${lotNote}`} value={Number.isFinite(flow?.cumulative_delta) ? money.format(flow!.cumulative_delta / lot) : "—"}
           tone={Number.isFinite(flow?.cumulative_delta) ? flow!.cumulative_delta : undefined} />
         {/* The same delta with each print weighted by how much the three
             classification votes agreed. Where the two part company the tape
             was batched or contested — which is where the raw one misleads. */}
         {Number.isFinite(flow?.weighted_cumulative_delta) && <Stat label="CVD × conf"
-          value={money.format(flow!.weighted_cumulative_delta!)} tone={flow!.weighted_cumulative_delta!} />}
+          value={money.format(flow!.weighted_cumulative_delta! / lot)} tone={flow!.weighted_cumulative_delta!} />}
         <Stat label="Imbalance" value={Number.isFinite(flow?.imbalance) ? `${(flow!.imbalance * 100).toFixed(1)}%` : "—"}
           tone={Number.isFinite(flow?.imbalance) ? flow!.imbalance : undefined} />
         <Stat label="Imb. cells" value={data ? `${totals.imbalanced} / ${totals.cells}` : "—"} />
@@ -341,12 +344,12 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
       <section className="panel of-ladder">
         <div className="panel-title"><span>DOM</span><span>touch only</span></div>
         <DomLadder dom={data?.dom ?? null} profile={data?.profile ?? null}
-          tickSize={data?.tick_size ?? 0.05} lastPrice={data?.dom?.last ?? data?.profile?.last ?? null} />
+          tickSize={data?.tick_size ?? 0.05} lastPrice={data?.dom?.last ?? data?.profile?.last ?? null} lot={lot} />
       </section>
 
       <section className="panel of-tape">
         <div className="panel-title"><span>Time &amp; sales</span><span>{data?.tape?.length ?? 0}</span></div>
-        <TimeAndSales tape={data?.tape ?? []} tickSize={data?.tick_size ?? 0.05} />
+        <TimeAndSales tape={data?.tape ?? []} tickSize={data?.tick_size ?? 0.05} lot={lot} />
       </section>
     </div>
   </div>;
