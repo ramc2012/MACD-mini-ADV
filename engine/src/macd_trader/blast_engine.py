@@ -1372,13 +1372,14 @@ class BlastEngine:
 
 
 def fill_unstreamed_minutes(database_path: str, since: dict[str, int], stored: dict[str, list[Candle]],
-                            limit: int) -> dict[str, list[Candle]]:
+                            limit: int, today: date | None = None) -> dict[str, list[Candle]]:
     """``stored`` plus option-chain minutes for the stretches each contract was not streamed.
 
     Not streamed means an IST day with no stored minute, or the part of a day before its first stored minute. A
     stored day with no trade in some bucket stays empty, as it is on the exchange's own chart. The day of ``since``
     was streamed, and a read cut short by ``limit`` is not extended backwards.
     """
+    today = today or datetime.now(IST).date()
     result = dict(stored)
     for symbol, after in since.items():
         rows = stored.get(symbol, [])
@@ -1386,6 +1387,10 @@ def fill_unstreamed_minutes(database_path: str, since: dict[str, int], stored: d
         if len(rows) >= limit:
             floor = max(floor, rows[0].timestamp)
         streamed_day = datetime.fromtimestamp(after, IST).date() if after > 0 else None
+        if streamed_day is not None and streamed_day >= today:
+            # Already streamed today: only a later day could be added. Skipping the chain read keeps an intraday
+            # re-warm off the feed's critical path (2 Nov 2026: 546 reads, ~43 s of the 75-89 s ladder-refresh outage).
+            continue
         first_by_day: dict[date, int] = {}
         for row in rows:
             first_by_day.setdefault(datetime.fromtimestamp(row.timestamp, IST).date(), row.timestamp)

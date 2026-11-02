@@ -170,6 +170,20 @@ def test_chain_marks_fill_only_the_stretches_the_contract_was_not_streamed(tmp_p
     assert blast_engine.fill_unstreamed_minutes(path, {SYMBOL: minute(28, 11, 5)}, later, 10_000)[SYMBOL] == later[SYMBOL]
 
 
+def test_an_intraday_re_warm_of_a_contract_streamed_today_reads_no_chain_marks(tmp_path, monkeypatch):
+    """2 Nov 2026: every ladder refresh re-read the chain for all 546 contracts (~43 s) with the feed down."""
+    stored = [(minute(28, 11, m), 60.0) for m in range(0, 10)]
+    path = history_db(tmp_path, stored, [(minute(27, 13, 0), 30.0)])
+    read = blast_engine.read_stored_minute_bars(path, {SYMBOL: minute(28, 11, 5)}, 10_000)
+
+    def no_read(*_):
+        raise AssertionError("a contract already streamed today has no unstreamed stretch to fill")
+
+    monkeypatch.setattr(blast_engine, "chain_minutes", no_read)
+    today = datetime(2026, 10, 28, tzinfo=IST_ZONE).date()
+    assert blast_engine.fill_unstreamed_minutes(path, {SYMBOL: minute(28, 11, 5)}, read, 10_000, today)[SYMBOL] == read[SYMBOL]
+
+
 def test_warm_up_folds_the_chain_filled_days_on_the_hma_kama_strategy(tmp_path):
     stored = [(minute(28, 9, 15) + i * 60, 50.0 + i * 0.01) for i in range(30)]
     marks = [(minute(day, 9, 20) + k * 900, 10.0 + day + k * 0.1) for day in (26, 27) for k in range(25)]

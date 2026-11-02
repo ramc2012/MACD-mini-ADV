@@ -243,6 +243,7 @@ class TradingEngine(DeskMixin):
         self.history: dict[str, deque[Candle]] = defaultdict(lambda: deque(maxlen=500))
         self.history_errors: dict[str, str] = {}
         self.warmup_report: dict = {}
+        self.connect_steps: dict[str, float] = {}
         self.history_backfill: dict = {}
         self._history_backfill_task: asyncio.Task | None = None
         self._warming_symbols: set[str] = set()
@@ -843,6 +844,14 @@ class TradingEngine(DeskMixin):
         self.error = None
         self.feed_connects += 1
         self.events.publish("broker", self.broker_status())
+        # Seconds from the start of this connect to each step: everything before "stream" is time the feed is down
+        # (a ladder refresh calls this with the socket closed).
+        connect_started = time.monotonic()
+        connect_steps: dict[str, float] = {}
+        self.connect_steps = connect_steps
+
+        def step(name: str) -> None:
+            connect_steps[name] = round(time.monotonic() - connect_started, 1)
         try:
             await self.broker.connect()
             self._auth_validated_date = datetime.now(IST).date().isoformat()
@@ -873,6 +882,7 @@ class TradingEngine(DeskMixin):
                     + ", ".join(sorted(missing_held))
                 )
             self._selection_date = datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+            step("selection")
             self._contracts_live_since = datetime.now(UTC)
             # ITM/OTM legs are market-context inputs only.  They are live-feed
             # subscribers and chart sources, never additions to either paper
@@ -960,7 +970,9 @@ class TradingEngine(DeskMixin):
             except Exception as exc:  # noqa: BLE001
                 self.lot_audit = {"at": datetime.now(IST).isoformat(timespec="seconds"),
                                   "error": f"{type(exc).__name__}: {exc}"[:300]}
+            step("lot_audit")
             await self._refresh_position_marks()
+            step("marks")
 
             # Self-heal: download the session minutes the app did not capture (host down, feed dead) BEFORE
             # warm-up, so no indicator steps across a hole. On 15 Oct 2026 this took a manual backfill.
@@ -1097,6 +1109,7 @@ class TradingEngine(DeskMixin):
                 )
             except Exception as exc:  # noqa: BLE001 - the lane must not block the feed
                 self.blast.error = f"minute-bar warm-up failed: {exc}"
+            step("blast_warm")
             # Subscribe before the hundreds of FYERS history requests. Each
             # symbol buffers closed live bars until its historical replay is
             # complete, so signals cannot run on a partial indicator state.
@@ -1107,6 +1120,7 @@ class TradingEngine(DeskMixin):
             self.status = "connected"
             self.error = None
             self._stream_task = asyncio.create_task(self._run_broker_stream())
+            step("stream")
             warm_started = time.monotonic()
             await asyncio.gather(*(warm(symbol) for symbol in warm_symbols))
             self.warmup_report = {
@@ -1115,6 +1129,7 @@ class TradingEngine(DeskMixin):
                 "symbols": len(warm_symbols), "new_contracts": len(new_contracts & set(warm_symbols)),
                 "downloaded": len(downloaded), "chain_seeded": len(self.chain_seeded),
                 "selection": dict(self.contract_selector.selection_source),
+                "connect_steps": connect_steps,
             }
             if downloaded:
                 # The blast lane seeded from the store before these strikes'
@@ -2520,11 +2535,17 @@ class TradingEngine(DeskMixin):
                                         "replaced": sorted(changed)}
         if changed:
             async with self._reconfigure_lock:
+                down_from = time.monotonic()
                 await self.disconnect_feed()
                 self.history.clear()
                 self.history_errors.clear()
                 self.latest_ticks.clear()
+                closed = time.monotonic() - down_from
                 await self.connect_feed()
+            steps = getattr(self, "connect_steps", {})
+            self.contract_refresh_status["feed_down_seconds"] = (
+                round(closed + steps["stream"], 1) if "stream" in steps else None)
+            self.contract_refresh_status["disconnect_seconds"] = round(closed, 1)
             self.events.publish("snapshot_required", {"reason": "contract_refresh", "spots": sorted(changed)})
         return changed
 
