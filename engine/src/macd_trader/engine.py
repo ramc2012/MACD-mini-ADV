@@ -1757,7 +1757,13 @@ class TradingEngine(DeskMixin):
         analysis_only = tick.symbol in getattr(self, "analysis_option_symbols", set())
         if self.desk_local:
             await self._desk_on_tick(tick, analysis_only)
-        _, minute_closed = self.minute_candles.on_tick(tick)
+        minute_closed = None
+        if exchange_at.astimezone(IST).date() >= self.last_tick_at.astimezone(IST).date():
+            # A print stamped on an earlier day is the morning snapshot or a pre-open quote carrying the last
+            # session's trade time. Bucketed by that stamp it rewrote the previous close: on 2 Nov 2026 the Fri
+            # 15:39 bar of 962 contracts took Monday's pre-open price and the whole day's volume (RELIANCE
+            # 1160 PE closed 23.55, stored 7.5).
+            _, minute_closed = self.minute_candles.on_tick(tick)
         if minute_closed and in_session(minute_closed.symbol, minute_closed_moment(minute_closed)):
             self.candle_writer.add(minute_closed, resolve_expiry(minute_closed.symbol, self.contract_selector.contracts))
             if not analysis_only or minute_closed.symbol in self.blast.portfolio.positions:
