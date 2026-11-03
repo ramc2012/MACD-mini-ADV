@@ -62,6 +62,7 @@ TOO_ILLIQUID = "TOO_ILLIQUID"
 TOO_SMALL = "LOT_ABOVE_TICKET"
 NO_CASH = "NO_CASH"
 POSITION_LIMIT = "POSITION_LIMIT"
+WHALE_REPLACE_EXIT = "WHALE_PRIORITY_REPLACE"
 ENTRY_REJECTED = "ENTRY_REJECTED"
 QWEN_REJECTED = "QWEN_REJECTED"
 QWEN_UNAVAILABLE = "QWEN_UNAVAILABLE"
@@ -272,6 +273,7 @@ class SmartLane:
         self._macd_confirm = lambda symbol, bucket, price: None
         self._dispersion = lambda: None
         self._entry_context = lambda item, now: {}
+        self._whale = lambda symbol: None    # the underlying's live whale reading (engine.whale_interest)
         self._last_equity = 0.0
         self._last_equity_write = -1e9
         self._last_equity_value = float("nan")
@@ -364,7 +366,9 @@ class SmartLane:
             symbol: row.get("expiry") for symbol, row in self._contracts.items()
         })
 
-    def set_resolvers(self, *, macd_confirm=None, dispersion=None, entry_context=None) -> None:
+    def set_resolvers(self, *, macd_confirm=None, dispersion=None, entry_context=None, whale=None) -> None:
+        if whale is not None:
+            self._whale = whale
         if macd_confirm is not None:
             self._macd_confirm = macd_confirm
         if dispersion is not None:
@@ -433,7 +437,8 @@ class SmartLane:
         for item in due:
             item.retry_at = None
             self._allocate(item, now)
-        ordered = sorted(due, key=lambda p: (p.source != MACD_SOURCE,
+        # Whale-interesting underlyings first (owner, 3 Nov 2026), then the existing order.
+        ordered = sorted(due, key=lambda p: (p.detail.get('whale') is None, p.source != MACD_SOURCE,
             -p.detail['allocation']['priority'], p.created, p.symbol))
         cut = self.cutoff()
         for item in ordered:
@@ -463,7 +468,44 @@ class SmartLane:
             exposure_fraction=exposure / equity if equity > 0 else 0.)
         allocation.update(observed_at=now.isoformat(), context=context)
         item.detail['allocation'] = allocation
+        try:
+            whale = self._whale(item.symbol)
+        except Exception:  # noqa: BLE001 -- context only
+            whale = None
+        item.detail['whale'] = ({k: whale[k] for k in ("symbol", "leg", "multiple", "strength", "at", "age_minutes")}
+                                if whale else None)
         self.local_allocation = allocation
+
+    async def _make_room(self, incoming: str) -> dict | None:
+        """Close the weakest holding (lowest return on its entry price) to free one slot; what was closed."""
+        execution = self.execution
+        pending = {order.symbol for order in execution.orders.values() if order.status == "OPEN"}
+        weakest = None
+        for symbol, position in self.portfolio.positions.items():
+            if (position.quantity <= 0 or symbol == incoming or symbol in pending
+                    or symbol in execution._armed_exits or not position.average_price):
+                continue
+            try:
+                price = execution._fresh_price(symbol)
+            except RuntimeError:
+                continue                       # no executable quote: it cannot be sold now
+            change = price / position.average_price - 1
+            if weakest is None or change < weakest[1]:
+                weakest = (symbol, change, price, position.quantity)
+        if weakest is None:
+            return None
+        symbol, change, price, quantity = weakest
+        execution.arm_exit(symbol, WHALE_REPLACE_EXIT)
+        try:
+            order = await execution.submit(symbol, "SELL", quantity)
+        except (ValueError, RuntimeError, PermissionError) as exc:
+            execution._armed_exits.discard(symbol)
+            self.error = f"replace {symbol}: {type(exc).__name__}: {exc}"[:300]
+            return None
+        left = self.portfolio.positions.get(symbol)
+        if order.status != "FILLED" or (left is not None and left.quantity > 0):
+            return None
+        return {"replaced": symbol, "replaced_return_pct": round(100 * change, 2), "replaced_exit_price": price}
 
     def _liquidity_lots(self, symbol: str, lot_size: int) -> int | None:
         contract = self._contracts.get(symbol) or {}
@@ -502,6 +544,8 @@ class SmartLane:
                 return self._record(item, MACD_FADED, now, price=price, cut=cut)
             base = dispersion_size(item.option_type, self._dispersion(), self.settings.smart_min_dispersion_size)
             ranked = score_size(item.score, self._scores, getattr(self.settings, "smart_min_score_size", 0.25))
+            if item.detail.get('whale'):
+                ranked = 1.0          # owner, 3 Nov 2026: no score cut-down on a whale-interesting underlying
             item.detail["score_size"] = round(ranked, 4)
             size = base * ranked
         else:
@@ -520,6 +564,12 @@ class SmartLane:
         equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
         if self.slots:
             held = len(self.held_symbols())
+            if held >= self.slots and item.detail.get('whale'):
+                # Owner, 3 Nov 2026: a whale-interesting signal on a full book takes the weakest holding's slot.
+                room = await self._make_room(item.symbol)
+                if room:
+                    item.detail.update(room)
+                    held = len(self.held_symbols())
             if held >= self.slots:
                 return self._record(item, POSITION_LIMIT, now, price=price, cut=cut, size=size,
                                     detail={"held": held, "slots": self.slots})

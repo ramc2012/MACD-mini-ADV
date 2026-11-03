@@ -115,6 +115,30 @@ EVIDENCE_FLOOR = -3          # dropped only when nearly every leg argues for the
 # top-10 performers over 1-3 sessions against random 6.7% / 9.2%, with paper results of +19.6% / +31.8% a pick
 # (random +6.5% / +5.5%). Cheapness breaks ties; the payoff ranker and the votes inform, they do not lead.
 OWN_SIDE_OI = {"long_buildup": 1, "short_covering": 1, "long_unwind": -1, "short_buildup": -1}
+# Whale interest (owner, 3 Nov 2026): a stock whose cash traded a minute at >= 30x its usual volume for that slot (an
+# option contract at >= 60x) in the hour up to the decision bar's close goes first among the survivors. Measured
+# (research/whale_review_20261103): such a minute is followed by a move ~1.4x the size of an ordinary one, on 30-34 of
+# 35 sessions -- and never by a side. The MACD engine writes the readings; this process only reads the file.
+WHALE_INTEREST_PATH = Path(os.environ.get("WHALE_INTEREST_PATH", "/runtime/shadow_lanes/whale_interest.json"))
+WHALE_WINDOW_SECONDS = 3600
+
+
+def whale_readings(until):
+    """root -> strongest whale reading in the hour ending ``until``; {} when the engine has written none today."""
+    import json
+    try:
+        payload = json.loads(WHALE_INTEREST_PATH.read_text())
+    except (OSError, ValueError):
+        return {}
+    if payload.get("day") != until.astimezone(IST).date().isoformat():
+        return {}
+    at = int(until.timestamp())
+    out = {}
+    for root, rows in (payload.get("readings") or {}).items():
+        live = [r for r in rows if at - WHALE_WINDOW_SECONDS <= r.get("at", 0) <= at]
+        if live:
+            out[root] = max(live, key=lambda r: r.get("strength", 0))
+    return out
 
 
 def evidence(inputs, side):
@@ -204,10 +228,12 @@ def rank_bar(connection, bar, now):
         if key not in best or (row["combined_score"], row["direction_score"]) > (best[key]["combined_score"], best[key]["direction_score"]):
             best[key] = row
     rows = []
+    whales = whale_readings(bar + timedelta(minutes=30))
     for row in best.values():
         evaluation = by_symbol[row["symbol"]]
         spot = float(spots[row["symbol"]]["close"])
-        row.update(sector20=evaluation.sector20, conviction=evaluation.conviction, underlying_signal_close=spot)
+        row.update(sector20=evaluation.sector20, conviction=evaluation.conviction, underlying_signal_close=spot,
+                   whale=whales.get(row["symbol"]))
         rows.append(screen(row, evaluation.inputs, spot))
     selected = select_atm([r for r in rows if not r["filtered"]])
     chosen = {(r["symbol"], r["option_type"]) for r in selected}
@@ -232,7 +258,9 @@ def rank_bar(connection, bar, now):
          "pe": sum(1 for r in sides["PE"] if r["evidence_net"] > EVIDENCE_FLOOR)},
         {"stage": "pass every filter", "ce": sum(1 for r in sides["CE"] if not r["filtered"]),
          "pe": sum(1 for r in sides["PE"] if not r["filtered"])},
-        {"stage": f"selected: {PER_SIDE} per side, furthest out of the money first",
+        {"stage": "whale-interesting survivors (go first)", "ce": sum(1 for r in sides["CE"] if r.get("whale") and not r["filtered"]),
+         "pe": sum(1 for r in sides["PE"] if r.get("whale") and not r["filtered"])},
+        {"stage": f"selected: {PER_SIDE} per side, whale-interesting first, then furthest out of the money",
          "ce": sum(1 for r in selected if r["option_type"] == "CE"), "pe": sum(1 for r in selected if r["option_type"] == "PE")},
     ]
     return dict(status="ok", source_session=str(day), **diagnostics, chain=coverage, stages=stages,
@@ -287,7 +315,7 @@ def rank_key(r):
 
 def select_atm(candidates, per_side=PER_SIDE):
     ranked = sorted([r for r in candidates if r.get('contract_kind')=='ATM'],
-                    key=lambda r:(*rank_key(r),-r['contract_score'],r['symbol'],r['option_type']))
+                    key=lambda r:(not r.get('whale'),*rank_key(r),-r['contract_score'],r['symbol'],r['option_type']))
     selected=[];seen=set();count={'CE':0,'PE':0}
     for row in ranked:
         side=row.get('option_type')

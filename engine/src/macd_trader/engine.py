@@ -297,6 +297,13 @@ class TradingEngine(DeskMixin):
         self.lane_errors: dict[str, dict] = {}
         from .entry_scorer import EntryGate
         self.entry_gate = EntryGate(settings, settings.research_database_path)
+        # Whale interest (owner, 3 Nov 2026): a whale-sized minute on an underlying gives its signals priority.
+        from .whale_interest import WhaleInterest
+        self.whale_interest = WhaleInterest()
+        self._whale_interest_loading = False
+        self._whale_interest_exported: int | None = None
+        self._whale_tasks: set[asyncio.Task] = set()
+        self.entry_gate.whale = self.whale_interest.reading
         self._preopen_refresh_day: str | None = None
         self.preopen_refreshes = 0
         self.signals_dropped_stale = 0
@@ -954,7 +961,7 @@ class TradingEngine(DeskMixin):
                 lane.set_tradable_contracts(tradable)
                 lane.set_contract_context(lane_context)
                 lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
-                                   entry_context=self._smart_entry_context)
+                                   entry_context=self._smart_entry_context, whale=self.whale_interest.reading)
             if getattr(self, "agentic", None) is not None:
                 # The agentic lane may pick any selected index strike or roll to the next expiry.
                 self.agentic.set_index_universe({
@@ -1766,6 +1773,7 @@ class TradingEngine(DeskMixin):
             _, minute_closed = self.minute_candles.on_tick(tick)
         if minute_closed and in_session(minute_closed.symbol, minute_closed_moment(minute_closed)):
             self.candle_writer.add(minute_closed, resolve_expiry(minute_closed.symbol, self.contract_selector.contracts))
+            self._whale_interest_bar(minute_closed)
             if not analysis_only or minute_closed.symbol in self.blast.portfolio.positions:
                 # The blast lane screens one-minute bars whatever the strategy
                 # timeframe is; that is the resolution its screen was measured at.
@@ -1909,6 +1917,40 @@ class TradingEngine(DeskMixin):
             await self.execution.on_signal(signal)
             return
         gate.admit(signal, features)
+
+    def _whale_interest_bar(self, candle) -> None:
+        """Score a closed minute for whale interest; reload the baseline on a new day; export once a minute."""
+        interest = self.whale_interest
+        today = datetime.now(IST).date().isoformat()
+        if interest.day != today and not self._whale_interest_loading:
+            self._whale_interest_loading = True
+            task = asyncio.create_task(self._load_whale_interest(today))
+            self._whale_tasks.add(task)
+            task.add_done_callback(self._whale_tasks.discard)
+        try:
+            interest.on_minute_bar(candle)
+        except Exception as exc:  # noqa: BLE001 -- a context feature must not cost the feed
+            interest.error = f"{candle.symbol}: {type(exc).__name__}: {exc}"[:200]
+        minute = int(candle.timestamp) // 60
+        if interest.day == today and self._whale_interest_exported != minute:
+            self._whale_interest_exported = minute
+            from .whale_interest import write_export
+            path = Path(self.settings.runtime_settings_path).parent / "shadow_lanes" / "whale_interest.json"
+            task = asyncio.create_task(asyncio.to_thread(write_export, path, interest.export_payload()))
+            self._whale_tasks.add(task)
+            task.add_done_callback(self._whale_tasks.discard)
+            task.add_done_callback(lambda done: done.cancelled() or done.exception() is None
+                                   or setattr(interest, "error", f"export: {done.exception()}"[:200]))
+
+    async def _load_whale_interest(self, today: str) -> None:
+        try:
+            await asyncio.to_thread(self.whale_interest.load, self.settings.research_database_path, today)
+            self.whale_interest.error = None
+        except Exception as exc:  # noqa: BLE001
+            self.whale_interest.error = f"baseline: {type(exc).__name__}: {exc}"[:200]
+            self.whale_interest.day = today      # retried tomorrow, not on every bar
+        finally:
+            self._whale_interest_loading = False
 
     def _offer_blast_candidate(self, row: dict) -> None:
         for smart in _smart_lanes(self):
@@ -2894,6 +2936,7 @@ class TradingEngine(DeskMixin):
             "feed_recoveries": self.feed_recoveries,
             "lane_errors": self.lane_errors,
             "entry_scoring": self.entry_gate.status(),
+            "whale_interest": {k: v for k, v in self.whale_interest.status().items() if k != "live"},
             "preopen_refreshes": self.preopen_refreshes,
             "extreme_booking": self.extreme_booker.health() if self.settings.extreme_booking_enabled else {"enabled": False},
             "entry_flow": self.entry_flow.health(),

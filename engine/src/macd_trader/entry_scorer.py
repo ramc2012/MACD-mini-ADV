@@ -191,6 +191,7 @@ class _Queued:
     score: float
     signal: object
     features: dict
+    whale: dict | None = None
     queued_at: float = field(default_factory=time.monotonic)
 
 
@@ -243,6 +244,8 @@ class EntryGate:
         self.recent: list[dict] = []
         self._day_scores: dict[str, list[float]] = {}
         self.error: str | None = None
+        # symbol -> the underlying's live whale reading or None (engine.whale_interest.reading)
+        self.whale = lambda symbol: None
 
     @property
     def enabled(self) -> bool:
@@ -281,10 +284,15 @@ class EntryGate:
             # expiry-day decay or flattened by the expiry sweep before the move it was bought for.
             self._decide(signal, features, score, EXPIRES_WITHIN_HOLD)
             return False
-        signal.size_fraction = round(size_fraction(
+        try:
+            whale = self.whale(signal.symbol)
+        except Exception:  # noqa: BLE001 -- context only
+            whale = None
+        # Owner, 3 Nov 2026: a signal on a whale-interesting underlying takes the full ticket and goes first.
+        signal.size_fraction = 1.0 if whale else round(size_fraction(
             score_percentile(score, scores),
             float(getattr(self.settings, "macd_entry_min_size_fraction", 0.25))), 4)
-        self._queue.append(_Queued(score, signal, features))
+        self._queue.append(_Queued(score, signal, features, whale))
         return True
 
     def crowd(self, bucket: int, side: str) -> tuple[int, int]:
@@ -293,18 +301,20 @@ class EntryGate:
         other = "PE" if side == "CE" else "CE"
         return self._crowd[(bucket, side)], self._crowd.get((bucket, other), 0)
 
-    def _decide(self, signal, features: dict, score: float, decision: str) -> None:
+    def _decide(self, signal, features: dict, score: float, decision: str, whale: dict | None = None) -> None:
         self.counts[decision] += 1
         now = datetime.now(UTC)
         side = "CE" if signal.symbol.endswith("CE") else "PE"
         fraction = getattr(signal, "size_fraction", 1.0)
         row = {"at": now.isoformat(), "symbol": signal.symbol, "score": round(score, 4), "decision": decision,
                "size_fraction": fraction}
+        mark = {"whale": {k: whale[k] for k in ("symbol", "leg", "multiple", "strength", "at")}} if whale else {}
+        row.update(mark)
         self.recent.append(row)
         del self.recent[:-50]
         self._journal.append((now.isoformat(), now.astimezone(IST).date().isoformat(), signal.symbol, side,
                               round(score, 5), round(self.cut(), 5), decision, getattr(signal, "signal_id", None),
-                              json.dumps({**{k: round(v, 6) for k, v in features.items()}, "size_fraction": fraction}),
+                              json.dumps({**{k: round(v, 6) for k, v in features.items()}, "size_fraction": fraction, **mark}),
                               MODEL_SHA256))
 
     async def run(self, get_execution, get_portfolio, validate_signal=None) -> None:
@@ -328,11 +338,11 @@ class EntryGate:
         wait = float(getattr(self.settings, "macd_entry_rank_seconds", 15.0))
         if time.monotonic() - min(item.queued_at for item in self._queue) < wait:
             return
-        batch, self._queue = sorted(self._queue, key=lambda item: -item.score), []
+        batch, self._queue = sorted(self._queue, key=lambda item: (item.whale is None, -item.score)), []
         for item in batch:
             symbol = item.signal.symbol
             if time.monotonic() - item.queued_at > STALE_SECONDS:
-                self._decide(item.signal, item.features, item.score, "STALE")
+                self._decide(item.signal, item.features, item.score, "STALE", item.whale)
                 continue
             held_before = symbol in portfolio.positions
             if not held_before and validate_signal is not None:
@@ -344,12 +354,12 @@ class EntryGate:
                     self.error = f"validation {symbol}: {type(exc).__name__}: {exc}"[:300]
                     rejection = "VALIDATION_ERROR"
                 if rejection:
-                    self._decide(item.signal, item.features, item.score, rejection)
+                    self._decide(item.signal, item.features, item.score, rejection, item.whale)
                     continue
             await execution.on_signal(item.signal)
             entered = not held_before and symbol in portfolio.positions
             self._decide(item.signal, item.features, item.score,
-                         "TAKEN" if entered else ("ALREADY_HELD" if held_before else "NOT_FILLED"))
+                         "TAKEN" if entered else ("ALREADY_HELD" if held_before else "NOT_FILLED"), item.whale)
 
     def _write(self, rows: list[tuple]) -> None:
         connection = sqlite3.connect(self.database_path, timeout=30)

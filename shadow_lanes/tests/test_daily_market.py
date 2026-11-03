@@ -100,6 +100,23 @@ def test_the_most_out_of_the_money_leg_leads_and_cheapness_breaks_ties():
     assert source.screen({'option_type':'PE','strike':98,'option_volume':5000,'lot_size':1000,'source_mark':2},{},100)['otm']==0.020000000000000018
 
 
+def test_whale_interesting_survivors_go_first_then_the_out_of_the_money_order(tmp_path, monkeypatch):
+    # Owner, 3 Nov 2026: a whale-interesting stock is given priority among the survivors.
+    rows=[dict(symbol=s,option_type='CE',contract_kind='ATM',combined_score=0,direction_score=0,contract_score=0,otm=otm,premium_pct=0.02,
+               whale=whale) for s,otm,whale in [('OTM',0.02,None),('WHALE',0.0,{'multiple':40.0}),('ATM',0.0,None)]]
+    assert [r['symbol'] for r in source.select_atm(rows)]==['WHALE','OTM','ATM']
+    import json
+    from datetime import datetime, timedelta
+    path=tmp_path/'whale_interest.json'
+    bar=datetime(2026,11,3,14,15,tzinfo=source.IST)
+    path.write_text(json.dumps({'day':'2026-11-03','readings':{'SBIN':[{'at':int((bar-timedelta(minutes=20)).timestamp()),'strength':1.2},
+        {'at':int((bar+timedelta(minutes=40)).timestamp()),'strength':9.0}],'OLD':[{'at':int((bar-timedelta(minutes=50)).timestamp()),'strength':2.0}]}}))
+    monkeypatch.setattr(source,'WHALE_INTEREST_PATH',path)
+    found=source.whale_readings(bar+timedelta(minutes=30))
+    assert set(found)=={'SBIN'} and found['SBIN']['strength']==1.2     # the hour up to 14:45; later readings unseen
+    assert source.whale_readings(bar+timedelta(days=1))=={}
+
+
 def test_daily_swing_does_not_require_intraday_market_profile(monkeypatch):
     c,now=fixture(monkeypatch,mp_current=False)
     r=scan(c,now)

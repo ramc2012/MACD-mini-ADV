@@ -281,6 +281,12 @@ async def trend_rotation(kind: Literal["CE", "PE", "SPOT"] = "CE",
     return await engine.trend_rotation(kind, timeframe_seconds)
 
 
+@app.get("/api/whale-interest", dependencies=[Depends(authorize)])
+async def whale_interest() -> dict:
+    """Underlyings a whale-sized minute made interesting in the last hour (lane priority, owner 3 Nov 2026)."""
+    return engine.whale_interest.status()
+
+
 @app.get("/api/dispersion", dependencies=[Depends(authorize)])
 async def dispersion(
     timeframe_seconds: int | None = Query(default=None, ge=60, le=86_400),
