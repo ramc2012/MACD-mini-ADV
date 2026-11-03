@@ -315,8 +315,9 @@ class ExecutionManager:
                 else:
                     order.broker_order_id = await self.broker.place_order(order)
                     order.status = "SUBMITTED"
-            except Exception:
+            except Exception as exc:
                 order.status = "REJECTED"
+                order.reject_reason = f"{type(exc).__name__}: {exc}"[:160]
                 self.repository.save_order(order)
                 self.events.publish("order", order)
                 raise

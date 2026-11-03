@@ -4,6 +4,7 @@ import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPosition
 
 import { bookFillCounts } from "./ledgerMath";
 import { LedgerCounts } from "./LedgerCounts";
+import { attempts, rejectionsByReason } from "./ledgerCountState";
 import { istDay, istStamp } from "./istTime";
 export { istDay } from "./istTime";
 
@@ -98,7 +99,9 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     { key: "lots", label: "Lots", value: (row) => row.lots || 0, render: (row) => row.lots || "—" },
     { key: "quantity", label: "Units", value: (row) => row.quantity, render: (row) => `${row.quantity} (${row.lot_size || 1}/lot)` },
     { key: "fill", label: "Fill", value: (row) => row.fill_price || 0, render: (row) => row.fill_price ? currency(row.fill_price) : "—" },
-    { key: "status", label: "Status", value: (row) => row.status },
+    { key: "status", label: "Status", value: (row) => row.status, render: (row) => (row.repeat_count ?? 1) > 1
+      ? <span title={`${row.repeat_count} attempts from ${fullStamp(row.first_at || row.created_at)}${row.reject_reasons?.length ? ` · ${row.reject_reasons.join(" | ")}` : ""}`}>{row.status} ×{row.repeat_count?.toLocaleString("en-IN")}</span>
+      : <span title={row.reject_reason || undefined}>{row.status}</span> },
   ];
   const tradeColumns: Column<Trade>[] = [
     { key: "time", label: "Time (IST)", value: (row) => Date.parse(row.timestamp), render: (row) => fullStamp(row.timestamp) },
@@ -308,17 +311,29 @@ function Statistics({ orders, trades, portfolio, rounds }: { orders: Order[]; tr
     ["Worst trade", currency(rounds.length ? Math.min(...rounds.map((row) => row.pnl)) : 0)],
     ["Average return", rounds.length ? `${(rounds.reduce((sum, row) => sum + row.returnPct, 0) / rounds.length).toFixed(2)}%` : "—"],
     ["Turnover", currency(turnover)],
-    ["Filled / rejected orders", `${orders.filter((row) => row.status === "FILLED").length} / ${orders.filter((row) => row.status === "REJECTED").length}`],
+    ["Filled / rejected orders", `${orders.filter((row) => row.status === "FILLED").length} / ${attempts(orders.filter((row) => row.status === "REJECTED")).toLocaleString("en-IN")}`],
     ["Open positions", number.format(portfolio.positions.length)],
     ["Live unrealized P&L", currency(portfolio.unrealized_pnl)],
   ];
   return <div className="statistics"><h2>Agent paper book</h2><div className="statistics-note">One trade runs from first entry until fully flat. Partial exits in open cycles are excluded from win rate and completed-trade returns. Returns include recorded fees; realized P&L in open cycles includes their entry fees.</div><div className="statistics-grid">{stats.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
+    <Rejections orders={orders} />
     <h2>Completed trades · entry to flat</h2>
     <table className="ledger-table"><thead><tr><th>Symbol</th><th>Entry (IST)</th><th>Exit (IST)</th><th>Entries</th><th>Exits</th><th>Net P&L</th><th>Return</th></tr></thead><tbody>
       {[...rounds].reverse().map((row) => <tr key={`${row.symbol}:${row.entryTime}:${row.exitTime}`}><td>{row.symbol}</td><td>{entryStamp(row.entryTime)}</td><td>{entryStamp(row.exitTime)}</td><td>{row.entryCount}</td><td>{row.exitCount}</td><td className={row.pnl >= 0 ? "positive" : "negative"}>{currency(row.pnl)}</td><td>{pct(row.returnPct)}</td></tr>)}
       {!rounds.length && <tr><td colSpan={7}>No fully closed trades</td></tr>}
     </tbody></table>
   </div>;
+}
+
+function Rejections({ orders }: { orders: Order[] }) {
+  const groups = rejectionsByReason(orders);
+  if (!groups.length) return null;
+  return <><h2>Rejected order attempts by reason</h2>
+    <div className="statistics-note">A run of identical rejects (same contract, side and IST day) counts every attempt. Since 4 Nov 2026 a rejected automated exit backs off for 15 s, 60 s, then 300 s instead of retrying on every tick.</div>
+    <table className="ledger-table"><thead><tr><th>Reason</th><th>Attempts</th><th>Contracts</th><th>Last (IST)</th></tr></thead><tbody>
+      {groups.map((g) => <tr key={g.reason}><td>{g.reason}</td><td>{g.attempts.toLocaleString("en-IN")}</td>
+        <td title={g.symbols.join(", ")}>{g.symbols.length} · {g.symbols.slice(0, 3).map((s) => s.replace(/^NSE:/, "")).join(", ")}{g.symbols.length > 3 ? " …" : ""}</td><td>{entryStamp(g.last)}</td></tr>)}
+    </tbody></table></>;
 }
 
 function Stat({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><b className={label.includes("P&L") || label.includes("profit") || label.includes("loss") || label.includes("drawdown") ? valueTone(value) : ""}>{value}</b></div>; }

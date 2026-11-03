@@ -694,6 +694,40 @@ class TradeRepository:
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
+    def orders_collapsed(self, limit: int = 10_000) -> list[dict]:
+        """The order log with each run of rejects folded into one row per symbol, side and IST day.
+
+        A rejected exit used to retry on every tick: one contract left 42,201 REJECTED rows over 29-30 Oct 2026,
+        92% of the log. The folded row is the run's latest order, with ``repeat_count``, ``first_at`` and the
+        reasons seen; every other order is returned as stored.
+        """
+        with self._lock:
+            kept = self._connection.execute(
+                "SELECT payload FROM orders WHERE json_extract(payload, '$.status') != 'REJECTED' "
+                "ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            runs = self._connection.execute(
+                """SELECT json_extract(payload, '$.symbol') AS symbol, json_extract(payload, '$.side') AS side,
+                          date(created_at, '+330 minutes') AS day, COUNT(*) AS n, MIN(created_at) AS first_at,
+                          MAX(created_at) AS last_at,
+                          group_concat(DISTINCT json_extract(payload, '$.reject_reason')) AS reasons
+                   FROM orders WHERE json_extract(payload, '$.status') = 'REJECTED'
+                   GROUP BY symbol, side, day""").fetchall()
+            latest = {}
+            for run in runs:
+                row = self._connection.execute(
+                    "SELECT payload FROM orders WHERE created_at = ? AND json_extract(payload, '$.status') = 'REJECTED' "
+                    "AND json_extract(payload, '$.symbol') = ? LIMIT 1", (run["last_at"], run["symbol"])).fetchone()
+                if row is not None:
+                    latest[(run["symbol"], run["side"], run["day"])] = (run, row["payload"])
+        out = [json.loads(row["payload"]) for row in kept]
+        for run, payload in latest.values():
+            item = json.loads(payload)
+            item.update(repeat_count=int(run["n"]), first_at=run["first_at"],
+                        reject_reasons=[r for r in str(run["reasons"] or "").split(",") if r])
+            out.append(item)
+        out.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return out[:limit]
+
     def close(self) -> None:
         with self._lock:
             self._connection.close()

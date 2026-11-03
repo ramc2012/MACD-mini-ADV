@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import {test} from "node:test";
-import {ledgerCounts} from "../src/ledgerCountState.ts";
+import {ledgerCounts, rejectionsByReason} from "../src/ledgerCountState.ts";
 import {bookFillCounts} from "../src/ledgerMath.ts";
 import type {Order, Trade} from "../src/types.ts";
 const order = (id:string,status:string) => ({order_id:id,status} as Order);
@@ -27,4 +27,17 @@ test("weekend buy/sell counts retain Friday's book and exclude future fills and 
 test("holiday book rollover uses the same calendar as Closed today",()=>{
   const now=Date.parse("2026-10-19T10:00:00+05:30");
   assert.equal(bookFillCounts([fill("1","a","BUY")],now,new Set(["2026-10-19"])).buys,1);
+});
+
+test("a folded run of rejects counts every attempt and groups by reason without the contract name",()=>{
+  const run={order_id:"r",status:"REJECTED",symbol:"NSE:OFSS26NOV10000CE",created_at:"2026-10-30T09:00:00+00:00",repeat_count:22699} as Order;
+  const one={order_id:"s",status:"REJECTED",symbol:"NSE:SBIN26NOV800CE",created_at:"2026-11-04T09:00:00+00:00",
+    reject_reason:"RuntimeError: Live price is stale for NSE:SBIN26NOV800CE"} as Order;
+  const two={...one,order_id:"t",symbol:"NSE:INFY26NOV1500CE",reject_reason:"RuntimeError: Live price is stale for NSE:INFY26NOV1500CE"} as Order;
+  const counts=ledgerCounts([order("a","FILLED"),run,one,two],[]);
+  assert.equal(counts.rejected,22701);assert.equal(counts.orders,22702);assert.equal(counts.other,0);
+  const groups=rejectionsByReason([run,one,two]);
+  assert.equal(groups[0].attempts,22699);assert.match(groups[0].reason,/not recorded/);
+  assert.equal(groups[1].reason,"RuntimeError: Live price is stale for …");assert.equal(groups[1].attempts,2);
+  assert.deepEqual(groups[1].symbols,["NSE:SBIN26NOV800CE","NSE:INFY26NOV1500CE"]);
 });

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager, suppress
 from html import escape
 from pathlib import Path
@@ -327,7 +328,10 @@ async def dispersion(
 
 
 @app.get("/api/orders", dependencies=[Depends(authorize)])
-async def orders(limit: int = Query(default=10_000, ge=1, le=100_000)):
+async def orders(limit: int = Query(default=10_000, ge=1, le=100_000), collapse: bool = False):
+    """The order log; ``collapse`` folds each run of rejects into one row per symbol, side and IST day."""
+    if collapse:
+        return await asyncio.to_thread(engine.repository.orders_collapsed, limit)
     return engine.repository.rows("orders", limit)
 
 
@@ -588,9 +592,37 @@ async def _shadow_lane_read(lane: str, archive: bool = False, view: str = ""):
             response = await client.get(f"{url}/api/shadow-lanes/{lane}" + ("/archive" if archive else f"/{view}" if view else ""),
                 headers={"X-Macd-Token": engine.settings.api_token} if engine.settings.api_token else {})
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(502, f"Shadow lane service unavailable: {type(exc).__name__}") from exc
+    return payload if archive or view else _trim_shadow_journal(payload)
+
+
+SHADOW_DETAIL_MAX_BYTES = 20_000
+
+
+def _trim_shadow_journal(payload):
+    """Shrink oversized journal details for the live view; the shadow store keeps them whole.
+
+    One CBE readiness row (27 Oct 2026 15:31 IST) carried a 3.3 MB detail, 95% of the lane's 3.5 MB snapshot,
+    which every Terminal load fetched. The panels read only detail.reason and detail.blockers.
+    """
+    journal = payload.get("journal") if isinstance(payload, dict) else None
+    if not isinstance(journal, list):
+        return payload
+    rows = []
+    for row in journal:
+        detail = row.get("detail") if isinstance(row, dict) else None
+        size = len(json.dumps(detail, default=str)) if isinstance(detail, (dict, list)) else 0
+        if size <= SHADOW_DETAIL_MAX_BYTES or not isinstance(detail, dict):
+            rows.append(row)
+            continue
+        kept = {k: v for k, v in detail.items() if isinstance(v, (str, int, float, bool)) or v is None}
+        if isinstance(detail.get("blockers"), list):
+            kept["blockers"] = detail["blockers"][:20]
+        kept["detail_truncated_bytes"] = size
+        rows.append({**row, "detail": kept})
+    return {**payload, "journal": rows}
 
 
 @app.get("/api/shadow-lanes/{lane}", dependencies=[Depends(authorize)])
@@ -666,6 +698,20 @@ async def retained_desk_read(path: str, request: Request):
         return Response(response.content,status_code=response.status_code,media_type='application/json')
     except httpx.HTTPError:
         raise HTTPException(502,'Retained desk reader is unavailable') from None
+
+
+_scoreboard_cache: dict = {"at": 0.0, "value": None}
+
+
+@app.get("/api/scoreboard", dependencies=[Depends(authorize)])
+async def lanes_scoreboard(refresh: bool = False):
+    """Every paper book scored alike (scoreboard.py); rebuilt at most once a minute."""
+    from . import scoreboard
+    now = time.monotonic()
+    if refresh or _scoreboard_cache["value"] is None or now - _scoreboard_cache["at"] > 60:
+        _scoreboard_cache["value"] = await asyncio.to_thread(scoreboard.build, engine)
+        _scoreboard_cache["at"] = now
+    return _scoreboard_cache["value"]
 
 
 @app.get("/api/lanes", dependencies=[Depends(authorize)])

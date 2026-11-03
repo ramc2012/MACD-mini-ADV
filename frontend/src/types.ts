@@ -28,6 +28,9 @@ export type Signal = Indicator & { signal_id: string; side: "BUY" | "SELL"; kind
 export type Order = {
   order_id: string; symbol: string; side: string; quantity: number; lots: number; lot_size: number; order_type: string;
   status: string; fill_price?: number; signal_id?: string; created_at: string;
+  // Rejects: the reason (recorded from 4 Nov 2026), and for a folded run (/api/orders?collapse=true) how many
+  // attempts the row stands for and the reasons seen.
+  reject_reason?: string | null; repeat_count?: number; first_at?: string; reject_reasons?: string[];
 };
 export type Trade = {
   trade_id: string; order_id?: string; symbol: string; side: string; quantity: number; lots: number; lot_size: number; price: number; timestamp: string;
@@ -112,6 +115,8 @@ export type HealthInfo = {
   symbols: number; history_errors: number; stream_clients: number; day_baseline_equity?: number | null;
   chain?: { snapshots: number; last_at: string | null; error: string | null; windows: number; alerts_today: number;
             history_days: number; composite: Record<string, number | null>; whale_error: string | null };
+  alerts?: { configured: boolean; chat_is_bot?: boolean; sent_total: number; last_message: string | null; last_error: string | null };
+  exit_failures?: { lane: string; symbol: string; reason: string | null; count: number; error: string; first_at: string; last_at: string; retry_after_seconds: number }[];
 };
 
 export type SignalEvaluation = {

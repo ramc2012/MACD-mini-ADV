@@ -24,6 +24,7 @@ const QuantAnalyticsPage = lazy(() => import("./QuantAnalytics").then((m) => ({ 
 const AgentPage = lazy(() => import("./AgentPage").then((m) => ({ default: m.AgentPage })));
 const AgenticPage = lazy(() => import("./AgenticPage").then((m) => ({ default: m.AgenticPage })));
 const LanesPage = lazy(() => import("./LanesPage").then((m) => ({ default: m.LanesPage })));
+const ScoreboardPage = lazy(() => import("./ScoreboardPage").then((m) => ({ default: m.ScoreboardPage })));
 const SpotLanePage = lazy(() => import("./SpotLanePage").then((m) => ({ default: m.SpotLanePage })));
 const NomadLanePage = lazy(() => import("./NomadLanePage").then((m) => ({ default: m.NomadLanePage })));
 import { Readiness } from "./Readiness";
@@ -293,7 +294,7 @@ export default function App() {
     const headers = API_TOKEN ? { "x-macd-token": API_TOKEN } : undefined;
     const timers: ReturnType<typeof setTimeout>[] = [];
     const jobs: [string, string, (data: any, version: number) => void][] = [
-      ["Orders", "/api/orders?limit=100000", (rows: Order[], version) => setOrders((old) => mergeRows(mergeRows(old, rows, "order_id"), [...recentOrders.current.values()].filter((entry) => entry.version > version).map((entry) => entry.row), "order_id"))],
+      ["Orders", "/api/orders?limit=100000&collapse=true", (rows: Order[], version) => setOrders((old) => mergeRows(mergeRows(old, rows, "order_id"), [...recentOrders.current.values()].filter((entry) => entry.version > version).map((entry) => entry.row), "order_id"))],
       ["Trades", "/api/trades?limit=100000", (rows: Trade[]) => setTrades((old) => mergeRows(rows, old, "trade_id"))],
       ["Research trades", "/api/research/trades?limit=5000", (rows: ResearchTrade[]) => setResearchTrades(rows)],
       ["Research report", "/api/research/report", (report) => {
@@ -543,6 +544,7 @@ export default function App() {
               <span className={`feed-dot${feedTone(brokerStatus, health)}`} aria-hidden="true">●</span>Fyers<small>{connected ? token.text : "reconnecting"}</small>
             </button>}
         <span className="mode">{snapshot?.execution.mode || "—"}</span>
+        <AlertChips health={health} />
         <span className="header-date">{IST_HEADER_DAY.format(new Date())}</span>
         <button className="settings-button settings-glyph" onClick={() => openSettings("FYERS")} aria-label="Settings" title="Settings">⚙</button>
       </div>
@@ -603,7 +605,7 @@ export default function App() {
           timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
           fitKey={`${selected}:${snapshot?.config.timeframe_seconds}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
-    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "AGENTIC" ? <AgenticPage /> : page === "LANES" ? <LanesPage ticks={ticks} portfolios={smartPortfolios} /> : page === "SPOT" ? <SpotLanePage ticks={ticks} portfolio={smartPortfolios.spot_macd} /> : page === "VANGUARD" || page === "CBE" ? <NomadLanePage lane={page === "VANGUARD" ? "vanguard" : "cbe"} ticks={ticks} connected={connected} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage />: marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "STRADDLE" ? <StraddlePage /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "WORKSTATION" ? <PlatformWorkstation /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</Suspense>}
+    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "AGENTIC" ? <AgenticPage /> : page === "LANES" ? <LanesPage ticks={ticks} portfolios={smartPortfolios} /> : page === "SCORE" ? <ScoreboardPage /> : page === "SPOT" ? <SpotLanePage ticks={ticks} portfolio={smartPortfolios.spot_macd} /> : page === "VANGUARD" || page === "CBE" ? <NomadLanePage lane={page === "VANGUARD" ? "vanguard" : "cbe"} ticks={ticks} connected={connected} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage />: marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "STRADDLE" ? <StraddlePage /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "WORKSTATION" ? <PlatformWorkstation /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</Suspense>}
     {positionFocus && <PositionChartModal focus={positionFocus} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
     <SettingsPanel open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />
   </main>;
@@ -624,9 +626,9 @@ function pick<T extends string>(options: readonly (readonly [T, string])[], valu
 const PERFORMANCE_VIEWS = [["STATISTICS", "Trade statistics"], ["EQUITY", "Equity curve"]] as const;
 const MARKET_VIEWS = [["RRG", "RRG"], ["TREND", "Trend rotation"], ["DISPERSION", "Dispersion"], ["RATIOS", "Premium ratios"], ["HEATMAP", "ATM heat map"], ["STRADDLE", "ATM straddle & OI"], ["WHEEL", "Sector wheel"]] as const;
 
-type Lane = "MACD" | "LANES" | "SPOT" | "BLAST" | "AUCTION" | "AGENT" | "AGENTIC" | "VANGUARD" | "CBE";
+type Lane = "MACD" | "SCORE" | "LANES" | "SPOT" | "BLAST" | "AUCTION" | "AGENT" | "AGENTIC" | "VANGUARD" | "CBE";
 type MacdView = "TERMINAL" | Exclude<LedgerTab, "STATISTICS"> | "PERFORMANCE" | "QUANT" | "MARKET" | "STATUS";
-const LANES = [["MACD", "MACD lane"], ["LANES", "Smart lanes"], ["SPOT", "Spot MACD"], ["BLAST", "Blast lane"], ["AUCTION", "Auction desk"], ["AGENT", "Option agent"], ["AGENTIC", "Agentic lane"], ["VANGUARD", "Vanguard"], ["CBE", "CBE"]] as const;
+const LANES = [["MACD", "MACD lane"], ["SCORE", "Scoreboard"], ["LANES", "Smart lanes"], ["SPOT", "Spot MACD"], ["BLAST", "Blast lane"], ["AUCTION", "Auction desk"], ["AGENT", "Option agent"], ["AGENTIC", "Agentic lane"], ["VANGUARD", "Vanguard"], ["CBE", "CBE"]] as const;
 const MACD_VIEWS = [["TERMINAL", "Terminal"], ["PORTFOLIO", "Portfolio"], ["STATUS", "Status"], ["ORDERS", "Orders"], ["TRADES", "Trades"], ["PERFORMANCE", "Performance"],
   ["SIGNALS", "Signals"], ["QUANT", "Quant analytics"], ["MARKET", "Market breadth"]] as const;
 const AUCTION_VIEWS = [["AUCTION", "Desk"], ["PROFILE", "Profile / Flow"], ["WORKSTATION", "Live workstation"]] as const;
@@ -777,4 +779,22 @@ function compareWatch(a: SpotWatchRow | OptionWatchRow, b: SpotWatchRow | Option
   };
   const av = value(a); const bv = value(b);
   return typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv), undefined, { numeric: true });
+}
+
+/** Telegram alert health and rejected exits backing off, in the header (review 3 Nov 2026: a 403 went unseen). */
+function AlertChips({ health }: { health?: HealthInfo }) {
+  const alerts = health?.alerts;
+  const exits = health?.exit_failures ?? [];
+  if (!alerts && !exits.length) return null;
+  const failing = !!alerts?.last_error || !!alerts?.chat_is_bot;
+  const text = !alerts ? "" : !alerts.configured ? "Alerts off" : alerts.chat_is_bot ? "Alerts misconfigured" : failing ? "Alerts failing" : alerts.sent_total ? "Alerts ok" : "Alerts idle";
+  const title = !alerts ? "" : !alerts.configured ? "Telegram bot token or chat id not set: no alert can be sent"
+    : alerts.chat_is_bot ? "The Telegram chat id is the bot's own id, so Telegram refuses every alert (HTTP 403). Set your own chat id in Settings."
+    : failing ? `Last Telegram send failed: ${alerts.last_error}` : alerts.sent_total ? `${alerts.sent_total} sent since start · last: ${alerts.last_message ?? ""}`
+    : "Telegram configured; nothing has needed an alert since the engine started";
+  return <>
+    {text && <span className={`mode${failing || !alerts?.configured ? " alert" : ""}`} title={title}>{text}</span>}
+    {exits.length > 0 && <span className="mode alert" title={exits.slice(0, 8).map((row) => `${row.lane} ${row.symbol}: ${row.reason ?? "exit"} rejected ${row.count}× since ${row.first_at} — ${row.error}`).join("\n")}>
+      {exits.length} exit{exits.length > 1 ? "s" : ""} backing off</span>}
+  </>;
 }

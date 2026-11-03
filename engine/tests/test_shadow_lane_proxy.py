@@ -14,12 +14,16 @@ def proxy(monkeypatch, handler):
     path = Path(__file__).resolve().parents[1] / "src/macd_trader/app.py"
     tree = ast.parse(path.read_text())
     function = next(n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_shadow_lane_read")
+    trim = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_trim_shadow_journal"
+            or isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "SHADOW_DETAIL_MAX_BYTES"]
     real_client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
     monkeypatch.setenv("MACD_SHADOW_LANES_URL", "http://shadow-lanes:8430/")
     import os
-    namespace = dict(os=os, HTTPException=HTTPException, engine=SimpleNamespace(settings=SimpleNamespace(api_token="test-only")))
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    import json
+    namespace = dict(os=os, json=json, HTTPException=HTTPException,
+                     engine=SimpleNamespace(settings=SimpleNamespace(api_token="test-only")))
+    exec(compile(ast.Module(body=[*trim, function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_shadow_lane_read"]
 
 
@@ -77,3 +81,15 @@ def test_retained_proxy_forwards_only_authenticated_reads_and_scope(monkeypatch)
     for invalid in ('orders','https://other.example/api','vanguard/../orders'):
         with pytest.raises(HTTPException):asyncio.run(read(invalid,request))
     assert len(seen)==1
+
+
+def test_an_oversized_journal_detail_is_trimmed_for_the_live_view_only(monkeypatch):
+    big = {"reason": "readiness", "blockers": [f"b{k}" for k in range(50)], "universe": ["x" * 100] * 1000, "ok": True}
+    body = {"journal": [{"at": "t1", "kind": "readiness", "detail": big}, {"at": "t2", "kind": "x", "detail": {"reason": "r"}}]}
+    read = proxy(monkeypatch, lambda request: httpx.Response(200, json=body))
+    live = asyncio.run(read("cbe"))
+    detail = live["journal"][0]["detail"]
+    assert detail["reason"] == "readiness" and detail["ok"] is True and len(detail["blockers"]) == 20
+    assert "universe" not in detail and detail["detail_truncated_bytes"] > 100_000
+    assert live["journal"][1]["detail"] == {"reason": "r"}
+    assert "universe" in asyncio.run(read("cbe", archive=True))["journal"][0]["detail"]

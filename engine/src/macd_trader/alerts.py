@@ -11,6 +11,7 @@ carries the one-line read; the evidence stays on the dashboard.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from contextlib import suppress
 from datetime import datetime
@@ -169,12 +170,21 @@ class AlertManager:
             self.last_error = str(exc)
         return key
 
+    @property
+    def chat_is_bot(self) -> bool:
+        """The chat id is the bot's own id (the token's prefix): Telegram refuses with 403, the 3 Nov 2026 state."""
+        settings = self.engine.settings
+        token, chat = str(settings.telegram_bot_token or ""), str(settings.telegram_chat_id or "").strip()
+        return bool(token and chat) and chat == token.split(":", 1)[0]
+
     def status(self) -> dict:
         return {
             "configured": self.configured,
+            "chat_is_bot": self.chat_is_bot,
             "sent_total": self.sent_total,
             "last_message": self.last_message,
-            "last_error": self.last_error,
+            # An HTTP error string can quote the request URL, which carries the bot token.
+            "last_error": re.sub(r"bot\d+:[\w-]+", "bot<redacted>", self.last_error) if self.last_error else None,
             "active_cooldowns": sorted(self._last_sent),
         }
 

@@ -96,6 +96,7 @@ class Order:
     signal_id: str | None = None
     created_at: datetime = field(default_factory=utc_now)
     order_id: str = field(default_factory=lambda: uuid4().hex)
+    reject_reason: str | None = None     # why a REJECTED order failed (recorded from 4 Nov 2026)
 
 
 @dataclass(slots=True)
