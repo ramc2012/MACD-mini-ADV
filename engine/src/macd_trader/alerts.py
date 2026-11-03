@@ -11,9 +11,12 @@ carries the one-line read; the evidence stays on the dashboard.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import time
 from contextlib import suppress
+from pathlib import Path
 from datetime import datetime
 from datetime import time as dtime
 from zoneinfo import ZoneInfo
@@ -44,6 +47,35 @@ class AlertManager:
         self.sent_total = 0
         self.last_message: str | None = None
         self.last_error: str | None = None
+        self.last_result_at: str | None = None
+        self._restore_result()
+
+    # The last send's outcome survives a restart (owner's review, 3 Nov 2026: a 403 from a wrong chat id was
+    # invisible because a restart forgot it and nothing fired again until the next fault). Kept per chat id, so
+    # entering a new one clears it. Never holds the token.
+    def _result_path(self) -> Path | None:
+        runtime = getattr(self.engine.settings, "runtime_settings_path", None)
+        return Path(runtime).parent / "alerts_status.json" if runtime else None
+
+    def _chat_key(self) -> str:
+        return hashlib.sha256(str(self.engine.settings.telegram_chat_id or "").encode()).hexdigest()[:12]
+
+    def _restore_result(self) -> None:
+        try:
+            path = self._result_path()
+            row = json.loads(path.read_text()) if path and path.exists() else {}
+        except (OSError, ValueError):
+            return
+        if row.get("chat") == self._chat_key():
+            self.last_error, self.last_result_at = row.get("last_error"), row.get("at")
+
+    def _save_result(self) -> None:
+        path = self._result_path()
+        if path is None:
+            return
+        with suppress(OSError):
+            path.write_text(json.dumps({"chat": self._chat_key(), "last_error": self.status()["last_error"],
+                                        "at": self.last_result_at}))
 
     @property
     def configured(self) -> bool:
@@ -168,6 +200,8 @@ class AlertManager:
             self.last_error = None
         except Exception as exc:  # noqa: BLE001
             self.last_error = str(exc)
+        self.last_result_at = datetime.now(IST).isoformat(timespec="seconds")
+        await asyncio.to_thread(self._save_result)
         return key
 
     @property
@@ -183,6 +217,7 @@ class AlertManager:
             "chat_is_bot": self.chat_is_bot,
             "sent_total": self.sent_total,
             "last_message": self.last_message,
+            "last_result_at": self.last_result_at,
             # An HTTP error string can quote the request URL, which carries the bot token.
             "last_error": re.sub(r"bot\d+:[\w-]+", "bot<redacted>", self.last_error) if self.last_error else None,
             "active_cooldowns": sorted(self._last_sent),
