@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { requestJson } from "./requestJson";
 import { API_TOKEN, API_URL } from "./runtime";
+import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
+import { EquityChart } from "./LaneEquityChart";
+import { fillMarkers } from "./laneChartMarks";
+import type { ClosedPosition, Trade as Fill } from "./types";
 
 // The agentic lane: a Grok-run paper options book. Every cycle the model reads the market and the book and
 // answers with actions and its reasoning; code validates and executes them. This page shows the book with
@@ -242,6 +246,9 @@ export function AgenticPage() {
   const [days, setDays] = useState<string[]>([]);
   const [day, setDay] = useState("");
   const [equity, setEquity] = useState<{ at: string; equity: number }[]>([]);
+  const [fills, setFills] = useState<Fill[]>([]);
+  const [closed, setClosed] = useState<ClosedPosition[]>([]);
+  const [focus, setFocus] = useState<{ list: LaneChartFocus[]; index: number }>();
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState("");
@@ -254,6 +261,9 @@ export function AgenticPage() {
         requestJson<{ equity: { at: string; equity: number }[] }>(`${API_URL}/api/agentic/equity`, { headers: headers() }),
       ]);
       setSnap(s); setCycles(c.cycles); setDays(c.days); setEquity(e.equity); setError("");
+      // Fills only feed the chart markers; an older backend without the route leaves them empty.
+      requestJson<{ trades: Fill[]; closed_positions: ClosedPosition[] }>(`${API_URL}/api/agentic/book`, { headers: headers() })
+        .then((book) => { setFills(book.trades); setClosed(book.closed_positions); }).catch(() => undefined);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unavailable");
     }
@@ -321,6 +331,11 @@ export function AgenticPage() {
         <span>{h?.cycles_today ?? 0} cycles today · next {hhmm(h?.next_cycle_at)}{h?.pending_triggers?.length ? ` · trigger: ${h.pending_triggers.join("; ")}` : ""}</span></div>
     </div>
 
+    <div className="panel agentic-section lane-equity">
+      <div className="panel-title">Equity and drawdown <small>hover for the IST time, equity, return and fall from the peak</small></div>
+      <EquityChart points={equity} capital={snap?.capital ?? 0} height={230} />
+    </div>
+
     <MatrixPanel />
 
     {(snap?.triggers || []).length > 0 && <div className="panel agentic-section">
@@ -334,12 +349,17 @@ export function AgenticPage() {
     </div>}
 
     <div className="panel agentic-section">
-      <div className="panel-title">Open positions ({p?.positions.filter((x) => x.quantity > 0).length ?? 0})</div>
+      <div className="panel-title">Open positions ({p?.positions.filter((x) => x.quantity > 0).length ?? 0}) <small>click a contract for its chart</small></div>
       {p && p.positions.filter((x) => x.quantity > 0).length === 0 && <div className="agentic-empty">Flat.</div>}
       {p && p.positions.some((x) => x.quantity > 0) && <table className="ledger-table agentic-table"><thead><tr>
         <th>Contract</th><th>Lots</th><th>Avg → now</th><th>P&amp;L</th><th>Best / worst</th><th>Stop / target</th><th>Thesis and latest comment</th><th></th></tr></thead>
-        <tbody>{p.positions.filter((x) => x.quantity > 0).map((row) => <tr key={row.symbol}>
-          <td><b>{row.symbol.split(":")[1]}</b><small>{row.expiry ? ` exp ${row.expiry.slice(5)}` : ""}{row.booked ? " · half booked" : ""}</small>
+        <tbody>{p.positions.filter((x) => x.quantity > 0).map((row, index, open) => <tr key={row.symbol}>
+          <td className="openable-row" onClick={() => setFocus({ index, list: open.map((x) => ({ symbol: x.symbol, title: x.symbol.split(":")[1],
+            subtitle: `${x.lots} lots @ ₹${x.average_price.toFixed(2)}${x.setup ? ` · ${x.setup.replace(/_/g, " ")}` : ""}`,
+            markers: fillMarkers(fills, x.symbol, x.opened_at ?? undefined),
+            levels: [{ price: x.average_price, label: "Avg", tone: "avg" as const },
+              ...(x.stop_premium ? [{ price: x.stop_premium, label: "Stop", tone: "stop" as const }] : []),
+              ...(x.target_premium ? [{ price: x.target_premium, label: "Target", tone: "target" as const }] : [])] })) })}><b>{row.symbol.split(":")[1]}</b><small>{row.expiry ? ` exp ${row.expiry.slice(5)}` : ""}{row.booked ? " · half booked" : ""}</small>
             <small>{row.horizon || "intraday"}{row.setup ? ` · ${row.setup.replace(/_/g, " ")}` : ""}{row.grade ? ` · grade ${row.grade}` : ""}{row.invalidation_level ? ` · wrong past ${row.invalidation_level}` : ""}</small></td>
           <td>{row.lots}</td>
           <td>{row.average_price.toFixed(2)} → {row.last_price.toFixed(2)}</td>
@@ -351,6 +371,19 @@ export function AgenticPage() {
             onClick={() => { if (window.confirm(`Close ${row.symbol} (${row.lots} lots) at market? (paper)`)) void post("/api/agentic/close-position", { symbol: row.symbol, expected_quantity: row.quantity }, row.symbol); }}>Close</button></td>
         </tr>)}</tbody></table>}
     </div>
+
+    {closed.length > 0 && <div className="panel agentic-section">
+      <div className="panel-title">Closed recently ({closed.length}) <small>click a row for its chart</small></div>
+      <table className="ledger-table agentic-table"><thead><tr><th>Contract</th><th>Lots</th><th>Entry → exit</th><th>P&amp;L</th><th>Best / worst</th><th>Exit reason</th></tr></thead>
+        <tbody>{closed.map((row, index) => <tr key={row.closed_id} className="openable-row" onClick={() => setFocus({ index, list: closed.map((x) => ({
+          symbol: x.symbol, title: x.symbol.split(":")[1], subtitle: `${x.lots} lots · ${(x.exit_reason || "").replace(/_/g, " ").toLowerCase()} ${pct(x.return_pct)}`,
+          markers: fillMarkers(fills, x.symbol, x.entry_time, x.exit_time) })) })}>
+          <td><b>{row.symbol.split(":")[1]}</b>{row.partial && <small> part</small>}</td><td>{row.lots}</td>
+          <td>{row.entry_price.toFixed(2)} → {row.exit_price.toFixed(2)}</td>
+          <td className={tone(row.realized_pnl)}>{rupees(row.realized_pnl)}<small> {pct(row.return_pct)}</small></td>
+          <td>{pct(row.max_return_pct ?? undefined, 0)} / {pct(row.min_return_pct ?? undefined, 0)}</td>
+          <td>{(row.exit_reason || "—").replace(/_/g, " ").toLowerCase()}</td></tr>)}</tbody></table>
+    </div>}
 
     {(snap?.setups || []).length > 0 && <div className="panel agentic-section">
       <div className="panel-title">Setup scoreboard — what the lane is learning</div>

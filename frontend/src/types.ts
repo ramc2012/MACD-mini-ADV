@@ -9,7 +9,9 @@ export type Candle = {
   closed: boolean;
 };
 
-export type ChartMarker = { timestamp: number; price: number; label: string; tone?: "entry" | "stop" | "signal" };
+export type ChartMarker = { timestamp: number; price: number; label: string; tone?: "entry" | "stop" | "signal" | "add" | "exit" | "exit_loss" };
+// A position's working prices drawn across the chart: average cost, hard stop, trail, target.
+export type ChartLevel = { price: number; label: string; tone: "avg" | "stop" | "trail" | "target" };
 
 export type Tick = { symbol: string; ltp: number; volume: number; prev_close?: number; change?: number; change_pct?: number; timestamp: string };
 export type SpotWatchRow = { symbol: string; tick?: Tick; indicator?: Indicator };

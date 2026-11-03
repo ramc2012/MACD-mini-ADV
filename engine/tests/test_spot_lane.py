@@ -11,6 +11,7 @@ from macd_trader.config import Settings
 from macd_trader.events import EventHub
 from macd_trader.execution import ExitRetryWait
 from macd_trader.models import Signal
+from macd_trader.smart_lane import hold_until
 from macd_trader.spot_lane import SpotLane, staged_levels
 
 SYMBOL = "NSE:SBIN-EQ"
@@ -42,6 +43,16 @@ def enter(lane, price=2500.0, symbol=SYMBOL):
     asyncio.run(lane.step(T0 + timedelta(seconds=2)))
     lane.flush_journal()
     return lane.portfolio.positions.get(symbol)
+
+
+def settle(position, sessions=3):
+    """Back-date the entry so the minimum hold has passed but the 5-session limit has not."""
+    now = datetime.now(UTC)
+    opened = now - timedelta(days=1)
+    while hold_until(opened, sessions) > now:
+        opened -= timedelta(days=1)
+    assert hold_until(opened, 5) > now
+    position.opened_at = opened
 
 
 def tick(lane, price, symbol=SYMBOL):
@@ -119,7 +130,7 @@ class TestExits:
 
     def test_thirds_come_out_at_three_five_and_seven_and_a_half_percent(self, tmp_path):
         lane = build(tmp_path)
-        enter(lane)                                     # 40 shares at 2500
+        settle(enter(lane))                             # 40 shares at 2500, past the minimum hold
         tick(lane, 2575.0)
         assert lane.portfolio.positions[SYMBOL].quantity == 27
         tick(lane, 2625.0)
@@ -130,7 +141,7 @@ class TestExits:
 
     def test_the_trail_arms_at_three_percent_and_gives_back_two_and_a_half(self, tmp_path):
         lane = build(tmp_path, spot_staged_exits_csv="0.5")
-        enter(lane)
+        settle(enter(lane))
         tick(lane, 2600.0)                              # +4%: trail at 2535
         position = lane.portfolio.positions[SYMBOL]
         assert position.trailing_stop == pytest.approx(2535.0)
@@ -140,27 +151,48 @@ class TestExits:
 
     def test_macd_below_zero_closes_only_a_position_that_never_worked(self, tmp_path):
         lane = build(tmp_path)
-        enter(lane)
-        enter(lane, 1000.0, "NSE:INFY-EQ")
+        settle(enter(lane))
+        settle(enter(lane, 1000.0, "NSE:INFY-EQ"))
         tick(lane, 1011.0, "NSE:INFY-EQ")               # INFY's best +1.1%: earned the ladder
         assert asyncio.run(lane.execution.on_closed_bar("NSE:INFY-EQ", -0.5)) is False
         assert asyncio.run(lane.execution.on_closed_bar(SYMBOL, -0.5)) is True
         assert SYMBOL not in lane.portfolio.positions and "NSE:INFY-EQ" in lane.portfolio.positions
 
-    def test_the_hold_limit_is_twenty_sessions(self, tmp_path):
+    def test_inside_the_minimum_hold_only_the_hard_stop_acts(self, tmp_path):
+        lane = build(tmp_path)
+        position = enter(lane)                          # opened now: inside the first 3 sessions
+        tick(lane, 2700.0)                              # +8%: past every third and the trail's arming
+        assert position.quantity == 40 and position.trailing_stop is not None
+        tick(lane, 2550.0)                              # below the trail (2632.5): it waits
+        assert asyncio.run(lane.execution.on_closed_bar(SYMBOL, -0.5)) is False
+        assert lane.portfolio.positions[SYMBOL].quantity == 40
+        tick(lane, 2425.0)                              # the 3% stop always acts
+        assert SYMBOL not in lane.portfolio.positions
+        assert lane.trades()[0]["exit_reason"] == "HARD_STOP_3_PCT"
+
+    def test_after_the_minimum_hold_the_tracked_trail_fires(self, tmp_path):
+        lane = build(tmp_path, spot_staged_exits_csv="0.5")
+        position = enter(lane)
+        tick(lane, 2600.0)                              # best +4% while held: trail 2535, not yet live
+        tick(lane, 2540.0)
+        settle(position)
+        tick(lane, 2530.0)
+        assert lane.trades()[0]["exit_reason"] == "TRAILING_STOP_2.5_PCT"
+
+    def test_the_hold_limit_is_five_sessions(self, tmp_path):
         lane = build(tmp_path)
         position = enter(lane)
         position.opened_at = datetime.now(UTC) - timedelta(days=40)
         tick(lane, 2510.0)
         assert SYMBOL not in lane.portfolio.positions
-        assert lane.trades()[0]["exit_reason"] == "HOLD_LIMIT_20_SESSIONS"
+        assert lane.trades()[0]["exit_reason"] == "HOLD_LIMIT_5_SESSIONS"
 
     def test_a_restart_restores_the_book_and_its_stage(self, tmp_path):
-        lane = build(tmp_path)
+        lane = build(tmp_path, spot_min_hold_sessions=0)      # back-dating would change the position id
         enter(lane)
         tick(lane, 2575.0)
         lane.repository.save_position_excursions(list(lane.portfolio.positions.values()))
-        again = build(tmp_path)
+        again = build(tmp_path, spot_min_hold_sessions=0)
         position = again.portfolio.positions[SYMBOL]
         assert position.quantity == 27 and position.exit_stage == 1 and position.entry_stage == 40
         assert again.meta[SYMBOL]["source"] == "macd"

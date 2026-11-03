@@ -1,15 +1,15 @@
 import { useEffect, useRef } from "react";
 import { TradingChart, type ChartSource, type PriceStyle } from "./Chart";
 import type { CloseStudy } from "./chartMath";
-import type { AuctionContext, Candle, ChartLayers, ChartMarker, Indicator, PaneCollapse } from "./types";
+import type { AuctionContext, Candle, ChartLayers, ChartLevel, ChartMarker, Indicator, PaneCollapse } from "./types";
 
 type PositionAudit = { signalTime?: string; signalPrice?: number; macd?: number; fillLatencyMs?: number; message?: string; intrabar?: boolean };
 type PositionFocus = { position: { symbol: string; entryTime: string; entryPrice: number; audit?: PositionAudit }; list: { symbol: string; entryTime: string; entryPrice: number }[]; index: number };
 type ChartPeriod = "1D" | "5D" | "1M" | "3M" | "ALL";
 const periods: ChartPeriod[] = ["1D", "5D", "1M", "3M", "ALL"];
 
-export function PositionChartModal({ focus, candles, current, indicators, studies, markers, error, timeframe, period, layers, references, paneCollapse, priceStyle, source, onPriceStyle, onPeriod, onPrevious, onNext, onClose }: {
-  focus: PositionFocus; candles: Candle[]; current?: Candle; indicators: Indicator[]; studies: CloseStudy[]; markers: ChartMarker[]; error?: string; timeframe?: number; period: ChartPeriod;
+export function PositionChartModal({ focus, levels, candles, current, indicators, studies, markers, error, timeframe, period, layers, references, paneCollapse, priceStyle, source, onPriceStyle, onPeriod, onPrevious, onNext, onClose }: {
+  focus: PositionFocus; levels?: ChartLevel[]; candles: Candle[]; current?: Candle; indicators: Indicator[]; studies: CloseStudy[]; markers: ChartMarker[]; error?: string; timeframe?: number; period: ChartPeriod;
   layers?: ChartLayers; references?: AuctionContext; paneCollapse?: PaneCollapse; priceStyle: PriceStyle; source?: ChartSource;
   onPriceStyle: (style: PriceStyle) => void;
   onPeriod: (period: ChartPeriod) => void; onPrevious: () => void; onNext: () => void; onClose: () => void;
@@ -68,7 +68,7 @@ export function PositionChartModal({ focus, candles, current, indicators, studie
           <button className="position-chart-close" aria-label="Close position chart" onClick={onClose}>×</button>
         </div>
       </div>
-      <div className="position-chart-body"><TradingChart candles={candles} current={current} indicators={indicators} studies={studies} markers={markers} error={error} fitKey={`${focus.position.symbol}:${timeframe}:${period}`} timeframe={timeframe} layers={layers} references={references} paneCollapse={paneCollapse} priceStyle={priceStyle} source={source} /></div>
+      <div className="position-chart-body"><TradingChart candles={candles} current={current} indicators={indicators} studies={studies} markers={markers} levels={levels} error={error} fitKey={`${focus.position.symbol}:${timeframe}:${period}`} timeframe={timeframe} layers={layers} references={references} paneCollapse={paneCollapse} priceStyle={priceStyle} source={source} /></div>
     </section>
   </div>;
 }

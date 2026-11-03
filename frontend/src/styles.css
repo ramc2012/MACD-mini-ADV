@@ -1340,3 +1340,41 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .ledger-day-toggle b { color: #d7e3f4; }
 .ledger-day-toggle button { border: 1px solid #2a3a52; border-radius: 10px; background: #0f1826; color: #9fc3ff; padding: 3px 9px; font-size: 10px; cursor: pointer; }
 .ledger-day-toggle button:hover { background: #172539; }
+
+/* Lane charts (LaneChart.tsx, LaneEquityChart.tsx): one chart and toolbar for every lane page. */
+.lane-chart { display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; min-height: 360px; min-width: 0; }
+.lane-chart > .chart-stack { height: 100%; min-height: 0; overflow: hidden; }
+.lane-chart-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px; border-bottom: 1px solid #1b2433; }
+.lane-chart-key { display: flex; flex-wrap: wrap; gap: 10px; margin-left: auto; color: #8796aa; font-size: 10px; }
+.lane-chart-key i { font-style: normal; white-space: nowrap; }
+.lane-chart-key .k-entry, .lane-chart-key .k-avg { color: #4da3ff; }
+.lane-chart-key .k-exit, .lane-chart-key .k-trail { color: #ffad42; }
+.lane-chart-key .k-loss, .lane-chart-key .k-stop { color: #f15b6c; }
+.lane-chart-key .k-target { color: #22c893; }
+.lane-chart-modal .position-chart-body { min-height: 0; }
+.lane-chart-modal .lane-chart { height: 100%; }
+.lane-chart-modal .chart-controls { display: flex; align-items: center; gap: 8px; }
+.lane-chart-inline { height: 460px; }
+.equity-chart { position: relative; width: 100%; min-height: 140px; }
+.equity-chart-canvas { position: absolute; inset: 0; }
+.equity-chart-legend { position: absolute; top: 6px; left: 8px; z-index: 2; pointer-events: none; display: flex; flex-wrap: wrap; gap: 4px 12px; max-width: calc(100% - 90px); }
+.equity-chart-legend s, .returns-legend s { display: inline-block; width: 10px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; text-decoration: none; }
+.returns-legend { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0 8px; }
+.returns-legend button { display: inline-flex; align-items: center; gap: 2px; padding: 3px 8px; border: 1px solid #263144; border-radius: 4px; background: transparent; color: #687990; font-size: 11px; cursor: pointer; }
+.returns-legend button.active { color: #dfe7f2; border-color: #3a4b66; background: #111a27; }
+.returns-legend button:disabled { cursor: not-allowed; opacity: .5; }
+.lane-equity { padding: 4px 0 0; }
+/* Spot MACD lane: the MACD/Blast layout. */
+.spot-page .blast-metrics { grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.spot-terminal { padding: 0; height: calc(100vh - 290px); min-height: 520px; grid-template-columns: minmax(260px, 24%) minmax(0, 1fr); }
+.spot-terminal > .chart { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.spot-terminal > .chart > .panel-title { height: auto; min-height: 36px; flex-wrap: wrap; gap: 8px; }
+.spot-watch-row { display: grid; grid-template-columns: 1fr auto auto; gap: 2px 10px; width: 100%; padding: 7px 11px; border: 0; border-bottom: 1px solid #151d29; background: transparent; color: #c7d3e2; text-align: left; cursor: pointer; font-size: 12px; font-variant-numeric: tabular-nums; }
+.spot-watch-row small { grid-column: 1 / -1; color: #687990; font-size: 10px; }
+.spot-watch-row:hover { background: #101826; }
+.spot-watch-row.active { background: #132034; box-shadow: inset 2px 0 #4da3ff; }
+.spot-status { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 8px; }
+.spot-status th { width: 150px; color: #8796aa; text-align: left; font-weight: 500; vertical-align: top; }
+.spot-status td { white-space: normal; }
+@media (max-width: 1380px) { .spot-page .blast-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+@media (max-width: 900px) { .spot-terminal { grid-template-columns: 1fr; height: auto; } .spot-terminal > .chart { height: 520px; } }

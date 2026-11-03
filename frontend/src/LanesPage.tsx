@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { curvePath, rupees, tone } from "./agentMath";
-import type { Tick } from "./types";
+import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
+import { EquityChart, type EquityPoint } from "./LaneEquityChart";
+import { fillMarkers, positionLevels } from "./laneChartMarks";
+import type { Tick, Trade as Fill } from "./types";
 import { currentSmartBook } from "./laneMarks";
 import { API_TOKEN, API_URL } from "./runtime";
 
@@ -62,7 +65,9 @@ function LaneCard({ summary, active, curve, onSelect }: { summary: Summary; acti
 export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; portfolios: Record<string, any> }) {
   const [lanes, setLanes] = useState<Summary[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, Snapshot>>({});
-  const [curves, setCurves] = useState<Record<string, number[]>>({});
+  const [curves, setCurves] = useState<Record<string, EquityPoint[]>>({});
+  const [fills, setFills] = useState<Fill[]>([]);
+  const [focus, setFocus] = useState<{ list: LaneChartFocus[]; index: number }>();
   const [selected, setSelected] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [trades, setTrades] = useState<Trade[]>([]);
@@ -81,7 +86,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
       setSnapshots(Object.fromEntries(books));
       setSelected((current) => current ?? index.lanes[0]?.lane ?? null);
       const pairs = await Promise.all(index.lanes.map(async (lane) =>
-        [lane.lane, (await call<{ equity: { equity: number }[] }>(`/api/lanes/${lane.lane}/equity`)).equity.map((p) => p.equity)] as const));
+        [lane.lane, (await call<{ equity: EquityPoint[] }>(`/api/lanes/${lane.lane}/equity`)).equity] as const));
       setCurves(Object.fromEntries(pairs));
       setError(null);
     } catch (exc) { setError(String(exc instanceof Error ? exc.message : exc)); }
@@ -102,6 +107,12 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
     } catch (exc) { setError(String(exc instanceof Error ? exc.message : exc)); }
   }, [selected, day, decision]);
 
+  // The lane's own fills, for the position charts' buy / sell markers.
+  const loadFills = useCallback(async () => {
+    if (!selected) return;
+    try { setFills((await call<{ trades: Fill[] }>(`/api/lanes/${selected}/book?limit=3000`)).trades); } catch { /* markers only */ }
+  }, [selected]);
+  useEffect(() => { setFills([]); void loadFills(); const id = window.setInterval(loadFills, 20_000); return () => window.clearInterval(id); }, [loadFills]);
   useEffect(() => { void loadIndex(); const id = window.setInterval(loadIndex, 15_000); return () => window.clearInterval(id); }, [loadIndex]);
   useEffect(() => { void loadLane(); const id = window.setInterval(loadLane, 5_000); return () => window.clearInterval(id); }, [loadLane]);
 
@@ -111,6 +122,12 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
     lane.lane===selected&&snapshot?.lane===selected?snapshot:snapshots[lane.lane],portfolios[lane.lane],ticks)]));
   const marked = selected ? books[selected] : null;
   const positions: Position[] = marked?.positions || [];
+  const openPosition = (index: number) => setFocus({ index, list: positions.map((p) => ({
+    symbol: p.symbol, title: short(p.symbol), subtitle: `${p.lots} lots @ ₹${p.average_price.toFixed(2)} · ${p.source} · opened ${when(p.opened_at)}`,
+    markers: fillMarkers(fills, p.symbol, p.opened_at), levels: positionLevels(p) })) });
+  const openClosed = (index: number) => setFocus({ index, list: trades.map((t) => ({
+    symbol: t.symbol, title: short(t.symbol), subtitle: `${t.lots} lots @ ₹${t.entry_price.toFixed(2)} · ${(t.exit_reason || "").replace(/_/g, " ").toLowerCase()} ${percent(t.return_pct)} · ${when(t.entry_time)} → ${when(t.exit_time)}`,
+    markers: fillMarkers(fills, t.symbol, t.entry_time, t.exit_time) })) });
   return <div className="agent-page lanes-page">
     <div className="agent-head panel-row">
       <div><b>Smart lanes · local intelligence</b><span className="agent-sub">MACD signals · paper only · Qwen independent</span></div>
@@ -128,21 +145,25 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
       const book=books[lane.lane];
       const summary=book?{...lane,equity:book.equity,cash:book.cash,unrealized:book.unrealized_pnl,
         realized:book.realized_pnl??lane.realized,open_positions:book.positions.length,return_pct:(book.equity/lane.capital-1)*100}:lane;
-      return <LaneCard key={lane.lane} summary={summary} active={lane.lane===selected} curve={curves[lane.lane]||[]} onSelect={()=>setSelected(lane.lane)}/>;
+      return <LaneCard key={lane.lane} summary={summary} active={lane.lane===selected} curve={(curves[lane.lane]||[]).map((p)=>p.equity)} onSelect={()=>setSelected(lane.lane)}/>;
     })}
       {lanes.length === 0 && !error && <div className="agent-empty">No smart lanes configured.</div>}</div>
 
     {selected && <>
+      <section className="panel agent-panel lane-equity">
+        <div className="panel-title">{label(selected)} — equity and drawdown <small>hover for the IST time, equity, return and fall from the peak</small></div>
+        <EquityChart points={curves[selected] || []} capital={lanes.find((l) => l.lane === selected)?.capital ?? 0} height={240} />
+      </section>
       <section className="panel agent-panel">
-        <div className="panel-title">{label(selected)} — open positions ({positions.length})</div>
+        <div className="panel-title">{label(selected)} — open positions ({positions.length}) <small>click a row for its chart</small></div>
         {positions.length === 0 ? <div className="agent-empty">Nothing open.</div> :
           <div className="live-table-wrap"><table className="live-table agent-table"><thead><tr>
             <th>Contract</th><th>Source</th><th>Lots</th><th>Avg</th><th>LTP</th><th>P&amp;L</th><th>Stop</th><th>Trail</th><th>Target</th><th>Hold until</th><th>Score</th><th>Size×</th><th>Opened</th>
-          </tr></thead><tbody>{positions.map((p) => {
+          </tr></thead><tbody>{positions.map((p, index) => {
             const tick = ticks[p.symbol];
             const ltp = tick && tick.ltp > 0 ? tick.ltp : p.last_price;
             const ret = (ltp / p.average_price - 1) * 100;
-            return <tr key={p.symbol}>
+            return <tr key={p.symbol} className="openable-row" onClick={() => openPosition(index)}>
               <td>{short(p.symbol)}<small> {p.expiry ? `exp ${p.expiry.slice(5)}` : ""}</small></td><td>{p.source}</td><td>{p.lots}</td>
               <td>{p.average_price.toFixed(2)}</td><td>{ltp.toFixed(2)}</td>
               <td className={tone(ret)}>{percent(ret)}<small> {rupees((ltp - p.average_price) * p.quantity)}</small></td>
@@ -154,11 +175,11 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
 
       <div className="agent-bottom">
         <section className="panel agent-panel">
-          <div className="panel-title">Closed trades ({trades.length})</div>
+          <div className="panel-title">Closed trades ({trades.length}) <small>click a row for its chart</small></div>
           {trades.length === 0 ? <div className="agent-empty">No closed trades yet.</div> :
             <div className="live-table-wrap lane-scroll"><table className="live-table agent-table"><thead><tr>
               <th>Contract</th><th>Source</th><th>Entry</th><th>Exit</th><th>Lots</th><th>P&amp;L</th><th>Return</th><th>Peak</th><th>Exit reason</th>
-            </tr></thead><tbody>{trades.map((t) => <tr key={t.position_id}>
+            </tr></thead><tbody>{trades.map((t, index) => <tr key={t.position_id} className="openable-row" onClick={() => openClosed(index)}>
               <td>{short(t.symbol)}</td><td>{t.source}</td><td>{when(t.entry_time)}</td><td>{when(t.exit_time)}</td><td>{t.lots}</td>
               <td className={tone(t.pnl)}>{rupees(t.pnl)}</td><td className={tone(t.return_pct)}>{percent(t.return_pct)}</td>
               <td>{percent(t.max_return_pct)}</td><td>{(t.exit_reason || "—").replace(/_/g, " ").toLowerCase()}{t.closed ? "" : " (part)"}</td>
@@ -182,5 +203,6 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
         </section>
       </div>
     </>}
+    {focus && <LaneChartModal list={focus.list} index={focus.index} onIndex={(index) => setFocus((old) => old && { ...old, index })} onClose={() => setFocus(undefined)} />}
   </div>;
 }

@@ -9,8 +9,10 @@ Exits are the MACD lane's option ladder scaled to spot by 1/10 (research/spot_ma
 - hard stop 3% below the entry;
 - a third out at +3%, a third at +5%, the rest at +7.5%;
 - a 2.5% trail once the best is +3%, never below breakeven;
-- MACD closing a bar below zero while the best was under +1% (the MACD lane's invalidation, scaled);
-- a 20-session hold limit (15:25 on the 20th session).
+- MACD closing a bar below zero while the best was under +1% (the MACD lane's invalidation, scaled).
+Owner, later on 3 Nov 2026: "start with 50L capital. hold time 3-5 days". So the book is Rs 50 L, and a position is
+held 3 to 5 sessions: until 15:25 on the 3rd session after entry only the hard stop can close it (the trail keeps
+tracking the best price but does not fire; thirds and the MACD exit wait), and it is out at 15:25 on the 5th.
 Positions carry overnight. Paper fills ignore delivery charges (about 0.25% round trip in the research).
 
 The research found no edge over random entries for long-only spot MACD (positive in 2025, negative since): this
@@ -66,7 +68,22 @@ class SpotExecutionManager(ExecutionManager):
         s = self.lane.settings
         return {"hard": s.spot_hard_stop_pct, "act": s.spot_trail_activation_pct, "trail": s.spot_trail_pct,
                 "target": None, "staged": staged_levels(s.spot_staged_exits_csv), "hold": s.spot_max_hold_sessions,
+                "min_hold": min(s.spot_min_hold_sessions, s.spot_max_hold_sessions or s.spot_min_hold_sessions),
                 "invalidate_below_mfe": s.spot_invalidation_max_mfe_pct}
+
+    def settled(self, position, now: datetime | None = None) -> bool:
+        """Past the minimum hold: the whole ladder may act (before it, only the hard stop)."""
+        sessions_ = self.exit_rules()["min_hold"]
+        if not sessions_:
+            return True
+        now = (now or datetime.now(UTC)).astimezone(IST)
+        return now >= hold_until(position.opened_at, sessions_)
+
+    async def on_closed_bar(self, symbol: str, macd: float) -> bool:
+        position = self.portfolio.positions.get(symbol)
+        if position is not None and not self.settled(position):
+            return False             # inside the minimum hold the MACD exit waits
+        return await super().on_closed_bar(symbol, macd)
 
     async def on_tick(self, symbol: str, price: float, timestamp: datetime | None = None) -> None:
         self.set_quote(symbol, price, timestamp)
@@ -99,10 +116,11 @@ class SpotExecutionManager(ExecutionManager):
             trail = round(max(position.peak_price * (1 - rules["trail"]), floor), 4)
             position.trailing_stop = max(position.trailing_stop or 0.0, trail)
         now = (timestamp or datetime.now(UTC)).astimezone(IST)
+        settled = self.settled(position, now)
         reason = None
         if price <= position.hard_stop:
             reason = f"HARD_STOP_{pct_label(rules['hard'])}_PCT"
-        elif position.trailing_stop and price <= position.trailing_stop:
+        elif settled and position.trailing_stop and price <= position.trailing_stop:
             reason = f"TRAILING_STOP_{pct_label(rules['trail'])}_PCT"
         elif rules["hold"] and now >= hold_until(position.opened_at, rules["hold"]):
             reason = f"HOLD_LIMIT_{rules['hold']}_SESSIONS"
@@ -111,7 +129,7 @@ class SpotExecutionManager(ExecutionManager):
             await self.submit(symbol, "SELL", position.quantity)
             return
         stages = rules["staged"]
-        if position.exit_stage < len(stages) and price >= position.average_price * (1 + stages[position.exit_stage]):
+        if settled and position.exit_stage < len(stages) and price >= position.average_price * (1 + stages[position.exit_stage]):
             stage = position.exit_stage + 1
             # Thirds of the shares bought (entry_stage holds the entry's lots, one share each); the last stage
             # and any remainder too small to split go in full.
@@ -307,6 +325,7 @@ class SpotLane(SmartLane):
                     "sizing": "whole shares within the ticket and cash; no score cut-off",
                     "hard_stop_pct": rules["hard"], "trail_activation_pct": rules["act"], "trail_pct": rules["trail"],
                     "staged_exits": list(rules["staged"]), "invalidate_below_mfe_pct": rules["invalidate_below_mfe"],
-                    "max_hold_sessions": rules["hold"], "long_only": True, "overnight": True,
+                    "min_hold_sessions": rules["min_hold"], "max_hold_sessions": rules["hold"],
+                    "long_only": True, "overnight": True,
                 },
                 "validation": "research/spot_macd_20261103: long-only spot MACD ≈ market, not proven"}

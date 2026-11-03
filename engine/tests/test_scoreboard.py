@@ -28,6 +28,7 @@ def test_trades_run_to_flat_and_weeks_are_ist_mondays():
     exits = {(row["reason"], row["hold"]): row["net"] for row in board["exits"]}
     assert exits[("STAGED_PROFIT_EXIT_1", "<1h")] == 300.0 and exits[("TRAILING_STOP_25_PCT", ">2d")] == 700.0
     assert board["book_full"] is None and board["since"] == "2026-10-19T04:00:00+00:00"
+    assert board["curve"] == []                       # bare values: drawdown only, nothing to chart
 
 
 def test_book_full_from_slots_or_ticket():
@@ -36,6 +37,13 @@ def test_book_full_from_slots_or_ticket():
     assert score_book("x", "X", slices=[], curve=[], capital=100_000, now=now, ticket=100_000)["book_full"] is True
     assert score_book("x", "X", slices=[], curve=[], capital=100_000, now={**now, "cash": 200_000, "open": 1},
                       ticket=100_000, slots=3)["book_full"] is False
+
+
+def test_a_stamped_curve_is_returned_thinned():
+    points = [(f"2026-10-{1 + i // 100:02d}T04:{i % 60:02d}:00+00:00", 100_000.0 + i) for i in range(1000)]
+    board = score_book("x", "X", slices=[], curve=points, capital=100_000, now={"equity": 101_000, "cash": 0, "open": 0})
+    assert len(board["curve"]) == 400 and board["curve"][-1] == {"at": points[-1][0], "equity": 100_999.0}
+    assert board["max_drawdown"] == 0
 
 
 def test_helpers():
@@ -82,5 +90,5 @@ def test_shadow_and_desk_books_read_their_own_schemas(tmp_path):
     book = mp_book(desk, 1_000_000)
     (exit_,) = book["slices"]
     assert exit_["pnl"] == pytest.approx(-2980.0) and exit_["exit_reason"] == "MP_TIME" and exit_["partial"] is False
-    assert book["now"]["equity"] == 997020 and book["curve"] == [997020.0]
+    assert book["now"]["equity"] == 997020 and book["curve"] == [("2026-11-02T06:00:00+00:00", 997020.0)]
     assert shadow_book(tmp_path / "missing.sqlite3") is None

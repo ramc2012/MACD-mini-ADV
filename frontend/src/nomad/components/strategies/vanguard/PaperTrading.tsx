@@ -3,7 +3,7 @@ import {ShadowPortfolio} from "@/ShadowPanels";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { Section, MetricTile, useUrlTab, formatIST, formatMoney, formatSignedMoney } from "@/components/desk-ui";
-import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip } from "recharts";
+import { EquityChart } from "../../../../LaneEquityChart";
 const pct=(n:unknown)=>n==null?"—":`${(Number(n)*100).toFixed(2)}%`;
 const money=(n:unknown)=>n==null?"—":formatMoney(Number(n));
 const signed=(n:unknown)=>n==null?"—":formatSignedMoney(Number(n));
@@ -72,7 +72,7 @@ export default function PaperTrading(){
    <div className="overflow-auto"><table className="w-full whitespace-nowrap text-xs"><thead><tr>{['Model / strategy','Hold','Picks / entries','Open / closed','Queued / skipped','Net realized','Hit rate','Profit factor','Expectancy','Fees paid'].map(t=><th key={t} className="p-3 text-left">{t}</th>)}</tr></thead><tbody>{perf.map((p:any)=><tr key={`${p.strategy}-${p.model_version}-${p.horizon_sessions}-${p.direction}`} className="border-t border-bg-border"><td className="max-w-xs whitespace-normal p-3">{p.model_version}<br/>{p.strategy}</td><td className="p-3">{p.horizon_sessions} · {p.direction}</td><td className="p-3">{p.picks} / {p.entries}</td><td className="p-3">{p.open} / {p.closed}</td><td className="p-3">{p.queued} / {p.skipped}</td><td className="p-3">{signed(p.net_pnl)}</td><td className="p-3">{pct(p.hit_rate)}</td><td className="p-3">{p.profit_factor==null?'—':Number(p.profit_factor).toFixed(2)}</td><td className="p-3">{money(p.expectancy_rupees)}</td><td className="p-3">{money(p.fees_paid)}</td></tr>)}</tbody></table></div>
    <p className="mt-3 text-xs text-text-muted">Overlapping horizons and repeated stocks are correlated. Paper performance is descriptive evidence, not a validated forecast. The Stock skill tab also tracks all frozen selections without capital constraints against Nifty.</p>
   </Section><Section title="Account equity" description="Whole account, after estimated liquidation costs. Stale prices remain visibly flagged.">
-   <ResponsiveContainer width="100%" height={250}><LineChart data={d.equity_curve??[]}><CartesianGrid stroke="#334155" strokeDasharray="3 3"/><XAxis dataKey="ts" tickFormatter={v=>formatIST(v)} stroke="#94a3b8" hide/><YAxis domain={['auto','auto']} stroke="#94a3b8" tickFormatter={v=>money(v)}/><Tooltip labelFormatter={v=>formatIST(String(v))} formatter={v=>money(v)} contentStyle={{background:'#0f172a',borderColor:'#334155'}}/><Line dataKey="equity" name="Net equity" stroke="#22d3ee" dot={false} isAnimationActive={false}/></LineChart></ResponsiveContainer>
+   <EquityChart points={(d.equity_curve??[]).map((r:any)=>({at:r.ts,equity:Number(r.equity)}))} capital={a?.initial_capital??0} height={250} label="Net equity"/>
   </Section></>}
   {view==='journal'&&<Section title="Paper execution journal" description="Immutable queue, fill, exit and skip events survive restarts"><div className="max-h-[600px] overflow-auto">{!(d.events??[]).some((e:any)=>e.horizon_label===period)&&<p>No paper events recorded for this holding period.</p>}{(d.events??[]).filter((e:any)=>e.horizon_label===period).map((e:any)=><div key={e.id} className="border-b border-bg-border py-3 text-xs"><span className="font-semibold">{e.symbol} · {e.kind}</span> · {formatIST(e.event_at)}<pre className="mt-1 whitespace-pre-wrap text-text-secondary">{JSON.stringify(e.detail,null,2)}</pre></div>)}</div></Section>}
  </div>;

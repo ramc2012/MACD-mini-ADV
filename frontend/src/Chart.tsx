@@ -5,7 +5,7 @@ import {
 } from "lightweight-charts";
 import { useEffect, useRef } from "react";
 import { initialBalance, referenceLevels, sessionKey, sessionStarts, type CloseStudy, type ReferenceKind } from "./chartMath";
-import type { AuctionContext, Candle, ChartLayers, ChartMarker, Indicator, PaneCollapse } from "./types";
+import type { AuctionContext, Candle, ChartLayers, ChartLevel, ChartMarker, Indicator, PaneCollapse } from "./types";
 
 export const DEFAULT_LAYERS: ChartLayers = { volume: true, legend: true, priorDay: true, week: false, nakedPocs: false, ib: true, sessions: true };
 export const DEFAULT_PANES: PaneCollapse = { rsi: false };
@@ -15,7 +15,7 @@ export type ChartSource = { label: string; title: string; tone: "live" | "warn" 
 type Props = {
   candles: Candle[]; current?: Candle; indicators: Indicator[]; studies?: CloseStudy[]; markers?: ChartMarker[]; error?: string; fitKey: string;
   timeframe?: number; layers?: ChartLayers; references?: AuctionContext; paneCollapse?: PaneCollapse;
-  priceStyle?: PriceStyle; source?: ChartSource;
+  priceStyle?: PriceStyle; source?: ChartSource; levels?: ChartLevel[];
 };
 const istDateTime = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
 const istDay = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short" });
@@ -31,6 +31,21 @@ const asDate = (value: Time) => {
 const fmt = (value?: number | null, digits = 2) => (value === undefined || value === null || Number.isNaN(value) ? "—" : value.toFixed(digits));
 const UP = "#22c893";
 const DOWN = "#f15b6c";
+// Fill markers: buys below the bar, sells above; a sell at a loss is red, at a profit amber.
+const MARKER_STYLE: Record<NonNullable<ChartMarker["tone"]>, { color: string; position: "aboveBar" | "belowBar"; shape: "arrowUp" | "arrowDown" | "circle" }> = {
+  entry: { color: "#4da3ff", position: "belowBar", shape: "arrowUp" },
+  add: { color: "#7dc4ff", position: "belowBar", shape: "circle" },
+  signal: { color: "#f5b84b", position: "belowBar", shape: "arrowUp" },
+  exit: { color: "#ffad42", position: "aboveBar", shape: "arrowDown" },
+  exit_loss: { color: DOWN, position: "aboveBar", shape: "arrowDown" },
+  stop: { color: DOWN, position: "aboveBar", shape: "arrowDown" },
+};
+const LEVEL_LINE: Record<ChartLevel["tone"], { color: string; lineStyle: LineStyle; lineWidth: 1 | 2 }> = {
+  avg: { color: "#4da3ff", lineStyle: LineStyle.Solid, lineWidth: 1 },
+  stop: { color: DOWN, lineStyle: LineStyle.Dashed, lineWidth: 1 },
+  trail: { color: "#ffad42", lineStyle: LineStyle.Dashed, lineWidth: 1 },
+  target: { color: UP, lineStyle: LineStyle.Dotted, lineWidth: 1 },
+};
 const volumeColor = (bar: Candle) => (bar.close >= bar.open ? "#22c89366" : "#f15b6c66");
 // Pane heights are proportional to stretch (minimum 2px), so a factor near
 // zero collapses a pane to a sliver whose separator stays draggable.
@@ -93,7 +108,7 @@ type ChartHandles = {
   hma: ISeriesApi<"Line">; rsi: ISeriesApi<"Line">; separators: SessionSeparators[];
 };
 
-export function TradingChart({ candles, current, indicators, studies = [], markers = [], error, fitKey, timeframe, layers = DEFAULT_LAYERS, references, paneCollapse = DEFAULT_PANES, priceStyle = "candles", source }: Props) {
+export function TradingChart({ candles, current, indicators, studies = [], markers = [], error, fitKey, timeframe, layers = DEFAULT_LAYERS, references, paneCollapse = DEFAULT_PANES, priceStyle = "candles", source, levels }: Props) {
   const element = useRef<HTMLDivElement>(null);
   const legend = useRef<HTMLDivElement>(null);
   const lastFit = useRef("");
@@ -106,6 +121,7 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
   // recomputed per tick without walking the session again.
   const vwapTail = useRef({ session: Number.NaN, tradedValue: 0, tradedVolume: 0 });
   const priceLines = useRef(new Map<string, { price: number; kind: ReferenceKind; lines: IPriceLine[] }>());
+  const levelLines = useRef<IPriceLine[][]>([]);
   const charts = useRef<ChartHandles>();
   // The bar under the crosshair, or undefined when the pointer is off the
   // data.  Held in a ref rather than passed per call because the legend is
@@ -246,7 +262,7 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
       chart.applyOptions({ width: element.current?.clientWidth, height: element.current?.clientHeight });
     });
     observer.observe(element.current);
-    return () => { chart.unsubscribeCrosshairMove(onCrosshair); observer.disconnect(); chart.remove(); charts.current = undefined; priceLines.current.clear(); };
+    return () => { chart.unsubscribeCrosshairMove(onCrosshair); observer.disconnect(); chart.remove(); charts.current = undefined; priceLines.current.clear(); levelLines.current = []; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -269,8 +285,9 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
     const candleTimes = all.map((c) => c.timestamp);
     const displayMarkers = markers.flatMap((marker) => {
       const time = candleTimes.filter((candidate) => candidate <= marker.timestamp).pop();
-      return time === undefined ? [] : [{ time: time as Time, position: marker.tone === "stop" ? "aboveBar" as const : "belowBar" as const, color: marker.tone === "stop" ? DOWN : marker.tone === "signal" ? "#f5b84b" : "#4da3ff", shape: marker.tone === "stop" ? "arrowDown" as const : "arrowUp" as const, text: `${marker.label} ₹${marker.price.toFixed(2)}` }];
-    });
+      const style = MARKER_STYLE[marker.tone ?? "entry"];
+      return time === undefined ? [] : [{ time: time as Time, position: style.position, color: style.color, shape: style.shape, text: `${marker.label} ₹${marker.price.toFixed(2)}` }];
+    }).sort((a, b) => (a.time as number) - (b.time as number));
     api.candleMarkers.setMarkers(displayMarkers);
     api.barMarkers.setMarkers(displayMarkers);
     api.bbUpper.setData(indicatorsByTime.filter((p) => p.bb_upper != null).map((p) => ({ time: p.timestamp as Time, value: p.bb_upper as number })));
@@ -358,6 +375,19 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
         lines: [api.candle.createPriceLine(options), api.bar.createPriceLine(options)] });
     }
   }, [references, layers, timeframe, candles, current?.timestamp, current?.high, current?.low]);
+
+  // Position levels are few and change only on a stage or trail move: rebuilt whole.
+  const levelKey = (levels ?? []).map((level) => `${level.tone}:${level.price}`).join("|");
+  useEffect(() => {
+    const api = charts.current;
+    if (!api) return;
+    for (const [candleLine, barLine] of levelLines.current) { api.candle.removePriceLine(candleLine); api.bar.removePriceLine(barLine); }
+    levelLines.current = (levels ?? []).filter((level) => Number.isFinite(level.price) && level.price > 0).map((level) => {
+      const options = { price: level.price, title: level.label, axisLabelVisible: true, ...LEVEL_LINE[level.tone] };
+      return [api.candle.createPriceLine(options), api.bar.createPriceLine(options)];
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [levelKey]);
 
   useEffect(() => {
     const api = charts.current;

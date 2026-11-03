@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { rupees, tone } from "./agentMath";
+import { ReturnsChart } from "./LaneEquityChart";
 import { API_TOKEN, API_URL } from "./runtime";
 
 // Every paper book scored alike (engine scoreboard.py, /api/scoreboard).
@@ -10,6 +11,7 @@ type Book = {
   unrealized: number; open_positions: number; max_drawdown: number; max_drawdown_pct: number; closed: Stats;
   weekly: { week: string; net: number }[]; best_week: { week: string; net: number } | null; net_without_best_week: number | null;
   exits: ExitRow[]; book_full: boolean | null; ticket: number | null; slots: number | null; note: string | null; since: string | null;
+  curve?: { at: string; equity: number }[];
 };
 type Board = { as_of: string; lanes: Book[]; hold_buckets: string[] };
 
@@ -35,11 +37,12 @@ export function ScoreboardPage() {
   }, []);
   useEffect(() => { void load(); const id = window.setInterval(() => void load(), 60_000); return () => window.clearInterval(id); }, [load]);
 
-  const books = (board?.lanes ?? []).filter((b) => !b.error);
+  const books = useMemo(() => (board?.lanes ?? []).filter((b) => !b.error), [board]);
   const broken = (board?.lanes ?? []).filter((b) => b.error);
   const weeks = useMemo(() => [...new Set(books.flatMap((b) => b.weekly.map((w) => w.week)))].sort(), [books]);
   const book = books.find((b) => b.lane === selected) ?? books[0];
   const holds = board?.hold_buckets ?? [];
+  const returnBooks = useMemo(() => books.map((b) => ({ lane: b.lane, label: b.label, capital: b.capital, points: b.curve ?? [] })), [books]);
   const reasons = useMemo(() => {
     if (!book) return [];
     const byReason = new Map<string, Record<string, ExitRow>>();
@@ -73,6 +76,11 @@ export function ScoreboardPage() {
         <td className={tone(b.net_without_best_week)}>{b.net_without_best_week == null ? "—" : rupees(b.net_without_best_week)}</td>
         <td className={b.book_full ? "negative" : ""}>{b.book_full == null ? "—" : b.book_full ? "Full" : "Open"}<small>{b.slots ? ` · ${b.open_positions}/${b.slots} slots` : b.ticket ? ` · cash ${lakh(b.cash)}` : ""}</small></td>
       </tr>)}</tbody></table></div>
+    </section>
+
+    <section className="panel agent-panel">
+      <div className="panel-title">Return on capital over time <small>one % axis for every book · click a name to show or hide it · hover for the IST time</small></div>
+      {books.length > 0 && <ReturnsChart books={returnBooks} height={300} initial={["macd", "smart_1l", "smart_50l", "spot_macd", "blast", "agentic"]} />}
     </section>
 
     <section className="panel agent-panel">

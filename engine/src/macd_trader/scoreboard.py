@@ -77,7 +77,13 @@ def max_drawdown(curve, capital: float) -> tuple[float, float]:
 
 def score_book(name: str, label: str, *, slices: list[dict], curve, capital: float, now: dict,
                ticket: float | None = None, slots: int | None = None, note: str | None = None) -> dict:
-    """slices: {position_id, entry_time, exit_time, pnl, exit_reason, partial}; now: equity/cash/realized/unrealized/open."""
+    """slices: {position_id, entry_time, exit_time, pnl, exit_reason, partial}; now: equity/cash/realized/unrealized/open.
+
+    curve: equity values in time order, or (at, equity) pairs -- with stamps the board also returns the curve
+    itself, thinned to CURVE_POINTS, for the scoreboard's returns chart.
+    """
+    pairs = [tuple(point) if isinstance(point, (tuple, list)) else (None, point) for point in curve]
+    curve = [value for _, value in pairs]
     trades: dict[str, dict] = {}
     for row in sorted(slices, key=lambda r: str(r.get("exit_time") or "")):
         trade = trades.setdefault(str(row.get("position_id")), {"pnl": 0.0, "closed": False, "exit_time": None})
@@ -115,8 +121,20 @@ def score_book(name: str, label: str, *, slices: list[dict], curve, capital: flo
         "net_without_best_week": round(realised - best[1], 2) if best else None,
         "exits": [{"reason": reason, "hold": hold, **stats(pnls)} for (reason, hold), pnls in sorted(by_reason.items())],
         "book_full": full, "ticket": ticket, "slots": slots, "note": note,
+        "curve": thin([{"at": at, "equity": round(float(value), 2)} for at, value in pairs if at and value is not None]),
         "since": min((str(r.get("entry_time")) for r in slices if r.get("entry_time")), default=None),
     }
+
+
+CURVE_POINTS = 400
+
+
+def thin(points: list[dict], limit: int = CURVE_POINTS) -> list[dict]:
+    """At most `limit` evenly spaced points, always keeping the last."""
+    if len(points) <= limit:
+        return points
+    step = len(points) / limit
+    return [points[int(i * step)] for i in range(limit - 1)] + [points[-1]]
 
 
 # ------------------------------------------------------------------ adapters
@@ -138,8 +156,9 @@ def sqlite_rows(path: str | Path, sql: str) -> list[sqlite3.Row]:
         connection.close()
 
 
-def equity_curve(path: str | Path) -> list[float]:
-    return [float(r["equity"]) for r in sqlite_rows(path, "SELECT equity FROM equity_points ORDER BY timestamp")]
+def equity_curve(path: str | Path) -> list[tuple[str, float]]:
+    return [(r["timestamp"], float(r["equity"]))
+            for r in sqlite_rows(path, "SELECT timestamp, equity FROM equity_points ORDER BY timestamp")]
 
 
 def fifo_slices(trades: list[dict], reasons: dict | None = None) -> list[dict]:
@@ -205,7 +224,7 @@ def shadow_book(path: str | Path) -> dict | None:
               for r in sqlite_rows(path, "SELECT id, opened_at, closed_at, exit_reason, pnl_paise FROM positions "
                                          "WHERE closed_at IS NOT NULL")]
     open_rows = sqlite_rows(path, "SELECT quantity, entry, last_bid FROM positions WHERE closed_at IS NULL")
-    curve = [r["equity_paise"] / 100 for r in sqlite_rows(path, "SELECT equity_paise FROM equity ORDER BY at")]
+    curve = [(r["at"], r["equity_paise"] / 100) for r in sqlite_rows(path, "SELECT at, equity_paise FROM equity ORDER BY at")]
     cash = account[0]["cash_paise"] / 100
     marked = sum((r["last_bid"] or r["entry"] or 0) * (r["quantity"] or 0) for r in open_rows)
     cost = sum((r["entry"] or 0) * (r["quantity"] or 0) for r in open_rows)

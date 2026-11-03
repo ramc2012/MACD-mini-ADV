@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import re
 import time
 from contextlib import asynccontextmanager, suppress
 from html import escape
@@ -198,13 +199,18 @@ async def watchlist():
     return fast_json(engine.snapshot()["watchlist"])
 
 
+CHART_SYMBOL = re.compile(r"(NSE|BSE):[A-Z0-9&_-]{2,40}")
+
+
 @app.get("/api/chart/{symbol:path}", dependencies=[Depends(authorize)])
 async def chart_history(symbol: str, timeframe_seconds: int = Query(default=1800, ge=60, le=86400)):
-    if symbol not in engine.all_symbols:
+    # Outside the watchlist (a shadow or agentic lane's contract, an expired one) the stored minutes still chart.
+    watched = symbol in engine.all_symbols
+    if not watched and not CHART_SYMBOL.fullmatch(symbol):
         raise HTTPException(404, "Symbol is not in the active watchlist")
     live_rows = (
         list(engine.history.get(symbol, ()))
-        if timeframe_seconds == engine.settings.timeframe_seconds
+        if watched and timeframe_seconds == engine.settings.timeframe_seconds
         else None
     )
     try:
@@ -227,6 +233,8 @@ async def chart_history(symbol: str, timeframe_seconds: int = Query(default=1800
         )
     except sqlite3.Error as exc:
         raise HTTPException(500, f"Historical chart data is unavailable: {exc}") from exc
+    if not watched and not chart.get("candles"):
+        raise HTTPException(404, "No stored bars for this symbol")
     # Consumers that recompute MACD (the parallel Rust analytics) need the
     # periods these indicators were built with, not an assumed 12/26/9.
     chart["macd_periods"] = {
@@ -451,6 +459,14 @@ async def agentic_cycles(day: str | None = None, limit: int = Query(default=40, 
 @app.get("/api/agentic/actions", dependencies=[Depends(authorize)])
 async def agentic_actions(limit: int = Query(default=300, ge=1, le=2000)):
     return {"actions": await asyncio.to_thread(_agentic().actions, limit)}
+
+
+@app.get("/api/agentic/book", dependencies=[Depends(authorize)])
+async def agentic_book(limit: int = Query(default=2000, ge=1, le=5000)):
+    """The agentic lane's fills and recently closed positions, for its position charts' markers."""
+    lane = _agentic()
+    return fast_json(await asyncio.to_thread(lambda: {"trades": lane.repository.rows("trades", limit),
+                                                      "closed_positions": lane.execution.visible_closed_positions()}))
 
 
 @app.get("/api/agentic/equity", dependencies=[Depends(authorize)])
@@ -762,6 +778,18 @@ async def smart_lane_journal(name: str, day: str | None = Query(default=None, pa
     lane = _smart_lane(name)
     rows = await asyncio.to_thread(lambda: lane.journal_rows(day=day, decision=decision, limit=limit))
     return {"rows": rows, "days": await asyncio.to_thread(lane.journal_days)}
+
+
+@app.get("/api/lanes/{name}/book", dependencies=[Depends(authorize)])
+async def smart_lane_book(name: str, limit: int = Query(default=500, ge=1, le=5000)):
+    """A lane's own orders, fills, portfolio and recently closed positions, in the MACD lane's shapes (its ledger)."""
+    lane = _smart_lane(name)
+
+    def read() -> dict:
+        return {"orders": lane.repository.rows("orders", limit), "trades": lane.repository.rows("trades", limit),
+                "portfolio": lane.execution.portfolio_snapshot(),
+                "closed_positions": lane.execution.visible_closed_positions()}
+    return fast_json(await asyncio.to_thread(read))
 
 
 @app.get("/api/lanes/{name}/equity", dependencies=[Depends(authorize)])
