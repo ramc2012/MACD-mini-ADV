@@ -15,6 +15,13 @@ from .models import Order, Signal, Trade
 IST = ZoneInfo("Asia/Kolkata")
 # After a failed or unaffordable pyramid add, that contract is not tried again for this long.
 ADD_RETRY_SECONDS = 300.0
+# A rejected automated exit waits this long before the next try, rising with each consecutive failure. On 29-30 Oct
+# 2026 one contract's lot mismatch rejected its SELL on every tick: 42,201 REJECTED orders in two sessions.
+EXIT_RETRY_SECONDS = (15.0, 60.0, 300.0)
+
+
+class ExitRetryWait(RuntimeError):
+    """An automated exit inside its back-off after a rejected attempt; no order was created."""
 
 
 def _session_day(moment: datetime) -> date:
@@ -40,6 +47,10 @@ class ExecutionManager:
         self.repository = repository
         self.events = events
         self._add_blocked_until: dict[str, float] = {}
+        # symbol -> monotonic time before which an automated exit is not retried, and the failure record shown
+        # in health (count, reason, error, first/last IST). Cleared by the next filled SELL.
+        self._exit_blocked_until: dict[str, float] = {}
+        self.exit_failures: dict[str, dict] = {}
         self.orders: dict[str, Order] = {}
         if settings.execution_mode == "paper":
             self.orders = {order.order_id: order for order in repository.load_open_orders()}
@@ -204,6 +215,34 @@ class ExecutionManager:
         # the day's selection, its stop could not be filled, and the ValueError
         # raised inside the tick path stopped the whole Fyers stream.
         held_exit = side == "SELL" and position is not None and position.quantity > 0
+        automated_exit = held_exit and symbol in self._armed_exits
+        if automated_exit and time.monotonic() < self._exit_blocked_until.get(symbol, 0.0):
+            self._armed_exits.discard(symbol)      # a manual SELL meanwhile must not inherit the automated reason
+            raise ExitRetryWait(f"{symbol}: exit backing off after {self.exit_failures[symbol]['count']} rejection(s)")
+        try:
+            return await self._submit(symbol, side, quantity, position=position, held_exit=held_exit, lots=lots,
+                                      order_type=order_type, limit_price=limit_price, signal=signal,
+                                      _exit_stage=_exit_stage)
+        except Exception as exc:
+            if automated_exit:
+                self._exit_failed(symbol, exc)
+            raise
+
+    def _exit_failed(self, symbol: str, exc: Exception) -> None:
+        row = self.exit_failures.get(symbol) or {"count": 0, "first_at": datetime.now(IST).isoformat(timespec="seconds")}
+        row["count"] += 1
+        wait = EXIT_RETRY_SECONDS[min(row["count"], len(EXIT_RETRY_SECONDS)) - 1]
+        row.update(lane=self.portfolio.lane, symbol=symbol, reason=self.exit_reasons.get(symbol),
+                   error=f"{type(exc).__name__}: {exc}"[:200], last_at=datetime.now(IST).isoformat(timespec="seconds"),
+                   retry_after_seconds=wait)
+        self.exit_failures[symbol] = row
+        self._exit_blocked_until[symbol] = time.monotonic() + wait
+        if row["count"] == 1:
+            self.events.publish("exit_failing", dict(row))
+
+    async def _submit(self, symbol: str, side: str, quantity: int | None, *, position, held_exit: bool,
+                      lots: int | None, order_type: str, limit_price: float | None, signal: Signal | None,
+                      _exit_stage: int | None) -> Order:
         if symbol not in self.tradable_symbols and not held_exit:
             raise ValueError(f"{symbol} is not on the watchlist")
         lot_size = self.lot_sizes.get(symbol, 0) or (position.lot_size if held_exit and position.lot_size > 1 else 0)
@@ -284,6 +323,9 @@ class ExecutionManager:
             if order.status != "FILLED":
                 self.repository.save_order(order)
                 self.events.publish("order", order)
+        if side == "SELL" and order.status == "FILLED":
+            self._exit_blocked_until.pop(symbol, None)
+            self.exit_failures.pop(symbol, None)
         return order
 
     async def _paper_fill(self, order: Order, *, exit_stage: int | None = None) -> None:

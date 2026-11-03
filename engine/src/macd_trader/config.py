@@ -284,6 +284,22 @@ class Settings(BaseSettings):
     smart_min_dispersion_size: float = Field(default=0.25, gt=0, le=1)
     smart_blast_source: bool = False
 
+    # Spot MACD lane (spot_lane.py; owner, 3 Nov 2026: "a positional trading system with macd rules but to trade
+    # spot with ticket size of 1L"). Long-only cash equities on the MACD lane's own EQ signals (30-min MACD zero
+    # cross up), one ticket per stock, carried overnight. Exits are the MACD lane's ladder scaled to spot by 1/10:
+    # 3% stop, a third out at +3/+5/+7.5%, 2.5% trail from +3% (breakeven floor), MACD-below-zero close while the
+    # best was under +1%, and a 20-session hold limit. research/spot_macd_20261103: long-only spot MACD tracked the
+    # market (entry skill vs random entries positive in 2025, negative since) -- not proven.
+    spot_lane_enabled: bool = True
+    spot_lane_capital: float = Field(default=20_000_000.0, gt=0)
+    spot_lane_ticket: float = Field(default=100_000.0, gt=0)
+    spot_hard_stop_pct: float = Field(default=0.03, gt=0, lt=1)
+    spot_trail_activation_pct: float = Field(default=0.03, gt=0, lt=5)
+    spot_trail_pct: float = Field(default=0.025, gt=0, lt=1)
+    spot_staged_exits_csv: str = "0.03,0.05,0.075"
+    spot_invalidation_max_mfe_pct: float = Field(default=0.01, ge=0, lt=1)
+    spot_max_hold_sessions: int = Field(default=20, ge=0, le=250)
+
     # Agentic lane (agentic_lane.py): a paper options book run by a Grok model that opens, adds, reduces,
     # closes and re-levels positions every cycle with written reasoning. The API key comes from the
     # XAI_API_KEY environment variable (never a setting); without it the lane only manages open positions.

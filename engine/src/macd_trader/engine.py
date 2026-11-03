@@ -21,7 +21,7 @@ from .candle_store import (
 from .tick_store import TickStore
 from .regimes import regime_for
 from .rollover import days_to_expiry, first_tradable, is_futures_symbol, Expiry, is_stock_option, stock_exit_due, stock_last_day
-from .sessions import in_session, market_close, market_open
+from .sessions import in_session, market_close, market_open, segment
 from .chain_warmup import chain_candles
 from .candles import CandleAggregator
 from .chart_history import aggregate_session_candles, load_chart_history
@@ -29,12 +29,13 @@ from .config import Settings
 from .contracts import ContractSelector
 from .events import EventHub, json_value
 from .greeks import contract_gex
-from .execution import ExecutionManager
+from .execution import ExecutionManager, ExitRetryWait
 from .models import Candle, Tick, Trade
 from . import market_calendar
 from .blast_engine import BlastEngine
 from .smart_lane import SmartLanes
 from .agentic_lane import AgenticLane
+from .spot_lane import SpotLane
 from .agentic_telegram import TelegramBridge
 from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
 from .option_greeks import book_greeks
@@ -212,9 +213,12 @@ def _smart_lanes(engine) -> list:
     """The engine's smart lanes, or none -- tests drive engine methods on bare stand-ins."""
     lanes = getattr(engine, "smart_lanes", None)
     agentic = getattr(engine, "agentic", None)
-    # The agentic lane (agentic_lane.py) wears the same surface, so ticks, subscriptions, settlement and sweeps
-    # reach it through every loop below; the /api/smart_lanes routes list smart_lanes.lanes only.
-    return [*(lanes.lanes if lanes is not None else []), *([agentic] if agentic is not None else [])]
+    spot = getattr(engine, "spot_lane", None)
+    # The agentic lane (agentic_lane.py) and the spot MACD lane (spot_lane.py) wear the same surface, so ticks,
+    # subscriptions, settlement and sweeps reach them through every loop below; the /api/smart_lanes routes list
+    # smart_lanes.lanes only.
+    return [*(lanes.lanes if lanes is not None else []), *([agentic] if agentic is not None else []),
+            *([spot] if spot is not None else [])]
 
 
 def _held_contract_lots(engine) -> dict[str, int]:
@@ -225,6 +229,8 @@ def _held_contract_lots(engine) -> dict[str, int]:
     if blast is not None:
         held.update({s: p.lot_size for s, p in blast.portfolio.positions.items() if p.quantity > 0})
     for lane in _smart_lanes(engine):
+        if getattr(lane, "kind", None) == "spot":
+            continue           # shares, not contracts: nothing for the option master or the selector to retain
         held.update({s: p.lot_size for s, p in lane.portfolio.positions.items() if p.quantity > 0})
     return held
 
@@ -377,6 +383,10 @@ class TradingEngine(DeskMixin):
                         if settings.agentic_enabled else None)
         if self.agentic is not None:
             self.agentic.telegram = TelegramBridge(self.agentic, settings, close_position=self.close_smart_paper_position)
+        # Seventh book: the spot MACD lane, cash equities on the MACD lane's own stock signals at a Rs 1 L ticket.
+        self.spot_lane = (SpotLane(settings, self.broker, self.events,
+                                   str(Path(settings.database_path).parent / "spot_macd.sqlite3"))
+                          if settings.spot_lane_enabled else None)
         self.extreme_booker = ExtremeBooker(settings.research_database_path)
         # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
         # priced them, and the blast journal reads the spread and IV inputs at each candidate.
@@ -438,6 +448,8 @@ class TradingEngine(DeskMixin):
         if self.agentic is not None:
             self.agentic.start()
             self.agentic.telegram.start()
+        if self.spot_lane is not None:
+            self.spot_lane.start()
         self._entry_gate_task = asyncio.create_task(self.entry_gate.run(
             lambda: self.execution, lambda: self.portfolio, self._queued_macd_entry_rejection,
         ))
@@ -1673,6 +1685,8 @@ class TradingEngine(DeskMixin):
             await self.agentic.stop()
             if self.agentic.telegram is not None:
                 await self.agentic.telegram.stop()
+        if getattr(self, "spot_lane", None) is not None:
+            await self.spot_lane.stop()
         if self.bus is not None:
             await self.bus.stop()
             if self.flow_snapshots is not None:
@@ -1701,6 +1715,8 @@ class TradingEngine(DeskMixin):
                     await manager.on_tick(tick.symbol, tick.ltp, self.last_tick_at)
                 else:
                     manager.portfolio.mark(tick.symbol, tick.ltp)
+            except ExitRetryWait:
+                pass
             except Exception as exc:
                 self.lane_errors[name] = {"count": self.lane_errors.get(name, {}).get("count", 0) + 1,
                                           "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
@@ -1731,6 +1747,7 @@ class TradingEngine(DeskMixin):
         if position is None or position.quantity != expected_quantity:
             raise ValueError("Holding quantity changed during quote refresh")
         lane.execution.set_quote(symbol, quote.ltp, datetime.now(UTC))
+        lane.execution._exit_blocked_until.pop(symbol, None)     # the owner's click is never held by a back-off
         lane.execution.arm_exit(symbol, "MANUAL_USER_CLOSE")
         return await lane.execution.submit(symbol, "SELL", expected_quantity)
 
@@ -1815,6 +1832,8 @@ class TradingEngine(DeskMixin):
             for lane, step in steps:
                 try:
                     await step()
+                except ExitRetryWait:
+                    pass           # a rejected exit backing off (execution.EXIT_RETRY_SECONDS); counted in health
                 except Exception as exc:  # noqa: BLE001 -- one lane must not stop the feed or the other lanes
                     self.lane_errors[lane] = {"count": self.lane_errors.get(lane, {}).get("count", 0) + 1,
                                               "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
@@ -1887,6 +1906,12 @@ class TradingEngine(DeskMixin):
         the MACD lane does with it -- each lane keeps its own book. Features are
         computed once: building them counts the signal into the crowd tally.
         """
+        spot = getattr(self, "spot_lane", None)
+        if spot is not None and signal.side == "BUY" and segment(signal.symbol) == "cash":
+            try:
+                spot.on_spot_signal(signal)
+            except Exception as exc:  # noqa: BLE001
+                spot.error = f"intake {signal.symbol}: {type(exc).__name__}: {exc}"[:300]
         gate = self.entry_gate
         gate.settings = self.settings
         contract = self.contract_selector.contracts.get(signal.symbol)
@@ -2246,6 +2271,12 @@ class TradingEngine(DeskMixin):
     def _books(self) -> list[tuple[str, object]]:
         return [("macd", self.execution), ("blast", self.blast.execution),
                 *[(lane.name, lane.execution) for lane in _smart_lanes(self)]]
+
+    def exit_failures(self) -> list[dict]:
+        """Automated exits rejected and backing off, every book (execution.EXIT_RETRY_SECONDS), newest first."""
+        rows = [{**row, "lane": name} for name, execution in self._books()
+                for row in getattr(execution, "exit_failures", {}).values()]
+        return sorted(rows, key=lambda row: row.get("last_at") or "", reverse=True)
 
     async def _settle_expired(self) -> None:
         """Close holdings whose contract expired while the app was down (self_heal.settle_expired_books)."""
@@ -2887,7 +2918,7 @@ class TradingEngine(DeskMixin):
             return (spot, parsed) if spot else None
 
         books = [("macd", self.portfolio), ("blast", self.blast.portfolio),
-                 *[(lane.name, lane.portfolio) for lane in _smart_lanes(self)]]
+                 *[(lane.name, lane.portfolio) for lane in _smart_lanes(self) if getattr(lane, "kind", None) != "spot"]]
         return {"as_of": now.isoformat(),
                 "model": "Black-Scholes on spot, r 6.5%, no dividend; delta in rupees of underlying",
                 "books": {name: book_greeks(list(portfolio.positions.items()), portfolio.snapshot()["equity"], spot_of, now)
@@ -2965,6 +2996,7 @@ class TradingEngine(DeskMixin):
                        "bus": self.bus.status() if self.bus else None},
             "blast": self.blast.health(),
             "smart_lanes": {smart.name: smart.health() for smart in _smart_lanes(self)},
+            "exit_failures": self.exit_failures(),
             "rollover": self.rollover_status(),
         }
 

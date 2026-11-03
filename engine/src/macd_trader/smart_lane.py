@@ -242,6 +242,8 @@ class SmartExecutionManager(ExecutionManager):
 
 
 class SmartLane:
+    execution_class = SmartExecutionManager      # the spot lane (spot_lane.py) brings its own exits
+
     def __init__(self, name: str, capital: float, settings, broker, events, database_path: str, slots: int = 0):
         self.name = name
         self.capital = float(capital)
@@ -258,7 +260,7 @@ class SmartLane:
         self.portfolio = Portfolio(self.capital, lane=name)
         self.events = LaneEvents(events, prefix=f"{name}_")
         self.broker = OrderOnlyBroker(broker)
-        self.execution = SmartExecutionManager(
+        self.execution = self.execution_class(
             self.execution_settings(settings), self.broker, self.portfolio, self.repository, self.events, lane=self)
         self.meta: dict[str, dict] = {}
         self._contracts: dict[str, dict] = {}

@@ -567,6 +567,9 @@ async def agentic_close_position(payload: AgenticCloseInput):
 
 def _smart_lane(name: str):
     lane = engine.smart_lanes.get(name)
+    spot = getattr(engine, "spot_lane", None)
+    if lane is None and spot is not None and spot.name == name:
+        lane = spot            # the spot MACD lane shares the smart lanes' views (spot_lane.py)
     if lane is None:
         raise HTTPException(404, f"no smart lane {name}")
     return lane

@@ -123,6 +123,13 @@ class AlertManager:
                 "loop_lag",
                 f"Event-loop lag high: p95 {lag['p95']:.0f}ms — the process is saturating.",
             ))
+        for row in (health.get("exit_failures") or [])[:10]:
+            # One alert per book and symbol per cooldown, however many ticks retry it.
+            fired.append(await self._alert(
+                f"exit_failing:{row.get('lane')}:{row.get('symbol')}",
+                f"{row.get('lane')}: exit {row.get('reason') or ''} for {row.get('symbol')} rejected {row.get('count')}× "
+                f"since {row.get('first_at')} — {row.get('error')}. Retrying every {row.get('retry_after_seconds'):.0f}s.",
+            ))
         for row in pending:
             # Keyed per underlying and nothing else, so the 30-minute cooldown
             # actually applies. A per-window suffix mints a key that can never
