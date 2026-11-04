@@ -141,3 +141,49 @@ export function bookFillCounts(trades: Trade[], now: number, holidays: ReadonlyS
   });
   return { start, buys: fills.filter((r) => r.side === "BUY").length, sells: fills.filter((r) => r.side === "SELL").length };
 }
+
+/** Index option underlyings, longest first so NIFTYNXT50 is not read as NIFTY. */
+export const INDEX_UNDERLYINGS = ["MIDCPNIFTY", "NIFTYNXT50", "BANKNIFTY", "FINNIFTY", "SENSEX", "BANKEX", "NIFTY"] as const;
+
+/** The index an option or future is written on ("NSE:BANKNIFTY26NOV57000CE" → "BANKNIFTY"); null for stock options,
+ * cash equities and the indices' own spot symbols. */
+export function indexUnderlying(symbol: string): string | null {
+  const [, body = ""] = symbol.toUpperCase().split(":");
+  if (!/(CE|PE|FUT)$/.test(body)) return null;
+  const root = INDEX_UNDERLYINGS.find((name) => body.startsWith(name) && /\d/.test(body.charAt(name.length)));
+  return root ?? null;
+}
+
+export function optionSide(symbol: string): "CE" | "PE" | null {
+  const upper = symbol.toUpperCase();
+  return upper.endsWith("CE") ? "CE" : upper.endsWith("PE") ? "PE" : null;
+}
+
+export type RoundStats = {
+  trades: number; wins: number; losses: number; winRate: number | null; net: number; grossProfit: number; grossLoss: number;
+  profitFactor: number | null; avgWin: number | null; avgLoss: number | null; payoff: number | null; avgReturn: number | null;
+  best: number | null; worst: number | null; medianHeldMs: number | null;
+};
+
+/** Completed-trade figures for any slice of round trips. payoff = average winner ÷ |average loser| (the asymmetry an
+ * option book lives on); profit factor is ∞ when there are no losers. */
+export function roundStats(rounds: readonly RoundTrip[]): RoundStats {
+  const wins = rounds.filter((row) => row.pnl > 0), losses = rounds.filter((row) => row.pnl < 0);
+  const grossProfit = wins.reduce((sum, row) => sum + row.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((sum, row) => sum + row.pnl, 0));
+  const mean = (rows: readonly RoundTrip[], pick: (row: RoundTrip) => number) => rows.length ? rows.reduce((sum, row) => sum + pick(row), 0) / rows.length : null;
+  const avgWin = mean(wins, (row) => row.pnl), avgLoss = mean(losses, (row) => row.pnl);
+  const held = rounds.map((row) => row.heldMs).sort((a, b) => a - b);
+  const middle = held.length >> 1;
+  return {
+    trades: rounds.length, wins: wins.length, losses: losses.length,
+    winRate: rounds.length ? wins.length / rounds.length : null,
+    net: grossProfit - grossLoss, grossProfit, grossLoss,
+    profitFactor: grossLoss ? grossProfit / grossLoss : grossProfit ? Number.POSITIVE_INFINITY : null,
+    avgWin, avgLoss, payoff: avgWin !== null && avgLoss ? avgWin / Math.abs(avgLoss) : null,
+    avgReturn: mean(rounds, (row) => row.returnPct),
+    best: rounds.length ? Math.max(...rounds.map((row) => row.pnl)) : null,
+    worst: rounds.length ? Math.min(...rounds.map((row) => row.pnl)) : null,
+    medianHeldMs: held.length ? (held.length % 2 ? held[middle] : (held[middle - 1] + held[middle]) / 2) : null,
+  };
+}

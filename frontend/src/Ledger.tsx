@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ClosedBook, ClosedPosition, Excursion, Order, Portfolio, Position, Signal, Trade } from "./types";
-import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPositions, observedExcursion, visibleClosedRows, type RoundTrip } from "./ledgerMath";
+import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPositions, indexUnderlying, INDEX_UNDERLYINGS, observedExcursion, optionSide, roundStats, visibleClosedRows, type RoundStats, type RoundTrip } from "./ledgerMath";
 
 import { bookFillCounts } from "./ledgerMath";
 import { LedgerCounts } from "./LedgerCounts";
@@ -316,6 +316,7 @@ function Statistics({ orders, trades, portfolio, rounds }: { orders: Order[]; tr
     ["Live unrealized P&L", currency(portfolio.unrealized_pnl)],
   ];
   return <div className="statistics"><h2>Agent paper book</h2><div className="statistics-note">One trade runs from first entry until fully flat. Partial exits in open cycles are excluded from win rate and completed-trade returns. Returns include recorded fees; realized P&L in open cycles includes their entry fees.</div><div className="statistics-grid">{stats.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
+    <IndexStatistics rounds={rounds} portfolio={portfolio} bookNet={net} />
     <Rejections orders={orders} />
     <h2>Completed trades · entry to flat</h2>
     <table className="ledger-table"><thead><tr><th>Symbol</th><th>Entry (IST)</th><th>Exit (IST)</th><th>Entries</th><th>Exits</th><th>Net P&L</th><th>Return</th></tr></thead><tbody>
@@ -323,6 +324,53 @@ function Statistics({ orders, trades, portfolio, rounds }: { orders: Order[]; tr
       {!rounds.length && <tr><td colSpan={7}>No fully closed trades</td></tr>}
     </tbody></table>
   </div>;
+}
+
+/** The book's index-option trades on their own (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY, …): the same completed-trade
+ * figures, then by side and by index. Hidden for a book with no index trades (spot, stock-only lanes). */
+function IndexStatistics({ rounds, portfolio, bookNet }: { rounds: RoundTrip[]; portfolio: Portfolio; bookNet: number }) {
+  const index = useMemo(() => rounds.filter((row) => indexUnderlying(row.symbol)), [rounds]);
+  const open = portfolio.positions.filter((row) => indexUnderlying(row.symbol));
+  if (!index.length && !open.length) return null;
+  const all = roundStats(index);
+  const ratio = (value: number | null, digits = 2) => value === null ? "—" : Number.isFinite(value) ? value.toFixed(digits) : "∞";
+  const money = (value: number | null) => value === null ? "—" : currency(value);
+  const rate = (value: number | null) => value === null ? "—" : `${(100 * value).toFixed(1)}%`;
+  const stats = [
+    ["Index trades", `${number.format(all.trades)} of ${number.format(rounds.length)}`],
+    ["Winning / losing trades", `${all.wins} / ${all.losses}`],
+    ["Win rate", rate(all.winRate)],
+    ["Index net P&L", currency(all.net)],
+    ["Share of completed net P&L", bookNet && all.trades ? `${(100 * all.net / bookNet).toFixed(0)}%` : "—"],
+    ["Profit factor", ratio(all.profitFactor)],
+    ["Average winner", money(all.avgWin)],
+    ["Average loser", money(all.avgLoss)],
+    ["Winner ÷ loser size", ratio(all.payoff)],
+    ["Average return", pct(all.avgReturn)],
+    ["Best trade", money(all.best)],
+    ["Worst trade", money(all.worst)],
+    ["Median hold", all.medianHeldMs === null ? "—" : heldLabel(all.medianHeldMs)],
+    ["Open index positions", number.format(open.length)],
+    ["Open index unrealized P&L", currency(open.reduce((sum, row) => sum + row.unrealized_pnl, 0))],
+  ];
+  const groups: [string, RoundStats][] = [
+    ...(["CE", "PE"] as const).map((side) => [`All index ${side}`, roundStats(index.filter((row) => optionSide(row.symbol) === side))] as [string, RoundStats]),
+    ...INDEX_UNDERLYINGS.flatMap((name): [string, RoundStats][] => {
+      const rows = index.filter((row) => indexUnderlying(row.symbol) === name);
+      if (!rows.length) return [];
+      return [[name, roundStats(rows)], ...(["CE", "PE"] as const).map((side) => [`${name} ${side}`, roundStats(rows.filter((row) => optionSide(row.symbol) === side))] as [string, RoundStats])];
+    }),
+  ].filter(([, row]) => row.trades > 0);
+  return <>
+    <h2>Index options only</h2>
+    <div className="statistics-note">Completed trades on index options ({INDEX_UNDERLYINGS.join(", ")}), entry to flat, fees included. Winner ÷ loser size is the average winner over the average loser; with a win rate under 50% it has to exceed (1 − win rate) ÷ win rate to pay.</div>
+    <div className="statistics-grid">{stats.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
+    {!!groups.length && <table className="ledger-table index-stats"><thead><tr><th>Index · side</th><th>Trades</th><th>Win rate</th><th>Net P&L</th><th>Profit factor</th><th>Avg winner</th><th>Avg loser</th><th>Winner ÷ loser</th><th>Avg return</th><th>Median hold</th></tr></thead><tbody>
+      {groups.map(([label, row]) => <tr key={label} className={label.includes(" ") ? "" : "index-stats-total"}><td>{label}</td><td>{number.format(row.trades)}</td><td>{rate(row.winRate)}</td>
+        <td className={row.net >= 0 ? "positive" : "negative"}>{currency(row.net)}</td><td>{ratio(row.profitFactor)}</td><td>{money(row.avgWin)}</td><td>{money(row.avgLoss)}</td>
+        <td>{ratio(row.payoff)}</td><td>{pct(row.avgReturn)}</td><td>{row.medianHeldMs === null ? "—" : heldLabel(row.medianHeldMs)}</td></tr>)}
+    </tbody></table>}
+  </>;
 }
 
 function Rejections({ orders }: { orders: Order[] }) {

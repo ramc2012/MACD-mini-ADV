@@ -162,3 +162,29 @@ test("a row without a backend stamp uses the holiday calendar too", () => {
   assert.equal(visibleClosedRows([row], ist(HOLIDAY_MON, "09:00"), HOLIDAY).length, 1);
   assert.equal(visibleClosedRows([row], ist(TUE_AFTER_HOLIDAY, WELL_AFTER), HOLIDAY).length, 0);
 });
+
+test("index options are told apart from stock options, cash and index spot", async () => {
+  const { indexUnderlying, optionSide } = await import("../src/ledgerMath.ts");
+  assert.equal(indexUnderlying("NSE:NIFTY26N0425500CE"), "NIFTY");
+  assert.equal(indexUnderlying("NSE:BANKNIFTY26NOV57000PE"), "BANKNIFTY");
+  assert.equal(indexUnderlying("NSE:MIDCPNIFTY26NOV13800CE"), "MIDCPNIFTY");
+  assert.equal(indexUnderlying("NSE:NIFTYNXT5026NOV70000CE"), "NIFTYNXT50");
+  assert.equal(indexUnderlying("BSE:SENSEX26N0682000PE"), "SENSEX");
+  assert.equal(indexUnderlying("NSE:ADANIENT26NOV2600CE"), null);
+  assert.equal(indexUnderlying("NSE:NIFTY50-INDEX"), null);
+  assert.equal(indexUnderlying("NSE:SBIN-EQ"), null);
+  assert.equal(optionSide("NSE:NIFTY26N0425500PE"), "PE");
+});
+
+test("round stats give win rate, profit factor, payoff and median hold", async () => {
+  const { roundStats } = await import("../src/ledgerMath.ts");
+  const round = (pnl: number, heldMin: number) => ({ symbol: "X", quantity: 1, lots: 1, lotSize: 1, entryPrice: 100, exitPrice: 100, entryTime: "", exitTime: "", pnl, returnPct: pnl / 10, heldMs: heldMin * 60_000, entryCount: 1, exitCount: 1 });
+  const stats = roundStats([round(300, 10), round(-100, 20), round(-50, 40)]);
+  assert.equal(stats.trades, 3);
+  assert.equal(stats.net, 150);
+  assert.equal(stats.profitFactor, 2);
+  assert.equal(stats.payoff, 4);
+  assert.equal(stats.medianHeldMs, 20 * 60_000);
+  assert.equal(roundStats([round(5, 1)]).profitFactor, Number.POSITIVE_INFINITY);
+  assert.equal(roundStats([]).winRate, null);
+});

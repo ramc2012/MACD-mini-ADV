@@ -1378,3 +1378,5 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .spot-status td { white-space: normal; }
 @media (max-width: 1380px) { .spot-page .blast-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 @media (max-width: 900px) { .spot-terminal { grid-template-columns: 1fr; height: auto; } .spot-terminal > .chart { height: 520px; } }
+.statistics > .index-stats { margin-top: 10px; }
+.index-stats tr.index-stats-total td { color: #dce5f1; font-weight: 600; border-top: 1px solid #2a3850; }
