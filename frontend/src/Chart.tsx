@@ -331,7 +331,9 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
     api.separators.forEach((primitive) => primitive.setTimes(layers.sessions ? sessionStarts(all) : []));
     // Index symbols report volume 0; an empty histogram would only steal the
     // bottom of the price pane, so the margin goes with the series.
-    const volumeVisible = layers.volume && all.some((c) => (c.volume || 0) > 0);
+    // Indices carry no traded volume; a few stray non-zero bars drew towers that dwarfed the pane. Volume shows
+    // only when most bars have it.
+    const volumeVisible = layers.volume && all.filter((c) => (c.volume || 0) > 0).length * 2 >= all.length && all.length > 0;
     api.volume.applyOptions({ visible: volumeVisible });
     api.candle.priceScale().applyOptions({ scaleMargins: { top: 0.06, bottom: volumeVisible ? 0.22 : 0.06 } });
     paintLegend();

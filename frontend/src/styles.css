@@ -1444,3 +1444,4 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .agentic-usage-axis { display: flex; justify-content: space-between; color: #687990; font-size: 10px; margin-top: 3px; }
 .agentic-usage-axis s { display: inline-block; width: 10px; height: 3px; margin: 0 4px 0 8px; vertical-align: middle; border-radius: 2px; text-decoration: none; }
 @media (max-width: 1100px) { .agentic-usage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.chart-frames .lane-frame-dot { display: inline-block; width: 4px; height: 4px; margin-left: 4px; vertical-align: middle; border-radius: 50%; background: #22c893; }

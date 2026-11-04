@@ -57,6 +57,10 @@ const CHART_PERIOD_STORE = "macd.chartPeriod";
 const CHART_LAYERS_STORE = "macd.chartLayers";
 const CHART_PANES_STORE = "macd.chartPanes";
 const CHART_STYLE_STORE = "macd.chartStyle";
+// Bar sizes the terminal chart can show (owner, 4 Nov 2026: 3, 5 and 15 minutes too). The lane's own frame streams
+// live; any other is aggregated from the stored minutes by /api/chart and refetched every 30 s.
+const CHART_FRAME_STORE = "macd.chartFrame";
+const CHART_FRAMES: [number, string][] = [[180, "3m"], [300, "5m"], [900, "15m"], [1800, "30m"], [3600, "1h"], [86400, "1D"]];
 const SELECTED_SYMBOL_STORE = "macd.selectedSymbol";
 // Every localStorage touch goes through these.  Writes throw outright in
 // Safari private browsing and with site data blocked, and a throw inside a
@@ -191,6 +195,14 @@ export default function App() {
     return stored && CHART_PERIODS.some((row) => row.key === stored) ? stored : "5D";
   });
   const pickChartPeriod = (key: ChartPeriod) => { setChartPeriod(key); writeKey(CHART_PERIOD_STORE, key); };
+  const [chartFrame, setChartFrame] = useState<number | null>(() => {
+    const stored = Number(readKey(CHART_FRAME_STORE));
+    return CHART_FRAMES.some(([seconds]) => seconds === stored) ? stored : null;
+  });
+  const pickChartFrame = (seconds: number, lane: number | undefined) => {
+    const next = seconds === lane ? null : seconds;          // null: follow the lane's frame if it is reconfigured
+    setChartFrame(next); writeKey(CHART_FRAME_STORE, next === null ? "" : String(next));
+  };
   const [fullChart, setFullChart] = useState<{ symbol: string; timeframe: number; candles: Candle[]; indicators: Indicator[] }>();
   const [fullChartError, setFullChartError] = useState("");
   const [chartLoading, setChartLoading] = useState(false);
@@ -350,8 +362,11 @@ export default function App() {
   }, []);
 
 
+  const laneFrame = snapshot?.config.timeframe_seconds;
+  const frame = chartFrame ?? laneFrame;
+  const nativeFrame = frame === laneFrame;
   useEffect(() => {
-    if (!selected || !snapshot) return;
+    if (!selected || !frame) return;
     const controller = new AbortController();
     const headers = API_TOKEN ? { "x-macd-token": API_TOKEN } : undefined;
     // Never combine the previous symbol's full history (or the short live
@@ -360,19 +375,22 @@ export default function App() {
     setFullChart(undefined);
     setFullChartError("");
     setChartLoading(true);
-    void fetch(`${API_URL}/api/chart/${encodeURIComponent(selected)}?timeframe_seconds=${snapshot.config.timeframe_seconds}`, { headers, signal: controller.signal })
+    const load = (quiet: boolean) => fetch(`${API_URL}/api/chart/${encodeURIComponent(selected)}?timeframe_seconds=${frame}`, { headers, signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error((await response.json()).detail || "Historical chart request failed");
         return response.json();
       })
-      .then((data) => setFullChart({ symbol: selected, timeframe: snapshot.config.timeframe_seconds, candles: data.candles, indicators: data.indicators }))
-      .catch((error) => { if (error.name !== "AbortError") setFullChartError(error instanceof Error ? error.message : "Historical chart request failed"); })
-      .finally(() => { if (!controller.signal.aborted) setChartLoading(false); });
-    return () => controller.abort();
-  }, [selected, snapshot?.config.timeframe_seconds, snapshotRevision]);
+      .then((data) => setFullChart({ symbol: selected, timeframe: frame, candles: data.candles, indicators: data.indicators }))
+      .catch((error) => { if (error.name !== "AbortError" && !quiet) setFullChartError(error instanceof Error ? error.message : "Historical chart request failed"); })
+      .finally(() => { if (!controller.signal.aborted && !quiet) setChartLoading(false); });
+    void load(false);
+    // Only the lane's frame has live bars on the stream; another frame refreshes from the stored minutes.
+    const refresh = nativeFrame ? 0 : window.setInterval(() => void load(true), 30_000);
+    return () => { controller.abort(); if (refresh) window.clearInterval(refresh); };
+  }, [selected, frame, nativeFrame, snapshotRevision]);
 
-  const chartReady = fullChart?.symbol === selected && fullChart.timeframe === snapshot?.config.timeframe_seconds;
-  const historical = useMemo(() => (chartReady ? mergeLiveCandles(fullChart.candles, closedLive[selected] || []) : []), [chartReady, fullChart, closedLive, selected]);
+  const chartReady = fullChart?.symbol === selected && fullChart.timeframe === frame;
+  const historical = useMemo(() => (chartReady ? (nativeFrame ? mergeLiveCandles(fullChart.candles, closedLive[selected] || []) : fullChart.candles) : []), [chartReady, nativeFrame, fullChart, closedLive, selected]);
   const indicatorRows = useMemo(() => {
     if (!chartReady) return [];
     const stored = fullChart.indicators;
@@ -381,9 +399,9 @@ export default function App() {
     // newer point; it must never replace a historical row or become a second
     // time domain for the lower panes.
     const lastStoredTimestamp = stored.length ? stored[stored.length - 1].timestamp : 0;
-    (indicators[selected] || []).filter((row) => row.timestamp > lastStoredTimestamp).forEach((row) => merged.set(row.timestamp, row));
+    if (nativeFrame) (indicators[selected] || []).filter((row) => row.timestamp > lastStoredTimestamp).forEach((row) => merged.set(row.timestamp, row));
     return [...merged.values()].sort((a, b) => a.timestamp - b.timestamp);
-  }, [chartReady, fullChart, indicators, selected]);
+  }, [chartReady, nativeFrame, fullChart, indicators, selected]);
   const chartCutoff = useMemo(() => {
     const sessions = CHART_PERIODS.find((row) => row.key === chartPeriod)?.sessions || 0;
     return sessionCutoff(historical, sessions);
@@ -544,7 +562,7 @@ export default function App() {
     now: quoteNow,
     marketOpen: health?.session_open,
     streamConnected: connected && brokerStatus === "connected",
-    timeframeSeconds: snapshot?.config.timeframe_seconds,
+    timeframeSeconds: frame,
     loading: chartLoading,
   });
   return <main style={{ "--chrome-h": `${chromeHeight}px` } as CSSProperties}>
@@ -615,15 +633,16 @@ export default function App() {
             </span>
             <span className="radar-filter">{CHART_PERIODS.map((row, index) => <button key={row.key} className={chartPeriod === row.key ? "active" : ""} title={`${row.key} (${index + 1})`} onClick={() => pickChartPeriod(row.key)}>{row.key}</button>)}</span>
             <button className="chart-fit" title="Fit all visible bars (f)" onClick={() => setFitNonce((n) => n + 1)}>Fit</button>
-            <span>{(snapshot?.config.timeframe_seconds || 0) / 60}m</span>
+            <span className="radar-filter chart-frames" aria-label="Bar size">{CHART_FRAMES.map(([seconds, label]) => <button key={seconds} className={frame === seconds ? "active" : ""} aria-pressed={frame === seconds}
+              title={seconds === laneFrame ? `${label} bars: the MACD lane's signal frame (live)` : `${label} bars from the stored minutes (refreshed every 30 s)`} onClick={() => pickChartFrame(seconds, laneFrame)}>{label}{seconds === laneFrame ? <i className="lane-frame-dot" aria-hidden="true" /> : null}</button>)}</span>
           </span>
         </div>
-        <TradingChart candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} levels={terminalLevels} error={fullChartError || snapshot?.history_errors?.[selected]}
-          timeframe={snapshot?.config.timeframe_seconds} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
-          fitKey={`${selected}:${snapshot?.config.timeframe_seconds}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
+        <TradingChart candles={visibleCandles} current={chartReady && nativeFrame ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} levels={terminalLevels} error={fullChartError || snapshot?.history_errors?.[selected]}
+          timeframe={frame} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
+          fitKey={`${selected}:${frame}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
     </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "AGENTIC" ? <AgenticPage /> : page === "LANES" ? <LanesPage ticks={ticks} portfolios={smartPortfolios} /> : page === "SCORE" ? <ScoreboardPage /> : page === "SPOT" ? <SpotLanePage ticks={ticks} portfolio={smartPortfolios.spot_macd} holidays={snapshot?.config.market_holidays} /> : page === "VANGUARD" || page === "CBE" ? <NomadLanePage lane={page === "VANGUARD" ? "vanguard" : "cbe"} ticks={ticks} connected={connected} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage /> : marketView === "DAYHIGH" ? <DayHighs onOpen={(symbol) => { setSelected(symbol); setLane("MACD"); setMacdView("TERMINAL"); }} /> : marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "STRADDLE" ? <StraddlePage /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "WORKSTATION" ? <PlatformWorkstation /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} />}</Suspense>}
-    {positionFocus && <PositionChartModal focus={positionFocus} levels={positionChartLevels} candles={visibleCandles} current={chartReady ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={snapshot?.config.timeframe_seconds} period={chartPeriod} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
+    {positionFocus && <PositionChartModal focus={positionFocus} levels={positionChartLevels} candles={visibleCandles} current={chartReady && nativeFrame ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={frame} period={chartPeriod} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
     <SettingsPanel open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />
   </main>;
 }
