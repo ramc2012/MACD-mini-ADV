@@ -952,9 +952,14 @@ class TradingEngine(DeskMixin):
                 {row.symbol: row.expiry for row in contracts}, datetime.now(IST).date())
             self.strategy = MACDStrategyManager(self.settings, self.events, self.option_symbols)
             tradable = {row.symbol: row.lot_size for row in contracts if row.symbol in self.option_symbols}
+            # New signal entries: today's ATM legs only, one position per stock (execution.entry_block). Held
+            # contracts stay tradable above so they can be added to and exited.
+            atm = {row.symbol for row in contracts if row.moneyness == "ATM" and not row.analysis_only}
             self.execution.set_tradable_contracts(tradable)
+            self.execution.set_entry_universe(atm)
             self.execution.set_contract_expiries({row.symbol: row.expiry for row in contracts})
             self.blast.set_tradable_contracts(tradable)
+            self.blast.execution.set_entry_universe(atm)
             self.blast.set_contract_context({
                 row.symbol: {
                     "spot_symbol": row.spot_symbol, "option_type": row.option_type,
@@ -976,6 +981,8 @@ class TradingEngine(DeskMixin):
             }
             for lane in _smart_lanes(self):
                 lane.set_tradable_contracts(tradable)
+                if lane is not getattr(self, "spot_lane", None):       # stock futures: its own one-per-stock rule
+                    lane.execution.set_entry_universe(atm)
                 lane.set_contract_context(lane_context)
                 lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
                                    entry_context=self._smart_entry_context, whale=self.whale_interest.reading)
@@ -3024,6 +3031,8 @@ class TradingEngine(DeskMixin):
             "blast": self.blast.health(),
             "smart_lanes": {smart.name: smart.health() for smart in _smart_lanes(self)},
             "exit_failures": self.exit_failures(),
+            "entry_rule": {name: status for name, execution in self._books()
+                           if (status := getattr(execution, "entry_rule_status", lambda: None)()) is not None},
             "rollover": self.rollover_status(),
         }
 

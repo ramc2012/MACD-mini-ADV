@@ -345,6 +345,11 @@ class EntryGate:
                 self._decide(item.signal, item.features, item.score, "STALE", item.whale)
                 continue
             held_before = symbol in portfolio.positions
+            blocked = None if held_before else getattr(execution, "entry_block", lambda _symbol: None)(symbol)
+            if blocked:                                  # NOT_ATM / STOCK_HELD (owner, 4 Nov 2026)
+                execution.note_entry_block(symbol, blocked)
+                self._decide(item.signal, item.features, item.score, blocked, item.whale)
+                continue
             if not held_before and validate_signal is not None:
                 try:
                     rejection = validate_signal(item.signal)

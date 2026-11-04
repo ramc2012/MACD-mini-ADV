@@ -20,6 +20,17 @@ ADD_RETRY_SECONDS = 300.0
 EXIT_RETRY_SECONDS = (15.0, 60.0, 300.0)
 
 
+def contract_root(symbol: str) -> str:
+    """The stock or index an option belongs to (NSE:HAL26NOV4900CE -> HAL); the symbol itself if unparsed."""
+    from .option_agent import parse_option
+    parsed = parse_option(symbol)
+    return parsed["root"] if parsed else symbol
+
+
+class EntryBlocked(ValueError):
+    """A signal entry outside the day's ATM legs, or on a stock the book already holds (entry_block)."""
+
+
 class ExitRetryWait(RuntimeError):
     """An automated exit inside its back-off after a rejected attempt; no order was created."""
 
@@ -51,6 +62,13 @@ class ExecutionManager:
         # in health (count, reason, error, first/last IST). Cleared by the next filled SELL.
         self._exit_blocked_until: dict[str, float] = {}
         self.exit_failures: dict[str, dict] = {}
+        # Owner, 4 Nov 2026: "our ATM watchlist should only be traded. ATM+1 is for analysis and liquidity only. if
+        # atm is illiquid other one can be traded but only one per stock." Signal entries may open only the day's
+        # ATM legs (the selector's ATM slot already moves to a nearby strike when that one is 1.5x as liquid), and
+        # only on a stock (option root) this book holds nothing in. None = no such rule (the spot lane, tests).
+        self.entry_universe: set[str] | None = None
+        self.entry_blocks: dict[str, int] = {}
+        self.last_entry_block: dict | None = None
         self.orders: dict[str, Order] = {}
         if settings.execution_mode == "paper":
             self.orders = {order.order_id: order for order in repository.load_open_orders()}
@@ -108,6 +126,33 @@ class ExecutionManager:
     def set_tradable_symbols(self, symbols: list[str]) -> None:
         self.tradable_symbols = set(symbols)
         self.lot_sizes = {symbol: 1 for symbol in symbols}
+
+    def set_entry_universe(self, symbols: set[str] | None) -> None:
+        self.entry_universe = set(symbols) if symbols is not None else None
+
+    def entry_block(self, symbol: str) -> str | None:
+        """Why a signal may not open a new position in ``symbol``, or None."""
+        if self.entry_universe is None:
+            return None
+        if symbol not in self.entry_universe:
+            return "NOT_ATM"
+        root = contract_root(symbol)
+        if any(held != symbol and position.quantity != 0 and contract_root(held) == root
+               for held, position in self.portfolio.positions.items()):
+            return "STOCK_HELD"
+        if any(order.status == "OPEN" and order.side == "BUY" and order.symbol != symbol
+               and contract_root(order.symbol) == root for order in self.orders.values()):
+            return "STOCK_HELD"
+        return None
+
+    def note_entry_block(self, symbol: str, reason: str) -> None:
+        self.entry_blocks[reason] = self.entry_blocks.get(reason, 0) + 1
+        self.last_entry_block = {"symbol": symbol, "reason": reason, "at": datetime.now(IST).isoformat(timespec="seconds")}
+
+    def entry_rule_status(self) -> dict | None:
+        if self.entry_universe is None:
+            return None
+        return {"atm_contracts": len(self.entry_universe), "blocked": dict(self.entry_blocks), "last": self.last_entry_block}
 
     def set_tradable_contracts(self, lot_sizes: dict[str, int]) -> None:
         self.lot_sizes = {symbol: int(size) for symbol, size in lot_sizes.items() if int(size) > 0}
@@ -245,6 +290,12 @@ class ExecutionManager:
                       _exit_stage: int | None) -> Order:
         if symbol not in self.tradable_symbols and not held_exit:
             raise ValueError(f"{symbol} is not on the watchlist")
+        if side == "BUY" and signal is not None and position is None:
+            blocked = self.entry_block(symbol)
+            if blocked:
+                self.note_entry_block(symbol, blocked)
+                raise EntryBlocked(f"{symbol}: {'not the ATM contract' if blocked == 'NOT_ATM' else 'one position per stock'}"
+                                   f" ({blocked})")
         lot_size = self.lot_sizes.get(symbol, 0) or (position.lot_size if held_exit and position.lot_size > 1 else 0)
         if lot_size < 1:
             raise ValueError(f"Lot size is unavailable for {symbol}; order blocked")

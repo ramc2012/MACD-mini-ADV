@@ -85,7 +85,7 @@ from .brokers import Broker
 from .chain_warmup import chain_minutes
 from .config import Settings
 from .events import EventHub, json_value
-from .execution import ExecutionManager
+from .execution import EntryBlocked, ExecutionManager
 from .indicators import IncrementalHMA, IncrementalKAMA, IncrementalMACD
 from . import market_calendar
 from .models import Candle, IndicatorPoint, Signal, Trade
@@ -1063,6 +1063,9 @@ class BlastEngine:
                 detail["entry_rejection"] = "No whole lot fits the ticket, cash or liquidity cap"
                 return None
             order = await self.execution.submit(signal.symbol, "BUY", lots=lots, signal=signal)
+        except EntryBlocked as exc:                      # the ATM / one-per-stock rule: routine, not a lane error
+            detail["entry_rejection"] = str(exc)
+            return None
         except (ValueError, RuntimeError, PermissionError) as exc:
             self.error = f"entry rejected: {exc}"
             detail["entry_rejection"] = str(exc)

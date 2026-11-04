@@ -521,6 +521,10 @@ class SmartLane:
         execution = self.execution
         if symbol in self.portfolio.positions:
             return self._record(item, ALREADY_HELD, now, cut=cut)
+        blocked = execution.entry_block(symbol)       # NOT_ATM / STOCK_HELD (owner, 4 Nov 2026)
+        if blocked:
+            execution.note_entry_block(symbol, blocked)
+            return self._record(item, blocked, now, cut=cut)
         if (now - item.due).total_seconds() > STALE_SECONDS:
             return self._record(item, NO_PRICE if item.detail.get('quote_retries') else STALE, now, cut=cut,
                                 detail={'reason': 'Original admission deadline elapsed; no stale fill'})
