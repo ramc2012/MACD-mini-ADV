@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from collections import Counter
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -120,7 +121,8 @@ def build(database_path: str, symbols: list[str], now: datetime | None = None) -
             else:
                 rows.append(row)
     starts = [row["bar_start"] for row in rows if not row["stale"]]
-    as_of = max(starts) if starts else None
+    # The bar most rows end on: after 15:15 cash stocks are done while indices still print to 15:30.
+    as_of = Counter(starts).most_common(1)[0][0] if starts else None
     return {
         "session": day.isoformat(), "timeframe_seconds": TIMEFRAME, "generated_at": now.isoformat(),
         "as_of": as_of, "as_of_end": as_of + TIMEFRAME if as_of else None,

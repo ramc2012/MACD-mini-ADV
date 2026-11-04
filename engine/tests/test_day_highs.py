@@ -70,3 +70,12 @@ def test_a_symbol_whose_feed_stopped_is_marked_stale(tmp_path):
     result = day_highs.build(path, ["NSE:UP-EQ", "NSE:LIVE-EQ"], _now("10:00", 40))
     rows = {row["label"]: row for row in result["rows"]}
     assert rows["UP"]["stale"] and not rows["LIVE"]["stale"]
+
+
+def test_after_the_cash_close_the_header_bar_is_the_one_most_rows_end_on(tmp_path):
+    bars = [(100, 101, 99, 100.5)] * 25
+    path = _store(tmp_path, {"NSE:A-EQ": bars[:24], "NSE:B-EQ": bars[:24], "NSE:NIFTY50-INDEX": bars})
+    result = day_highs.build(path, ["NSE:A-EQ", "NSE:B-EQ", "NSE:NIFTY50-INDEX"], _now("21:00"))
+    rows = {row["symbol"]: row for row in result["rows"]}
+    assert result["as_of"] == _at("15:00") and rows["NSE:A-EQ"]["bar_start"] == _at("15:00")
+    assert rows["NSE:NIFTY50-INDEX"]["bar_start"] == _at("15:15") and not rows["NSE:NIFTY50-INDEX"]["stale"]
