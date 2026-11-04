@@ -57,3 +57,48 @@ def test_local_recovery_never_requests_historical_broker_data(monkeypatch):
         broker = _broker(hub)
         with pytest.raises(RuntimeError, match="disabled"):
             _run(broker, forbidden, lambda c: broker._data_get(c, "history", {}, priority="bulk"))
+
+
+def test_a_hub_that_does_not_answer_falls_back_to_fyers_and_is_skipped_for_a_minute():
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.host)
+        if request.url.host == "hub":
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(200, json={"s": "ok"})
+
+    broker = _broker("http://hub:8400")
+    for _ in range(2):
+        response = _run(broker, handler, lambda c: broker._data_get(c, "quotes", {"symbols": "NSE:A"}, priority="high"))
+        assert response.json() == {"s": "ok"}
+    assert seen == ["hub", "api-t1.fyers.in", "api-t1.fyers.in"]       # the second call skipped the hub
+    status = broker.hub_status()
+    assert status["bypassed"] and status["fallbacks"] == 1 and "ConnectError" in status["last_error"]
+    broker._hub_skip_until = 0                                          # a minute later the hub is tried again
+    _run(broker, handler, lambda c: broker._data_get(c, "quotes", {"symbols": "NSE:A"}, priority="high"))
+    assert seen[-2:] == ["hub", "api-t1.fyers.in"] and broker.hub_fallbacks == 2
+
+
+def test_the_hubs_own_error_falls_back_but_a_fyers_answer_through_the_hub_does_not():
+    def answer(status, served):
+        def handler(request):
+            if request.url.host == "hub":
+                return httpx.Response(status, json={"error": "no_session"} if not served else {"s": "error", "code": -16},
+                                      headers={"x-mi-served": "fetched"} if served else {})
+            return httpx.Response(200, json={"s": "direct"})
+        return handler
+
+    broker = _broker("http://hub:8400")
+    assert _run(broker, answer(503, False), lambda c: broker._data_get(c, "depth", {}, priority="high")).json() == {"s": "direct"}
+    broker = _broker("http://hub:8400")
+    response = _run(broker, answer(401, True), lambda c: broker._data_get(c, "depth", {}, priority="high"))
+    assert response.status_code == 401 and broker.hub_fallbacks == 0   # Fyers' own 401 still reaches the caller
+    broker = _broker("http://hub:8400")
+    response = _run(broker, answer(429, False), lambda c: broker._data_get(c, "depth", {}, priority="high"))
+    assert response.status_code == 429 and broker.hub_fallbacks == 0   # the shared day budget is not routed around
+
+
+def test_the_hub_url_comes_from_the_environment_never_settings_json():
+    from macd_trader.config import ENVIRONMENT_ONLY
+    assert "market_hub_url" in ENVIRONMENT_ONLY

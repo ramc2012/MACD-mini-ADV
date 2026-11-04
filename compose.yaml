@@ -42,8 +42,8 @@ services:
       # The agentic lane's brain (xAI Grok). Put XAI_API_KEY=... in the git-ignored .env beside this file;
       # empty leaves the lane in rules-only mode (it manages open positions and opens nothing).
       XAI_API_KEY: ${XAI_API_KEY:-}
-      # The market-intelligence hub (~/CLAUDE PROJECTS/market-intelligence); empty = call Fyers directly (the default until the
-      # hub's shadow capture has matched this app's).
+      # The market-intelligence hub (~/CLAUDE PROJECTS/market-intelligence): Fyers data REST goes through it, straight to
+      # Fyers for a minute whenever it fails; empty = call Fyers directly. The desk takes the same value.
       MACD_MARKET_HUB_URL: ${MACD_MARKET_HUB_URL:-}
       MACD_SHADOW_LANES_URL: http://shadow-lanes:8430
       LOCAL_DECISION_URL: http://local-decisions:8435
@@ -82,6 +82,7 @@ services:
       MACD_EXECUTION_MODE: paper
       MACD_ALLOW_LIVE_ORDERS: "false"
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      MACD_MARKET_HUB_URL: ${MACD_MARKET_HUB_URL:-}
     volumes:
       # Read-only: the engine owns settings.json and the credentials.
       - ./runtime:/app/runtime:ro

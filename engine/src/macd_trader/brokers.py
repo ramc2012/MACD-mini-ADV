@@ -341,6 +341,11 @@ def _is_socket_auth_failure(detail: object) -> bool:
     return code == _SOCKET_AUTH_FAILURE_CODE or str(detail.get("message") or "").lower() == "authentication failed"
 
 
+# The market-intelligence hub's own failures (not Fyers' answers), and how long the hub is skipped after one.
+HUB_OWN_FAILURES = frozenset({400, 404, 500, 502, 503, 504})
+HUB_RETRY_SECONDS = 60.0
+
+
 class FyersBroker(Broker):
     name = "fyers"
     data_url = "https://api-t1.fyers.in/data"
@@ -372,6 +377,12 @@ class FyersBroker(Broker):
         self._master_dir = Path(settings.contract_snapshot_path).parent
         self._master_text: dict[str, tuple[str, str]] = {}
         self._chain_keys_logged = False
+        # Calls the hub could not serve (down, or its own error rather than Fyers'): they went straight to
+        # Fyers, and the hub is skipped until _hub_skip_until.
+        self.hub_fallbacks = 0
+        self.hub_last_error: str | None = None
+        self.hub_last_error_at: datetime | None = None
+        self._hub_skip_until = 0.0
 
     def tick_buffer_status(self) -> dict:
         status = self._tick_buffer.status() if self._tick_buffer else {
@@ -488,14 +499,42 @@ class FyersBroker(Broker):
         if endpoint == "history" and os.environ.get("MACD_HISTORY_DOWNLOADS_ENABLED", "true").lower() in ("false", "0", "off"):
             raise RuntimeError("Historical broker downloads disabled during local-archive recovery")
         hub = (getattr(self.settings, "market_hub_url", "") or "").rstrip("/")
-        if not hub:
-            return await client.get(f"{self.data_url}/{endpoint}", params=params,
-                                    headers={"Authorization": self.authorization})
+        if not hub or time.monotonic() < self._hub_skip_until:
+            return await self._direct_get(client, endpoint, params)
         body = {"broker": "fyers", "endpoint": endpoint, "query": {k: str(v) for k, v in params.items()},
                 "priority": priority, "caller": "macd-mini-adv"}
         if ttl_ms is not None:
             body["ttl_ms"] = ttl_ms
-        return await client.post(f"{hub}/v1/request", json=body)
+        try:
+            response = await client.post(f"{hub}/v1/request", json=body)
+        except httpx.TransportError as exc:
+            return await self._hub_fallback(client, endpoint, params, f"{type(exc).__name__}: {exc}"[:200])
+        # A Fyers answer carries x-mi-served. Without it the status is the hub's own: no session, a broker it
+        # could not reach, an endpoint it does not allow. Its 429 (the shared day budget is spent) stands:
+        # going around it would only spend the same account's limit.
+        if "x-mi-served" not in response.headers and response.status_code in HUB_OWN_FAILURES:
+            return await self._hub_fallback(client, endpoint, params, f"hub {response.status_code}: {response.text[:160]}")
+        return response
+
+    async def _direct_get(self, client: httpx.AsyncClient, endpoint: str, params: dict) -> httpx.Response:
+        return await client.get(f"{self.data_url}/{endpoint}", params=params,
+                                headers={"Authorization": self.authorization})
+
+    async def _hub_fallback(self, client: httpx.AsyncClient, endpoint: str, params: dict, error: str) -> httpx.Response:
+        if self.hub_fallbacks == 0 or time.monotonic() >= self._hub_skip_until:
+            print(f"market hub unavailable ({error}); Fyers {endpoint} direct for {HUB_RETRY_SECONDS:.0f} s")
+        self.hub_fallbacks += 1
+        self.hub_last_error, self.hub_last_error_at = error, datetime.now(UTC)
+        self._hub_skip_until = time.monotonic() + HUB_RETRY_SECONDS
+        return await self._direct_get(client, endpoint, params)
+
+    def hub_status(self) -> dict | None:
+        hub = (getattr(self.settings, "market_hub_url", "") or "").rstrip("/")
+        if not hub:
+            return None
+        return {"url": hub, "bypassed": time.monotonic() < self._hub_skip_until, "fallbacks": self.hub_fallbacks,
+                "last_error": self.hub_last_error,
+                "last_error_at": self.hub_last_error_at.isoformat() if self.hub_last_error_at else None}
 
     @staticmethod
     def exchange_timestamp(payload: dict) -> datetime:

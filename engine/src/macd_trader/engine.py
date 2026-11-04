@@ -2739,6 +2739,7 @@ class TradingEngine(DeskMixin):
             "option_count": len(self.option_symbols),
             "analysis_option_count": len(getattr(self, "analysis_option_symbols", set())),
             "tick_buffer": getattr(self.broker, "tick_buffer_status", lambda: None)(),
+            "market_hub": getattr(self.broker, "hub_status", lambda: None)(),
         }
 
     def option_greeks(self, contract) -> dict:

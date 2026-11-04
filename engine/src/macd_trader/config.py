@@ -337,8 +337,9 @@ class Settings(BaseSettings):
     # reset cannot take it. Raw ticks are kept there tick_archive_retention_days; every other dataset forever.
     # The SQLite stores below are the hot window: nothing leaves them until the archive holds it.
     # The market-intelligence hub (~/CLAUDE PROJECTS/market-intelligence): when set, every Fyers data REST call goes through its
-    # shared budget and cache (brokers.FyersBroker._data_get). Empty = straight to Fyers. Switch on only after the
-    # hub's shadow capture has matched this app's over a session (platform phase 2 gate).
+    # shared budget and cache (brokers.FyersBroker._data_get), straight to Fyers for a minute whenever the hub fails.
+    # Empty = straight to Fyers. Environment only (MACD_MARKET_HUB_URL, engine and desk): a "" left in
+    # settings.json silently kept both processes off the hub until 4 Nov 2026 (owner: route through the hub).
     market_hub_url: str = ""
     # Entry-time order flow: "desk" reads the desk's published snapshots (live_features.FlowSnapshots) and runs no
     # tracker here; the engine's own tracker runs only while no snapshot has arrived. "local" = the old tracker.
@@ -449,5 +450,5 @@ ENVIRONMENT_ONLY = frozenset({
     "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
     "research_report_path", "contract_snapshot_path", "mp_database_path",
     "blast_database_path", "tick_database_path", "api_token", "allowed_origins_csv",
-    "engine_role", "nats_url", "strategy_url", "desk_url",
+    "engine_role", "nats_url", "strategy_url", "desk_url", "market_hub_url",
 })
