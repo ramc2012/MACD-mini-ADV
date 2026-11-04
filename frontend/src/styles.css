@@ -959,7 +959,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .agent-weights { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 4px 10px; font-size: 10px; font-variant-numeric: tabular-nums; }
 @media (max-width: 1100px) { .agent-picks, .agent-bottom { grid-template-columns: minmax(0, 1fr); } .agent-stats { grid-template-columns: minmax(0, 1fr); } }
 .agent-empty { padding: 18px 12px; color: #718198; font-size: 12px; }
-.agent-index-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: #1a2433; }
+.agent-index-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: #1a2433; }
 .agent-index-card { background: #0e151f; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; min-width: 0; border-top: 2px solid transparent; }
 .agent-index-call { border-top-color: #22c893; } .agent-index-put { border-top-color: #f15b6c; } .agent-index-none { border-top-color: #34465f; }
 .agent-index-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -975,15 +975,57 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @media (max-width: 1100px) { .agent-index-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 560px) { .agent-index-grid { grid-template-columns: minmax(0, 1fr); } }
 .agent-equity-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: #1a2433; }
-.agent-equity { background: #0b1018; display: flex; flex-direction: column; min-width: 0; padding: 6px 8px 8px; gap: 4px; }
+.agent-equity { background: #090d14; display: flex; flex-direction: column; min-width: 0; padding: 10px 12px 10px; gap: 6px; }
 .agent-equity-head { display: flex; align-items: baseline; gap: 8px; }
 .agent-equity-head b { color: #dce5f1; font-size: 12px; } .agent-equity-head small { color: #687990; font-size: 10px; }
-.agent-equity-chart { height: 220px; min-width: 0; }
-.agent-equity-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px 8px; font-size: 10px; color: #687990; }
+.agent-equity-chart { height: 240px; min-width: 0; border-radius: 3px; overflow: hidden; }
+.agent-equity-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px 10px; padding-top: 8px; border-top: 1px solid #151d29; font-size: 10px; color: #687990; }
 .agent-equity-stats b { display: block; color: #c9d4e3; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .agent-equity-exits { color: #687990; font-size: 10px; }
 @media (max-width: 1100px) { .agent-equity-grid { grid-template-columns: minmax(0, 1fr); } }
 .agent-index-series { padding: 1px 6px; border-radius: 8px; background: #2a2340; color: #c5b5ff; font-size: 10px; }
+/* Option agent, 4 Nov 2026: tabs, the watchlist tracker and the equity legends. */
+.agent-tabs { display: flex; gap: 2px; border-bottom: 1px solid #1d2838; }
+.agent-tabs button { padding: 7px 14px 8px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #8a9bb2; font-size: 12px; cursor: pointer; }
+.agent-tabs button:hover { color: #c9d4e3; }
+.agent-tabs button.active { border-bottom-color: #4d91ff; color: #e3ebf6; font-weight: 600; }
+.agent-tabs button span { margin-left: 6px; padding: 1px 6px; border-radius: 8px; background: #16314f; color: #9cc6ff; font-size: 10px; font-weight: 600; }
+.agent-list-bar, .agent-tracker-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.agent-tracker-bar .heatmap-search { width: 160px; }
+.agent-hint { margin-left: auto; color: #5f6f86; font-size: 10px; }
+.agent-link { border: 0; padding: 0; background: none; cursor: pointer; text-decoration: underline dotted #4d6a90; text-underline-offset: 3px; }
+.agent-link:hover { color: #dce5f1; }
+.agent-picks .openable-row, .agent-track-table .openable-row { cursor: pointer; }
+.agent-picks .openable-row:hover td, .agent-track-table .openable-row:hover td { background: #101a28; }
+.agent-equity-head { align-items: center; }
+.agent-equity-final { margin-left: auto; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.agent-equity-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; min-height: 16px; color: #7d8ea6; font-size: 10px; font-variant-numeric: tabular-nums; }
+.agent-equity-legend i { margin-left: 5px; font-style: normal; color: #dce5f1; }
+.agent-equity-legend i.positive { color: #22c893; } .agent-equity-legend i.negative { color: #f15b6c; }
+.agent-equity-legend s { display: inline-block; width: 12px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; text-decoration: none; }
+.agent-equity-legend s.swatch-main { background: linear-gradient(90deg, #22c893 50%, #f15b6c 50%); }
+.agent-equity-legend s.swatch-bench { height: 0; border-top: 2px dashed #8796aa; background: none !important; }
+.agent-equity-day { color: #c7d3e2; font-weight: 650; letter-spacing: .02em; }
+.agent-tracker-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: #1a2433; }
+.agent-tracker-cards > div { background: #0e151f; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.agent-tracker-cards small { color: #687990; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+.agent-tracker-cards b { color: #dce5f1; font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.agent-tracker-cards span { color: #7d8ea6; font-size: 10px; }
+.agent-track { border-left: 2px solid #34465f; }
+.agent-track.is-open { border-left-color: #4d91ff; }
+.agent-track-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; width: 100%; padding: 9px 12px; border: 0; background: transparent; color: #9fb0c5; font-size: 11px; text-align: left; cursor: pointer; }
+.agent-track-head:hover { background: #0f1724; }
+.agent-track-head b { color: #e3ebf6; font-size: 13px; }
+.agent-track-head small { color: #687990; font-size: 10px; }
+.agent-track-caret { width: 10px; color: #6b7d96; }
+.agent-track-status { padding: 1px 7px; border-radius: 8px; font-size: 10px; font-weight: 650; }
+.agent-track-status.open { background: #16314f; color: #9cc6ff; } .agent-track-status.closed { background: #1b2230; color: #8a9bb2; }
+.agent-track-figures { display: inline-flex; gap: 14px; margin-left: auto; font-variant-numeric: tabular-nums; }
+.agent-track-figures em { font-style: normal; font-weight: 600; }
+.agent-leg { display: inline-block; min-width: 26px; padding: 1px 5px; border-radius: 3px; font-size: 9.5px; font-weight: 700; text-align: center; letter-spacing: .04em; }
+.agent-leg-ce { background: #10291f; color: #5fdcae; } .agent-leg-pe { background: #2c141a; color: #ff8d9a; } .agent-leg-index { background: #16263d; color: #8cbcff; }
+.agent-outcome { font-weight: 600; font-variant-numeric: tabular-nums; } .agent-outcome.win { color: #22c893; } .agent-outcome.loss { color: #f15b6c; }
+@media (max-width: 1100px) { .agent-tracker-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } .agent-track-figures { margin-left: 0; } }
 
 /* Header, 30 Sep 2026: four index cards, a session clock and the Fyers chip.
    Cards are equal-width grid cells with fixed rows, so digits, signs and the
@@ -1380,3 +1422,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 @media (max-width: 900px) { .spot-terminal { grid-template-columns: 1fr; height: auto; } .spot-terminal > .chart { height: 520px; } }
 .statistics > .index-stats { margin-top: 10px; }
 .index-stats tr.index-stats-total td { color: #dce5f1; font-weight: 600; border-top: 1px solid #2a3850; }
+
+/* Agentic lane, 4 Nov 2026: Grok usage and credit. */
+.agentic-usage-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 1px; background: #1a2433; margin: 0 12px; border-radius: 4px; overflow: hidden; }
+.agentic-usage-card { background: #0e151f; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.agentic-usage-card small { color: #687990; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; }
+.agentic-usage-card b { color: #eef3f9; font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.agentic-usage-card b em { color: #7d8ea6; font-size: 10px; font-style: normal; font-weight: 400; }
+.agentic-usage-card span { color: #8fa1b8; font-size: 11px; font-variant-numeric: tabular-nums; }
+.agentic-usage-card .agentic-usage-split { color: #687990; font-size: 10px; }
+.agentic-usage-balance { border-left: 2px solid #c98500; }
+.agentic-usage-balance .agentic-btn { align-self: flex-start; margin-top: 4px; }
+.agentic-usage-days { margin: 10px 12px 12px; }
+.agentic-usage-days svg { width: 100%; height: 60px; display: block; }
+.agentic-usage-axis { display: flex; justify-content: space-between; color: #687990; font-size: 10px; margin-top: 3px; }
+.agentic-usage-axis s { display: inline-block; width: 10px; height: 3px; margin: 0 4px 0 8px; vertical-align: middle; border-radius: 2px; text-decoration: none; }
+@media (max-width: 1100px) { .agentic-usage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

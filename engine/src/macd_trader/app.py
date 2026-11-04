@@ -488,6 +488,9 @@ class AgenticBrainInput(BaseModel):
     reasoning_effort: str | None = Field(default=None, max_length=10)
     universe: str | None = Field(default=None, max_length=10)
     cycle_minutes: int | None = None
+    management_key: str | None = Field(default=None, max_length=400)
+    clear_management_key: bool = False
+    team_id: str | None = Field(default=None, max_length=80)
 
 
 @app.get("/api/agentic/brain", dependencies=[Depends(authorize)])
@@ -502,9 +505,22 @@ async def agentic_brain_update(payload: AgenticBrainInput):
         return await asyncio.to_thread(_agentic().update_brain, api_key=payload.api_key, clear_key=payload.clear_key,
                                        model=payload.model, api_base=payload.api_base,
                                        reasoning_effort=payload.reasoning_effort, universe=payload.universe,
-                                       cycle_minutes=payload.cycle_minutes)
+                                       cycle_minutes=payload.cycle_minutes, management_key=payload.management_key,
+                                       clear_management_key=payload.clear_management_key, team_id=payload.team_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/agentic/usage", dependencies=[Depends(authorize)])
+async def agentic_usage():
+    """Grok calls, tokens and xAI's cost per IST day from the journal, and the last fetched credit balance."""
+    return await asyncio.to_thread(_agentic().usage_summary)
+
+
+@app.post("/api/agentic/usage/balance", dependencies=[Depends(authorize)])
+async def agentic_usage_balance():
+    """Fetch the prepaid credit balance from xAI's Management API (needs a management key and team id)."""
+    return await _agentic().refresh_balance()
 
 
 @app.post("/api/agentic/brain/test", dependencies=[Depends(authorize)])

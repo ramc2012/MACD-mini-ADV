@@ -402,3 +402,69 @@ def test_connection_test_lists_models_and_checks_the_chosen_one():
         lambda r: httpx.Response(401, json={"error": "bad key"})))
     result = asyncio.run(denied.test())
     assert not result["ok"] and "HTTP 401" in result["error"]
+
+
+# ----------------------------------------------------------------------------------- Grok usage and credit
+
+def test_usage_meta_reads_reasoning_cached_tokens_and_xai_cost():
+    meta = brain.usage_meta({"prompt_tokens": 1200, "completion_tokens": 300, "cost_in_usd_ticks": 158_500,
+                             "prompt_tokens_details": {"cached_tokens": 800},
+                             "completion_tokens_details": {"reasoning_tokens": 220}})
+    assert meta == {"prompt_tokens": 1200, "completion_tokens": 300, "reasoning_tokens": 220, "cached_tokens": 800,
+                    "cost_ticks": 158_500}
+    assert brain.usage_meta({"input_tokens": 9, "output_tokens": 3})["prompt_tokens"] == 9
+    assert brain.usage_meta(None)["cost_ticks"] is None
+
+
+def test_usage_summary_totals_calls_tokens_and_cost_by_period(tmp_path):
+    lane = build(tmp_path)
+    priced = {"latency_ms": 5, "model": "grok-test", "prompt_tokens": 1000, "completion_tokens": 200,
+              "reasoning_tokens": 150, "cached_tokens": 600, "cost_ticks": 25_000_000}   # $0.0025 a call
+    client = FakeClient(decision(), decision())
+    client.decide = lambda *a, **k: _done((decision(), priced))
+    lane.client = client
+    asyncio.run(lane.think("test", None, NOW))
+    asyncio.run(lane.think("test", None, NOW + timedelta(days=1)))
+    summary = lane.usage_summary(NOW + timedelta(days=1))
+    today, week = summary["periods"]["today"], summary["periods"]["last_7_days"]
+    assert today["calls"] == 1 and week["calls"] == 2 and week["reasoning_tokens"] == 300 and week["cached_tokens"] == 1200
+    assert week["cost_usd"] == 0.005 and summary["days"][-1]["day"] == "2026-10-06"
+    assert summary["balance"] is None and summary["balance_configured"] is False
+
+
+async def _done(value):
+    return value
+
+
+def test_credit_balance_needs_a_management_key_and_never_returns_it(tmp_path, monkeypatch):
+    lane = build(tmp_path)
+    assert asyncio.run(lane.refresh_balance())["error"].startswith("a management key")
+    status = lane.update_brain(management_key="mgmt-key-5555abcd", team_id="team-1")
+    assert status["management_key_hint"] == "…abcd" and status["team_id"] == "team-1"
+    assert "mgmt-key" not in json.dumps(status) and lane.usage_summary(NOW)["balance_configured"] is True
+    seen = {}
+
+    async def fake_balance(key, team, timeout=20.0):
+        seen.update(key=key, team=team)
+        return {"balance_usd": 19.88, "changes": []}
+
+    monkeypatch.setattr(brain, "prepaid_balance", fake_balance)
+    balance = asyncio.run(lane.refresh_balance())
+    assert balance["balance_usd"] == 19.88 and balance["error"] is None and seen == {"key": "mgmt-key-5555abcd", "team": "team-1"}
+    assert lane.update_brain(clear_management_key=True)["management_key_hint"] is None and lane.last_balance is None
+
+
+def test_prepaid_balance_reads_cents_from_the_management_api():
+    def handler(request: httpx.Request):
+        assert request.url.host == "management-api.x.ai" and request.url.path == "/v1/billing/teams/team-1/prepaid/balance"
+        assert request.headers["authorization"] == "Bearer mk"
+        return httpx.Response(200, json={"total": {"val": "1988"}, "changes": [{"createTime": "2026-11-01T10:00:00Z",
+                                                                                "changeOrigin": "PURCHASE", "amount": {"val": "2000"}}]})
+
+    real = httpx.AsyncClient
+    try:
+        httpx.AsyncClient = lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+        out = asyncio.run(brain.prepaid_balance("mk", "team-1"))
+    finally:
+        httpx.AsyncClient = real
+    assert out["balance_usd"] == 19.88 and out["changes"][0]["amount_usd"] == 20.0

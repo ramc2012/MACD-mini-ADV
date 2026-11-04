@@ -645,6 +645,12 @@ def test_past_lists_are_listed_openable_by_id_and_open_ones_gathered(history, mo
     active = oa.active_view(history)
     open_days = [l["run"]["day"] for l in active["lists"]]
     assert "2026-09-23" in open_days and "2026-09-18" not in open_days
+    tracker = oa.tracker_view(history, days=30)
+    by_day = {l["run"]["day"]: l for l in tracker["lists"]}
+    assert by_day["2026-09-23"]["open"] and not by_day["2026-09-18"]["open"]      # closed lists stay for follow-up
+    early_list = by_day["2026-09-18"]
+    assert early_list["summary"]["legs"] == len(early_list["ce"]) + len(early_list["pe"]) + len(early_list["index"])
+    assert early_list["summary"]["final"] <= early_list["summary"]["legs"]
 
 
 def test_a_list_is_compared_with_the_actual_top_performers_of_its_day(history):

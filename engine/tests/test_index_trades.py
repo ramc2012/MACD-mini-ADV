@@ -85,7 +85,7 @@ def test_loop_emits_index_trades_with_plan_and_tracks_them(tmp_path):
     assert trained["status"] == "promoted" and trained["champion"] in it.CONFIGS
     assert it.train(history)["status"] == "kept"
     run = oa.emit(history, "2026-09-02", source="manual", lots={"NSE:NIFTY26OCT25000CE": 75, "NSE:NIFTY26OCT25000PE": 75})
-    assert set(run["index"]) == set(it.INDEX_SPOTS)
+    assert set(run["index"]) == set(it.TRADED_INDICES)          # owner, 4 Nov 2026: five indices only
     view = oa.picks_view(history, "2026-09-02")["index"]
     nifty = next(t for t in view if t["underlying"] == "NIFTY")
     if nifty["side"]:

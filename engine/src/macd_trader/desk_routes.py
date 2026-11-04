@@ -260,6 +260,14 @@ async def agent_active():
     return await asyncio.to_thread(_with_history, lambda h: option_agent.active_view(h, lots), False)
 
 
+@router.get("/api/agent/tracker", dependencies=[Depends(authorize)])
+async def agent_tracker(days: int = Query(default=30, ge=1, le=120)):
+    """Every emitted list of the last ``days`` with each pick's follow-up: entry, latest, D+1..D+3, open or closed."""
+    from . import option_agent
+    lots = _agent_lots()
+    return await asyncio.to_thread(_with_history, lambda h: option_agent.tracker_view(h, days, lots), False)
+
+
 @router.get("/api/agent/performance", dependencies=[Depends(authorize)])
 async def agent_performance(days: int = Query(default=30, ge=1, le=365)):
     """Every emission's picks against their day's full candidate set, and the basket curve."""

@@ -15,7 +15,7 @@ const PERIODS: { key: Period; sessions: number }[] = [
   { key: "1D", sessions: 1 }, { key: "5D", sessions: 5 }, { key: "1M", sessions: 22 }, { key: "3M", sessions: 64 }, { key: "ALL", sessions: 0 },
 ];
 const FRAMES: { seconds: number; label: string }[] = [
-  { seconds: 300, label: "5m" }, { seconds: 900, label: "15m" }, { seconds: 1800, label: "30m" }, { seconds: 3600, label: "1h" }, { seconds: 86400, label: "1D" },
+  { seconds: 180, label: "3m" }, { seconds: 300, label: "5m" }, { seconds: 900, label: "15m" }, { seconds: 1800, label: "30m" }, { seconds: 3600, label: "1h" }, { seconds: 86400, label: "1D" },
 ];
 const STORE = "macd.laneChart";
 type Prefs = { period: Period; frame: number; style: PriceStyle; rsi: boolean };

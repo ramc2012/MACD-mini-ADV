@@ -33,7 +33,7 @@ type Act = { action: string; symbol?: string; contract_id?: string | null; posit
 type Exec = { action: string; symbol: string; lots?: number | null; status: string; price?: number | null; error?: string };
 type Cycle = { cycle_id: string; at: string; trigger: string; mode: string; model: string | null; market_view: string; regime: string | null;
   confidence: number | null; notes: string | null; operator_note: string | null; accepted: Act[] | null; rejected: Act[] | null;
-  executed: Exec[] | null; latency_ms: number | null; prompt_tokens: number | null; completion_tokens: number | null; error: string | null };
+  executed: Exec[] | null; latency_ms: number | null; prompt_tokens: number | null; completion_tokens: number | null; reasoning_tokens?: number | null; cost_ticks?: number | null; error: string | null };
 
 const headers = (json = false): HeadersInit => ({ ...(API_TOKEN ? { "x-macd-token": API_TOKEN } : {}), ...(json ? { "Content-Type": "application/json" } : {}) });
 const rupees = (v: number | null | undefined) => (v === null || v === undefined ? "—" : `₹${Math.round(v).toLocaleString("en-IN")}`);
@@ -47,7 +47,7 @@ type BrainTest = { ok: boolean; models: string[]; model: string; model_listed: b
   latency_ms: number | null; error: string | null; at: string | null };
 type BrainStatus = { configured: boolean; key_source: "panel" | "environment" | "none"; key_hint: string | null; model: string;
   api_base: string; reasoning_effort: string; efforts: string[]; default_model: string; last_test: BrainTest | null;
-  universe: string; universes: string[]; cycle_minutes: number; cycle_choices: number[] };
+  universe: string; universes: string[]; cycle_minutes: number; cycle_choices: number[]; management_key_hint?: string | null; team_id?: string };
 
 /** Connection panel: the xAI key (write-only; only its last 4 characters ever come back), model, effort, endpoint. */
 function BrainPanel({ onChanged }: { onChanged: () => void }) {
@@ -59,11 +59,13 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
   const [base, setBase] = useState("");
   const [universe, setUniverse] = useState("index");
   const [cycle, setCycle] = useState(60);
+  const [managementKey, setManagementKey] = useState("");
+  const [team, setTeam] = useState("");
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
 
   const apply = (s: BrainStatus) => {
-    setStatus(s); setModel(s.model); setEffort(s.reasoning_effort); setBase(s.api_base); setUniverse(s.universe); setCycle(s.cycle_minutes);
+    setStatus(s); setModel(s.model); setEffort(s.reasoning_effort); setBase(s.api_base); setUniverse(s.universe); setCycle(s.cycle_minutes); setTeam(s.team_id || "");
   };
   useEffect(() => {
     void requestJson<BrainStatus>(`${API_URL}/api/agentic/brain`, { headers: headers() })
@@ -88,8 +90,9 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
     }
   };
   const save = async () => {
-    const saved = await call("save", "PUT", "/api/agentic/brain", { api_key: key || null, model, api_base: base, reasoning_effort: effort, universe, cycle_minutes: cycle });
-    if (saved) { setKey(""); setMessage("Saved."); }
+    const saved = await call("save", "PUT", "/api/agentic/brain", { api_key: key || null, model, api_base: base, reasoning_effort: effort, universe, cycle_minutes: cycle,
+      management_key: managementKey || null, team_id: team });
+    if (saved) { setKey(""); setManagementKey(""); setMessage("Saved."); }
   };
   const test = status?.last_test;
 
@@ -102,8 +105,8 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
       <span>{open ? "▾" : "▸"}</span>
     </button>
     {open && <div className="agentic-brain-body">
-      <p className="agentic-hint">Use an API key from <b>console.x.ai</b> (API usage is billed there from prepaid credits; a Grok / X Premium
-        subscription does not include API access). The key is stored only in the app's runtime folder (owner-only file) and is never shown again.</p>
+      <p className="agentic-hint">Use an API key from <b>console.x.ai</b>. On this account the calls show as <b>Included</b> in the Grok plan's
+        weekly allowance and draw on prepaid credits only once that is used up. The key is stored only in the app's runtime folder (owner-only file) and is never shown again.</p>
       <div className="agentic-form">
         <label>API key<input type="password" autoComplete="off" placeholder={status?.configured ? `saved ${status.key_hint} — leave blank to keep` : "xai-…"}
           value={key} onChange={(event) => setKey(event.target.value)} /></label>
@@ -117,6 +120,10 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
           <option value="all">Index + F&amp;O stock options</option></select></label>
         <label>Cycle<select value={cycle} onChange={(event) => setCycle(Number(event.target.value))}>
           {(status?.cycle_choices || [15, 30, 60, 120]).map((m) => <option key={m} value={m}>Every {m} min</option>)}</select></label>
+        <label title="Optional. Only to read the prepaid credit balance (console.x.ai › Settings › Management keys). It cannot make model calls.">Management key (credit balance)
+          <input type="password" autoComplete="off" placeholder={status?.management_key_hint ? `saved ${status.management_key_hint} — leave blank to keep` : "optional"}
+            value={managementKey} onChange={(event) => setManagementKey(event.target.value)} /></label>
+        <label title="console.x.ai › Settings › Team: the team id">Team id<input value={team} placeholder="optional" onChange={(event) => setTeam(event.target.value)} /></label>
       </div>
       <div className="agentic-controls">
         <button className="agentic-btn primary" disabled={!!busy} onClick={() => void save()}>{busy === "save" ? "Saving…" : "Save"}</button>
@@ -124,6 +131,8 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
           {busy === "test" ? "Testing…" : "Test connection"}</button>
         {status?.key_source === "panel" && <button className="agentic-btn" disabled={!!busy}
           onClick={() => { if (window.confirm("Remove the saved API key? The lane falls back to rules-only.")) void call("clear", "PUT", "/api/agentic/brain", { clear_key: true }); }}>Remove key</button>}
+        {status?.management_key_hint && <button className="agentic-btn" disabled={!!busy}
+          onClick={() => { if (window.confirm("Remove the saved management key? The credit balance stops updating.")) void call("clearm", "PUT", "/api/agentic/brain", { clear_management_key: true }); }}>Remove management key</button>}
         {message && <span className="agentic-meta">{message}</span>}
       </div>
       {test && <div className={`agentic-test ${test.ok ? "ok" : "bad"}`}>
@@ -132,6 +141,66 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
           : <>Test failed: {test.error}</>}
         {test.models.length > 0 && <div className="agentic-models">{test.models.map((m) => <button key={m} className="agentic-btn small" onClick={() => setModel(m)}>{m}</button>)}</div>}
       </div>}
+    </div>}
+  </div>;
+}
+
+type UsageTotals = { calls: number; prompt_tokens: number; cached_tokens: number; completion_tokens: number; reasoning_tokens: number; priced_calls: number; cost_usd: number };
+type UsageDay = UsageTotals & { day: string; avg_latency_ms: number };
+type Balance = { balance_usd?: number; changes?: { at: string | null; origin: string | null; amount_usd: number }[]; at: string; error: string | null };
+type Usage = { as_of: string; model: string; periods: Record<"today" | "last_7_days" | "this_month" | "since_start", UsageTotals>; days: UsageDay[];
+  cost_recorded_from: string | null; balance: Balance | null; balance_configured: boolean };
+const PERIODS: [keyof Usage["periods"], string][] = [["today", "Today"], ["last_7_days", "Last 7 days"], ["this_month", "This month"], ["since_start", "Since start"]];
+const tokens = (v: number) => (v >= 1_000_000 ? `${(v / 1_000_000).toFixed(2)} M` : v >= 1000 ? `${(v / 1000).toFixed(1)} k` : String(v));
+const dollars = (v: number | null | undefined) => (v == null ? "—" : v < 1 ? `$${v.toFixed(4)}` : `$${v.toFixed(2)}`);
+const istFull = (iso?: string | null) => (iso ? `${new Date(iso).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })} IST` : "—");
+const shortDay = (day: string) => new Date(`${day}T12:00:00+05:30`).toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+
+/** Grok usage from the lane's own journal (every response's usage block, no extra call to xAI) and, when a
+ * management key is saved, the prepaid credit balance from xAI's Management API on request. */
+function UsagePanel() {
+  const [usage, setUsage] = useState<Usage | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => requestJson<Usage>(`${API_URL}/api/agentic/usage`, { headers: headers() })
+    .then((u) => { setUsage(u); setError(""); }).catch((reason) => setError(reason instanceof Error ? reason.message : "Unavailable")), []);
+  useEffect(() => { void load(); const id = setInterval(() => void load(), 60_000); return () => clearInterval(id); }, [load]);
+  const refresh = async () => {
+    setBusy(true);
+    try { await requestJson(`${API_URL}/api/agentic/usage/balance`, { method: "POST", headers: headers() }); await load(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Balance failed"); } finally { setBusy(false); }
+  };
+  const days = usage?.days.slice(-21) || [];
+  const peak = Math.max(1, ...days.map((d) => d.prompt_tokens + d.completion_tokens + d.reasoning_tokens));
+  const balance = usage?.balance;
+  return <div className="panel agentic-section agentic-usage">
+    <div className="panel-title">Grok usage <small>{usage ? `${usage.model} · from each response's usage block · cost is xAI's own price per call (recorded since ${usage.cost_recorded_from ? istFull(usage.cost_recorded_from) : "the next cycle"}) · as of ${istFull(usage.as_of)}` : error || "Loading…"}</small></div>
+    <div className="agentic-usage-grid">
+      {PERIODS.map(([key, label]) => { const t = usage?.periods[key]; return <div key={key} className="agentic-usage-card">
+        <small>{label}</small>
+        <b>{t ? tokens(t.prompt_tokens + t.completion_tokens + t.reasoning_tokens) : "—"} <em>tokens</em></b>
+        <span>{t ? `${t.calls} call${t.calls === 1 ? "" : "s"}` : ""}{t && t.priced_calls ? ` · ${dollars(t.cost_usd)}${t.priced_calls < t.calls ? ` (${t.priced_calls} priced)` : ""}` : ""}</span>
+        {t && <span className="agentic-usage-split">in {tokens(t.prompt_tokens)}{t.cached_tokens ? ` (${tokens(t.cached_tokens)} cached)` : ""} · out {tokens(t.completion_tokens)}{t.reasoning_tokens ? ` · reasoning ${tokens(t.reasoning_tokens)}` : ""}</span>}
+      </div>; })}
+      <div className="agentic-usage-card agentic-usage-balance">
+        <small>Prepaid credits</small>
+        <b>{balance?.balance_usd != null ? `$${balance.balance_usd.toFixed(2)}` : "—"}</b>
+        <span>{usage?.balance_configured
+          ? balance ? (balance.error ? <span className="agentic-down">{balance.error}</span> : `checked ${istFull(balance.at)}`) : "not checked yet"
+          : "add a management key and team id in Brain connection to read it"}</span>
+        <span className="agentic-usage-split">Plan allowance (Included) is shown only on console.x.ai</span>
+        {usage?.balance_configured && <button className="agentic-btn small" disabled={busy} onClick={() => void refresh()}>{busy ? "Checking…" : "Check balance"}</button>}
+      </div>
+    </div>
+    {days.length > 0 && <div className="agentic-usage-days">
+      <svg viewBox={`0 0 ${days.length * 14} 60`} preserveAspectRatio="none" role="img" aria-label="Tokens per IST day">
+        {days.map((d, i) => { const total = d.prompt_tokens + d.completion_tokens + d.reasoning_tokens; const h = (total / peak) * 56;
+          const out = ((d.completion_tokens + d.reasoning_tokens) / peak) * 56;
+          return <g key={d.day}><title>{`${shortDay(d.day)}: ${d.calls} calls · in ${tokens(d.prompt_tokens)} · out ${tokens(d.completion_tokens)} · reasoning ${tokens(d.reasoning_tokens)}${d.priced_calls ? ` · ${dollars(d.cost_usd)}` : ""} · avg ${(d.avg_latency_ms / 1000).toFixed(0)} s`}</title>
+            <rect x={i * 14 + 2} y={60 - h} width={10} height={Math.max(0, h - out - (out > 0 ? 1 : 0))} rx={2} fill="#3987e5" />
+            {out > 0 && <rect x={i * 14 + 2} y={60 - out} width={10} height={out} rx={2} fill="#d95926" />}</g>; })}
+      </svg>
+      <div className="agentic-usage-axis"><span>{shortDay(days[0].day)}</span><span><s style={{ background: "#3987e5" }} />input <s style={{ background: "#d95926" }} />output + reasoning · hover a day</span><span>{shortDay(days[days.length - 1].day)}</span></div>
     </div>}
   </div>;
 }
@@ -331,6 +400,8 @@ export function AgenticPage() {
         <span>{h?.cycles_today ?? 0} cycles today · next {hhmm(h?.next_cycle_at)}{h?.pending_triggers?.length ? ` · trigger: ${h.pending_triggers.join("; ")}` : ""}</span></div>
     </div>
 
+    <UsagePanel />
+
     <div className="panel agentic-section lane-equity">
       <div className="panel-title">Equity and drawdown <small>hover for the IST time, equity, return and fall from the peak</small></div>
       <EquityChart points={equity} capital={snap?.capital ?? 0} height={230} />
@@ -403,7 +474,7 @@ export function AgenticPage() {
         <header>
           <b>{hhmm(c.at)}</b>
           <span className={`agentic-chip ${c.regime || ""}`}>{c.regime || "—"}{c.confidence !== null ? ` · ${Math.round((c.confidence || 0) * 100)}%` : ""}</span>
-          <span className="agentic-meta">{c.trigger} · {c.mode === "grok" ? c.model : "rules only"}{c.latency_ms ? ` · ${(c.latency_ms / 1000).toFixed(1)} s` : ""}{c.prompt_tokens ? ` · ${c.prompt_tokens}/${c.completion_tokens} tok` : ""}</span>
+          <span className="agentic-meta">{c.trigger} · {c.mode === "grok" ? c.model : "rules only"}{c.latency_ms ? ` · ${(c.latency_ms / 1000).toFixed(1)} s` : ""}{c.prompt_tokens ? ` · ${c.prompt_tokens}/${c.completion_tokens}${c.reasoning_tokens ? `+${c.reasoning_tokens}r` : ""} tok` : ""}{c.cost_ticks ? ` · $${(c.cost_ticks / 1e10).toFixed(4)}` : ""}</span>
         </header>
         {c.operator_note && <p className="agentic-operator">You: {c.operator_note}</p>}
         <p className="agentic-view">{c.market_view}</p>

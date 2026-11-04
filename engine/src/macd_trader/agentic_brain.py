@@ -377,9 +377,51 @@ class GrokClient:
             decision = json.loads(content)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise BrainError(f"unparseable model output: {type(exc).__name__}") from exc
-        usage = payload.get("usage") or {}
-        return decision, {"latency_ms": latency, "model": payload.get("model", self.model),
-                          "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens")}
+        return decision, {"latency_ms": latency, "model": payload.get("model", self.model), **usage_meta(payload.get("usage"))}
+
+
+def usage_meta(usage: dict | None) -> dict:
+    """The billed usage of one response. Reasoning tokens are counted apart from the completion tokens and billed at
+    the completion rate; cost_in_usd_ticks (1 USD = 10^10 ticks) is xAI's own price of the call, cache discount in.
+    Both the chat-completions names and the Responses API's input/output names are read."""
+    usage = usage or {}
+    prompt = usage.get("prompt_tokens", usage.get("input_tokens"))
+    completion = usage.get("completion_tokens", usage.get("output_tokens"))
+    prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+    completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}
+    ticks = usage.get("cost_in_usd_ticks")
+    return {"prompt_tokens": prompt, "completion_tokens": completion,
+            "reasoning_tokens": completion_details.get("reasoning_tokens"),
+            "cached_tokens": prompt_details.get("cached_tokens"),
+            "cost_ticks": int(ticks) if isinstance(ticks, (int, float)) else None}
+
+
+MANAGEMENT_BASE_URL = "https://management-api.x.ai/v1"
+TICKS_PER_USD = 10_000_000_000
+
+
+async def prepaid_balance(management_key: str, team_id: str, timeout: float = 20.0) -> dict:
+    """The team's prepaid credit balance from xAI's Management API. It takes a management key (console.x.ai >
+    Settings > Management keys), not the inference key; total.val is in US cents. Called only when the owner asks."""
+    if not management_key or not team_id:
+        raise BrainError("a management key and the team id are both needed for the credit balance")
+    team = "".join(ch for ch in team_id.strip() if ch.isalnum() or ch == "-")
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers={"Authorization": f"Bearer {management_key}"}) as client:
+            response = await client.get(f"{MANAGEMENT_BASE_URL}/billing/teams/{team}/prepaid/balance")
+    except httpx.HTTPError as exc:
+        raise BrainError(f"cannot reach the xAI Management API: {type(exc).__name__}") from exc
+    if response.status_code != 200:
+        raise BrainError(f"HTTP {response.status_code}: {_error_text(response)}")
+    payload = response.json()
+    try:
+        cents = float((payload.get("total") or {}).get("val"))
+    except (TypeError, ValueError) as exc:
+        raise BrainError("the balance reply had no total") from exc
+    return {"balance_usd": round(cents / 100, 2),
+            "changes": [{"at": row.get("createTime"), "origin": row.get("changeOrigin"),
+                         "amount_usd": round(float((row.get("amount") or {}).get("val") or 0) / 100, 2)}
+                        for row in (payload.get("changes") or [])[:20]]}
 
 
 # ---------------------------------------------------------------------------------------------- validation

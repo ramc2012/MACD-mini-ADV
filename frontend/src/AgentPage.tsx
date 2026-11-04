@@ -1,13 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ColorType, createChart, LineSeries, LineStyle, type IChartApi, type Time } from "lightweight-charts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BaselineSeries, ColorType, createChart, LineSeries, LineStyle, type IChartApi, type MouseEventParams, type Time } from "lightweight-charts";
 import { driverText, featureLabel, indexPrediction, pct, rupees, sinceEntry, tone } from "./agentMath";
+import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
 import type { Tick } from "./types";
 import { API_TOKEN, API_URL } from "./runtime";
 
 type Pick = {
   rank: number; symbol: string; underlying: string; strike: number; expiry: string; entry_price: number; score: number;
   drivers: [string, number][]; last_price: number | null; last_at: string | null; since_entry_pct: number | null;
-  r1: number | null; r2: number | null; r3: number | null; max_ret: number | null; min_ret: number | null;
+  r1: number | null; r2: number | null; r3: number | null; y?: number | null; max_ret: number | null; min_ret: number | null;
   size?: { vol_daily: number | null; notional: number; lot_size: number | null; lot_value: number | null; lots: number | null };
 };
 type Picks = { run: { run_id: number; day: string; emitted_at: string; model_version: number | null; candidates: number; source: string } | null; ce: Pick[]; pe: Pick[]; index?: IndexTrade[] };
@@ -45,7 +46,7 @@ async function call<T>(path: string, method = "GET"): Promise<T> {
 const num = (value: number | null | undefined, digits = 2) => value == null ? "—" : value.toFixed(digits);
 
 type Ticks = Record<string, Tick>;
-const INDEX_SPOT: Record<string, string> = { NIFTY: "NSE:NIFTY50-INDEX", BANKNIFTY: "NSE:NIFTYBANK-INDEX", SENSEX: "BSE:SENSEX-INDEX", MIDCPNIFTY: "NSE:MIDCPNIFTY-INDEX" };
+const INDEX_SPOT: Record<string, string> = { NIFTY: "NSE:NIFTY50-INDEX", BANKNIFTY: "NSE:NIFTYBANK-INDEX", SENSEX: "BSE:SENSEX-INDEX", MIDCPNIFTY: "NSE:MIDCPNIFTY-INDEX", FINNIFTY: "NSE:FINNIFTY-INDEX" };
 const CLOCK = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 
 /** The live tick when the stream carries this contract, else the last stored price. */
@@ -78,15 +79,32 @@ type RunSummary = {
   ce: { picks: number; mean_1_3d: number | null; labelled: number; mean_d1: number | null };
   pe: { picks: number; mean_1_3d: number | null; labelled: number; mean_d1: number | null };
 };
-type ActiveList = { run: Picks["run"]; hold_until: string; sessions_elapsed: number; ce: Pick[]; pe: Pick[]; index: IndexTrade[] };
-type View = "latest" | "active" | number;
+type TrackerList = { run: NonNullable<Picks["run"]>; hold_until: string; sessions_elapsed: number; open: boolean; ce: Pick[]; pe: Pick[]; index: IndexTrade[];
+  no_trade: string[]; summary: { legs: number; final: number; mean_1_3d: number | null; winners: number; mean_since_entry_pct: number | null } };
+type View = "latest" | number;
+type Tab = "LIST" | "TRACKER" | "EQUITY" | "LEARNING";
+const TABS: [Tab, string][] = [["LIST", "Today's list"], ["TRACKER", "Watchlist tracker"], ["EQUITY", "Equity"], ["LEARNING", "Learning"]];
+const TAB_STORE = "macd.agentTab";
 const DAY = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short" });
 const dayLabel = (iso: string) => DAY.format(new Date(`${iso}T12:00:00+05:30`));
+const FULL = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+const fullTime = (iso: string | null | undefined) => (iso ? `${FULL.format(new Date(iso))} IST` : "—");
+const recallTab = (): Tab => { try { const v = window.localStorage.getItem(TAB_STORE); return TABS.some(([k]) => k === v) ? v as Tab : "LIST"; } catch { return "LIST"; } };
+
+type ChartFocus = { list: LaneChartFocus[]; index: number };
+/** A pick on the lane chart: the emission as the entry marker, the entry premium as a level. */
+const pickFocus = (rows: { symbol: string | null; underlying: string; strike: number | null; expiry: string | null; entry_price: number | null }[], emittedAt: string | null | undefined, day: string): LaneChartFocus[] =>
+  rows.filter((r) => r.symbol).map((r) => ({
+    symbol: r.symbol!, title: `${r.underlying} ${r.strike ?? ""} ${r.symbol!.slice(-2)}`,
+    subtitle: `listed ${dayLabel(day)}${r.expiry ? ` · exp ${r.expiry}` : ""} · entry ₹${num(r.entry_price)}`,
+    markers: emittedAt && r.entry_price ? [{ timestamp: Math.floor(Date.parse(emittedAt) / 1000), price: r.entry_price, label: "LIST", tone: "entry" as const }] : [],
+    levels: r.entry_price ? [{ price: r.entry_price, label: "Entry", tone: "avg" as const }] : [],
+  }));
 
 export function AgentPage({ ticks = {} }: { ticks?: Ticks }) {
+  const [tab, setTabState] = useState<Tab>(recallTab);
   const [view, setView] = useState<View>("latest");
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [active, setActive] = useState<ActiveList[]>([]);
   const [historic, setHistoric] = useState<Picks>();
   const [picks, setPicks] = useState<Picks>();
   const [perf, setPerf] = useState<Performance>();
@@ -94,15 +112,16 @@ export function AgentPage({ ticks = {} }: { ticks?: Ticks }) {
   const [status, setStatus] = useState<Status>();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
+  const [focus, setFocus] = useState<ChartFocus | null>(null);
+  const setTab = (next: Tab) => { setTabState(next); try { window.localStorage.setItem(TAB_STORE, next); } catch { /* not kept */ } };
 
   const load = useCallback(async () => {
     try {
-      const [p, f, m, s, r, a] = await Promise.all([
+      const [p, f, m, s, r] = await Promise.all([
         call<Picks>("/api/agent/picks"), call<Performance>("/api/agent/performance?days=90"),
-        call<Models>("/api/agent/models"), call<Status>("/api/agent/status"),
-        call<RunSummary[]>("/api/agent/runs?days=60"), call<{ lists: ActiveList[] }>("/api/agent/active"),
+        call<Models>("/api/agent/models"), call<Status>("/api/agent/status"), call<RunSummary[]>("/api/agent/runs?days=60"),
       ]);
-      setPicks(p); setPerf(f); setModels(m); setStatus(s); setRuns(r); setActive(a.lists); setError("");
+      setPicks(p); setPerf(f); setModels(m); setStatus(s); setRuns(r); setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "request failed");
     }
@@ -133,63 +152,77 @@ export function AgentPage({ ticks = {} }: { ticks?: Ticks }) {
   const champion = models?.models.find((m) => m.status === "champion");
   const shown = typeof view === "number" ? historic : picks;
   const run = shown?.run;
+  const openLists = runs.filter((r, i) => r.open && runs.findIndex((x) => x.day === r.day) === i).length;
+  const openChart = (rows: Parameters<typeof pickFocus>[0], at: string | null | undefined, day: string, symbol: string) => {
+    const list = pickFocus(rows, at, day);
+    const index = list.findIndex((row) => row.symbol === symbol);
+    if (index >= 0) setFocus({ list, index });
+  };
   return <div className="ledger-page agent-page">
     <div className="mp-head agent-head">
       <div>
         <b>Option agent</b>
-        <span className="agent-sub">Top {models?.constants.top_n ?? 10} calls and puts for the next 1–3 sessions, as of {models?.constants.as_of ?? "14:45"} · emitted {status?.emit_at ?? "14:45:15"} each session</span>
+        <span className="agent-sub">Top {models?.constants.top_n ?? 10} calls and puts for the next 1–3 sessions, as of {models?.constants.as_of ?? "14:45"} · emitted {status?.emit_at ?? "14:47"} IST each session · index trades on NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY and FINNIFTY</span>
       </div>
       <div className="agent-actions">
-        <div className="agent-views" role="tablist" aria-label="Which list">
-          <button role="tab" aria-selected={view === "latest"} className={view === "latest" ? "active" : ""} onClick={() => setView("latest")}>Latest list</button>
-          <button role="tab" aria-selected={view === "active"} className={view === "active" ? "active" : ""} onClick={() => setView("active")}>Open lists <span>{active.length}</span></button>
+        {champion && <span className="agent-chip">champion v{champion.version} {champion.config.name}</span>}
+        {!champion&&models?.models.some(m=>m.status==='baseline')&&<span className="agent-chip">Local paper baseline · untrained</span>}
+        <span className="agent-chip" title="Last emission">{status?.emitted_day ? `last emitted ${dayLabel(status.emitted_day)}` : "not emitted yet"}</span>
+        <button disabled={!!busy} onClick={() => void act("emit", "/api/agent/run")}>{busy === "emit" ? "Emitting…" : "Emit now"}</button>
+        <button disabled={!!busy} onClick={() => void act("train", "/api/agent/train")}>{busy === "train" ? "Training…" : "Retrain"}</button>
+      </div>
+    </div>
+    <nav className="agent-tabs" role="tablist" aria-label="Option agent views">{TABS.map(([key, label]) =>
+      <button key={key} role="tab" aria-selected={tab === key} className={tab === key ? "active" : ""} onClick={() => setTab(key)}>
+        {label}{key === "TRACKER" && openLists > 0 && <span title="Lists still inside their 1–3 session hold">{openLists} open</span>}
+      </button>)}</nav>
+    {(error || status?.error) && <div className="agent-error">{error || status?.error}</div>}
+    {tab === "LIST" && <>
+      <div className="agent-list-bar">
+        <div className="agent-views" role="group" aria-label="Which list">
+          <button className={view === "latest" ? "active" : ""} aria-pressed={view === "latest"} onClick={() => setView("latest")}>Latest list</button>
           <select aria-label="Past lists" value={typeof view === "number" ? String(view) : ""} onChange={(e) => setView(e.target.value ? Number(e.target.value) : "latest")}>
-            <option value="">History…</option>
+            <option value="">Past lists…</option>
             {runs.map((r) => <option key={r.run_id} value={r.run_id}>
               {dayLabel(r.day)} · {r.source}{r.open ? ` · open D+${r.sessions_elapsed}/3` : " · closed"}
               {r.ce.mean_1_3d != null ? ` · CE ${pct(r.ce.mean_1_3d)} PE ${pct(r.pe.mean_1_3d)}` : ""}
             </option>)}
           </select>
         </div>
-        {run && <span className="agent-chip">{run.day} · run #{run.run_id} · {run.candidates.toLocaleString("en-IN")} candidates · {run.model_version != null ? `model v${run.model_version}` : "no stored model"} · {run.source}</span>}
-        {champion && <span className="agent-chip">champion v{champion.version} {champion.config.name}</span>}
-        {!champion&&models?.models.some(m=>m.status==='baseline')&&<span className="agent-chip">Local paper baseline · untrained</span>}
-        <button disabled={!!busy} onClick={() => void act("emit", "/api/agent/run")}>{busy === "emit" ? "Emitting…" : "Emit now"}</button>
-        <button disabled={!!busy} onClick={() => void act("train", "/api/agent/train")}>{busy === "train" ? "Training…" : "Retrain"}</button>
+        {run && <span className="agent-chip">List of {dayLabel(run.day)} · emitted {fullTime(run.emitted_at)} · run #{run.run_id} · {run.candidates.toLocaleString("en-IN")} candidates · {run.model_version != null ? `model v${run.model_version}` : "no stored model"} · {run.source}</span>}
+        {typeof view === "number" && run && <span className="agent-chip">{(() => { const r = runs.find((x) => x.run_id === run.run_id); return r ? (r.open ? `in its hold: D+${r.sessions_elapsed} of 3, exits by ${dayLabel(r.hold_until)}` : `hold ended ${dayLabel(r.hold_until)}: D+1/D+2/D+3 are final`) : ""; })()}</span>}
+        <small className="agent-hint">click a contract for its chart</small>
       </div>
-    </div>
-    {(error || status?.error) && <div className="agent-error">{error || status?.error}</div>}
-    {view === "active" ? <OpenLists lists={active} ticks={ticks} /> : <>
-      {typeof view === "number" && run && <div className="agent-list-banner">
-        List of {dayLabel(run.day)} ({run.source}) · {(() => { const r = runs.find((x) => x.run_id === run.run_id); return r ? (r.open ? `in its hold: D+${r.sessions_elapsed} of 3, exits by ${dayLabel(r.hold_until)}` : `hold ended ${dayLabel(r.hold_until)} — D+1/D+2/D+3 are final`) : ""; })()}
-        <button onClick={() => setView("latest")}>Back to latest</button>
-      </div>}
-      <IndexTrades trades={shown?.index || []} ticks={ticks} />
-    <div className="agent-picks">
-      <PickTable title="Calls (CE)" rows={shown?.ce || []} ticks={ticks} emitAt={status?.emit_at} />
-      <PickTable title="Puts (PE)" rows={shown?.pe || []} ticks={ticks} emitAt={status?.emit_at} />
-    </div>
-    <CompareTopPanel runId={run?.run_id} />
+      <IndexTrades trades={shown?.index || []} ticks={ticks} onOpen={run ? (symbol) => openChart(shown?.index || [], run.emitted_at, run.day, symbol) : undefined} />
+      <div className="agent-picks">
+        <PickTable title="Calls (CE)" rows={shown?.ce || []} ticks={ticks} emitAt={status?.emit_at} onOpen={run ? (symbol) => openChart(shown?.ce || [], run.emitted_at, run.day, symbol) : undefined} />
+        <PickTable title="Puts (PE)" rows={shown?.pe || []} ticks={ticks} emitAt={status?.emit_at} onOpen={run ? (symbol) => openChart(shown?.pe || [], run.emitted_at, run.day, symbol) : undefined} />
+      </div>
+      <CompareTopPanel runId={run?.run_id} />
     </>}
-    <EquityPanel />
-    <CompareSummaryPanel />
-    <div className="agent-bottom">
-      <PerformancePanel perf={perf} />
-      <ModelsPanel models={models} status={status} />
-    </div>
+    {tab === "TRACKER" && <WatchlistTracker ticks={ticks} onChart={(list, index) => setFocus({ list, index })} />}
+    {tab === "EQUITY" && <EquityPanel />}
+    {tab === "LEARNING" && <>
+      <CompareSummaryPanel />
+      <div className="agent-bottom">
+        <PerformancePanel perf={perf} />
+        <ModelsPanel models={models} status={status} />
+      </div>
+    </>}
+    {focus && <LaneChartModal list={focus.list} index={focus.index} onIndex={(index) => setFocus({ ...focus, index })} onClose={() => setFocus(null)} />}
   </div>;
 }
 
-function PickTable({ title, rows, ticks, emitAt }: { title: string; rows: Pick[]; ticks: Ticks; emitAt?: string }) {
+function PickTable({ title, rows, ticks, emitAt, onOpen }: { title: string; rows: Pick[]; ticks: Ticks; emitAt?: string; onOpen?: (symbol: string) => void }) {
   const liveCount = rows.filter((p) => ticks[p.symbol]?.ltp).length;
   return <section className="panel agent-panel">
     <div className="panel-title">{title}{rows.length > 0 && <span className="agent-live-count">{liveCount}/{rows.length} live</span>}</div>
     {!rows.length ? <div className="agent-empty">Awaiting fresh candidates at {emitAt ?? "14:47:00"}. A local paper baseline can collect observations before a trained model is available.</div> :
       <div className="live-table-wrap"><table className="live-table agent-table">
         <thead><tr><th>#</th><th>Contract</th><th>Entry</th><th>LTP</th><th>Chg</th><th>Since entry</th><th title="Profit or loss for one lot at the current price">₹ / lot</th><th>D+1</th><th>D+2</th><th>D+3</th><th>Best / worst</th><th title="Volatility-sized: a one-sigma day moves the position about ₹1,500">Size</th><th>Why</th></tr></thead>
-        <tbody>{rows.map((p) => { const mark = markOf(ticks, p.symbol, p.last_price); const m = sinceEntry(p.entry_price, mark.ltp, p.size?.lot_size); return <tr key={p.symbol}>
+        <tbody>{rows.map((p) => { const mark = markOf(ticks, p.symbol, p.last_price); const m = sinceEntry(p.entry_price, mark.ltp, p.size?.lot_size); return <tr key={p.symbol} className={onOpen ? "openable-row" : ""} onClick={onOpen ? () => onOpen(p.symbol) : undefined}>
           <td>{p.rank}</td>
-          <td title={p.symbol}><b>{p.underlying}</b> {p.strike} <small>{p.expiry.slice(5)}</small></td>
+          <td title={`${p.symbol}${onOpen ? " · click for its chart" : ""}`}><b>{p.underlying}</b> {p.strike} <small>{p.expiry.slice(5)}</small></td>
           <td>{num(p.entry_price)}</td>
           <td><LivePrice value={mark.ltp} live={mark.live} at={mark.at || p.last_at} /></td>
           <td className={tone(m.points)}>{m.points == null ? "—" : `${m.points > 0 ? "+" : ""}${m.points.toFixed(2)}`}</td>
@@ -263,19 +296,19 @@ function ModelsPanel({ models, status }: { models?: Models; status?: Status }) {
   </section>;
 }
 
-const INDEX_ORDER = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY"];
+const INDEX_ORDER = ["NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY", "FINNIFTY"];   // owner, 4 Nov 2026: index trades on these five only
 const level = (value: number | null | undefined, digits = 0) => value == null ? "—" : value.toLocaleString("en-IN", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 
-function IndexTrades({ trades, ticks }: { trades: IndexTrade[]; ticks: Ticks }) {
+function IndexTrades({ trades, ticks, onOpen }: { trades: IndexTrade[]; ticks: Ticks; onOpen?: (symbol: string) => void }) {
   if (!trades.length) return null;
   const ordered = [...trades].sort((a, b) => INDEX_ORDER.indexOf(a.underlying) - INDEX_ORDER.indexOf(b.underlying));
   return <section className="panel agent-panel">
     <div className="panel-title">Index trades — side, contract and plan for the next 1–3 sessions</div>
-    <div className="agent-index-grid">{ordered.map((t) => <IndexCard key={t.underlying} trade={t} ticks={ticks} />)}</div>
+    <div className="agent-index-grid">{ordered.map((t) => <IndexCard key={t.underlying} trade={t} ticks={ticks} onOpen={onOpen} />)}</div>
   </section>;
 }
 
-function IndexCard({ trade: t, ticks }: { trade: IndexTrade; ticks: Ticks }) {
+function IndexCard({ trade: t, ticks, onOpen }: { trade: IndexTrade; ticks: Ticks; onOpen?: (symbol: string) => void }) {
   const prediction = indexPrediction(t.prediction_kind, t.predicted, t.conviction);
   if (!t.side) {
     return <div className="agent-index-card agent-index-none">
@@ -295,7 +328,9 @@ function IndexCard({ trade: t, ticks }: { trade: IndexTrade; ticks: Ticks }) {
     <div className="agent-index-head">
       <b>{t.underlying}</b>
       <span className={`agent-index-side ${call ? "positive" : "negative"}`}>Buy {call ? "CE" : "PE"}</span>
-      <span className="agent-index-contract" title={t.symbol || ""}>{t.strike} {call ? "CE" : "PE"} · exp {t.expiry?.slice(5)}</span>
+      {onOpen && t.symbol
+        ? <button className="agent-index-contract agent-link" title={`${t.symbol} · open its chart`} onClick={() => onOpen(t.symbol!)}>{t.strike} {call ? "CE" : "PE"} · exp {t.expiry?.slice(5)} ↗</button>
+        : <span className="agent-index-contract" title={t.symbol || ""}>{t.strike} {call ? "CE" : "PE"} · exp {t.expiry?.slice(5)}</span>}
       {t.series === "next" && <span className="agent-index-series" title={`The front series (${t.front_expiry}) expires inside the 3-session hold, so the next series is used`}>next series · front {t.front_expiry?.slice(5)} inside hold</span>}
     </div>
     <div className="agent-index-rows">
@@ -351,17 +386,30 @@ type EquityStats = { trades: number; closed?: number; open?: number; final?: num
 type EquityBook = { points: EquityPoint[]; stats: EquityStats };
 type Equity = { since: string; as_of: string; notional: number; books: Record<string, EquityBook> };
 
-const EQUITY_CHARTS: { title: string; note: string; lines: { book: string; label: string; color: string; dashed?: boolean }[] }[] = [
+// Book colours: the validated categorical slots of LaneEquityChart (blue, orange) and a muted benchmark grey; the
+// main book's area turns green above zero and red below, so the sign reads without the axis.
+const BOOK = { main: "#3987e5", alt: "#d95926", bench: "#8796aa" } as const;
+type BookRole = keyof typeof BOOK;
+const EQUITY_CHARTS: { title: string; note: string; lines: { book: string; label: string; role: BookRole }[] }[] = [
   { title: "Top-10 calls", note: "vol-sized, ₹3 L cap · held to the 3rd close", lines: [
-    { book: "ce_sized", label: "sized", color: "#22c893" }, { book: "ce", label: "flat ₹10k", color: "#1b7f60", dashed: true },
-    { book: "ce_all_sized", label: "all calls (same ₹)", color: "#8796aa", dashed: true }] },
+    { book: "ce_sized", label: "Sized", role: "main" }, { book: "ce", label: "Flat ₹10k", role: "alt" },
+    { book: "ce_all_sized", label: "All calls (same ₹)", role: "bench" }] },
   { title: "Top-10 puts", note: "vol-sized, ₹3 L cap · held to the 3rd close", lines: [
-    { book: "pe_sized", label: "sized", color: "#f15b6c" }, { book: "pe", label: "flat ₹10k", color: "#8f3a45", dashed: true },
-    { book: "pe_all_sized", label: "all puts (same ₹)", color: "#8796aa", dashed: true }] },
+    { book: "pe_sized", label: "Sized", role: "main" }, { book: "pe", label: "Flat ₹10k", role: "alt" },
+    { book: "pe_all_sized", label: "All puts (same ₹)", role: "bench" }] },
   { title: "Index trades", note: "₹4k risk at stop, ₹2 L cap · plan exit", lines: [
-    { book: "index_sized", label: "sized", color: "#55a9ff" }, { book: "index_plan", label: "1 lot", color: "#2f5f93", dashed: true },
-    { book: "index_coin", label: "coin flip ATM (1 lot)", color: "#8796aa", dashed: true }] },
+    { book: "index_sized", label: "Sized", role: "main" }, { book: "index_plan", label: "1 lot", role: "alt" },
+    { book: "index_coin", label: "Coin-flip ATM (1 lot)", role: "bench" }] },
 ];
+const compact = (value: number) => {
+  const a = Math.abs(value), sign = value < 0 ? "−" : value > 0 ? "+" : "";
+  return a >= 100_000 ? `${sign}₹${(a / 100_000).toFixed(2)} L` : a >= 1000 ? `${sign}₹${(a / 1000).toFixed(1)}k` : `${sign}₹${a.toFixed(0)}`;
+};
+const SESSION = new Intl.DateTimeFormat("en-GB", { weekday: "short", day: "2-digit", month: "short", year: "numeric" });
+const sessionLabel = (day: string) => SESSION.format(new Date(`${day}T12:00:00+05:30`));
+const timeDay = (time: Time) => typeof time === "string" ? time
+  : typeof time === "number" ? new Date(time * 1000).toISOString().slice(0, 10)
+  : `${time.year}-${String(time.month).padStart(2, "0")}-${String(time.day).padStart(2, "0")}`;
 
 function EquityPanel() {
   const [equity, setEquity] = useState<Equity>();
@@ -375,7 +423,7 @@ function EquityPanel() {
     return () => { live = false; clearInterval(timer); };
   }, []);
   return <section className="panel agent-panel">
-    <div className="panel-title">Equity curves — rupee P&L marked at every session close, net of costs{equity ? ` · ${equity.since} → ${equity.as_of}` : ""}</div>
+    <div className="panel-title">Equity curves <small>rupee P&amp;L marked at every session close, net of costs{equity ? ` · ${dayLabel(equity.since)} → ${dayLabel(equity.as_of)}` : ""} · hover for the session's values</small></div>
     {error && <div className="agent-empty">{error}</div>}
     <div className="agent-equity-grid">{EQUITY_CHARTS.map((spec) => <EquityChart key={spec.title} spec={spec} books={equity?.books} />)}</div>
   </section>;
@@ -384,31 +432,56 @@ function EquityPanel() {
 function EquityChart({ spec, books }: { spec: typeof EQUITY_CHARTS[number]; books?: Record<string, EquityBook> }) {
   const element = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi | null>(null);
+  const [hover, setHover] = useState<string | null>(null);
+  const byDay = useMemo(() => {
+    const out = new Map<string, Record<string, number>>();
+    for (const line of spec.lines) for (const point of books?.[line.book]?.points || []) {
+      out.set(point.day, { ...(out.get(point.day) || {}), [line.book]: point.equity });
+    }
+    return out;
+  }, [books, spec]);
+  const lastDay = useMemo(() => [...byDay.keys()].sort().pop() ?? null, [byDay]);
   useEffect(() => {
     if (!element.current) return;
     const api = createChart(element.current, {
       width: element.current.clientWidth, height: element.current.clientHeight,
-      layout: { background: { type: ColorType.Solid, color: "#090e16" }, textColor: "#8796aa", attributionLogo: false },
-      grid: { vertLines: { color: "#151e2b" }, horzLines: { color: "#151e2b" } },
-      rightPriceScale: { borderColor: "#263144", minimumWidth: 64 },
-      timeScale: { borderColor: "#263144" },
-      localization: { priceFormatter: (value: number) => rupees(value) },
-      crosshair: { vertLine: { color: "#61728a", labelBackgroundColor: "#243247" }, horzLine: { color: "#61728a", labelBackgroundColor: "#243247" } },
+      layout: { background: { type: ColorType.Solid, color: "#090d14" }, textColor: "#7d8ea6", fontSize: 10, attributionLogo: false },
+      grid: { vertLines: { visible: false }, horzLines: { color: "#151d29" } },
+      rightPriceScale: { borderVisible: false, minimumWidth: 58, scaleMargins: { top: 0.18, bottom: 0.08 } },
+      timeScale: { borderVisible: false, fixLeftEdge: true, fixRightEdge: true },
+      localization: { locale: "en-IN", priceFormatter: compact, timeFormatter: (time: Time) => sessionLabel(timeDay(time)) },
+      crosshair: { vertLine: { color: "#4a5a72", width: 1, style: LineStyle.Solid, labelBackgroundColor: "#1d2838" },
+        horzLine: { color: "#4a5a72", style: LineStyle.Dotted, labelBackgroundColor: "#1d2838" } },
+      handleScroll: false, handleScale: false,
     });
     chart.current = api;
+    const onMove = (param: MouseEventParams<Time>) => setHover(param.time === undefined ? null : timeDay(param.time));
+    api.subscribeCrosshairMove(onMove);
     const observer = new ResizeObserver(() => api.applyOptions({ width: element.current?.clientWidth, height: element.current?.clientHeight }));
     observer.observe(element.current);
-    return () => { observer.disconnect(); chart.current = null; api.remove(); };
+    return () => { observer.disconnect(); api.unsubscribeCrosshairMove(onMove); chart.current = null; api.remove(); };
   }, []);
   useEffect(() => {
     const api = chart.current;
     if (!api || !books) return;
-    const series = spec.lines.map((line) => {
-      const s = api.addSeries(LineSeries, { color: line.color, lineWidth: 2, lineStyle: line.dashed ? LineStyle.Dashed : LineStyle.Solid, title: line.label, priceLineVisible: false, lastValueVisible: true });
-      s.setData((books[line.book]?.points || []).map((p) => ({ time: p.day as Time, value: p.equity })));
+    // Benchmarks first so the main book draws on top.
+    const series = [...spec.lines].reverse().map((line) => {
+      const data = (books[line.book]?.points || []).map((p) => ({ time: p.day as Time, value: p.equity }));
+      if (line.role === "main") {
+        const s = api.addSeries(BaselineSeries, { baseValue: { type: "price", price: 0 }, lineWidth: 2,
+          topLineColor: "#22c893", topFillColor1: "rgba(34,200,147,0.28)", topFillColor2: "rgba(34,200,147,0.02)",
+          bottomLineColor: "#f15b6c", bottomFillColor1: "rgba(241,91,108,0.02)", bottomFillColor2: "rgba(241,91,108,0.28)",
+          priceLineVisible: false, lastValueVisible: true, crosshairMarkerRadius: 4, crosshairMarkerBorderColor: "#090d14" });
+        s.setData(data);
+        s.createPriceLine({ price: 0, color: "#56657c", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: false, title: "" });
+        return s;
+      }
+      const s = api.addSeries(LineSeries, { color: BOOK[line.role], lineWidth: line.role === "bench" ? 1 : 2,
+        lineStyle: line.role === "bench" ? LineStyle.Dashed : LineStyle.Solid, priceLineVisible: false, lastValueVisible: false,
+        crosshairMarkerRadius: 3, crosshairMarkerBorderColor: "#090d14" });
+      s.setData(data);
       return s;
     });
-    series[0]?.createPriceLine({ price: 0, color: "#71819877", lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: "" });
     api.timeScale().fitContent();
     return () => {
       // The chart effect disposes the API first on unmount; updates still remove their live series.
@@ -418,47 +491,139 @@ function EquityChart({ spec, books }: { spec: typeof EQUITY_CHARTS[number]; book
   }, [books, spec]);
   const main = books?.[spec.lines[0].book]?.stats;
   const bench = books?.[spec.lines[spec.lines.length - 1].book]?.stats;
+  const day = hover && byDay.has(hover) ? hover : lastDay;
+  const values = day ? byDay.get(day) : undefined;
+  const vsBench = main?.final != null && bench?.final != null ? main.final - bench.final : null;
   return <div className="agent-equity">
-    <div className="agent-equity-head"><b>{spec.title}</b><small>{spec.note}</small></div>
-    <div className="agent-equity-chart" ref={element} />
+    <div className="agent-equity-head">
+      <b>{spec.title}</b><small>{spec.note}</small>
+      <span className={`agent-equity-final ${tone(main?.final)}`}>{main?.final == null ? "—" : compact(main.final)}</span>
+    </div>
+    <div className="agent-equity-legend" aria-live="off">
+      <span className="agent-equity-day">{day ? sessionLabel(day) : "no sessions yet"}</span>
+      {spec.lines.map((line) => {
+        const value = values?.[line.book];
+        return <span key={line.book}><s className={`swatch-${line.role}`} style={{ background: line.role === "main" ? undefined : BOOK[line.role] }} />{line.label}
+          <i className={tone(value)}>{value == null ? "—" : compact(value)}</i></span>;
+      })}
+    </div>
+    <div className="agent-equity-chart" ref={element} aria-label={`${spec.title}: P&L by session, ${spec.lines.map((l) => l.label).join(", ")}`} />
     <div className="agent-equity-stats">
-      <span>P&amp;L <b className={tone(main?.final)}>{rupees(main?.final)}</b></span>
-      <span>vs benchmark <b className={tone(main?.final != null && bench?.final != null ? main.final - bench.final : null)}>{main?.final != null && bench?.final != null ? rupees(main.final - bench.final) : "—"}</b></span>
-      <span>Max drawdown <b className="negative">{rupees(main?.max_drawdown)}</b></span>
-      <span>Peak capital <b>{rupees(main?.max_deployed).replace("+", "")}</b></span>
+      <span>vs benchmark <b className={tone(vsBench)}>{vsBench == null ? "—" : compact(vsBench)}</b></span>
+      <span>Max drawdown <b className="negative">{main?.max_drawdown == null ? "—" : compact(main.max_drawdown)}</b></span>
+      <span>Peak capital <b>{main?.max_deployed == null ? "—" : compact(main.max_deployed).replace("+", "")}</b></span>
       <span>Win rate <b>{main?.win_rate == null ? "—" : `${(main.win_rate * 100).toFixed(0)}%`}</b></span>
       <span>Profit factor <b>{main?.profit_factor == null ? "—" : main.profit_factor.toFixed(2)}</b></span>
       <span>Trades <b>{main ? `${main.closed ?? 0} closed · ${main.open ?? 0} open` : "—"}</b></span>
-      <span>Costs <b>{rupees(main?.costs).replace("+", "")}</b></span>
+      <span>Costs <b>{main?.costs == null ? "—" : compact(main.costs).replace("+", "")}</b></span>
+      <span>Daily Sharpe <b>{main?.daily_sharpe == null ? "—" : main.daily_sharpe.toFixed(2)}</b></span>
     </div>
     {main?.exits && <small className="agent-equity-exits">exits: {Object.entries(main.exits).map(([k, v]) => `${k} ${v}`).join(" · ")}{main.stale_exits ? " (last known price = contract expired, no later bars)" : ""}</small>}
   </div>;
 }
 
+type Leg = { kind: "CE" | "PE" | "INDEX"; rank: number | null; symbol: string; underlying: string; strike: number | null; expiry: string | null;
+  entry_price: number | null; last_price: number | null | undefined; lot: number | null | undefined;
+  r1: number | null; r2: number | null; r3: number | null; max_ret: number | null; min_ret: number | null; y?: number | null; plan?: string | null };
+type Status3 = "OPEN" | "CLOSED" | "ALL";
+type KindFilter = "ALL" | "CE" | "PE" | "INDEX";
+const legsOf = (list: TrackerList): Leg[] => [
+  ...list.index.map((t): Leg => ({ kind: "INDEX", rank: null, symbol: t.symbol!, underlying: t.underlying, strike: t.strike, expiry: t.expiry,
+    entry_price: t.entry_price, last_price: t.last_price, lot: t.lot, r1: t.r1, r2: t.r2, r3: t.r3, max_ret: t.max_ret, min_ret: t.min_ret, y: t.y,
+    plan: t.spot_path })),
+  ...[...list.ce, ...list.pe].map((p): Leg => ({ kind: p.symbol.endsWith("CE") ? "CE" : "PE", rank: p.rank, symbol: p.symbol, underlying: p.underlying,
+    strike: p.strike, expiry: p.expiry, entry_price: p.entry_price, last_price: p.last_price, lot: p.size?.lot_size,
+    r1: p.r1, r2: p.r2, r3: p.r3, max_ret: p.max_ret, min_ret: p.min_ret, y: p.y })),
+];
+const mean = (values: number[]) => (values.length ? values.reduce((a, b) => a + b, 0) / values.length : null);
 
-/** Every list still inside its hold, newest first: the day it was issued, where it is in its hold, live marks. */
-function OpenLists({ lists, ticks }: { lists: ActiveList[]; ticks: Ticks }) {
-  if (!lists.length) return <section className="panel agent-panel"><div className="agent-empty">No list is inside its 1–3 session hold right now.</div></section>;
-  return <>{lists.map((list) => {
-    const run = list.run!;
-    const all = [...list.ce, ...list.pe];
-    const marks = all.map((p) => sinceEntry(p.entry_price, markOf(ticks, p.symbol, p.last_price).ltp)).map((m) => m.fraction).filter((x): x is number => x != null);
-    const mean = marks.length ? marks.reduce((a, b) => a + b, 0) / marks.length : null;
-    return <section key={run.run_id} className="agent-open-list">
-      <div className="agent-open-head">
-        <b>List of {dayLabel(run.day)}</b>
-        <span className="agent-chip">{list.sessions_elapsed === 0 ? "entered today" : `D+${list.sessions_elapsed} of 3`} · exits by {dayLabel(list.hold_until)}</span>
-        <span className="agent-chip">{run.source} · model v{run.model_version ?? "—"} · {run.candidates.toLocaleString("en-IN")} candidates</span>
-        <span className={`agent-open-mean ${tone(mean)}`}>{mean == null ? "" : `avg since entry ${pct(mean)}`}</span>
+/** Every emitted list and its follow-up: each leg's entry, latest mark, D+1..D+3 closes and where the list stands. */
+function WatchlistTracker({ ticks, onChart }: { ticks: Ticks; onChart: (list: LaneChartFocus[], index: number) => void }) {
+  const [days, setDays] = useState(30);
+  const [status, setStatus] = useState<Status3>("ALL");
+  const [kind, setKind] = useState<KindFilter>("ALL");
+  const [query, setQuery] = useState("");
+  const [data, setData] = useState<{ lists: TrackerList[] }>();
+  const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  useEffect(() => {
+    let live = true;
+    const load = () => call<{ lists: TrackerList[] }>(`/api/agent/tracker?days=${days}`).then((value) => { if (live) { setData(value); setError(""); } })
+      .catch((reason) => { if (live) setError(reason instanceof Error ? reason.message : "tracker failed"); });
+    void load();
+    const timer = setInterval(load, 30_000);
+    return () => { live = false; clearInterval(timer); };
+  }, [days]);
+  const lists = (data?.lists || []).filter((l) => status === "ALL" || (status === "OPEN") === l.open);
+  const needle = query.trim().toUpperCase();
+  const allOpen = (data?.lists || []).filter((l) => l.open);
+  const openMarks = allOpen.flatMap(legsOf).map((leg) => sinceEntry(leg.entry_price, markOf(ticks, leg.symbol, leg.last_price).ltp).fraction).filter((v): v is number => v != null);
+  const closed = (data?.lists || []).filter((l) => !l.open);
+  const closedLegs = closed.flatMap(legsOf).filter((leg) => leg.y != null);
+  return <>
+    <section className="panel agent-panel agent-tracker-summary">
+      <div className="agent-tracker-cards">
+        <div><small>Open lists</small><b>{allOpen.length}</b><span>{allOpen.reduce((n, l) => n + l.summary.legs, 0)} legs in their 1–3 session hold</span></div>
+        <div><small>Open legs since entry</small><b className={tone(mean(openMarks))}>{pct(mean(openMarks))}</b><span>{openMarks.filter((v) => v > 0).length} of {openMarks.length} up · live where streamed</span></div>
+        <div><small>Closed lists ({closed.length})</small><b className={tone(mean(closedLegs.map((l) => l.y!)))}>{pct(mean(closedLegs.map((l) => l.y!)))}</b><span>mean of D+1..D+3 · {closedLegs.filter((l) => l.y! > 0).length} of {closedLegs.length} legs positive</span></div>
+        <div><small>Closed: calls / puts / index</small><b>{(["CE", "PE", "INDEX"] as const).map((k) => pct(mean(closedLegs.filter((l) => l.kind === k).map((l) => l.y!)))).join(" / ")}</b><span>a short sample is not proven either way</span></div>
       </div>
-      {list.index.length > 0 && <IndexTrades trades={list.index} ticks={ticks} />}
-      <div className="agent-picks">
-        <PickTable title="Calls (CE)" rows={list.ce} ticks={ticks} />
-        <PickTable title="Puts (PE)" rows={list.pe} ticks={ticks} />
-      </div>
-    </section>;
-  })}</>;
+    </section>
+    <div className="agent-tracker-bar">
+      <div className="agent-views" role="group" aria-label="Status">{(["ALL", "OPEN", "CLOSED"] as const).map((key) =>
+        <button key={key} className={status === key ? "active" : ""} aria-pressed={status === key} onClick={() => setStatus(key)}>{key === "ALL" ? "All lists" : key === "OPEN" ? "Open" : "Closed"}</button>)}</div>
+      <div className="agent-views" role="group" aria-label="Leg kind">{(["ALL", "CE", "PE", "INDEX"] as const).map((key) =>
+        <button key={key} className={kind === key ? "active" : ""} aria-pressed={kind === key} onClick={() => setKind(key)}>{key === "ALL" ? "All legs" : key === "INDEX" ? "Index trades" : key}</button>)}</div>
+      <div className="agent-views" role="group" aria-label="Window">{[10, 30, 60].map((value) =>
+        <button key={value} className={days === value ? "active" : ""} aria-pressed={days === value} onClick={() => setDays(value)}>{value} days</button>)}</div>
+      <input className="heatmap-search" placeholder="Filter underlying" value={query} onChange={(event) => setQuery(event.target.value)} />
+      <small className="agent-hint">open lists expand by default · click a leg for its chart</small>
+    </div>
+    {error && <div className="agent-error">{error}</div>}
+    {data && !lists.length && <section className="panel agent-panel"><div className="agent-empty">No {status === "ALL" ? "" : status.toLowerCase() + " "}lists in the last {days} days.</div></section>}
+    {lists.map((list) => {
+      const legs = legsOf(list).filter((leg) => (kind === "ALL" || leg.kind === kind) && (!needle || leg.underlying.includes(needle)));
+      const marks = legsOf(list).map((leg) => sinceEntry(leg.entry_price, markOf(ticks, leg.symbol, leg.last_price).ltp).fraction).filter((v): v is number => v != null);
+      const open = expanded[list.run.run_id] ?? list.open;
+      const focus = pickFocus(legs, list.run.emitted_at, list.run.day);
+      return <section key={list.run.run_id} className={`panel agent-panel agent-track ${list.open ? "is-open" : "is-closed"}`}>
+        <button className="agent-track-head" aria-expanded={open} onClick={() => setExpanded({ ...expanded, [list.run.run_id]: !open })}>
+          <span className="agent-track-caret" aria-hidden="true">{open ? "▾" : "▸"}</span>
+          <b>List of {sessionLabel(list.run.day)}</b>
+          <span className={`agent-track-status ${list.open ? "open" : "closed"}`}>{list.open ? (list.sessions_elapsed === 0 ? "Entered today" : `Open · D+${list.sessions_elapsed} of 3`) : "Closed"}</span>
+          <small>emitted {fullTime(list.run.emitted_at)} · {list.open ? "exits by" : "hold ended"} {sessionLabel(list.hold_until)} · {list.run.source} · model v{list.run.model_version ?? "—"}</small>
+          <span className="agent-track-figures">
+            <span>{list.summary.legs} legs{list.no_trade.length ? ` · no trade: ${list.no_trade.join(", ")}` : ""}</span>
+            <span>since entry <em className={tone(mean(marks))}>{pct(mean(marks))}</em></span>
+            <span>1–3d <em className={tone(list.summary.mean_1_3d)}>{pct(list.summary.mean_1_3d)}</em>{list.summary.final < list.summary.legs ? <small> ({list.summary.final}/{list.summary.legs} final)</small> : null}</span>
+            {list.summary.final > 0 && <span>{list.summary.winners}/{list.summary.final} up</span>}
+          </span>
+        </button>
+        {open && <div className="live-table-wrap"><table className="live-table agent-table agent-track-table">
+          <thead><tr><th>Leg</th><th>Contract</th><th>Entry</th><th>LTP</th><th>Since entry</th><th title="Profit or loss for one lot at the current price">₹ / lot</th><th>D+1</th><th>D+2</th><th>D+3</th><th>Best / worst</th><th>Outcome</th></tr></thead>
+          <tbody>{legs.map((leg) => {
+            const mark = markOf(ticks, leg.symbol, leg.last_price);
+            const m = sinceEntry(leg.entry_price, mark.ltp, leg.lot ?? undefined);
+            const done = leg.y != null;
+            return <tr key={leg.symbol} className="openable-row" onClick={() => onChart(focus, focus.findIndex((row) => row.symbol === leg.symbol))}>
+              <td><span className={`agent-leg agent-leg-${leg.kind.toLowerCase()}`}>{leg.kind === "INDEX" ? "IDX" : leg.kind}</span>{leg.rank != null && <small> #{leg.rank}</small>}</td>
+              <td title={leg.symbol}><b>{leg.underlying}</b> {leg.strike} {leg.symbol.slice(-2)} <small>{leg.expiry?.slice(5)}</small></td>
+              <td>{num(leg.entry_price)}</td>
+              <td><LivePrice value={mark.ltp} live={mark.live} at={mark.at} /></td>
+              <td className={tone(m.fraction)}>{pct(m.fraction)}</td>
+              <td className={tone(m.perLot)}>{m.perLot == null ? "—" : rupees(m.perLot)}</td>
+              <td className={tone(leg.r1)}>{pct(leg.r1)}</td><td className={tone(leg.r2)}>{pct(leg.r2)}</td><td className={tone(leg.r3)}>{pct(leg.r3)}</td>
+              <td><span className="positive">{pct(leg.max_ret, 0)}</span> / <span className="negative">{pct(leg.min_ret, 0)}</span></td>
+              <td>{done ? <span className={`agent-outcome ${leg.y! > 0 ? "win" : "loss"}`}>{pct(leg.y)} {leg.y! > 0 ? "✓" : "✗"}</span>
+                : <small>{list.open ? `in hold · D+${list.sessions_elapsed}` : "awaiting closes"}</small>}{leg.plan ? <small> · {leg.plan}</small> : null}</td>
+            </tr>;
+          })}</tbody>
+        </table>{!legs.length && <div className="agent-empty">No legs match the filter.</div>}</div>}
+      </section>;
+    })}
+  </>;
 }
+
 
 type CompareRow = { symbol: string; underlying: string; strike: number; expiry: string; ret: number; rank: number; percentile: number; final: boolean; picked?: boolean };
 type CompareSide = { universe: number; picks: CompareRow[]; actual_top: CompareRow[]; overlap: number; picks_mean: number | null; top_mean: number | null;

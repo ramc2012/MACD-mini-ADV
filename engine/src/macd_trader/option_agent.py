@@ -987,7 +987,7 @@ def picks_view(history: sqlite3.Connection, day: str | None = None, lots: dict[s
                 "last_price": last, "last_at": datetime.fromtimestamp(last_ts, IST).strftime("%d %b %H:%M") if last_ts else None,
                 "since_entry_pct": round((last / entry - 1) * 100, 2) if last and entry else None,
                 "r1": labels[0] if labels else None, "r2": labels[1] if labels else None, "r3": labels[2] if labels else None,
-                "max_ret": labels[4] if labels else None, "min_ret": labels[5] if labels else None}
+                "y": labels[3] if labels else None, "max_ret": labels[4] if labels else None, "min_ret": labels[5] if labels else None}
         lot = (lots or {}).get(symbol) or per_root.get(underlying)
         item["size"] = agent_equity.size_pick(
             {"entry_price": entry, "features": json.loads(labels[6] or "{}") if labels else {}, "strike": strike,
@@ -1162,6 +1162,32 @@ def active_view(history: sqlite3.Connection, lots: dict[str, int] | None = None)
         lists.append({"run": view["run"], "hold_until": ends, "sessions_elapsed": elapsed,
                       "ce": view["ce"], "pe": view["pe"], "index": [t for t in view["index"] if t.get("symbol")]})
     return {"today": today, "lists": lists}
+
+
+def tracker_view(history: sqlite3.Connection, days: int = 30, lots: dict[str, int] | None = None) -> dict:
+    """The watchlist tracker: every day's emitted list (its latest run) with each pick's entry, latest price and
+    D+1..D+3 outcome, open or closed, and a per-list summary -- the follow-up of every emission in one place."""
+    ensure_schema(history)
+    today = datetime.now(IST).date().isoformat()
+    since = (datetime.now(IST).date() - timedelta(days=days)).isoformat()
+    latest = history.execute(
+        "SELECT MAX(run_id), day FROM agent_runs WHERE day >= ? GROUP BY day ORDER BY day DESC", (since,)).fetchall()
+    lists = []
+    for run_id, day in latest:
+        ends, elapsed = hold_window(day)
+        view = picks_view(history, lots=lots, run_id=run_id)
+        index = [t for t in view["index"] if t.get("symbol")]
+        legs = view["ce"] + view["pe"] + index
+        final = [leg["y"] for leg in legs if leg.get("y") is not None]
+        marks = [leg["since_entry_pct"] for leg in legs if leg.get("since_entry_pct") is not None]
+        lists.append({"run": view["run"], "hold_until": ends, "sessions_elapsed": elapsed, "open": ends >= today,
+                      "ce": view["ce"], "pe": view["pe"], "index": index,
+                      "no_trade": [t["underlying"] for t in view["index"] if not t.get("symbol")],
+                      "summary": {"legs": len(legs), "final": len(final),
+                                  "mean_1_3d": sum(final) / len(final) if final else None,
+                                  "winners": sum(1 for y in final if y > 0),
+                                  "mean_since_entry_pct": round(sum(marks) / len(marks), 2) if marks else None}})
+    return {"today": today, "since": since, "lists": lists}
 
 
 # ---------------------------------------------------------------------------

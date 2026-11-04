@@ -79,6 +79,10 @@ SECTOR_NAMES = {"NSE:NIFTYIT-INDEX": "IT", "NSE:NIFTYAUTO-INDEX": "Auto", "NSE:N
                 "NSE:NIFTYINFRA-INDEX": "Infra"}
 STOCK_SHORTLIST = 24
 
+CYCLE_COLUMNS = ("cycle_id", "at", "day", "trigger", "mode", "model", "market_view", "regime", "confidence", "notes",
+                 "operator_note", "decision", "accepted", "rejected", "executed", "digest", "latency_ms", "prompt_tokens",
+                 "completion_tokens", "error", "reasoning_tokens", "cached_tokens", "cost_ticks")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agentic_cycles (
   cycle_id TEXT PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL, trigger TEXT, mode TEXT, model TEXT,
@@ -333,6 +337,10 @@ class AgenticExecutionManager(ExecutionManager):
 
 # ------------------------------------------------------------------------------------------ the lane
 
+def _hint(secret) -> str | None:
+    return f"…{str(secret)[-4:]}" if secret and len(str(secret)) >= 8 else None
+
+
 class AgenticLane:
     def __init__(self, settings, broker, events, database_path: str, engine=None):
         self.name = LANE_NAME
@@ -352,12 +360,18 @@ class AgenticLane:
                     self._db.execute(f"ALTER TABLE agentic_positions ADD COLUMN {column}")
                 except sqlite3.OperationalError:
                     pass                                      # already there
+            for column in ("reasoning_tokens INTEGER", "cached_tokens INTEGER", "cost_ticks INTEGER"):
+                try:
+                    self._db.execute(f"ALTER TABLE agentic_cycles ADD COLUMN {column}")
+                except sqlite3.OperationalError:
+                    pass                                      # already there
         self.portfolio = Portfolio(self.capital, lane=self.name)
         self.events = LaneEvents(events, prefix=f"{self.name}_")
         self.broker = OrderOnlyBroker(broker)
         self.execution = AgenticExecutionManager(
             self.execution_settings(settings), self.broker, self.portfolio, self.repository, self.events, lane=self)
         self.meta: dict[str, dict] = {}
+        self.last_balance: dict | None = None          # xAI prepaid credit, fetched on the owner's click
         self._contracts: dict[str, dict] = {}
         self.runtime_dir = str(RUNTIME_DIR)
         self.last_test: dict | None = None
@@ -436,13 +450,27 @@ class AgenticLane:
                 "reasoning_effort": self.client.reasoning_effort or "", "efforts": list(brain.EFFORTS),
                 "default_model": self.settings.agentic_model, "last_test": self.last_test,
                 "universe": self.universe, "universes": list(UNIVERSES),
-                "cycle_minutes": self.cycle_minutes, "cycle_choices": list(CYCLE_CHOICES)}
+                "cycle_minutes": self.cycle_minutes, "cycle_choices": list(CYCLE_CHOICES),
+                "management_key_hint": _hint(self._config.get("management_key")), "team_id": self._config.get("team_id") or ""}
 
     def update_brain(self, *, api_key: str | None = None, clear_key: bool = False, model: str | None = None,
                      api_base: str | None = None, reasoning_effort: str | None = None,
-                     universe: str | None = None, cycle_minutes: int | None = None) -> dict:
+                     universe: str | None = None, cycle_minutes: int | None = None,
+                     management_key: str | None = None, clear_management_key: bool = False,
+                     team_id: str | None = None) -> dict:
         store = brain.brain_store(self.runtime_dir)
         config = store.load()
+        # The Management API key reads billing only; like the inference key it is write-only from the panel.
+        if clear_management_key:
+            config.pop("management_key", None)
+            self.last_balance = None
+        elif management_key is not None and management_key.strip():
+            config["management_key"] = management_key.strip()
+        if team_id is not None:
+            if team_id.strip():
+                config["team_id"] = team_id.strip()
+            else:
+                config.pop("team_id", None)
         if clear_key:
             config.pop("api_key", None)
         elif api_key is not None and api_key.strip():
@@ -1071,6 +1099,8 @@ class AgenticLane:
                           "decision": decision, "accepted": checked.accepted, "rejected": checked.rejected,
                           "executed": executed, "latency_ms": meta.get("latency_ms"),
                           "prompt_tokens": meta.get("prompt_tokens"), "completion_tokens": meta.get("completion_tokens"),
+                          "reasoning_tokens": meta.get("reasoning_tokens"), "cached_tokens": meta.get("cached_tokens"),
+                          "cost_ticks": meta.get("cost_ticks"),
                           "digest": {"nifty": _r(nifty), "positions": len(self.held_symbols()),
                                      "equity": round(self.portfolio.snapshot()["equity"])}})
             await asyncio.to_thread(self._save_cycle, cycle)
@@ -1379,11 +1409,10 @@ class AgenticLane:
     def _save_cycle(self, c: dict) -> None:
         dumps = lambda v: json.dumps(v, default=str)  # noqa: E731
         with self._db_lock, self._db:
-            self._db.execute("INSERT OR REPLACE INTO agentic_cycles VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (c["cycle_id"], c["at"], c["day"], c["trigger"], c["mode"], c["model"], c["market_view"],
-                              c["regime"], c["confidence"], c["notes"], c["operator_note"], dumps(c["decision"]),
-                              dumps(c["accepted"]), dumps(c["rejected"]), dumps(c["executed"]), dumps(c["digest"]),
-                              c["latency_ms"], c["prompt_tokens"], c["completion_tokens"], c["error"]))
+            values = {**{k: c.get(k) for k in CYCLE_COLUMNS},
+                      **{k: dumps(c.get(k)) for k in ("decision", "accepted", "rejected", "executed", "digest")}}
+            self._db.execute(f"INSERT OR REPLACE INTO agentic_cycles ({', '.join(CYCLE_COLUMNS)}) "
+                             f"VALUES ({', '.join('?' for _ in CYCLE_COLUMNS)})", [values[k] for k in CYCLE_COLUMNS])
 
     # ---------------------------------------------------------------- loop
 
@@ -1505,6 +1534,48 @@ class AgenticLane:
     def actions(self, limit: int = 300) -> list[dict]:
         with self._db_lock:
             return [dict(r) for r in self._db.execute("SELECT * FROM agentic_actions ORDER BY at DESC LIMIT ?", (limit,))]
+
+    def usage_summary(self, now: datetime | None = None) -> dict:
+        """Grok calls and tokens per IST day from the decision journal, with xAI's own cost of each call (recorded
+        from 4 Nov 2026; earlier cycles kept only prompt and completion tokens). No call to xAI."""
+        now = (now or _now()).astimezone(IST)
+        with self._db_lock:
+            rows = [dict(r) for r in self._db.execute(
+                "SELECT day, COUNT(*) AS calls, SUM(prompt_tokens) AS prompt, SUM(cached_tokens) AS cached,"
+                " SUM(completion_tokens) AS completion, SUM(reasoning_tokens) AS reasoning, SUM(cost_ticks) AS ticks,"
+                " COUNT(cost_ticks) AS priced, AVG(latency_ms) AS latency FROM agentic_cycles"
+                " WHERE prompt_tokens IS NOT NULL GROUP BY day ORDER BY day")]
+            first_priced = self._db.execute("SELECT MIN(at) FROM agentic_cycles WHERE cost_ticks IS NOT NULL").fetchone()[0]
+        today = now.date()
+
+        def total(days: list[dict]) -> dict:
+            ticks = sum(r["ticks"] or 0 for r in days)
+            return {"calls": sum(r["calls"] for r in days), "prompt_tokens": sum(r["prompt"] or 0 for r in days),
+                    "cached_tokens": sum(r["cached"] or 0 for r in days),
+                    "completion_tokens": sum(r["completion"] or 0 for r in days),
+                    "reasoning_tokens": sum(r["reasoning"] or 0 for r in days),
+                    "priced_calls": sum(r["priced"] for r in days), "cost_usd": round(ticks / brain.TICKS_PER_USD, 4)}
+
+        periods = {"today": [r for r in rows if r["day"] == today.isoformat()],
+                   "last_7_days": [r for r in rows if r["day"] > (today - timedelta(days=7)).isoformat()],
+                   "this_month": [r for r in rows if r["day"][:7] == today.isoformat()[:7]],
+                   "since_start": rows}
+        return {"as_of": now.isoformat(timespec="seconds"), "model": self.client.model,
+                "periods": {name: total(days) for name, days in periods.items()},
+                "days": [{**total([r]), "day": r["day"], "avg_latency_ms": round(r["latency"] or 0)} for r in rows[-30:]],
+                "cost_recorded_from": first_priced, "balance": self.last_balance,
+                "balance_configured": bool(self._config.get("management_key") and self._config.get("team_id"))}
+
+    async def refresh_balance(self) -> dict:
+        """The prepaid credit balance from xAI's Management API, on the owner's click only."""
+        config = self._config
+        try:
+            result = await brain.prepaid_balance(str(config.get("management_key") or ""), str(config.get("team_id") or ""))
+            self.last_balance = {**result, "at": _now().isoformat(timespec="seconds"), "error": None}
+        except brain.BrainError as exc:
+            self.last_balance = {**(self.last_balance or {}), "at": _now().isoformat(timespec="seconds"),
+                                 "error": str(exc)[:300]}
+        return self.last_balance
 
     def journal_days(self, limit: int = 30) -> list[str]:
         with self._db_lock:

@@ -40,6 +40,10 @@ from . import greeks, index_scorecard, market_calendar
 from . import option_agent as oa
 from .universe import INDEX_SPOTS
 
+# Owner, 4 Nov 2026: index trades only on these five. The other derivative indices (NIFTYNXT50, BANKEX, FOCIT,
+# NIFTYFPI) stay in the pooled training rows but are never traded.
+TRADED_INDICES = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY", "FINNIFTY")
+
 MAX_MONEYNESS = 0.02
 TARGET_CLIP = (-1.0, 2.0)
 MIN_EDGE = 0.0
@@ -166,7 +170,7 @@ def decide(day_rows: list[dict], model: dict, front: dict[str, str] | None = Non
         by_root[row["underlying"]].append(row)
     front = front or {}
     out = {}
-    for root in INDEX_SPOTS:
+    for root in TRADED_INDICES:
         rows = by_root.get(root, [])
         if not rows:
             out[root] = {"side": 0, "reason": (
@@ -426,7 +430,7 @@ def emit(history: sqlite3.Connection, run_id: int, day: str, rows: list[dict], h
     features = None
     if model.get("name") == "scorecard":
         index_scorecard.update_history(history, day)     # yesterday's session must be in the daily history
-        features = {root: index_scorecard.features_for(history, root, day) for root in INDEX_SPOTS}
+        features = {root: index_scorecard.features_for(history, root, day) for root in TRADED_INDICES}
     for root, choice in decide(rows, model, front, features).items():
         spot = INDEX_SPOTS[root]
         spot_price = (hist.by_day.get(day, {}).get(spot) or {}).get("p1445")
