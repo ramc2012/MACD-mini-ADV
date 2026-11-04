@@ -130,17 +130,18 @@ def build(database_path: str, symbols: list[str], now: datetime | None = None, o
                 unavailable.append({"symbol": symbol, "kind": instrument["kind"], "label": instrument.get("underlying") or label(symbol),
                                     "reason": "No stored minute bars today" if not bars else "Only one completed bar"})
             else:
+                row["bar_end"] = min(row["bar_start"] + TIMEFRAME, closes_at)      # F&O's last bar is 15:30-15:40
                 rows.append(row)
     kinds = ("SPOT", "CE", "PE")
     # Per kind, the bar most rows end on: after 15:15 cash stocks are done while indices print to 15:30 and options
     # to 15:40.
-    as_of = {}
+    as_of, as_of_end = {}, {}
     for kind in kinds:
-        starts = Counter(row["bar_start"] for row in rows if row["kind"] == kind and not row["stale"])
-        as_of[kind] = starts.most_common(1)[0][0] if starts else None
+        bars = Counter((row["bar_start"], row["bar_end"]) for row in rows if row["kind"] == kind and not row["stale"])
+        as_of[kind], as_of_end[kind] = bars.most_common(1)[0][0] if bars else (None, None)
     return {
         "session": day.isoformat(), "timeframe_seconds": TIMEFRAME, "generated_at": now.isoformat(),
-        "as_of": as_of, "rows": rows, "unavailable": unavailable, "evaluated": len(instruments),
+        "as_of": as_of, "as_of_end": as_of_end, "rows": rows, "unavailable": unavailable, "evaluated": len(instruments),
         "at_high": {kind: sum(row["at_high"] for row in rows if row["kind"] == kind) for kind in kinds},
         "at_low": {kind: sum(row["at_low"] for row in rows if row["kind"] == kind) for kind in kinds},
         "listed": {kind: sum(row["kind"] == kind for row in rows) for kind in kinds},

@@ -94,3 +94,4 @@ def test_atm_legs_are_judged_on_their_own_premium_to_the_fo_close(tmp_path):
     assert put["kind"] == "PE" and put["at_low"] and not put["at_high"]
     assert call["group"] == rows["NSE:SBIN-EQ"]["group"]
     assert result["at_high"] == {"SPOT": 0, "CE": 1, "PE": 0} and result["listed"]["CE"] == 1
+    assert result["as_of"]["CE"] == _at("09:30") and result["as_of_end"]["CE"] == _at("09:45")

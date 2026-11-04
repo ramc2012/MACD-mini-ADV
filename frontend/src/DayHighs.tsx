@@ -12,7 +12,7 @@ type Row = {
   from_high_pct: number; from_low_pct: number; change_pct: number | null; bars: number;
 };
 type Payload = {
-  session: string; as_of: Record<Kind, number | null>; generated_at: string; rows: Row[];
+  session: string; as_of: Record<Kind, number | null>; as_of_end: Record<Kind, number | null>; generated_at: string; rows: Row[];
   unavailable: { symbol: string; kind: Kind; label: string; reason: string }[]; evaluated: number;
   at_high: Record<Kind, number>; at_low: Record<Kind, number>; listed: Record<Kind, number>;
   rules: Record<string, string>;
@@ -72,7 +72,7 @@ export function DayHighs({ onOpen }: { onOpen?: (symbol: string) => void }) {
   ];
 
   const barStart = data?.as_of[kind];
-  const asOf = barStart ? `${clock(barStart)}–${clock(barStart + 900)} IST bar` : "no completed bar yet";
+  const asOf = barStart ? `${clock(barStart)}–${clock(data?.as_of_end[kind] ?? barStart + 900)} IST bar` : "no completed bar yet";
   const noun = option ? `ATM ${kind} legs` : "spots";
   const count = (counts: Record<Kind, number> | undefined) => counts?.[kind] ?? "…";
   return <section className="panel atm-heatmap">
