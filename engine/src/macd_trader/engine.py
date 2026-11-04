@@ -2297,6 +2297,19 @@ class TradingEngine(DeskMixin):
             tasks[key] = asyncio.create_task(compute())
         return await asyncio.shield(tasks[key])
 
+    async def day_highs(self) -> dict:
+        """Spots whose last completed 15-min bar closed at a new day high or low (day_highs.py); cached 30 s."""
+        from . import day_highs
+        cached = getattr(self, "_day_highs_cache", None)
+        if cached and time.monotonic() - cached[0] < 30:
+            return cached[1]
+        vix = self.settings.vix_symbol
+        symbols = [s for s in dict.fromkeys([*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
+                   if s.endswith(("-EQ", "-INDEX")) and s != vix]
+        result = await asyncio.to_thread(day_highs.build, self.settings.research_database_path, symbols)
+        self._day_highs_cache = (time.monotonic(), result)
+        return result
+
     def warmup_status(self) -> dict:
         wanted = set(self.settings.symbols) | set(self.option_symbols)
         return {"required": len(wanted), "with_indicators": sum(symbol in self.strategy.points for symbol in wanted)}

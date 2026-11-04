@@ -233,7 +233,7 @@ export function SpotLanePage({ ticks, portfolio, holidays }: { ticks: Record<str
       </div>}
 
       {(tab === "PORTFOLIO" || tab === "ORDERS" || tab === "TRADES") && <TradingLedger tab={tab} orders={book?.orders ?? []} trades={trades}
-        portfolio={ledgerPortfolio} signals={[]} onOpenPosition={openChart} holidays={holidays} ledgerReady={!!book} books="sides" />}
+        portfolio={ledgerPortfolio} signals={[]} onOpenPosition={openChart} holidays={holidays} ledgerReady={!!book} books="sides" marginRate={rules?.margin_pct} />}
 
       {tab === "STATUS" && <div className="spot-status">
         <section className="panel agent-panel">

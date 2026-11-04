@@ -296,13 +296,13 @@ class Settings(BaseSettings):
     # 30-min MACD crossing zero picks the side (up long, down short) and the trade is the stock's future,
     # spot_lane_lots exchange lots, the nearest series that outlives the hold. Capacity is margin: a position
     # blocks spot_futures_margin_pct of its notional (an estimate of SPAN + exposure, not the exchange's figure).
-    # spot_lane_ticket is no longer used for sizing.
+    # Owner, 4 Nov 2026 (evening): "futures trades need not have tickets size. It shall be governed by futures lot
+    # and margin requirements" -- the rupee ticket setting is gone.
     spot_lane_enabled: bool = True
     spot_lane_lots: int = Field(default=1, ge=1, le=50)
     spot_futures_margin_pct: float = Field(default=0.25, gt=0, le=1)
     spot_short_enabled: bool = True
     spot_lane_capital: float = Field(default=5_000_000.0, gt=0)
-    spot_lane_ticket: float = Field(default=100_000.0, gt=0)
     spot_hard_stop_pct: float = Field(default=0.03, gt=0, lt=1)
     spot_trail_activation_pct: float = Field(default=0.03, gt=0, lt=5)
     spot_trail_pct: float = Field(default=0.025, gt=0, lt=1)

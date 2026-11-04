@@ -48,9 +48,12 @@ const initialSorts: Record<LedgerTab, SortState> = {
   SIGNALS: { key: "time", direction: "desc" },
 };
 
-export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true, books = "options" }: {
+export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true, books = "options", marginRate }: {
   tab: LedgerTab;
   books?: LedgerBooks;
+  /** Futures: the share of notional a position blocks as margin. The books then show margin blocked and notional,
+   *  not money invested, and P&L % is on margin. */
+  marginRate?: number;
   ledgerReady?: boolean;
   /** Exchange holidays (YYYY-MM-DD) so the closed book rolls on trading days, not weekdays. */
   holidays?: string[];
@@ -161,12 +164,14 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     { key: "price", label: "Premium", value: (row) => row.price, render: (row) => currency(row.price) },
     { key: "macd", label: "MACD", value: (row) => row.macd, render: (row) => number.format(row.macd) },
   ];
+  const capital = (notional: number) => marginRate ? notional * marginRate : notional;
+  const labels: CapitalLabels = marginRate ? { capital: "Margin", current: "Notional", proceeds: "Exit notional" } : DEFAULT_LABELS;
   const liveSummary = useMemo(() => positionSummary(portfolio.positions.map((row) => ({
-    invested: row.average_price * Math.abs(row.quantity), current: row.last_price * Math.abs(row.quantity), pnl: row.unrealized_pnl, symbol: row.symbol,
-  }))), [portfolio.positions]);
+    invested: capital(row.average_price * Math.abs(row.quantity)), current: row.last_price * Math.abs(row.quantity), pnl: row.unrealized_pnl, symbol: row.symbol,
+  }))), [portfolio.positions, marginRate]);
   const closedSummary = useMemo(() => positionSummary(closedToday.map((row) => ({
-    invested: row.entry_price * row.quantity, current: row.exit_price * row.quantity, pnl: row.realized_pnl, symbol: row.symbol,
-  })), closedPositionCount), [closedToday, closedPositionCount]);
+    invested: capital(row.entry_price * row.quantity), current: row.exit_price * row.quantity, pnl: row.realized_pnl, symbol: row.symbol,
+  })), closedPositionCount), [closedToday, closedPositionCount, marginRate]);
   const positionGroups = useMemo(() => {
     const groups: { key: "CE" | "PE" | "OTHER" | "LONG" | "SHORT"; title: string; positions: Position[] }[] = books === "sides" ? [
       { key: "LONG", title: "Long positions", positions: [] },
@@ -183,13 +188,13 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     return groups.filter((group) => group.key !== "OTHER" || group.positions.length > 0).map((group) => ({
       ...group,
       summary: positionSummary(group.positions.map((row) => ({
-        invested: row.average_price * Math.abs(row.quantity),
+        invested: capital(row.average_price * Math.abs(row.quantity)),
         current: row.last_price * Math.abs(row.quantity),
         pnl: row.unrealized_pnl,
         symbol: row.symbol,
       }))),
     }));
-  }, [portfolio.positions, books]);
+  }, [portfolio.positions, books, marginRate]);
 
   const bookTabsAvailable: { key: BookKey; label: string; count: number }[] = [
     ...positionGroups.map((group) => ({ key: group.key, label: BOOK_LABELS[group.key], count: group.positions.length })),
@@ -216,9 +221,9 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
       {tab === "TRADES" && <SortableTable rows={shownTrades} columns={tradeColumns} sort={sort} onSort={updateSort} empty={allDays ? "No paper fills recorded yet" : `No fills today (${dayHeading(today)}). Show all days for the full log.`} />}
       {tab === "PORTFOLIO" && <div className="book-stack">{positionTabs}<div className="book-fill">
         {activeBook === "CLOSED"
-          ? <PositionBook title={`Closed today · since ${bookSince}`} closed rows={closedToday} empty={`No positions closed since ${bookSince}`} summary={closedSummary} columns={closedColumns} sort={closedSort} onSort={updateClosedSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />
-          : activeGroup && <PositionBook title={activeGroup.title} rows={activeGroup.positions} summary={activeGroup.summary} columns={positionColumns} sort={sort} onSort={updateSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />}
-      </div><SummaryStrip title="Combined open-position summary" summary={liveSummary} /></div>}
+          ? <PositionBook title={`Closed today · since ${bookSince}`} closed rows={closedToday} empty={`No positions closed since ${bookSince}`} summary={closedSummary} labels={labels} columns={closedColumns} sort={closedSort} onSort={updateClosedSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />
+          : activeGroup && <PositionBook title={activeGroup.title} rows={activeGroup.positions} summary={activeGroup.summary} labels={labels} columns={positionColumns} sort={sort} onSort={updateSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />}
+      </div><SummaryStrip title="Combined open-position summary" summary={liveSummary} labels={labels} /></div>}
       {tab === "SIGNALS" && <SortableTable rows={signals} columns={signalColumns} sort={sort} onSort={updateSort} empty="No MACD signals recorded" />}
       {tab === "STATISTICS" && <Statistics orders={orders} trades={trades} portfolio={portfolio} rounds={rounds} sides={books === "sides"} />}
     </div>
@@ -243,22 +248,26 @@ function positionSummary(rows: { invested: number; current: number; pnl: number;
   };
 }
 
-function SummaryStrip({ title, summary }: { title: string; summary: BookSummary }) {
+type CapitalLabels = { capital: string; current: string; proceeds: string };
+const DEFAULT_LABELS: CapitalLabels = { capital: "Invested", current: "Current value", proceeds: "Proceeds" };
+
+function SummaryStrip({ title, summary, labels = DEFAULT_LABELS }: { title: string; summary: BookSummary; labels?: CapitalLabels }) {
   return <div className="summary-strip">
     <b className="summary-title">{title}</b>
     <div><span>Positions</span><b>{summary.count} · {summary.winners}▲ {summary.losers}▼</b></div>
-    <div><span>Invested</span><b>{currency(summary.invested)}</b></div>
-    <div><span>Current value</span><b>{currency(summary.current)}</b></div>
+    <div><span>{labels.capital}</span><b>{currency(summary.invested)}</b></div>
+    <div><span>{labels.current}</span><b>{currency(summary.current)}</b></div>
     <div><span>Unrealized P&L</span><b className={summary.pnl >= 0 ? "positive" : "negative"}>{currency(summary.pnl)} ({summary.returnPct.toFixed(2)}%)</b></div>
     <div><span>Best / worst</span><b>{summary.best || "—"} / {summary.worst || "—"}</b></div>
   </div>;
 }
 
-function PositionBook<Row>({ title, rows, summary, columns, sort, onSort, toFocus, onOpenPosition, closed, empty }: {
+function PositionBook<Row>({ title, rows, summary, labels = DEFAULT_LABELS, columns, sort, onSort, toFocus, onOpenPosition, closed, empty }: {
   title: string;
   rows: Row[];
   empty?: string;
   summary: BookSummary;
+  labels?: CapitalLabels;
   columns: Column<Row>[];
   sort: SortState;
   onSort: (key: string) => void;
@@ -271,8 +280,8 @@ function PositionBook<Row>({ title, rows, summary, columns, sort, onSort, toFocu
     <div className={closed ? "position-book-heading closed" : "position-book-heading"}>
       <b>{title}</b>
       <span>{summary.count} positions{closed && summary.rows !== summary.count ? ` · ${summary.rows} exits` : ""} · {summary.winners}▲ {summary.losers}▼</span>
-      <span>Invested <b>{currency(summary.invested)}</b></span>
-      <span>{closed ? "Proceeds" : "Current"} <b>{currency(summary.current)}</b></span>
+      <span>{labels.capital} <b>{currency(summary.invested)}</b></span>
+      <span>{closed ? labels.proceeds : labels === DEFAULT_LABELS ? "Current" : labels.current} <b>{currency(summary.current)}</b></span>
       <span>{closed ? "Realized" : "P&L"} <b className={summary.pnl >= 0 ? "positive" : "negative"}>{currency(summary.pnl)} ({summary.returnPct.toFixed(2)}%)</b></span>
       {closed && <span>Best / worst <b>{summary.best || "—"} / {summary.worst || "—"}</b></span>}
     </div>

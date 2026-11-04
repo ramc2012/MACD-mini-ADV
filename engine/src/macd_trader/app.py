@@ -290,6 +290,12 @@ async def trend_rotation(kind: Literal["CE", "PE", "SPOT"] = "CE",
     return await engine.trend_rotation(kind, timeframe_seconds)
 
 
+@app.get("/api/day-highs", dependencies=[Depends(authorize)])
+async def day_highs():
+    """Spots whose last completed 15-min bar closed at a new day high (or low). Read-only market breadth."""
+    return await engine.day_highs()
+
+
 @app.get("/api/whale-interest", dependencies=[Depends(authorize)])
 async def whale_interest() -> dict:
     """Underlyings a whale-sized minute made interesting in the last hour (lane priority, owner 3 Nov 2026)."""
