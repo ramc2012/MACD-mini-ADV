@@ -292,7 +292,15 @@ class Settings(BaseSettings):
     # spot_min_hold_sessions only the hard stop can close a position (the rest of the ladder waits), and it is out at
     # 15:25 on the spot_max_hold_sessions-th session. research/spot_macd_20261103: long-only spot MACD tracked the
     # market (entry skill vs random entries positive in 2025, negative since) -- not proven.
+    # Owner, 4 Nov 2026: "in futures for both long and shorts with exchange specfied lot size" -- the stock's own
+    # 30-min MACD crossing zero picks the side (up long, down short) and the trade is the stock's future,
+    # spot_lane_lots exchange lots, the nearest series that outlives the hold. Capacity is margin: a position
+    # blocks spot_futures_margin_pct of its notional (an estimate of SPAN + exposure, not the exchange's figure).
+    # spot_lane_ticket is no longer used for sizing.
     spot_lane_enabled: bool = True
+    spot_lane_lots: int = Field(default=1, ge=1, le=50)
+    spot_futures_margin_pct: float = Field(default=0.25, gt=0, le=1)
+    spot_short_enabled: bool = True
     spot_lane_capital: float = Field(default=5_000_000.0, gt=0)
     spot_lane_ticket: float = Field(default=100_000.0, gt=0)
     spot_hard_stop_pct: float = Field(default=0.03, gt=0, lt=1)

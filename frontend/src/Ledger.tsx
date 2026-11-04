@@ -36,7 +36,9 @@ export type Column<Row> = {
 };
 export type FocusRow = { symbol: string; entryTime: string; entryPrice: number };
 type OpenPosition = Position & Excursion;
-type BookKey = "CE" | "PE" | "OTHER" | "CLOSED";
+type BookKey = "CE" | "PE" | "OTHER" | "LONG" | "SHORT" | "CLOSED";
+/** "options": the option lanes' CE / PE books. "sides": a book that sells short (spot lane futures): Long / Short. */
+export type LedgerBooks = "options" | "sides";
 
 const initialSorts: Record<LedgerTab, SortState> = {
   ORDERS: { key: "time", direction: "desc" },
@@ -46,8 +48,9 @@ const initialSorts: Record<LedgerTab, SortState> = {
   SIGNALS: { key: "time", direction: "desc" },
 };
 
-export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true }: {
+export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true, books = "options" }: {
   tab: LedgerTab;
+  books?: LedgerBooks;
   ledgerReady?: boolean;
   /** Exchange holidays (YYYY-MM-DD) so the closed book rolls on trading days, not weekdays. */
   holidays?: string[];
@@ -74,7 +77,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     const timer = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(timer);
   }, []);
-  const rounds = useMemo(() => completedRoundTrips(trades), [trades]);
+  const rounds = useMemo(() => completedRoundTrips(trades, { shorts: books === "sides" }), [trades, books]);
   // Orders and trades open on the current IST day; the full log is one click away.
   const [allDays, setAllDays] = useState(false);
   const today = istDay(now);
@@ -159,34 +162,37 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
     { key: "macd", label: "MACD", value: (row) => row.macd, render: (row) => number.format(row.macd) },
   ];
   const liveSummary = useMemo(() => positionSummary(portfolio.positions.map((row) => ({
-    invested: row.average_price * row.quantity, current: row.last_price * row.quantity, pnl: row.unrealized_pnl, symbol: row.symbol,
+    invested: row.average_price * Math.abs(row.quantity), current: row.last_price * Math.abs(row.quantity), pnl: row.unrealized_pnl, symbol: row.symbol,
   }))), [portfolio.positions]);
   const closedSummary = useMemo(() => positionSummary(closedToday.map((row) => ({
     invested: row.entry_price * row.quantity, current: row.exit_price * row.quantity, pnl: row.realized_pnl, symbol: row.symbol,
   })), closedPositionCount), [closedToday, closedPositionCount]);
   const positionGroups = useMemo(() => {
-    const groups: { key: "CE" | "PE" | "OTHER"; title: string; positions: Position[] }[] = [
+    const groups: { key: "CE" | "PE" | "OTHER" | "LONG" | "SHORT"; title: string; positions: Position[] }[] = books === "sides" ? [
+      { key: "LONG", title: "Long positions", positions: [] },
+      { key: "SHORT", title: "Short positions", positions: [] },
+    ] : [
       { key: "CE", title: "Call positions · CE", positions: [] },
       { key: "PE", title: "Put positions · PE", positions: [] },
       { key: "OTHER", title: "Other positions", positions: [] },
     ];
     portfolio.positions.forEach((position) => {
-      const optionType = positionOptionType(position.symbol);
-      groups.find((group) => group.key === optionType)?.positions.push(position);
+      const key = books === "sides" ? (position.quantity < 0 ? "SHORT" : "LONG") : positionOptionType(position.symbol);
+      groups.find((group) => group.key === key)?.positions.push(position);
     });
     return groups.filter((group) => group.key !== "OTHER" || group.positions.length > 0).map((group) => ({
       ...group,
       summary: positionSummary(group.positions.map((row) => ({
-        invested: row.average_price * row.quantity,
-        current: row.last_price * row.quantity,
+        invested: row.average_price * Math.abs(row.quantity),
+        current: row.last_price * Math.abs(row.quantity),
         pnl: row.unrealized_pnl,
         symbol: row.symbol,
       }))),
     }));
-  }, [portfolio.positions]);
+  }, [portfolio.positions, books]);
 
   const bookTabsAvailable: { key: BookKey; label: string; count: number }[] = [
-    ...positionGroups.map((group) => ({ key: group.key, label: group.key === "CE" ? "Calls · CE" : group.key === "PE" ? "Puts · PE" : "Other", count: group.positions.length })),
+    ...positionGroups.map((group) => ({ key: group.key, label: BOOK_LABELS[group.key], count: group.positions.length })),
     { key: "CLOSED", label: "Closed today", count: closedPositionCount },
   ];
   // OTHER disappears when its last position is flattened; fall back rather than show a blank panel.
@@ -214,7 +220,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
           : activeGroup && <PositionBook title={activeGroup.title} rows={activeGroup.positions} summary={activeGroup.summary} columns={positionColumns} sort={sort} onSort={updateSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />}
       </div><SummaryStrip title="Combined open-position summary" summary={liveSummary} /></div>}
       {tab === "SIGNALS" && <SortableTable rows={signals} columns={signalColumns} sort={sort} onSort={updateSort} empty="No MACD signals recorded" />}
-      {tab === "STATISTICS" && <Statistics orders={orders} trades={trades} portfolio={portfolio} rounds={rounds} />}
+      {tab === "STATISTICS" && <Statistics orders={orders} trades={trades} portfolio={portfolio} rounds={rounds} sides={books === "sides"} />}
     </div>
   </section>;
 }
@@ -287,7 +293,7 @@ export function SortableTable<Row>({ rows, columns, sort, onSort, empty, rowActi
   return <div className="ledger-table-wrap"><table className="ledger-table"><thead><tr>{columns.map((column) => <th key={column.key}><button onClick={() => onSort(column.key)}>{column.label}<span className={sort.key === column.key ? "sort active" : "sort"}>{sort.key === column.key ? (sort.direction === "asc" ? "▲" : "▼") : "↕"}</span></button></th>)}</tr></thead><tbody>{sorted.length ? sorted.map((row, index) => <tr key={index} className={rowAction ? "openable-row" : ""} onClick={() => rowAction?.(row)}>{columns.map((column, columnIndex) => <td key={column.key} className={column.tone?.(row) || ""}>{rowAction && columnIndex === 0 ? <button type="button" className="ledger-row-open" aria-label={`Open position chart for ${String(column.value(row))}`} onClick={(event) => { event.stopPropagation(); rowAction(row); }}>{column.render ? column.render(row) : String(column.value(row))}</button> : column.render ? column.render(row) : String(column.value(row))}</td>)}</tr>) : <tr><td colSpan={columns.length} className="empty">{empty}</td></tr>}</tbody></table></div>;
 }
 
-function Statistics({ orders, trades, portfolio, rounds }: { orders: Order[]; trades: Trade[]; portfolio: Portfolio; rounds: RoundTrip[] }) {
+function Statistics({ orders, trades, portfolio, rounds, sides = false }: { orders: Order[]; trades: Trade[]; portfolio: Portfolio; rounds: RoundTrip[]; sides?: boolean }) {
   const winners = rounds.filter((row) => row.pnl > 0);
   const losers = rounds.filter((row) => row.pnl < 0);
   const grossProfit = winners.reduce((sum, row) => sum + row.pnl, 0);
@@ -316,12 +322,12 @@ function Statistics({ orders, trades, portfolio, rounds }: { orders: Order[]; tr
     ["Live unrealized P&L", currency(portfolio.unrealized_pnl)],
   ];
   return <div className="statistics"><h2>Agent paper book</h2><div className="statistics-note">One trade runs from first entry until fully flat. Partial exits in open cycles are excluded from win rate and completed-trade returns. Returns include recorded fees; realized P&L in open cycles includes their entry fees.</div><div className="statistics-grid">{stats.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
-    <IndexStatistics rounds={rounds} portfolio={portfolio} bookNet={net} />
+    {sides ? <SideStatistics rounds={rounds} portfolio={portfolio} /> : <IndexStatistics rounds={rounds} portfolio={portfolio} bookNet={net} />}
     <Rejections orders={orders} />
     <h2>Completed trades · entry to flat</h2>
-    <table className="ledger-table"><thead><tr><th>Symbol</th><th>Entry (IST)</th><th>Exit (IST)</th><th>Entries</th><th>Exits</th><th>Net P&L</th><th>Return</th></tr></thead><tbody>
-      {[...rounds].reverse().map((row) => <tr key={`${row.symbol}:${row.entryTime}:${row.exitTime}`}><td>{row.symbol}</td><td>{entryStamp(row.entryTime)}</td><td>{entryStamp(row.exitTime)}</td><td>{row.entryCount}</td><td>{row.exitCount}</td><td className={row.pnl >= 0 ? "positive" : "negative"}>{currency(row.pnl)}</td><td>{pct(row.returnPct)}</td></tr>)}
-      {!rounds.length && <tr><td colSpan={7}>No fully closed trades</td></tr>}
+    <table className="ledger-table"><thead><tr><th>Symbol</th>{sides && <th>Side</th>}<th>Entry (IST)</th><th>Exit (IST)</th><th>Entries</th><th>Exits</th><th>Net P&L</th><th>Return</th></tr></thead><tbody>
+      {[...rounds].reverse().map((row) => <tr key={`${row.symbol}:${row.entryTime}:${row.exitTime}`}><td>{row.symbol}</td>{sides && <td className={row.side === "SHORT" ? "negative" : "positive"}>{row.side === "SHORT" ? "Short" : "Long"}</td>}<td>{entryStamp(row.entryTime)}</td><td>{entryStamp(row.exitTime)}</td><td>{row.entryCount}</td><td>{row.exitCount}</td><td className={row.pnl >= 0 ? "positive" : "negative"}>{currency(row.pnl)}</td><td>{pct(row.returnPct)}</td></tr>)}
+      {!rounds.length && <tr><td colSpan={sides ? 8 : 7}>No fully closed trades</td></tr>}
     </tbody></table>
   </div>;
 }
@@ -373,6 +379,26 @@ function IndexStatistics({ rounds, portfolio, bookNet }: { rounds: RoundTrip[]; 
   </>;
 }
 
+/** A long-and-short book's completed trades by side: the same figures for longs and shorts on their own. */
+function SideStatistics({ rounds, portfolio }: { rounds: RoundTrip[]; portfolio: Portfolio }) {
+  const ratio = (value: number | null) => value === null ? "—" : Number.isFinite(value) ? value.toFixed(2) : "∞";
+  const money = (value: number | null) => value === null ? "—" : currency(value);
+  const rate = (value: number | null) => value === null ? "—" : `${(100 * value).toFixed(1)}%`;
+  const rows: [string, RoundStats, Position[]][] = (["LONG", "SHORT"] as const).map((side) => [
+    side === "LONG" ? "Long" : "Short", roundStats(rounds.filter((row) => row.side === side)),
+    portfolio.positions.filter((row) => (row.quantity < 0) === (side === "SHORT"))]);
+  return <>
+    <h2>Long and short</h2>
+    <div className="statistics-note">Completed trades by side, entry to flat. Return is on the entry notional. Winner ÷ loser is the average winner over the average loser.</div>
+    <table className="ledger-table index-stats"><thead><tr><th>Side</th><th>Trades</th><th>Win rate</th><th>Net P&L</th><th>Profit factor</th><th>Avg winner</th><th>Avg loser</th><th>Winner ÷ loser</th><th>Avg return</th><th>Median hold</th><th>Open now</th><th>Open P&L</th></tr></thead><tbody>
+      {rows.map(([label, row, open]) => { const openPnl = open.reduce((sum, p) => sum + p.unrealized_pnl, 0); return <tr key={label}><td>{label}</td><td>{number.format(row.trades)}</td><td>{rate(row.winRate)}</td>
+        <td className={row.net >= 0 ? "positive" : "negative"}>{currency(row.net)}</td><td>{ratio(row.profitFactor)}</td><td>{money(row.avgWin)}</td><td>{money(row.avgLoss)}</td>
+        <td>{ratio(row.payoff)}</td><td>{pct(row.avgReturn)}</td><td>{row.medianHeldMs === null ? "—" : heldLabel(row.medianHeldMs)}</td>
+        <td>{open.length}</td><td className={openPnl >= 0 ? "positive" : "negative"}>{currency(openPnl)}</td></tr>; })}
+    </tbody></table>
+  </>;
+}
+
 function Rejections({ orders }: { orders: Order[] }) {
   const groups = rejectionsByReason(orders);
   if (!groups.length) return null;
@@ -398,6 +424,7 @@ function positionOptionType(symbol: string): "CE" | "PE" | "OTHER" {
   if (symbol.toUpperCase().endsWith("PE")) return "PE";
   return "OTHER";
 }
+const BOOK_LABELS: Record<Exclude<BookKey, "CLOSED">, string> = { CE: "Calls · CE", PE: "Puts · PE", OTHER: "Other", LONG: "Long", SHORT: "Short" };
 function titleCase(value: string) { return value.charAt(0) + value.slice(1).toLowerCase(); }
 function valueTone(value: string) { return value.includes("₹-") ? "negative" : value.includes("₹") && value !== "₹0" ? "positive" : ""; }
 function tabCount(tab: LedgerTab, orders: Order[], trades: Trade[], portfolio: Portfolio, signals: Signal[], rounds: RoundTrip[]) {

@@ -188,3 +188,19 @@ test("round stats give win rate, profit factor, payoff and median hold", async (
   assert.equal(roundStats([round(5, 1)]).profitFactor, Number.POSITIVE_INFINITY);
   assert.equal(roundStats([]).winRate, null);
 });
+
+test("a book that sells short closes its shorts on the cover; option books skip an orphan sell", () => {
+  const fill = (trade_id: string, side: "BUY" | "SELL", quantity: number, price: number, at: string) =>
+    ({ trade_id, symbol: "NSE:SBIN27JANFUT", side, quantity, price, lots: quantity / 750, lot_size: 750, timestamp: at, fees: 0 }) as unknown as Trade;
+  const trades = [fill("a", "SELL", 1500, 800, "2026-11-04T04:00:00Z"), fill("b", "BUY", 750, 776, "2026-11-05T04:00:00Z"),
+    fill("c", "BUY", 750, 760, "2026-11-06T04:00:00Z"), fill("d", "BUY", 750, 790, "2026-11-07T04:00:00Z"), fill("e", "SELL", 750, 800, "2026-11-07T05:00:00Z")];
+  const [short, long] = completedRoundTrips(trades, { shorts: true });
+  assert.equal(short.side, "SHORT");
+  assert.equal(short.pnl, 750 * 24 + 750 * 40);
+  assert.equal(short.entryPrice, 800);
+  assert.equal(short.exitPrice, 768);
+  assert.equal(long.side, "LONG");
+  assert.equal(long.pnl, 7500);
+  // Without shorts the orphan SELL is skipped: the three buys form one long that the last sell does not flatten.
+  assert.deepEqual(completedRoundTrips(trades), []);
+});

@@ -1,6 +1,7 @@
-"""The spot MACD lane buys a Rs 1 L ticket of shares on the MACD lane's stock signals and exits on the scaled ladder."""
+"""The spot MACD lane trades each stock's future, long on a MACD cross up and short on a cross down, at exchange lots."""
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -10,39 +11,67 @@ from macd_trader import execution as execution_module
 from macd_trader.config import Settings
 from macd_trader.events import EventHub
 from macd_trader.execution import ExitRetryWait
-from macd_trader.models import Signal
 from macd_trader.smart_lane import hold_until
-from macd_trader.spot_lane import SpotLane, staged_levels
+from macd_trader.spot_lane import SpotLane, cash_root, macd_cross, pick_series, staged_levels
 
-SYMBOL = "NSE:SBIN-EQ"
+STOCK, OTHER = "NSE:SBIN-EQ", "NSE:INFY-EQ"
+FUT, OTHER_FUT = "NSE:SBIN27JANFUT", "NSE:INFY27JANFUT"
 OPTION = "NSE:SBIN26NOV800CE"
+LOT = 750
 T0 = datetime(2026, 10, 5, 4, 30, tzinfo=UTC)          # Monday 10:00 IST
 
 
-class NoOrders:
+@dataclass
+class Series:
+    symbol: str
+    root: str
+    expiry: str
+    lot_size: int
+
+
+class Broker:
+    """Paper only: futures series from a fake master; any order reaching the broker fails the test."""
+
     name = "fyers"
+
+    def __init__(self, lots=None):
+        self.lots = lots or {"SBIN": LOT, "INFY": 400}
+
+    async def futures_series(self, symbols):
+        out = {}
+        for request in symbols:
+            root = request.split(":")[1][:-4]
+            if root in self.lots:
+                out[request] = [Series(f"NSE:{root}26OCTFUT", root, "2026-10-08", self.lots[root]),   # inside the hold
+                                Series(f"NSE:{root}27JANFUT", root, "2027-01-25", self.lots[root])]
+        return out
 
     async def place_order(self, _order):
         raise AssertionError("paper lanes must never reach the broker's order API")
 
 
-def build(tmp_path: Path, **overrides) -> SpotLane:
+def build(tmp_path: Path, broker=None, **overrides) -> SpotLane:
     settings = Settings(**{"execution_mode": "paper", "slippage_bps": 0, "database_path": str(tmp_path / "macd.sqlite3"),
-                           "symbols_csv": f"{SYMBOL},NSE:INFY-EQ,NSE:NIFTY50-INDEX", **overrides})
-    return SpotLane(settings, NoOrders(), EventHub(), str(tmp_path / "spot.sqlite3"))
+                           "symbols_csv": f"{STOCK},{OTHER},NSE:NIFTY50-INDEX", **overrides})
+    broker = broker or Broker()
+    lane = SpotLane(settings, broker, EventHub(), str(tmp_path / "spot.sqlite3"))
+    asyncio.run(lane.resolve_futures(broker, now=T0))
+    return lane
 
 
-def signal(symbol=SYMBOL, price=2500.0, side="BUY", bucket=1000) -> Signal:
-    return Signal(symbol, side, "PREMIUM_MACD_ZERO_CROSS_UP_INTRABAR", price, 0.1, 0.0, 0.1,
-                  evaluated_candle_timestamp=bucket)
+def cross(lane, side="BUY", stock=STOCK, bucket=1000, intrabar=True):
+    previous, macd = (-0.2, 0.1) if side == "BUY" else (0.2, -0.1)
+    return lane.on_macd(stock, previous, macd, 800.0, bucket, intrabar=intrabar)
 
 
-def enter(lane, price=2500.0, symbol=SYMBOL):
-    lane.execution.set_quote(symbol, price)
-    lane.on_spot_signal(signal(symbol, price), now=T0)
+def enter(lane, price=800.0, side="BUY", stock=STOCK, future=FUT, bucket=1000):
+    lane.execution.set_quote(future, price)
+    signal = cross(lane, side, stock, bucket)
+    assert signal is not None
+    lane.admit(signal, now=T0)
     asyncio.run(lane.step(T0 + timedelta(seconds=2)))
     lane.flush_journal()
-    return lane.portfolio.positions.get(symbol)
+    return lane.portfolio.positions.get(future)
 
 
 def settle(position, sessions=3):
@@ -55,183 +84,275 @@ def settle(position, sessions=3):
     position.opened_at = opened
 
 
-def tick(lane, price, symbol=SYMBOL):
+def tick(lane, price, symbol=FUT):
     asyncio.run(lane.execution.on_tick(symbol, price))
 
 
-class TestEntry:
-    def test_a_stock_signal_buys_whole_shares_within_the_ticket(self, tmp_path):
-        lane = build(tmp_path)
-        position = enter(lane, 2500.0)
-        assert position.quantity == 40 and position.lot_size == 1
-        row = lane.journal_rows()[0]
-        assert row["decision"] == "TAKEN" and row["lots"] == 40 and row["ticket"] == 100_000
-        assert row["detail"]["kind"] == "PREMIUM_MACD_ZERO_CROSS_UP_INTRABAR"
-        assert lane.meta[SYMBOL]["option_type"] == "EQ"
+class TestSignals:
+    def test_macd_crossing_zero_up_is_long_and_down_is_short(self):
+        assert macd_cross(-0.1, 0.2) == "BUY" and macd_cross(0.0, 0.1) == "BUY"
+        assert macd_cross(0.1, -0.2) == "SELL" and macd_cross(0.0, -0.1) == "SELL"
+        assert macd_cross(0.1, 0.2) is None and macd_cross(-0.1, -0.2) is None and macd_cross(None, 0.2) is None
 
-    def test_only_cash_buys_are_taken(self, tmp_path):
+    def test_a_bar_fires_once_per_side_and_only_on_stocks(self, tmp_path):
         lane = build(tmp_path)
-        lane.on_spot_signal(signal(OPTION), now=T0)
-        lane.on_spot_signal(signal("NSE:NIFTY50-INDEX"), now=T0)
-        lane.on_spot_signal(signal(side="SELL"), now=T0)
-        lane.on_macd_signal(signal(OPTION), "CE", {}, now=T0)
-        assert lane._pending == []
+        first = cross(lane, "BUY", bucket=1000)
+        assert first.side == "BUY" and first.kind == "SPOT_MACD_UP_INTRABAR"
+        assert cross(lane, "BUY", bucket=1000, intrabar=False) is None          # the close of the same bar
+        assert cross(lane, "SELL", bucket=1000).kind == "SPOT_MACD_DOWN_INTRABAR"
+        assert cross(lane, "BUY", bucket=2800, intrabar=False).kind == "SPOT_MACD_UP"
+        assert lane.on_macd(OPTION, -0.2, 0.1, 50.0, 1000, intrabar=True) is None
+        assert lane.on_macd("NSE:NIFTY50-INDEX", -0.2, 0.1, 50.0, 1000, intrabar=True) is None
 
-    def test_the_option_universe_never_replaces_the_share_universe(self, tmp_path):
+    def test_shorts_can_be_switched_off(self, tmp_path):
+        lane = build(tmp_path, spot_short_enabled=False)
+        assert cross(lane, "SELL") is None and cross(lane, "BUY") is not None
+
+
+class TestFutures:
+    def test_each_stock_trades_the_nearest_series_that_outlives_the_hold(self, tmp_path):
+        lane = build(tmp_path)
+        assert {stock: (leg.symbol, leg.lot_size) for stock, leg in lane.futures.items()} == {
+            STOCK: (FUT, LOT), OTHER: (OTHER_FUT, 400)}
+        assert lane.execution.lot_sizes == {FUT: LOT, OTHER_FUT: 400}
+        assert set(lane.feed_symbols()) == {FUT, OTHER_FUT}
+        assert cash_root("NSE:M&M-EQ") == ("NSE", "M&M") and cash_root(OPTION) is None
+
+    def test_a_series_expiring_inside_the_hold_is_skipped(self):
+        rows = [Series("A", "A", "2026-10-08", 10), Series("B", "B", "2026-10-27", 0), Series("C", "C", "2026-11-24", 10)]
+        assert pick_series(rows, datetime(2026, 10, 12).date()).symbol == "C"
+        assert pick_series(rows[:2], datetime(2026, 10, 12).date()) is None
+
+    def test_the_option_universe_never_replaces_the_futures(self, tmp_path):
         lane = build(tmp_path)
         lane.set_tradable_contracts({OPTION: 750})
-        assert lane.execution.lot_sizes == {SYMBOL: 1, "NSE:INFY-EQ": 1}
+        assert lane.execution.lot_sizes == {FUT: LOT, OTHER_FUT: 400}
 
-    def test_a_held_stock_is_not_bought_again(self, tmp_path):
+    def test_a_stock_without_a_series_is_journalled_not_traded(self, tmp_path):
+        lane = build(tmp_path, broker=Broker({"SBIN": LOT}))
+        lane.admit(cross(lane, "BUY", OTHER), now=T0)
+        asyncio.run(lane.step(T0))
+        assert lane.counts == {"NOT_TRADABLE": 1}
+        assert "1 of 2 stocks" in lane.futures_error
+
+
+class TestEntry:
+    def test_a_cross_up_buys_one_exchange_lot_of_the_future(self, tmp_path):
+        lane = build(tmp_path)
+        position = enter(lane)
+        assert position.quantity == LOT and position.lot_size == LOT and position.lots == 1
+        assert position.hard_stop == pytest.approx(776.0)
+        row = lane.journal_rows()[0]
+        assert row["decision"] == "TAKEN" and row["lots"] == 1 and row["symbol"] == STOCK and row["option_type"] == "LONG"
+        assert row["ticket"] == pytest.approx(600_000) and row["detail"]["future"] == FUT
+        assert lane.meta[FUT]["spot_symbol"] == STOCK and lane.meta[FUT]["option_type"] == "LONG"
+
+    def test_a_cross_down_sells_the_future_short(self, tmp_path):
+        lane = build(tmp_path)
+        position = enter(lane, side="SELL")
+        assert position.quantity == -LOT and position.lots == 1
+        assert position.hard_stop == pytest.approx(824.0) and position.peak_price == pytest.approx(800.0)
+        assert lane.held_symbols() == [FUT] and lane.held_future(STOCK) == FUT
+        snap = lane.snapshot()["portfolio"]["positions"][0]
+        assert snap["side"] == "SHORT" and snap["underlying"] == STOCK and snap["margin"] == pytest.approx(150_000)
+
+    def test_spot_lots_sets_the_lots_per_signal(self, tmp_path):
+        assert enter(build(tmp_path, spot_lane_lots=3)).quantity == 3 * LOT
+
+    def test_a_held_stock_is_not_entered_again_on_either_side(self, tmp_path):
         lane = build(tmp_path)
         enter(lane)
-        lane.on_spot_signal(signal(bucket=2000), now=T0)
+        lane.admit(cross(lane, "SELL", bucket=2800), now=T0)
         asyncio.run(lane.step(T0 + timedelta(seconds=4)))
-        assert lane.counts["ALREADY_HELD"] == 1 and lane.portfolio.positions[SYMBOL].quantity == 40
+        assert lane.counts["ALREADY_HELD"] == 1 and lane.portfolio.positions[FUT].quantity == LOT
 
-    def test_a_share_dearer_than_the_ticket_is_journalled_not_bought(self, tmp_path):
-        lane = build(tmp_path)
-        assert enter(lane, 150_000.0) is None
-        assert lane.counts == {"LOT_ABOVE_TICKET": 1}
-
-    def test_a_partial_ticket_is_bought_from_what_cash_is_left(self, tmp_path):
-        lane = build(tmp_path, spot_lane_capital=150_000.0)
-        enter(lane, 2500.0)
-        second = enter(lane, 1000.0, "NSE:INFY-EQ")
-        assert second.quantity == 50                # Rs 50 k left after the first Rs 1 L ticket
-        assert enter(build(tmp_path / "b", spot_lane_capital=500.0), 2500.0) is None
+    def test_entries_need_free_margin(self, tmp_path):
+        lane = build(tmp_path, spot_lane_capital=200_000.0)      # one lot blocks Rs 1.5 L of margin
+        assert enter(lane) is not None
+        assert lane.free_margin() == pytest.approx(50_000)
+        assert enter(lane, 1000.0, "SELL", OTHER, OTHER_FUT) is None   # Rs 1 L margin needed
+        assert lane.counts["NO_CASH"] == 1
 
     def test_no_fresh_quote_waits_then_expires(self, tmp_path):
         lane = build(tmp_path)
-        lane.on_spot_signal(signal(), now=T0)
+        lane.admit(cross(lane), now=T0)
         asyncio.run(lane.step(T0))
         assert lane.counts == {"WAITING_PRICE": 1} and len(lane._pending) == 1
         asyncio.run(lane.step(T0 + timedelta(minutes=11)))
         assert lane.counts["NO_PRICE"] == 1 and not lane._pending
 
-    def test_outside_the_cash_session_nothing_is_bought(self, tmp_path):
+    def test_outside_the_session_nothing_is_traded(self, tmp_path):
         lane = build(tmp_path)
-        lane.execution.set_quote(SYMBOL, 2500.0)
+        lane.execution.set_quote(FUT, 800.0)
         evening = datetime(2026, 10, 5, 11, 0, tzinfo=UTC)      # 16:30 IST
-        lane.on_spot_signal(signal(), now=evening)
+        lane.admit(cross(lane), now=evening)
         asyncio.run(lane.step(evening))
         assert lane.counts == {"SESSION_CLOSED": 1}
 
 
-class TestExits:
+class TestLongExits:
     def test_the_hard_stop_is_three_percent(self, tmp_path):
         lane = build(tmp_path)
         enter(lane)
-        tick(lane, 2426.0)
-        assert SYMBOL in lane.portfolio.positions
-        tick(lane, 2425.0)
-        assert SYMBOL not in lane.portfolio.positions
-        assert lane.trades()[0]["exit_reason"] == "HARD_STOP_3_PCT"
+        tick(lane, 776.5)
+        assert FUT in lane.portfolio.positions
+        tick(lane, 776.0)
+        assert FUT not in lane.portfolio.positions
+        trade = lane.trades()[0]
+        assert trade["exit_reason"] == "HARD_STOP_3_PCT" and trade["side"] == "LONG" and trade["underlying"] == STOCK
 
-    def test_thirds_come_out_at_three_five_and_seven_and_a_half_percent(self, tmp_path):
+    def test_one_lot_has_no_thirds_and_rides_the_trail(self, tmp_path):
         lane = build(tmp_path)
-        settle(enter(lane))                             # 40 shares at 2500, past the minimum hold
-        tick(lane, 2575.0)
-        assert lane.portfolio.positions[SYMBOL].quantity == 27
-        tick(lane, 2625.0)
-        assert lane.portfolio.positions[SYMBOL].quantity == 14
-        tick(lane, 2687.5)
-        assert SYMBOL not in lane.portfolio.positions
-        assert lane.trades()[0]["exit_reason"] == "STAGED_PROFIT_EXIT_3"
-
-    def test_the_trail_arms_at_three_percent_and_gives_back_two_and_a_half(self, tmp_path):
-        lane = build(tmp_path, spot_staged_exits_csv="0.5")
         settle(enter(lane))
-        tick(lane, 2600.0)                              # +4%: trail at 2535
-        position = lane.portfolio.positions[SYMBOL]
-        assert position.trailing_stop == pytest.approx(2535.0)
-        tick(lane, 2535.0)
-        assert SYMBOL not in lane.portfolio.positions
+        tick(lane, 840.0)                               # +5%: past two thirds, but one lot cannot be split
+        position = lane.portfolio.positions[FUT]
+        assert position.quantity == LOT and position.trailing_stop == pytest.approx(819.0)
+        tick(lane, 819.0)
         assert lane.trades()[0]["exit_reason"] == "TRAILING_STOP_2.5_PCT"
 
-    def test_macd_below_zero_closes_only_a_position_that_never_worked(self, tmp_path):
+    def test_thirds_come_out_in_whole_lots(self, tmp_path):
+        lane = build(tmp_path, spot_lane_lots=3)
+        settle(enter(lane))
+        tick(lane, 824.0)
+        assert lane.portfolio.positions[FUT].lots == 2
+        tick(lane, 840.0)
+        assert lane.portfolio.positions[FUT].lots == 1
+        tick(lane, 860.0)
+        assert FUT not in lane.portfolio.positions
+        assert lane.trades()[0]["exit_reason"] == "STAGED_PROFIT_EXIT_3"
+
+    def test_macd_below_zero_closes_only_a_long_that_never_worked(self, tmp_path):
         lane = build(tmp_path)
         settle(enter(lane))
-        settle(enter(lane, 1000.0, "NSE:INFY-EQ"))
-        tick(lane, 1011.0, "NSE:INFY-EQ")               # INFY's best +1.1%: earned the ladder
-        assert asyncio.run(lane.execution.on_closed_bar("NSE:INFY-EQ", -0.5)) is False
-        assert asyncio.run(lane.execution.on_closed_bar(SYMBOL, -0.5)) is True
-        assert SYMBOL not in lane.portfolio.positions and "NSE:INFY-EQ" in lane.portfolio.positions
+        settle(enter(lane, 1000.0, "BUY", OTHER, OTHER_FUT))
+        tick(lane, 1011.0, OTHER_FUT)                   # INFY's best +1.1%: earned the ladder
+        assert asyncio.run(lane.execution.on_closed_bar(OTHER, -0.5)) is False
+        assert asyncio.run(lane.execution.on_closed_bar(STOCK, 0.5)) is False     # still above zero
+        assert asyncio.run(lane.execution.on_closed_bar(FUT, -0.5)) is False      # the future's own MACD is not read
+        assert asyncio.run(lane.execution.on_closed_bar(STOCK, -0.5)) is True
+        assert FUT not in lane.portfolio.positions and OTHER_FUT in lane.portfolio.positions
+
+
+class TestShortExits:
+    def test_the_hard_stop_is_three_percent_above(self, tmp_path):
+        lane = build(tmp_path)
+        enter(lane, side="SELL")
+        tick(lane, 823.5)
+        assert FUT in lane.portfolio.positions
+        tick(lane, 824.0)
+        assert FUT not in lane.portfolio.positions
+        trade = lane.trades()[0]
+        assert trade["exit_reason"] == "HARD_STOP_3_PCT" and trade["side"] == "SHORT"
+        assert trade["pnl"] == pytest.approx(-24.0 * LOT)
+        assert lane.portfolio.cash == pytest.approx(lane.capital - 24.0 * LOT)
+
+    def test_the_trail_follows_the_low_and_covers_two_and_a_half_percent_up(self, tmp_path):
+        lane = build(tmp_path)
+        settle(enter(lane, side="SELL"))
+        tick(lane, 760.0)                               # -5%: trail at 779, under breakeven 800
+        position = lane.portfolio.positions[FUT]
+        assert position.peak_price == pytest.approx(760.0) and position.trailing_stop == pytest.approx(779.0)
+        tick(lane, 770.0)                               # a bounce does not loosen it
+        assert position.trailing_stop == pytest.approx(779.0)
+        tick(lane, 779.0)
+        trade = lane.trades()[0]
+        assert trade["exit_reason"] == "TRAILING_STOP_2.5_PCT" and trade["pnl"] == pytest.approx(21.0 * LOT)
+
+    def test_short_thirds_cover_in_whole_lots(self, tmp_path):
+        lane = build(tmp_path, spot_lane_lots=3)
+        settle(enter(lane, side="SELL"))
+        tick(lane, 776.0)
+        assert lane.portfolio.positions[FUT].quantity == -2 * LOT
+        assert lane.portfolio.positions[FUT].peak_price == pytest.approx(776.0)   # kept through the part cover
+        tick(lane, 760.0)
+        assert lane.portfolio.positions[FUT].quantity == -LOT
+        tick(lane, 740.0)
+        assert FUT not in lane.portfolio.positions
+
+    def test_macd_above_zero_covers_only_a_short_that_never_worked(self, tmp_path):
+        lane = build(tmp_path)
+        settle(enter(lane, side="SELL"))
+        assert asyncio.run(lane.execution.on_closed_bar(STOCK, -0.5)) is False
+        assert asyncio.run(lane.execution.on_closed_bar(STOCK, 0.5)) is True
+        assert lane.trades()[0]["exit_reason"] == "MACD_INVALIDATED"
 
     def test_inside_the_minimum_hold_only_the_hard_stop_acts(self, tmp_path):
         lane = build(tmp_path)
-        position = enter(lane)                          # opened now: inside the first 3 sessions
-        tick(lane, 2700.0)                              # +8%: past every third and the trail's arming
-        assert position.quantity == 40 and position.trailing_stop is not None
-        tick(lane, 2550.0)                              # below the trail (2632.5): it waits
-        assert asyncio.run(lane.execution.on_closed_bar(SYMBOL, -0.5)) is False
-        assert lane.portfolio.positions[SYMBOL].quantity == 40
-        tick(lane, 2425.0)                              # the 3% stop always acts
-        assert SYMBOL not in lane.portfolio.positions
+        position = enter(lane, side="SELL")             # opened now: inside the first 3 sessions
+        tick(lane, 740.0)                               # -7.5%: the trail arms but waits
+        tick(lane, 790.0)
+        assert asyncio.run(lane.execution.on_closed_bar(STOCK, 0.5)) is False
+        assert position.quantity == -LOT and position.trailing_stop is not None
+        tick(lane, 824.0)
         assert lane.trades()[0]["exit_reason"] == "HARD_STOP_3_PCT"
-
-    def test_after_the_minimum_hold_the_tracked_trail_fires(self, tmp_path):
-        lane = build(tmp_path, spot_staged_exits_csv="0.5")
-        position = enter(lane)
-        tick(lane, 2600.0)                              # best +4% while held: trail 2535, not yet live
-        tick(lane, 2540.0)
-        settle(position)
-        tick(lane, 2530.0)
-        assert lane.trades()[0]["exit_reason"] == "TRAILING_STOP_2.5_PCT"
 
     def test_the_hold_limit_is_five_sessions(self, tmp_path):
         lane = build(tmp_path)
-        position = enter(lane)
+        position = enter(lane, side="SELL")
         position.opened_at = datetime.now(UTC) - timedelta(days=40)
-        tick(lane, 2510.0)
-        assert SYMBOL not in lane.portfolio.positions
+        tick(lane, 801.0)
         assert lane.trades()[0]["exit_reason"] == "HOLD_LIMIT_5_SESSIONS"
 
-    def test_a_restart_restores_the_book_and_its_stage(self, tmp_path):
-        lane = build(tmp_path, spot_min_hold_sessions=0)      # back-dating would change the position id
-        enter(lane)
-        tick(lane, 2575.0)
+    def test_a_restart_restores_a_short_with_its_stop_and_trail(self, tmp_path):
+        lane = build(tmp_path, spot_min_hold_sessions=0)
+        enter(lane, side="SELL")
+        tick(lane, 770.0)
         lane.repository.save_position_excursions(list(lane.portfolio.positions.values()))
         again = build(tmp_path, spot_min_hold_sessions=0)
-        position = again.portfolio.positions[SYMBOL]
-        assert position.quantity == 27 and position.exit_stage == 1 and position.entry_stage == 40
-        assert again.meta[SYMBOL]["source"] == "macd"
-        assert again.execution.lot_sizes[SYMBOL] == 1
+        position = again.portfolio.positions[FUT]
+        assert position.quantity == -LOT and position.hard_stop == pytest.approx(824.0)
+        assert position.peak_price == pytest.approx(770.0) and position.trailing_stop == pytest.approx(789.25)
+        assert again.meta[FUT]["option_type"] == "SHORT" and again.execution.lot_sizes[FUT] == LOT
 
 
 class TestExitBackOff:
-    def test_a_rejected_automated_exit_waits_before_retrying(self, tmp_path, monkeypatch):
+    def test_a_rejected_automated_cover_waits_before_retrying(self, tmp_path, monkeypatch):
         lane = build(tmp_path)
-        enter(lane)
+        enter(lane, side="SELL")
         execution = lane.execution
-        execution.set_quote(SYMBOL, 2400.0, datetime.now(UTC) - timedelta(minutes=5))     # stale
-        execution.arm_exit(SYMBOL, "HARD_STOP_3_PCT")
+        execution.set_quote(FUT, 830.0, datetime.now(UTC) - timedelta(minutes=5))     # stale
+        execution.arm_exit(FUT, "HARD_STOP_3_PCT")
         with pytest.raises(RuntimeError):
-            asyncio.run(execution.submit(SYMBOL, "SELL", 40))
+            asyncio.run(execution.submit(FUT, "BUY", LOT))
         orders = len(lane.repository.rows("orders"))
-        execution.arm_exit(SYMBOL, "HARD_STOP_3_PCT")
+        execution.arm_exit(FUT, "HARD_STOP_3_PCT")
         with pytest.raises(ExitRetryWait):
-            asyncio.run(execution.submit(SYMBOL, "SELL", 40))
+            asyncio.run(execution.submit(FUT, "BUY", LOT))
         assert len(lane.repository.rows("orders")) == orders          # no order while backing off
-        assert execution.exit_failures[SYMBOL]["count"] == 1
-        assert execution.exit_failures[SYMBOL]["retry_after_seconds"] == execution_module.EXIT_RETRY_SECONDS[0]
+        assert execution.exit_failures[FUT]["count"] == 1
         later = time.monotonic() + 16
         monkeypatch.setattr(execution_module.time, "monotonic", lambda: later)
-        execution.set_quote(SYMBOL, 2400.0)
-        execution.arm_exit(SYMBOL, "HARD_STOP_3_PCT")
-        order = asyncio.run(execution.submit(SYMBOL, "SELL", 40))
-        assert order.status == "FILLED" and SYMBOL not in execution.exit_failures
+        execution.set_quote(FUT, 830.0)
+        execution.arm_exit(FUT, "HARD_STOP_3_PCT")
+        order = asyncio.run(execution.submit(FUT, "BUY", LOT))
+        assert order.status == "FILLED" and FUT not in execution.exit_failures and FUT not in lane.portfolio.positions
 
-    def test_a_manual_sell_is_never_held_back(self, tmp_path):
+    def test_a_manual_exit_is_never_held_back(self, tmp_path):
         lane = build(tmp_path)
         enter(lane)
         execution = lane.execution
-        execution._exit_blocked_until[SYMBOL] = time.monotonic() + 999
-        execution.exit_failures[SYMBOL] = {"count": 3}
-        execution.set_quote(SYMBOL, 2400.0)
-        order = asyncio.run(execution.submit(SYMBOL, "SELL", 40))     # not armed: a manual ticket
-        assert order.status == "FILLED"
+        execution._exit_blocked_until[FUT] = time.monotonic() + 999
+        execution.exit_failures[FUT] = {"count": 3}
+        execution.set_quote(FUT, 790.0)
+        assert asyncio.run(execution.submit(FUT, "SELL", LOT)).status == "FILLED"
+
+    def test_an_exit_cannot_exceed_the_position(self, tmp_path):
+        lane = build(tmp_path)
+        enter(lane, side="SELL")
+        with pytest.raises(ValueError):
+            asyncio.run(lane.execution.submit(FUT, "BUY", 2 * LOT))
 
 
 def test_staged_levels_parse():
     assert staged_levels("0.075, 0.03,x,-1,0.05") == (0.03, 0.05, 0.075)
+
+
+def test_the_engine_queues_a_current_cross_and_drops_a_stale_one(tmp_path):
+    from types import SimpleNamespace
+
+    from macd_trader.engine import TradingEngine
+    lane = build(tmp_path)
+    stub = SimpleNamespace(spot_lane=lane, _signal_bar_is_current=lambda signal: signal.evaluated_candle_timestamp > 500)
+    TradingEngine._spot_cross(stub, STOCK, 0.2, -0.1, 800.0, 1000, intrabar=True)
+    TradingEngine._spot_cross(stub, OTHER, -0.2, 0.1, 900.0, 100, intrabar=False)       # stale bar
+    assert [(p.symbol, p.option_type) for p in lane._pending] == [(STOCK, "SHORT")]

@@ -74,6 +74,7 @@ export function observedExcursion(price: number | null | undefined, returnPct: n
 
 export type RoundTrip = {
   symbol: string;
+  side: "LONG" | "SHORT";
   quantity: number;
   lots: number;
   lotSize: number;
@@ -90,40 +91,47 @@ export type RoundTrip = {
 
 // A trade ends only when inventory returns to flat. Partial exits accumulate
 // in that cycle; their realized P&L is excluded from completed-trade metrics.
-export function completedRoundTrips(trades: Trade[]): RoundTrip[] {
-  type Cycle = { quantity: number; bought: number; buyValue: number; sold: number; sellValue: number; fees: number; openedAt: number; lotSize: number; entries: number; exits: number };
+// Option books only buy to open, so a SELL with nothing held (a fill whose
+// entry fell outside the loaded window) is skipped. A book that sells short
+// (the spot lane's futures) passes `shorts`, and such a SELL opens a short.
+export function completedRoundTrips(trades: Trade[], { shorts = false }: { shorts?: boolean } = {}): RoundTrip[] {
+  type Cycle = { side: 1 | -1; quantity: number; opened: number; openValue: number; closed: number; closeValue: number; fees: number; openedAt: number; lotSize: number; entries: number; exits: number };
   const inventory = new Map<string, Cycle>();
   const result: RoundTrip[] = [];
   const seen = new Set<string>();
   for (const trade of [...trades].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp))) {
     if (seen.has(trade.trade_id)) continue;
     seen.add(trade.trade_id);
-    if (trade.side === "BUY") {
-      const cycle = inventory.get(trade.symbol) || { quantity: 0, bought: 0, buyValue: 0, sold: 0, sellValue: 0, fees: 0, openedAt: Date.parse(trade.timestamp), lotSize: trade.lot_size || 0, entries: 0, exits: 0 };
+    const direction = trade.side === "BUY" ? 1 : trade.side === "SELL" ? -1 : 0;
+    if (!direction) continue;
+    let cycle = inventory.get(trade.symbol);
+    if (!cycle) {
+      if (direction < 0 && !shorts) continue;
+      cycle = { side: direction, quantity: 0, opened: 0, openValue: 0, closed: 0, closeValue: 0, fees: 0, openedAt: Date.parse(trade.timestamp), lotSize: trade.lot_size || 0, entries: 0, exits: 0 };
+      inventory.set(trade.symbol, cycle);
+    }
+    if (direction === cycle.side) {
       cycle.quantity += trade.quantity;
-      cycle.bought += trade.quantity;
-      cycle.buyValue += trade.quantity * trade.price;
+      cycle.opened += trade.quantity;
+      cycle.openValue += trade.quantity * trade.price;
       cycle.fees += trade.fees || 0;
       cycle.entries += 1;
-      inventory.set(trade.symbol, cycle);
       continue;
     }
-    const cycle = inventory.get(trade.symbol);
-    if (trade.side !== "SELL" || !cycle || cycle.quantity <= 0) continue;
     const closed = Math.min(cycle.quantity, trade.quantity);
     cycle.quantity -= closed;
-    cycle.sold += closed;
-    cycle.sellValue += closed * trade.price;
+    cycle.closed += closed;
+    cycle.closeValue += closed * trade.price;
     cycle.fees += (trade.fees || 0) * closed / trade.quantity;
     cycle.exits += 1;
     if (cycle.quantity !== 0) continue;
-    const pnl = cycle.sellValue - cycle.buyValue - cycle.fees;
+    const pnl = cycle.side * (cycle.closeValue - cycle.openValue) - cycle.fees;
     result.push({
-      symbol: trade.symbol, quantity: cycle.bought,
-      lots: cycle.lotSize > 0 ? Math.floor(cycle.bought / cycle.lotSize) : 0,
-      lotSize: cycle.lotSize, entryPrice: cycle.buyValue / cycle.bought,
-      exitPrice: cycle.sellValue / cycle.sold, entryTime: new Date(cycle.openedAt).toISOString(),
-      exitTime: trade.timestamp, pnl, returnPct: cycle.buyValue ? 100 * pnl / cycle.buyValue : 0,
+      symbol: trade.symbol, side: cycle.side > 0 ? "LONG" : "SHORT", quantity: cycle.opened,
+      lots: cycle.lotSize > 0 ? Math.floor(cycle.opened / cycle.lotSize) : 0,
+      lotSize: cycle.lotSize, entryPrice: cycle.openValue / cycle.opened,
+      exitPrice: cycle.closeValue / cycle.closed, entryTime: new Date(cycle.openedAt).toISOString(),
+      exitTime: trade.timestamp, pnl, returnPct: cycle.openValue ? 100 * pnl / cycle.openValue : 0,
       heldMs: Math.max(0, Date.parse(trade.timestamp) - cycle.openedAt),
       entryCount: cycle.entries, exitCount: cycle.exits,
     });

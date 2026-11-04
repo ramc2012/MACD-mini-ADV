@@ -39,6 +39,10 @@ const MARKER_STYLE: Record<NonNullable<ChartMarker["tone"]>, { color: string; po
   exit: { color: "#ffad42", position: "aboveBar", shape: "arrowDown" },
   exit_loss: { color: DOWN, position: "aboveBar", shape: "arrowDown" },
   stop: { color: DOWN, position: "aboveBar", shape: "arrowDown" },
+  // A short (the spot lane's futures) opens above the bar pointing down and covers below pointing up.
+  short: { color: "#b48cff", position: "aboveBar", shape: "arrowDown" },
+  cover: { color: "#ffad42", position: "belowBar", shape: "arrowUp" },
+  cover_loss: { color: DOWN, position: "belowBar", shape: "arrowUp" },
 };
 const LEVEL_LINE: Record<ChartLevel["tone"], { color: string; lineStyle: LineStyle; lineWidth: 1 | 2 }> = {
   avg: { color: "#4da3ff", lineStyle: LineStyle.Solid, lineWidth: 1 },

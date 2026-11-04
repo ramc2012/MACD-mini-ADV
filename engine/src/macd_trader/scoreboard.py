@@ -240,7 +240,7 @@ def shadow_book(path: str | Path) -> dict | None:
 def portfolio_now(portfolio) -> dict:
     snap = portfolio.snapshot()
     return {"equity": snap["equity"], "cash": snap["cash"], "realized": snap["realized_pnl"],
-            "unrealized": snap["unrealized_pnl"], "open": sum(1 for p in portfolio.positions.values() if p.quantity > 0)}
+            "unrealized": snap["unrealized_pnl"], "open": sum(1 for p in portfolio.positions.values() if p.quantity != 0)}
 
 
 def build(engine) -> dict:
@@ -271,8 +271,10 @@ def build(engine) -> dict:
     if spot is not None:
         add(lambda: score_book("spot_macd", "Spot MACD", slices=repository_slices(spot.repository, spot.name),
                                curve=equity_curve(spot.database_path), capital=spot.capital,
-                               now=portfolio_now(spot.portfolio), ticket=settings.spot_lane_ticket,
-                               note="not proven: long-only spot MACD tracked the market in research"))
+                               # A futures book: what is free is margin, not cash (longs pay full notional in the
+                               # paper cash, shorts receive it), so the board's "cash" is the free margin.
+                               now={**portfolio_now(spot.portfolio), "cash": spot.free_margin()},
+                               note="stock futures long + short since 4 Nov 2026; not proven"))
 
     def blast():
         return score_book("blast", "Blast", slices=repository_slices(engine.blast.repository),

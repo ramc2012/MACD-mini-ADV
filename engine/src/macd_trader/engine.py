@@ -383,7 +383,7 @@ class TradingEngine(DeskMixin):
                         if settings.agentic_enabled else None)
         if self.agentic is not None:
             self.agentic.telegram = TelegramBridge(self.agentic, settings, close_position=self.close_smart_paper_position)
-        # Seventh book: the spot MACD lane, cash equities on the MACD lane's own stock signals at a Rs 1 L ticket.
+        # Seventh book: the spot MACD lane, stock futures long and short on each stock's own 30-min MACD zero cross.
         self.spot_lane = (SpotLane(settings, self.broker, self.events,
                                    str(Path(settings.database_path).parent / "spot_macd.sqlite3"))
                           if settings.spot_lane_enabled else None)
@@ -927,6 +927,9 @@ class TradingEngine(DeskMixin):
             asyncio.create_task(self.entry_gate.refresh_reference(
                 [*self.option_symbols, *{row.spot_symbol for row in contracts}]))
             await self._resolve_futures_series()
+            # The spot lane trades each stock's future: today's series are chosen before the subscription is built.
+            if getattr(self, "spot_lane", None) is not None:
+                await self.spot_lane.resolve_futures(self.broker)
             self.context_indices = await self._validated_context_indices()
             # The desk's own instruments must be subscribed too: it watches
             # index futures, which are in neither the spot universe nor the
@@ -943,7 +946,9 @@ class TradingEngine(DeskMixin):
                  # Stream subscription only, so a blast holding keeps its stop
                  # and trail live. Subscribing is not a fetch: it rides the
                  # websocket the engine already holds open.
-                 *self.blast.portfolio.positions, *[s for smart in _smart_lanes(self) for s in smart.held_symbols()]])),
+                 *self.blast.portfolio.positions, *[s for smart in _smart_lanes(self) for s in smart.held_symbols()],
+                 # Every stock's chosen future: a spot-lane entry fills on a fresh futures quote.
+                 *(self.spot_lane.feed_symbols() if getattr(self, "spot_lane", None) is not None else [])])),
                 {row.symbol: row.expiry for row in contracts}, datetime.now(IST).date())
             self.strategy = MACDStrategyManager(self.settings, self.events, self.option_symbols)
             tradable = {row.symbol: row.lot_size for row in contracts if row.symbol in self.option_symbols}
@@ -1737,7 +1742,8 @@ class TradingEngine(DeskMixin):
         if self.settings.execution_mode != "paper" or lane.execution.settings.execution_mode != "paper":
             raise PermissionError("This close action is paper-only")
         position = lane.portfolio.positions.get(symbol)
-        if position is None or position.quantity != expected_quantity or expected_quantity <= 0:
+        # A spot-lane short holds a negative quantity and is closed by a BUY.
+        if position is None or position.quantity != expected_quantity or expected_quantity == 0:
             raise ValueError("Holding quantity changed; refresh the position before closing")
         quotes = await self.broker.quotes([symbol])
         quote = quotes.get(symbol)
@@ -1749,7 +1755,7 @@ class TradingEngine(DeskMixin):
         lane.execution.set_quote(symbol, quote.ltp, datetime.now(UTC))
         lane.execution._exit_blocked_until.pop(symbol, None)     # the owner's click is never held by a back-off
         lane.execution.arm_exit(symbol, "MANUAL_USER_CLOSE")
-        return await lane.execution.submit(symbol, "SELL", expected_quantity)
+        return await lane.execution.submit(symbol, "SELL" if expected_quantity > 0 else "BUY", abs(expected_quantity))
 
     async def on_tick(self, tick: Tick) -> None:
         if not tick.symbol or tick.ltp <= 0:
@@ -1888,6 +1894,12 @@ class TradingEngine(DeskMixin):
                         await smart.execution.on_closed_bar(closed.symbol, point.macd)
                     except Exception as exc:  # noqa: BLE001
                         smart.error = f"invalidation {closed.symbol}: {type(exc).__name__}: {exc}"[:300]
+            if point is not None and segment(closed.symbol) == "cash":
+                history = self.strategy.point_history.get(closed.symbol)
+                indicator = self.strategy.indicators.get(closed.symbol)
+                if history and len(history) >= 2 and indicator is not None and indicator.count > self.settings.slow_period:
+                    self._spot_cross(closed.symbol, history[-2].macd, point.macd, closed.close, closed.timestamp,
+                                     intrabar=False)
             if signal and self._signal_bar_is_current(signal) and self.repository.save_signal(signal):
                 self.signals_emitted += 1
                 await self._route_signal(signal)
@@ -1898,6 +1910,26 @@ class TradingEngine(DeskMixin):
         if signal and self._signal_bar_is_current(signal) and self.repository.save_signal(signal):
             self.signals_emitted += 1
             await self._route_signal(signal)
+        if (getattr(self, "spot_lane", None) is not None and segment(current.symbol) == "cash"
+                and current.symbol not in self._warming_symbols):
+            indicator = self.strategy.indicators.get(current.symbol)
+            if indicator is not None and indicator.count + 1 > self.settings.slow_period:
+                value = indicator.preview(current.close)
+                self._spot_cross(current.symbol, value.previous_macd, value.macd, current.close, current.timestamp,
+                                 intrabar=True)
+
+    def _spot_cross(self, symbol: str, previous: float | None, macd: float, price: float, bucket: int, *,
+                    intrabar: bool) -> None:
+        """The stock's MACD crossing zero, up or down, is the spot lane's entry (its future, long or short)."""
+        spot = getattr(self, "spot_lane", None)
+        if spot is None:
+            return
+        try:
+            signal = spot.on_macd(symbol, previous, macd, price, bucket, intrabar=intrabar)
+            if signal is not None and self._signal_bar_is_current(signal):
+                spot.admit(signal)
+        except Exception as exc:  # noqa: BLE001 -- a lane fault must never stop the feed
+            spot.error = f"intake {symbol}: {type(exc).__name__}: {exc}"[:300]
 
     async def _route_signal(self, signal) -> None:
         """Option BUY signals go through the entry gate; everything else straight to execution.
@@ -1906,12 +1938,6 @@ class TradingEngine(DeskMixin):
         the MACD lane does with it -- each lane keeps its own book. Features are
         computed once: building them counts the signal into the crowd tally.
         """
-        spot = getattr(self, "spot_lane", None)
-        if spot is not None and signal.side == "BUY" and segment(signal.symbol) == "cash":
-            try:
-                spot.on_spot_signal(signal)
-            except Exception as exc:  # noqa: BLE001
-                spot.error = f"intake {signal.symbol}: {type(exc).__name__}: {exc}"[:300]
         gate = self.entry_gate
         gate.settings = self.settings
         contract = self.contract_selector.contracts.get(signal.symbol)

@@ -9,7 +9,7 @@ export type Candle = {
   closed: boolean;
 };
 
-export type ChartMarker = { timestamp: number; price: number; label: string; tone?: "entry" | "stop" | "signal" | "add" | "exit" | "exit_loss" };
+export type ChartMarker = { timestamp: number; price: number; label: string; tone?: "entry" | "stop" | "signal" | "add" | "exit" | "exit_loss" | "short" | "cover" | "cover_loss" };
 // A position's working prices drawn across the chart: average cost, hard stop, trail, target.
 export type ChartLevel = { price: number; label: string; tone: "avg" | "stop" | "trail" | "target" };
 

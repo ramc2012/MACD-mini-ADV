@@ -711,7 +711,8 @@ class SmartLane:
                 "entry_price": row["entry_price"], "lots": 0, "lot_size": row["lot_size"], "pnl": 0.0,
                 "cost": 0.0, "exit_time": None, "exit_reason": None, "max_return_pct": row.get("max_return_pct"),
                 "min_return_pct": row.get("min_return_pct"), "slices": 0,
-                "source": (sources.get(pid) or {}).get("source", MACD_SOURCE)})
+                "source": (sources.get(pid) or {}).get("source", MACD_SOURCE),
+                "side": row.get("side") or "LONG", "underlying": (sources.get(pid) or {}).get("spot_symbol")})
             g["lots"] += int(row["lots"])
             g["pnl"] += float(row["realized_pnl"])
             g["cost"] += float(row["entry_price"]) * int(row["quantity"])
