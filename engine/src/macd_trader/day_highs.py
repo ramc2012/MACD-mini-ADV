@@ -8,8 +8,12 @@ the day -- a new day high confirmed by the close, not by a wick. The mirror (clo
 is the day low. The first bar has nothing earlier to beat, so the first list is at 09:45 IST. ``streak`` counts the
 bars in a row, ending with the last one, that did so.
 
+Owner, 4 Nov 2026 (later): "Also include atm CE, PE list in 15 min closing day high" -- today's ATM legs (the traded
+watchlist) are judged the same way on their own premium, beside the spots.
+
 Read-only: today's stored minute bars (historical_candles, written from the live feed every ~10 s) aggregated to
-15 minutes; the previous close comes from daily_closes, else the previous session's last stored minute. No broker calls, no execution hooks.
+15 minutes; the previous close comes from daily_closes, else the previous session's last stored minute. No broker
+calls, no execution hooks.
 """
 from __future__ import annotations
 
@@ -58,8 +62,9 @@ def _streak(bars: list[Candle], high: bool) -> int:
     return count
 
 
-def evaluate(symbol: str, bars: list[Candle], previous_close: float | None, expected_last: int) -> dict | None:
+def evaluate(instrument: dict, bars: list[Candle], previous_close: float | None, expected_last: int) -> dict | None:
     """One instrument's row from its completed 15-minute bars of the session, oldest first."""
+    symbol = instrument["symbol"]
     if len(bars) < 2:
         return None
     last, earlier = bars[-1], bars[:-1]
@@ -67,7 +72,9 @@ def evaluate(symbol: str, bars: list[Candle], previous_close: float | None, expe
     low_before = min(b.low for b in earlier)
     day_high, day_low = max(high_before, last.high), min(low_before, last.low)
     return {
-        "symbol": symbol, "label": label(symbol), "group": sector_of(symbol), "index": symbol.endswith("-INDEX"),
+        **instrument, "label": instrument.get("underlying") or label(symbol),
+        "group": sector_of(instrument.get("spot_symbol") or symbol),
+        "index": (instrument.get("spot_symbol") or symbol).endswith("-INDEX"),
         "bar_start": last.timestamp, "stale": last.timestamp != expected_last,
         "close": last.close, "day_high": day_high, "day_low": day_low,
         "high_before": high_before, "low_before": low_before,
@@ -80,14 +87,18 @@ def evaluate(symbol: str, bars: list[Candle], previous_close: float | None, expe
     }
 
 
-def build(database_path: str, symbols: list[str], now: datetime | None = None) -> dict:
+def build(database_path: str, symbols: list[str], now: datetime | None = None, options: list[dict] | None = None) -> dict:
+    """``symbols`` are spots; ``options`` today's ATM legs (symbol, underlying, spot_symbol, option_type, strike, expiry)."""
     now = now or datetime.now(UTC)
     now_ts = int(now.timestamp())
     day = session_day(now)
     opened = int(datetime.combine(day, OPEN, IST).timestamp())
     rows, unavailable = [], []
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True, timeout=15) as db:
-        for symbol in symbols:
+        instruments = [{"symbol": s, "kind": "SPOT"} for s in symbols] + \
+            [{**leg, "kind": leg["option_type"]} for leg in options or []]
+        for instrument in instruments:
+            symbol = instrument["symbol"]
             closes_at = int(datetime.combine(day, session_close(symbol, day), IST).timestamp())
             # The latest bar that should be complete: after the close, the session's last bar; before it, the last
             # bar that ended at least GRACE_SECONDS ago.
@@ -114,25 +125,32 @@ def build(database_path: str, symbols: list[str], now: datetime | None = None) -
                 found = db.execute("SELECT close FROM historical_candles WHERE symbol=? AND timeframe_seconds=60 "
                                    "AND timestamp<? AND timestamp>=? ORDER BY timestamp DESC LIMIT 1",
                                    (symbol, opened, opened - 10 * 86400)).fetchone()
-            row = evaluate(symbol, bars, float(found[0]) if found and found[0] else None, expected_last)
+            row = evaluate(instrument, bars, float(found[0]) if found and found[0] else None, expected_last)
             if row is None:
-                unavailable.append({"symbol": symbol, "label": label(symbol),
+                unavailable.append({"symbol": symbol, "kind": instrument["kind"], "label": instrument.get("underlying") or label(symbol),
                                     "reason": "No stored minute bars today" if not bars else "Only one completed bar"})
             else:
                 rows.append(row)
-    starts = [row["bar_start"] for row in rows if not row["stale"]]
-    # The bar most rows end on: after 15:15 cash stocks are done while indices still print to 15:30.
-    as_of = Counter(starts).most_common(1)[0][0] if starts else None
+    kinds = ("SPOT", "CE", "PE")
+    # Per kind, the bar most rows end on: after 15:15 cash stocks are done while indices print to 15:30 and options
+    # to 15:40.
+    as_of = {}
+    for kind in kinds:
+        starts = Counter(row["bar_start"] for row in rows if row["kind"] == kind and not row["stale"])
+        as_of[kind] = starts.most_common(1)[0][0] if starts else None
     return {
         "session": day.isoformat(), "timeframe_seconds": TIMEFRAME, "generated_at": now.isoformat(),
-        "as_of": as_of, "as_of_end": as_of + TIMEFRAME if as_of else None,
-        "rows": rows, "unavailable": unavailable, "evaluated": len(symbols),
-        "at_high": sum(row["at_high"] for row in rows), "at_low": sum(row["at_low"] for row in rows),
+        "as_of": as_of, "rows": rows, "unavailable": unavailable, "evaluated": len(instruments),
+        "at_high": {kind: sum(row["at_high"] for row in rows if row["kind"] == kind) for kind in kinds},
+        "at_low": {kind: sum(row["at_low"] for row in rows if row["kind"] == kind) for kind in kinds},
+        "listed": {kind: sum(row["kind"] == kind for row in rows) for kind in kinds},
         "rules": {
             "high": "The last completed 15-min bar closed at or above every earlier high of the day",
             "low": "The last completed 15-min bar closed at or below every earlier low of the day",
             "streak": "Completed bars in a row, ending with the last, that did so",
             "first_list": "09:45 IST (the first bar has nothing earlier to beat)",
+            "options": "ATM CE and PE: today's ATM leg of each underlying (the traded watchlist), on its own premium; a leg "
+                       "with no trade in its latest 15 minutes is marked stale",
             "source": "Stored minute bars from the live feed; change is against the previous session's last stored minute; no broker calls",
         },
     }

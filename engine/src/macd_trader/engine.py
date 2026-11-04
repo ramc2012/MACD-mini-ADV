@@ -2298,7 +2298,7 @@ class TradingEngine(DeskMixin):
         return await asyncio.shield(tasks[key])
 
     async def day_highs(self) -> dict:
-        """Spots whose last completed 15-min bar closed at a new day high or low (day_highs.py); cached 30 s."""
+        """Spots and ATM legs whose last completed 15-min bar closed at a new day high or low (day_highs.py); cached 30 s."""
         from . import day_highs
         cached = getattr(self, "_day_highs_cache", None)
         if cached and time.monotonic() - cached[0] < 30:
@@ -2306,7 +2306,12 @@ class TradingEngine(DeskMixin):
         vix = self.settings.vix_symbol
         symbols = [s for s in dict.fromkeys([*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
                    if s.endswith(("-EQ", "-INDEX")) and s != vix]
-        result = await asyncio.to_thread(day_highs.build, self.settings.research_database_path, symbols)
+        # Today's ATM legs, the traded watchlist (ATM+1 and replaced ladders are analysis only).
+        options = [{"symbol": c.symbol, "underlying": c.underlying, "spot_symbol": c.spot_symbol,
+                    "option_type": c.option_type, "strike": c.strike, "expiry": str(c.expiry)}
+                   for c in self.contract_selector.contracts.values()
+                   if getattr(c, "moneyness", "ATM") == "ATM" and not getattr(c, "analysis_only", False)]
+        result = await asyncio.to_thread(day_highs.build, self.settings.research_database_path, symbols, None, options)
         self._day_highs_cache = (time.monotonic(), result)
         return result
 

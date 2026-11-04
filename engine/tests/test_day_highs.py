@@ -49,8 +49,8 @@ def test_a_close_beyond_every_earlier_high_is_at_the_day_high(tmp_path):
     assert rows["UP"]["change_pct"] == 2.8
     assert not rows["WICK"]["at_high"]                       # a close under an earlier wick is not a day high
     assert rows["DOWN"]["at_low"] and rows["DOWN"]["low_streak"] == 2 and not rows["DOWN"]["at_high"]
-    assert result["at_high"] == 1 and result["at_low"] == 1
-    assert result["as_of"] == _at("09:45")
+    assert result["at_high"]["SPOT"] == 1 and result["at_low"]["SPOT"] == 1
+    assert result["as_of"]["SPOT"] == _at("09:45")
 
 
 def test_only_completed_bars_count_and_the_first_bar_has_nothing_to_beat(tmp_path):
@@ -77,5 +77,20 @@ def test_after_the_cash_close_the_header_bar_is_the_one_most_rows_end_on(tmp_pat
     path = _store(tmp_path, {"NSE:A-EQ": bars[:24], "NSE:B-EQ": bars[:24], "NSE:NIFTY50-INDEX": bars})
     result = day_highs.build(path, ["NSE:A-EQ", "NSE:B-EQ", "NSE:NIFTY50-INDEX"], _now("21:00"))
     rows = {row["symbol"]: row for row in result["rows"]}
-    assert result["as_of"] == _at("15:00") and rows["NSE:A-EQ"]["bar_start"] == _at("15:00")
+    assert result["as_of"]["SPOT"] == _at("15:00") and rows["NSE:A-EQ"]["bar_start"] == _at("15:00")
     assert rows["NSE:NIFTY50-INDEX"]["bar_start"] == _at("15:15") and not rows["NSE:NIFTY50-INDEX"]["stale"]
+
+
+def test_atm_legs_are_judged_on_their_own_premium_to_the_fo_close(tmp_path):
+    rising = [(100, 101, 99, 100.5), (100.5, 104, 100, 103.8)]
+    path = _store(tmp_path, {"NSE:SBIN-EQ": [(100, 101, 99, 100.5), (100.5, 100.8, 99, 99.2)],
+                             "NSE:SBIN26NOV800CE": rising, "NSE:SBIN26NOV800PE": [(100, 101, 99, 99.5), (99.5, 99.6, 95, 95.2)]})
+    legs = [{"symbol": f"NSE:SBIN26NOV800{side}", "underlying": "SBIN", "spot_symbol": "NSE:SBIN-EQ", "option_type": side,
+             "strike": 800.0, "expiry": "2026-11-24"} for side in ("CE", "PE")]
+    result = day_highs.build(path, ["NSE:SBIN-EQ"], _now("09:45", 40), legs)
+    rows = {row["symbol"]: row for row in result["rows"]}
+    call, put = rows["NSE:SBIN26NOV800CE"], rows["NSE:SBIN26NOV800PE"]
+    assert call["kind"] == "CE" and call["at_high"] and call["label"] == "SBIN" and call["strike"] == 800.0
+    assert put["kind"] == "PE" and put["at_low"] and not put["at_high"]
+    assert call["group"] == rows["NSE:SBIN-EQ"]["group"]
+    assert result["at_high"] == {"SPOT": 0, "CE": 1, "PE": 0} and result["listed"]["CE"] == 1
