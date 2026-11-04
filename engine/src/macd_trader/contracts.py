@@ -521,6 +521,24 @@ class ContractSelector:
             row.retained = True
             self._save(list(self.contracts.values()))
 
+    def todays_atm(self) -> list[OptionContract]:
+        """The ATM watchlist: each spot's one current ATM leg per side (owner, 4 Nov 2026: "our ATM watchlist should
+        only be traded").
+
+        A held contract keeps its "ATM" label after it is replaced -- by an intraday refresh, or by a later day's
+        ladder -- so it stays subscribed and exitable; it is not today's ATM. Per spot and side, the leg chosen
+        today that is not held wins; a held leg counts only when nothing newer replaced it (it IS today's ATM, and
+        a position in it made it "retained"). On 4 Nov 64 stocks carried a second, held "ATM" call this way."""
+        legs: dict[tuple[str, str], list[OptionContract]] = {}
+        for row in self.contracts.values():
+            if row.moneyness != "ATM" or row.analysis_only:
+                continue
+            if row.retained and row.selected_on != self.selection_date:
+                continue                        # an earlier day's holding
+            legs.setdefault((row.spot_symbol, row.option_type), []).append(row)
+        # Rows are kept in selection order (a refresh appends its new ladder), so the last one is the newest.
+        return [([row for row in rows if not row.retained] or rows)[-1] for rows in legs.values()]
+
     async def refresh(self, spot_prices: dict[str, float], last_trade: dict[str, datetime], now: datetime,
                       inactive_seconds: int = 900, max_steps: float = 2.0) -> dict[str, dict]:
         """Re-select a spot's ladder when its ATM contract is not trading or spot has left it (owner, 28 Oct 2026).

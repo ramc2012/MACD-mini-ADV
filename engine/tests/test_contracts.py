@@ -4,7 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from macd_trader.brokers import OptionChainEntry, OptionContractMetadata
-from macd_trader.contracts import ContractSelector, select_contract_ladder, select_liquid_contract
+from macd_trader.contracts import ContractSelector, OptionContract, select_contract_ladder, select_liquid_contract
 
 
 def test_contract_selection_rounds_ce_up_and_pe_down():
@@ -369,3 +369,21 @@ def test_a_saved_index_selection_without_the_next_series_is_refreshed(tmp_path):
     calls.clear()
     again = asyncio.run(ContractSelector(Broker(), path).build(["NSE:NIFTY50-INDEX"]))
     assert calls == [None, "N"] and len(again) == len(rows) == 12
+
+
+def test_todays_atm_is_one_current_leg_per_spot_and_side(tmp_path):
+    # 4 Nov 2026: 64 stocks listed a second "ATM" call -- a holding from an earlier day, or a held leg an intraday
+    # refresh replaced. Only the current leg is the ATM watchlist.
+    def leg(symbol, side, strike, *, retained=False, selected_on="2026-11-04", moneyness="ATM", analysis=False):
+        return OptionContract("AXISBANK", "NSE:AXISBANK-EQ", side, symbol, strike, "2026-11-24", 1230.0,
+                              retained=retained, lot_size=625, moneyness=moneyness, analysis_only=analysis,
+                              selected_on=selected_on)
+    selector = ContractSelector(object(), str(tmp_path / "c.json"))     # no broker call
+    selector.selection_date = "2026-11-04"
+    rows = [leg("NSE:AXISBANK26NOV1220CE", "CE", 1220, retained=True, selected_on="2026-11-03"),   # older holding
+            leg("NSE:AXISBANK26NOV1230CE", "CE", 1230, retained=True),                            # held, then replaced
+            leg("NSE:AXISBANK26NOV1250CE", "CE", 1250, moneyness="OTM", analysis=True),
+            leg("NSE:AXISBANK26NOV1230PE", "PE", 1230, retained=True),                            # held, still current
+            leg("NSE:AXISBANK26NOV1240CE", "CE", 1240)]                                            # the refresh's new ATM
+    selector.contracts = {row.symbol: row for row in rows}
+    assert {row.symbol for row in selector.todays_atm()} == {"NSE:AXISBANK26NOV1240CE", "NSE:AXISBANK26NOV1230PE"}

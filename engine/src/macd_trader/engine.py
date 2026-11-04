@@ -954,7 +954,7 @@ class TradingEngine(DeskMixin):
             tradable = {row.symbol: row.lot_size for row in contracts if row.symbol in self.option_symbols}
             # New signal entries: today's ATM legs only, one position per stock (execution.entry_block). Held
             # contracts stay tradable above so they can be added to and exited.
-            atm = {row.symbol for row in contracts if row.moneyness == "ATM" and not row.analysis_only}
+            atm = {row.symbol for row in self.contract_selector.todays_atm()}
             self.execution.set_tradable_contracts(tradable)
             self.execution.set_entry_universe(atm)
             self.execution.set_contract_expiries({row.symbol: row.expiry for row in contracts})
@@ -2221,8 +2221,7 @@ class TradingEngine(DeskMixin):
         contracts = [
             {"underlying": c.underlying, "spot_symbol": c.spot_symbol, "option_type": c.option_type,
              "symbol": c.symbol, "strike": c.strike, "expiry": c.expiry}
-            for c in self.contract_selector.contracts.values()
-            if getattr(c, "moneyness", "ATM") == "ATM" and not getattr(c, "analysis_only", False)
+            for c in self.contract_selector.todays_atm()
         ]
         if not contracts:
             # No live selection yet (still connecting, or the day's broker token is not in): use the last
@@ -2306,11 +2305,10 @@ class TradingEngine(DeskMixin):
         vix = self.settings.vix_symbol
         symbols = [s for s in dict.fromkeys([*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
                    if s.endswith(("-EQ", "-INDEX")) and s != vix]
-        # Today's ATM legs, the traded watchlist (ATM+1 and replaced ladders are analysis only).
+        # Today's ATM legs, the traded watchlist (ATM+1, replaced ladders and older holdings are not).
         options = [{"symbol": c.symbol, "underlying": c.underlying, "spot_symbol": c.spot_symbol,
                     "option_type": c.option_type, "strike": c.strike, "expiry": str(c.expiry)}
-                   for c in self.contract_selector.contracts.values()
-                   if getattr(c, "moneyness", "ATM") == "ATM" and not getattr(c, "analysis_only", False)]
+                   for c in self.contract_selector.todays_atm()]
         result = await asyncio.to_thread(day_highs.build, self.settings.research_database_path, symbols, None, options)
         self._day_highs_cache = (time.monotonic(), result)
         return result
