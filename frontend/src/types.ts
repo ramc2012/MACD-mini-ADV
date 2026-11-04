@@ -276,7 +276,8 @@ export type WhaleView = {
 // again on the client. Optional so a backend that predates the record still
 // type-checks; the Ledger then derives the book from the trade log instead.
 // Terminal chart preferences, persisted by App under macd.chartLayers / macd.chartPanes.
-export type ChartLayers = { volume: boolean; legend: boolean; priorDay: boolean; week: boolean; nakedPocs: boolean; ib: boolean; sessions: boolean };
+export type ChartLayers = { volume: boolean; legend: boolean; priorDay: boolean; week: boolean; nakedPocs: boolean; ib: boolean; sessions: boolean;
+  /** Price overlays (Bollinger, KAMA, HMA 20, VWAP); shown unless false. */ studies?: boolean };
 export type PaneCollapse = { rsi: boolean };
 /* ---- Profile / Flow page: live OFI, tape speed, session badges, replay ----
    The per-BAR additions (confidence, marked prints) live in FootprintChart's

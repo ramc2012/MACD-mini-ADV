@@ -996,6 +996,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .agent-link { border: 0; padding: 0; background: none; cursor: pointer; text-decoration: underline dotted #4d6a90; text-underline-offset: 3px; }
 .agent-link:hover { color: #dce5f1; }
 .agent-picks .openable-row, .agent-track-table .openable-row { cursor: pointer; }
+.agent-track-table th:nth-child(-n+2), .agent-track-table td:nth-child(-n+2) { text-align: left; }
 .agent-picks .openable-row:hover td, .agent-track-table .openable-row:hover td { background: #101a28; }
 .agent-equity-head { align-items: center; }
 .agent-equity-final { margin-left: auto; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; }
@@ -1434,7 +1435,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .agentic-usage-balance { border-left: 2px solid #c98500; }
 .agentic-usage-balance .agentic-btn { align-self: flex-start; margin-top: 4px; }
 .agentic-usage-days { margin: 10px 12px 12px; }
-.agentic-usage-days svg { width: 100%; height: 60px; display: block; }
+.agentic-usage-bars { display: flex; align-items: flex-end; gap: 4px; height: 64px; padding-bottom: 1px; border-bottom: 1px solid #222d3d; }
+.agentic-usage-bar { flex: 1 1 0; max-width: 64px; height: 100%; display: flex; flex-direction: column-reverse; gap: 2px; }
+.agentic-usage-bar i { display: block; min-height: 0; }
+.agentic-usage-bar i.in { background: #3987e5; border-radius: 0 0 2px 2px; }
+.agentic-usage-bar i.out { background: #d95926; border-radius: 3px 3px 0 0; }
+.agentic-usage-bar:hover i { filter: brightness(1.25); }
 .agentic-usage-axis { display: flex; justify-content: space-between; color: #687990; font-size: 10px; margin-top: 3px; }
 .agentic-usage-axis s { display: inline-block; width: 10px; height: 3px; margin: 0 4px 0 8px; vertical-align: middle; border-radius: 2px; text-decoration: none; }
 @media (max-width: 1100px) { .agentic-usage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

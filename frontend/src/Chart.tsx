@@ -238,9 +238,9 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
     // Volume sits on its own overlay scale so it never bends the price axis.
     const volume = chart.addSeries(HistogramSeries, { priceScaleId: "volume", priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false }, 0);
     volume.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
-    const bbUpper = chart.addSeries(LineSeries, { color: "#7083a455", lineWidth: 1, title: "BB Upper", lastValueVisible: false, priceLineVisible: false }, 0);
-    const bbMiddle = chart.addSeries(LineSeries, { color: "#7083a499", lineWidth: 1, title: "BB 20", lastValueVisible: false, priceLineVisible: false }, 0);
-    const bbLower = chart.addSeries(LineSeries, { color: "#7083a455", lineWidth: 1, title: "BB Lower", lastValueVisible: false, priceLineVisible: false }, 0);
+    const bbUpper = chart.addSeries(LineSeries, { color: "#7083a455", lineWidth: 1, title: "", lastValueVisible: false, priceLineVisible: false }, 0);
+    const bbMiddle = chart.addSeries(LineSeries, { color: "#7083a499", lineWidth: 1, title: "", lastValueVisible: false, priceLineVisible: false }, 0);
+    const bbLower = chart.addSeries(LineSeries, { color: "#7083a455", lineWidth: 1, title: "", lastValueVisible: false, priceLineVisible: false }, 0);
     const kama = chart.addSeries(LineSeries, { color: "#c084fc", lineWidth: 2, title: "KAMA", lastValueVisible: true, priceLineVisible: false }, 0);
     const hma = chart.addSeries(LineSeries, { color: "#e8edf5", lineWidth: 2, title: "HMA 20", lastValueVisible: true, priceLineVisible: false }, 0);
     const vwap = chart.addSeries(LineSeries, { color: "#f5b84b", lineWidth: 2, title: "VWAP≈", lastValueVisible: true, priceLineVisible: false }, 0);
@@ -343,6 +343,13 @@ export function TradingChart({ candles, current, indicators, studies = [], marke
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, indicators, studies, markers, fitKey, layers.sessions, layers.volume]);
+
+  useEffect(() => {
+    const api = charts.current;
+    if (!api) return;
+    const visible = layers.studies !== false;
+    for (const series of [api.bbUpper, api.bbMiddle, api.bbLower, api.kama, api.hma, api.vwap]) series.applyOptions({ visible });
+  }, [layers.studies]);
 
   useEffect(() => {
     const api = charts.current;

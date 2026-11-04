@@ -193,13 +193,12 @@ function UsagePanel() {
       </div>
     </div>
     {days.length > 0 && <div className="agentic-usage-days">
-      <svg viewBox={`0 0 ${days.length * 14} 60`} preserveAspectRatio="none" role="img" aria-label="Tokens per IST day">
-        {days.map((d, i) => { const total = d.prompt_tokens + d.completion_tokens + d.reasoning_tokens; const h = (total / peak) * 56;
-          const out = ((d.completion_tokens + d.reasoning_tokens) / peak) * 56;
-          return <g key={d.day}><title>{`${shortDay(d.day)}: ${d.calls} calls · in ${tokens(d.prompt_tokens)} · out ${tokens(d.completion_tokens)} · reasoning ${tokens(d.reasoning_tokens)}${d.priced_calls ? ` · ${dollars(d.cost_usd)}` : ""} · avg ${(d.avg_latency_ms / 1000).toFixed(0)} s`}</title>
-            <rect x={i * 14 + 2} y={60 - h} width={10} height={Math.max(0, h - out - (out > 0 ? 1 : 0))} rx={2} fill="#3987e5" />
-            {out > 0 && <rect x={i * 14 + 2} y={60 - out} width={10} height={out} rx={2} fill="#d95926" />}</g>; })}
-      </svg>
+      <div className="agentic-usage-bars" role="img" aria-label="Tokens per IST day: input and output + reasoning">
+        {days.map((d) => { const out = d.completion_tokens + d.reasoning_tokens;
+          return <div key={d.day} className="agentic-usage-bar" title={`${shortDay(d.day)}: ${d.calls} calls · in ${tokens(d.prompt_tokens)} · out ${tokens(d.completion_tokens)} · reasoning ${tokens(d.reasoning_tokens)}${d.priced_calls ? ` · ${dollars(d.cost_usd)}` : ""} · avg ${(d.avg_latency_ms / 1000).toFixed(0)} s a call`}>
+            <i style={{ height: `${(d.prompt_tokens / peak) * 100}%` }} className="in" /><i style={{ height: `${(out / peak) * 100}%` }} className="out" />
+          </div>; })}
+      </div>
       <div className="agentic-usage-axis"><span>{shortDay(days[0].day)}</span><span><s style={{ background: "#3987e5" }} />input <s style={{ background: "#d95926" }} />output + reasoning · hover a day</span><span>{shortDay(days[days.length - 1].day)}</span></div>
     </div>}
   </div>;

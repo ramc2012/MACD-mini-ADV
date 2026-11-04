@@ -11,15 +11,17 @@ import type { Candle, ChartLevel, ChartMarker, Indicator } from "./types";
  * contracts outside the MACD watchlist (shadow and agentic lanes' strikes). */
 
 type Period = "1D" | "5D" | "1M" | "3M" | "ALL";
-const PERIODS: { key: Period; sessions: number }[] = [
-  { key: "1D", sessions: 1 }, { key: "5D", sessions: 5 }, { key: "1M", sessions: 22 }, { key: "3M", sessions: 64 }, { key: "ALL", sessions: 0 },
+// Labels say "Mo" so a 3-month window never reads like the 3-minute bar size beside it.
+const PERIODS: { key: Period; label: string; sessions: number }[] = [
+  { key: "1D", label: "1D", sessions: 1 }, { key: "5D", label: "5D", sessions: 5 }, { key: "1M", label: "1Mo", sessions: 22 },
+  { key: "3M", label: "3Mo", sessions: 64 }, { key: "ALL", label: "All", sessions: 0 },
 ];
 const FRAMES: { seconds: number; label: string }[] = [
   { seconds: 180, label: "3m" }, { seconds: 300, label: "5m" }, { seconds: 900, label: "15m" }, { seconds: 1800, label: "30m" }, { seconds: 3600, label: "1h" }, { seconds: 86400, label: "1D" },
 ];
 const STORE = "macd.laneChart";
-type Prefs = { period: Period; frame: number; style: PriceStyle; rsi: boolean };
-const DEFAULTS: Prefs = { period: "1M", frame: 1800, style: "candles", rsi: false };
+type Prefs = { period: Period; frame: number; style: PriceStyle; rsi: boolean; studies: boolean };
+const DEFAULTS: Prefs = { period: "1M", frame: 1800, style: "candles", rsi: false, studies: true };
 const recall = (): Prefs => {
   try { return { ...DEFAULTS, ...JSON.parse(window.localStorage.getItem(STORE) || "{}") }; } catch { return DEFAULTS; }
 };
@@ -60,17 +62,20 @@ export function LaneChart({ symbol, markers = [], levels = [], refreshMs = 60_00
   const studies = useMemo(() => { const rows = closeStudies(all); return cutoff ? rows.filter((row) => row.timestamp >= cutoff) : rows; }, [all, cutoff]);
   // A marker before the window would pin to the first bar and mislead; only those inside it are drawn.
   const shown = useMemo(() => markers.filter((m) => !candles.length || m.timestamp >= candles[0].timestamp - prefs.frame), [markers, candles, prefs.frame]);
-  const layers = useMemo(() => ({ ...DEFAULT_LAYERS, priorDay: false, ib: prefs.frame < 3600, sessions: prefs.frame < 86400 }), [prefs.frame]);
+  const layers = useMemo(() => ({ ...DEFAULT_LAYERS, priorDay: false, ib: prefs.studies && prefs.frame < 3600, sessions: prefs.frame < 86400, studies: prefs.studies }), [prefs.frame, prefs.studies]);
 
   return <div className={`lane-chart ${className}`}>
     <div className="lane-chart-bar">
       <span className="radar-filter" aria-label="Bar size">{FRAMES.map((row) => <button key={row.seconds} className={prefs.frame === row.seconds ? "active" : ""} aria-pressed={prefs.frame === row.seconds} onClick={() => update({ frame: row.seconds })}>{row.label}</button>)}</span>
-      <span className="radar-filter" aria-label="Period">{PERIODS.map((row) => <button key={row.key} className={prefs.period === row.key ? "active" : ""} aria-pressed={prefs.period === row.key} onClick={() => update({ period: row.key })}>{row.key}</button>)}</span>
+      <span className="radar-filter" aria-label="Period">{PERIODS.map((row) => <button key={row.key} className={prefs.period === row.key ? "active" : ""} aria-pressed={prefs.period === row.key} onClick={() => update({ period: row.key })}>{row.label}</button>)}</span>
       <span className="radar-filter" aria-label="Price style">
         <button className={prefs.style === "candles" ? "active" : ""} aria-pressed={prefs.style === "candles"} onClick={() => update({ style: "candles" })}>Candles</button>
         <button className={prefs.style === "ohlc" ? "active" : ""} aria-pressed={prefs.style === "ohlc"} onClick={() => update({ style: "ohlc" })}>OHLC</button>
       </span>
-      <span className="radar-filter"><button className={prefs.rsi ? "active" : ""} aria-pressed={prefs.rsi} title="RSI(14) pane" onClick={() => update({ rsi: !prefs.rsi })}>RSI</button></span>
+      <span className="radar-filter">
+        <button className={prefs.studies ? "active" : ""} aria-pressed={prefs.studies} title="Bollinger bands, KAMA, HMA 20, VWAP and the initial balance on the price pane" onClick={() => update({ studies: !prefs.studies })}>Overlays</button>
+        <button className={prefs.rsi ? "active" : ""} aria-pressed={prefs.rsi} title="RSI(14) pane" onClick={() => update({ rsi: !prefs.rsi })}>RSI</button>
+      </span>
       <button className="chart-fit" title="Fit all visible bars" onClick={() => setFitNonce((n) => n + 1)}>Fit</button>
       <span className="lane-chart-key" aria-hidden="true">
         <i className="k-entry">▲ buy</i><i className="k-exit">▼ sell</i><i className="k-loss">▼ sell at a loss</i>

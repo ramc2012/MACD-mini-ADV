@@ -167,7 +167,7 @@ export function AgentPage({ ticks = {} }: { ticks?: Ticks }) {
       <div className="agent-actions">
         {champion && <span className="agent-chip">champion v{champion.version} {champion.config.name}</span>}
         {!champion&&models?.models.some(m=>m.status==='baseline')&&<span className="agent-chip">Local paper baseline · untrained</span>}
-        <span className="agent-chip" title="Last emission">{status?.emitted_day ? `last emitted ${dayLabel(status.emitted_day)}` : "not emitted yet"}</span>
+        {runs[0] && <span className="agent-chip" title="Last emission">last list {fullTime(runs[0].emitted_at)}</span>}
         <button disabled={!!busy} onClick={() => void act("emit", "/api/agent/run")}>{busy === "emit" ? "Emitting…" : "Emit now"}</button>
         <button disabled={!!busy} onClick={() => void act("train", "/api/agent/train")}>{busy === "train" ? "Training…" : "Retrain"}</button>
       </div>
@@ -301,7 +301,9 @@ const level = (value: number | null | undefined, digits = 0) => value == null ? 
 
 function IndexTrades({ trades, ticks, onOpen }: { trades: IndexTrade[]; ticks: Ticks; onOpen?: (symbol: string) => void }) {
   if (!trades.length) return null;
-  const ordered = [...trades].sort((a, b) => INDEX_ORDER.indexOf(a.underlying) - INDEX_ORDER.indexOf(b.underlying));
+  // Lists from before 4 Nov 2026 also judged NIFTYNXT50, BANKEX, FOCIT and NIFTYFPI: their no-trade cards are not shown.
+  const rank = (root: string) => (INDEX_ORDER.includes(root) ? INDEX_ORDER.indexOf(root) : INDEX_ORDER.length);
+  const ordered = trades.filter((t) => t.side || INDEX_ORDER.includes(t.underlying)).sort((a, b) => rank(a.underlying) - rank(b.underlying));
   return <section className="panel agent-panel">
     <div className="panel-title">Index trades — side, contract and plan for the next 1–3 sessions</div>
     <div className="agent-index-grid">{ordered.map((t) => <IndexCard key={t.underlying} trade={t} ticks={ticks} onOpen={onOpen} />)}</div>
@@ -593,7 +595,7 @@ function WatchlistTracker({ ticks, onChart }: { ticks: Ticks; onChart: (list: La
           <span className={`agent-track-status ${list.open ? "open" : "closed"}`}>{list.open ? (list.sessions_elapsed === 0 ? "Entered today" : `Open · D+${list.sessions_elapsed} of 3`) : "Closed"}</span>
           <small>emitted {fullTime(list.run.emitted_at)} · {list.open ? "exits by" : "hold ended"} {sessionLabel(list.hold_until)} · {list.run.source} · model v{list.run.model_version ?? "—"}</small>
           <span className="agent-track-figures">
-            <span>{list.summary.legs} legs{list.no_trade.length ? ` · no trade: ${list.no_trade.join(", ")}` : ""}</span>
+            <span>{list.summary.legs} legs{list.no_trade.filter((root) => INDEX_ORDER.includes(root)).length ? ` · no index trade: ${list.no_trade.filter((root) => INDEX_ORDER.includes(root)).join(", ")}` : ""}</span>
             <span>since entry <em className={tone(mean(marks))}>{pct(mean(marks))}</em></span>
             <span>1–3d <em className={tone(list.summary.mean_1_3d)}>{pct(list.summary.mean_1_3d)}</em>{list.summary.final < list.summary.legs ? <small> ({list.summary.final}/{list.summary.legs} final)</small> : null}</span>
             {list.summary.final > 0 && <span>{list.summary.winners}/{list.summary.final} up</span>}
@@ -615,7 +617,7 @@ function WatchlistTracker({ ticks, onChart }: { ticks: Ticks; onChart: (list: La
               <td className={tone(leg.r1)}>{pct(leg.r1)}</td><td className={tone(leg.r2)}>{pct(leg.r2)}</td><td className={tone(leg.r3)}>{pct(leg.r3)}</td>
               <td><span className="positive">{pct(leg.max_ret, 0)}</span> / <span className="negative">{pct(leg.min_ret, 0)}</span></td>
               <td>{done ? <span className={`agent-outcome ${leg.y! > 0 ? "win" : "loss"}`}>{pct(leg.y)} {leg.y! > 0 ? "✓" : "✗"}</span>
-                : <small>{list.open ? `in hold · D+${list.sessions_elapsed}` : "awaiting closes"}</small>}{leg.plan ? <small> · {leg.plan}</small> : null}</td>
+                : <small>{list.open ? (list.sessions_elapsed === 0 ? "entered today" : `in hold · D+${list.sessions_elapsed} of 3`) : "awaiting closes"}</small>}{leg.plan && leg.plan !== "open" ? <small> · plan: {leg.plan}</small> : null}</td>
             </tr>;
           })}</tbody>
         </table>{!legs.length && <div className="agent-empty">No legs match the filter.</div>}</div>}
