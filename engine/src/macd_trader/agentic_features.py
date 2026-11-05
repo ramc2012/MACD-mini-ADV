@@ -22,7 +22,8 @@ from . import market_calendar, option_greeks
 IST = ZoneInfo("Asia/Kolkata")
 OPEN, CLOSE = time(9, 15), time(15, 30)
 FUTURES_GLOB = {"NIFTY": "NSE:NIFTY[0-9][0-9][A-Z][A-Z][A-Z]FUT", "BANKNIFTY": "NSE:BANKNIFTY[0-9][0-9][A-Z][A-Z][A-Z]FUT",
-                "SENSEX": "BSE:SENSEX[0-9][0-9][A-Z][A-Z][A-Z]FUT", "MIDCPNIFTY": "NSE:MIDCPNIFTY[0-9][0-9][A-Z][A-Z][A-Z]FUT"}
+                "SENSEX": "BSE:SENSEX[0-9][0-9][A-Z][A-Z][A-Z]FUT", "MIDCPNIFTY": "NSE:MIDCPNIFTY[0-9][0-9][A-Z][A-Z][A-Z]FUT",
+                "FINNIFTY": "NSE:FINNIFTY[0-9][0-9][A-Z][A-Z][A-Z]FUT"}
 
 
 def _r(value, digits=2):
@@ -254,7 +255,7 @@ def daily_ohlc(db: sqlite3.Connection, spot: str, today: date, sessions: int = 1
 
 
 SPOT_ROOTS = {"NSE:NIFTY50-INDEX": "NIFTY", "NSE:NIFTYBANK-INDEX": "BANKNIFTY", "BSE:SENSEX-INDEX": "SENSEX",
-              "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY"}
+              "NSE:MIDCPNIFTY-INDEX": "MIDCPNIFTY", "NSE:FINNIFTY-INDEX": "FINNIFTY"}
 _FIRST_HOUR_BASE: dict[tuple[str, date], float | None] = {}
 
 

@@ -34,7 +34,7 @@ from .models import Candle, Tick, Trade
 from . import market_calendar
 from .blast_engine import BlastEngine
 from .smart_lane import SmartLanes
-from .agentic_lane import AgenticLane
+from .agentic_lane import INDEX_SPOTS as AGENTIC_INDICES, AgenticLane
 from .spot_lane import SpotLane
 from .agentic_telegram import TelegramBridge
 from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
@@ -992,7 +992,7 @@ class TradingEngine(DeskMixin):
                     row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
                                  "expiry": row.expiry, "volume": row.volume, "oi": row.oi, "lot_size": row.lot_size,
                                  "moneyness": row.moneyness}
-                    for row in contracts if row.underlying in ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")})
+                    for row in contracts if row.underlying in AGENTIC_INDICES})
             self.configure_desk(tradable)
             # Before trading the new selection: every held contract's lot size against the exchange's
             # current one (owner, 30 Oct 2026). Never blocks the feed.

@@ -116,7 +116,7 @@ function BrainPanel({ onChanged }: { onChanged: () => void }) {
           <option value="">Default (medium)</option>{(status?.efforts || []).map((e) => <option key={e} value={e}>{e}</option>)}</select></label>
         <label>API base<input value={base} onChange={(event) => setBase(event.target.value)} /></label>
         <label>Universe<select value={universe} onChange={(event) => setUniverse(event.target.value)}>
-          <option value="index">Index options only (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY)</option>
+          <option value="index">Index options only (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY, FINNIFTY)</option>
           <option value="all">Index + F&amp;O stock options</option></select></label>
         <label>Cycle<select value={cycle} onChange={(event) => setCycle(Number(event.target.value))}>
           {(status?.cycle_choices || [15, 30, 60, 120]).map((m) => <option key={m} value={m}>Every {m} min</option>)}</select></label>

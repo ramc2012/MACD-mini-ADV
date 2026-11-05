@@ -468,3 +468,15 @@ def test_prepaid_balance_reads_cents_from_the_management_api():
     finally:
         httpx.AsyncClient = real
     assert out["balance_usd"] == 19.88 and out["changes"][0]["amount_usd"] == 20.0
+
+
+def test_finnifty_is_the_fifth_traded_index():
+    # Owner, 5 Nov 2026: the lane's index universe matches the option agent's five.
+    assert tuple(agentic_lane_module.INDEX_SPOTS) == brain.INDEX_ROOTS == (
+        "NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY", "FINNIFTY")
+    assert agentic_lane_module.INDEX_SPOTS["FINNIFTY"] == "NSE:FINNIFTY-INDEX"
+
+
+def test_deeper_effort_waits_longer_for_a_decision():
+    assert brain.EFFORT_TIMEOUT["medium"] == 240.0 and brain.EFFORT_TIMEOUT["high"] == 420.0
+    assert set(brain.EFFORT_TIMEOUT) == set(brain.EFFORTS)

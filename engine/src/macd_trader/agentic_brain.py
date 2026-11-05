@@ -46,7 +46,7 @@ SETUPS = {
 SWING_MIN_SESSIONS_TO_EXPIRY = 3
 SWING_MAX_SESSIONS = 5
 TRIGGER_OPS = ("above", "below")
-INDEX_ROOTS = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY")
+INDEX_ROOTS = ("NIFTY", "BANKNIFTY", "SENSEX", "MIDCPNIFTY", "FINNIFTY")   # FINNIFTY since 5 Nov 2026 (owner)
 BLOCKERS = ("none", "data_missing_or_stale", "no_signal", "price_location", "risk_reward", "time_decay", "trend_conflict",
             "limits", "event_risk")
 MAX_ARMED = 4
@@ -142,7 +142,7 @@ position_id and trigger ids exactly as given.
 
 Action fields: open/add need contract_id (open) or position_id (add), lots, stop_premium, target_premium, horizon,
 setup, and for swing an invalidation_level (set_levels may move it).
-arm needs contract_id, lots, stop/target, horizon, trigger_index (NIFTY/BANKNIFTY/SENSEX/MIDCPNIFTY), trigger_op
+arm needs contract_id, lots, stop/target, horizon, trigger_index (NIFTY/BANKNIFTY/SENSEX/MIDCPNIFTY/FINNIFTY), trigger_op
 (above/below), trigger_level, valid_until (HH:MM IST) and optionally confirm_index/confirm_op/confirm_level.
 disarm needs contract_id = the trigger id (T01...). Unused fields are null.
 
@@ -199,6 +199,9 @@ DECISION_SCHEMA = {
 
 BRAIN_FILE = "agentic_brain.json"          # beside credentials.json; that file is rewritten whole by the Fyers login
 EFFORTS = ("low", "medium", "high", "xhigh")
+# Seconds to wait for a decision. Medium peaked at 217 s (2 Nov 2026) and high took ~204 s in tests, so the
+# deeper efforts get more room: owner chose high effort on 30-minute cycles, 5 Nov 2026.
+EFFORT_TIMEOUT = {"low": 240.0, "medium": 240.0, "high": 420.0, "xhigh": 600.0}
 ALLOWED_HOST_SUFFIX = "x.ai"                # the key is only ever sent to xAI
 
 

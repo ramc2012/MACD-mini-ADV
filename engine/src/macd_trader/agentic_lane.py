@@ -64,14 +64,14 @@ TRAIL_FLOOR = 1.05                  # ... and never below entry +5%
 SETTLE_UNTIL = time(9, 30)          # first 15 minutes: only A/B opens, no trigger fills (relaxed from 09:45)
 # Swing positions (1-5 sessions): looser profit-taking, an index invalidation level, a session limit.
 SWING_BOOK_AT, SWING_TRAIL_FROM, SWING_TRAIL_KEEP = 0.50, 0.40, 0.75
-UNIVERSES = ("index", "all")          # index: NIFTY / BANKNIFTY / SENSEX / MIDCPNIFTY options only
+UNIVERSES = ("index", "all")          # index: the INDEX_SPOTS roots' options only
 CYCLE_CHOICES = (15, 30, 60, 120)
 DEFAULT_UNIVERSE = "index"
 MAX_CYCLES_PER_DAY = 60
 EQUITY_EVERY_SECONDS = 30.0
 NIFTY = "NSE:NIFTY50-INDEX"
 INDEX_SPOTS = {"NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX", "SENSEX": "BSE:SENSEX-INDEX",
-               "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX"}
+               "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX", "FINNIFTY": "NSE:FINNIFTY-INDEX"}   # FINNIFTY: owner, 5 Nov 2026
 SECTOR_NAMES = {"NSE:NIFTYIT-INDEX": "IT", "NSE:NIFTYAUTO-INDEX": "Auto", "NSE:NIFTYPHARMA-INDEX": "Pharma",
                 "NSE:NIFTYFMCG-INDEX": "FMCG", "NSE:NIFTYMETAL-INDEX": "Metal", "NSE:NIFTYENERGY-INDEX": "Energy",
                 "NSE:NIFTYREALTY-INDEX": "Realty", "NSE:FINNIFTY-INDEX": "Fin", "NSE:NIFTYNXT50-INDEX": "Next50",
@@ -430,8 +430,9 @@ class AgenticLane:
             base = brain.check_base_url(base)
         except ValueError:
             base = brain.DEFAULT_BASE_URL
+        effort = config.get("reasoning_effort") or DEFAULT_EFFORT
         return brain.GrokClient(key, config.get("model") or self.settings.agentic_model, base,
-                                reasoning_effort=config.get("reasoning_effort") or DEFAULT_EFFORT)
+                                timeout=brain.EFFORT_TIMEOUT.get(effort, 240.0), reasoning_effort=effort)
 
     @property
     def universe(self) -> str:
@@ -979,7 +980,7 @@ class AgenticLane:
         limits = self.limits()
         recent = self.recent_cycles(limit=3)
         prompt = {
-            "universe": ("INDEX OPTIONS ONLY: NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY. Do not propose stock options; "
+            "universe": (f"INDEX OPTIONS ONLY: {', '.join(INDEX_SPOTS)}. Do not propose stock options; "
                          "use breadth and sectors only as context for the index view." if self.universe == "index"
                          else "index and F&O stock options"),
             "cycle": f"you are consulted every {self.cycle_minutes} minutes (sooner only if an open position needs attention); "
