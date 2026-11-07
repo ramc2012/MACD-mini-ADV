@@ -6,8 +6,10 @@ relative performers over a month's first 3 sessions) out-ran the laggards for ab
 each row carries the 5-, 20- and 60-session picture together, and the month-start leaders are flagged with how far
 into that typical run they are.
 
-Daily closes live in ``daily_closes`` (historical database), refreshed once per completed session from the broker's
-daily history; during the session the live price stands in for today's close.
+Daily closes live in ``daily_closes`` (historical database), refreshed once per completed session: first from the
+engine's own stored minute bars (``fill_from_minutes``, no download), then from the broker's daily history for any name
+still behind. During the recovery hold the broker step is skipped. During the session the live price stands in for
+today's close.
 """
 from __future__ import annotations
 
@@ -68,16 +70,50 @@ def store(database_path: str, symbol: str, candles) -> int:
     return len(rows)
 
 
+CLOSE_CUTOFF_SECONDS = 15 * 3600 + 30 * 60      # a minute bar starting at or after 15:30 IST is not the session close
+
+
+def fill_from_minutes(database_path: str, symbols: list[str], now: datetime, days: int = 400) -> int:
+    """Store a daily close for every completed session that has stored 1-minute bars but no daily row yet.
+
+    The close is the last bar starting before 15:30 IST. That is within a few hundredths of a percent of the official
+    close for indices; cash stocks' stored bars end at 15:14 (by design), so theirs is the 15:14 price. Rows already
+    present (broker daily bars, or the 2019-2026 seed) are kept: INSERT OR IGNORE.
+    """
+    last = last_completed_session(now).isoformat()
+    since = int((now - timedelta(days=days)).timestamp())
+    rows: list[tuple[str, str, float]] = []
+    with sqlite3.connect(database_path, timeout=30) as db:
+        db.execute(SCHEMA)
+        try:
+            for symbol in symbols:
+                # SQLite returns the bare column (close) from the row holding MAX(timestamp) in each group.
+                rows += [(symbol, day, close) for day, close, _ in db.execute(
+                    """SELECT date(timestamp + 19800, 'unixepoch') AS day, close, MAX(timestamp) FROM historical_candles
+                       WHERE symbol = ? AND timeframe_seconds = 60 AND timestamp >= ? AND (timestamp + 19800) % 86400 < ?
+                       GROUP BY day""", (symbol, since, CLOSE_CUTOFF_SECONDS)) if day <= last and close]
+        except sqlite3.OperationalError:          # no minute store in this database
+            return 0
+        before = db.total_changes
+        db.executemany("INSERT OR IGNORE INTO daily_closes VALUES (?,?,?)", rows)
+        return db.total_changes - before
+
+
 async def refresh(broker, database_path: str, symbols: list[str], now: datetime | None = None, pacing: float = 0.25) -> dict:
-    """Download ~a year of daily bars for every stale symbol (one request each; Fyers allows 366 days per call)."""
+    """Fill closes from stored minute bars, then download ~a year of daily bars for every name still stale (one
+    request each; Fyers allows 366 days per call). Under the recovery hold the download is skipped (``held``)."""
     now = now or datetime.now(IST)
+    filled = await asyncio.to_thread(fill_from_minutes, database_path, symbols, now)
     stale = await asyncio.to_thread(stale_symbols, database_path, symbols, now)
-    report = {"stale": len(stale), "stored": 0, "errors": []}
+    report = {"filled_from_minutes": filled, "stale": len(stale), "stored": 0, "errors": [], "held": False}
     for symbol in stale:
         try:
             candles = await broker.history_range(symbol, 86_400, now - timedelta(days=360), now)
             report["stored"] += await asyncio.to_thread(store, database_path, symbol, candles)
         except Exception as exc:  # noqa: BLE001 -- one bad symbol must not stop the rest
+            if "downloads disabled" in str(exc):
+                report["held"] = True             # recovery hold: say it once, not once per symbol
+                break
             report["errors"].append(f"{symbol}: {type(exc).__name__}: {exc}"[:160])
         await asyncio.sleep(pacing)
     return report

@@ -234,6 +234,28 @@ def _held_contract_lots(engine) -> dict[str, int]:
         held.update({s: p.lot_size for s, p in lane.portfolio.positions.items() if p.quantity > 0})
     return held
 
+def _kick_daily_close_refresh(engine) -> None:
+    """Start the once-per-completed-session daily-close refresh (sector_wheel.refresh) if it is due and not running.
+
+    The day counts as done when nothing is left stale, or when the recovery hold stopped the download step (what the
+    stored minute bars could fill is filled; retrying every minute would only repeat the same refusal)."""
+    from . import sector_wheel
+    task = getattr(engine, "_wheel_refresh_task", None)
+    due = sector_wheel.last_completed_session(datetime.now(IST))
+    if task is not None and not task.done() or getattr(engine, "_wheel_refreshed_for", None) == due:
+        return
+
+    async def run() -> None:
+        report = await sector_wheel.refresh(engine.broker, engine.settings.research_database_path, engine._wheel_symbols())
+        engine.wheel_refresh_report = {**report, "at": datetime.now(UTC).isoformat()}
+        if report.get("held") or (not report["errors"] and not await asyncio.to_thread(
+                sector_wheel.stale_symbols, engine.settings.research_database_path, engine._wheel_symbols(), datetime.now(IST))):
+            engine._wheel_refreshed_for = due
+        engine._sector_wheel_cache = None
+        engine.__dict__.get("_sector_coil_cache", {}).clear()
+    engine._wheel_refresh_task = asyncio.create_task(run())
+
+
 class TradingEngine(DeskMixin):
     def __init__(self, settings: Settings):
         set_stock_exit_sessions(settings.stock_option_exit_sessions)   # T-2 for stock options (rollover.py)
@@ -2248,16 +2270,7 @@ class TradingEngine(DeskMixin):
         """Own and NIFTY-relative 1/5/20/60-session returns (sector_wheel.py); cached 60 s. Daily closes are
         refreshed in the background once per completed session."""
         from . import sector_wheel
-        task = getattr(self, "_wheel_refresh_task", None)
-        if (task is None or task.done()) and getattr(self, "_wheel_refreshed_for", None) != sector_wheel.last_completed_session(datetime.now(IST)):
-            async def run() -> None:
-                report = await sector_wheel.refresh(self.broker, self.settings.research_database_path, self._wheel_symbols())
-                self.wheel_refresh_report = {**report, "at": datetime.now(UTC).isoformat()}
-                if not report["errors"] and not await asyncio.to_thread(
-                        sector_wheel.stale_symbols, self.settings.research_database_path, self._wheel_symbols(), datetime.now(IST)):
-                    self._wheel_refreshed_for = sector_wheel.last_completed_session(datetime.now(IST))
-                self._sector_wheel_cache = None
-            self._wheel_refresh_task = asyncio.create_task(run())
+        _kick_daily_close_refresh(self)
         cached = getattr(self, "_sector_wheel_cache", None)
         if cached and time.monotonic() - cached[0] < 60:
             return cached[1]
@@ -2266,6 +2279,24 @@ class TradingEngine(DeskMixin):
         result["refreshing"] = not self._wheel_refresh_task.done()
         if result["rows"]:
             self._sector_wheel_cache = (time.monotonic(), result)
+        return result
+
+    async def sector_coil(self, base: str, step: str, measure: str) -> dict:
+        """Index and sector returns from a base close at every checkpoint (sector_coil.py); cached 60 s per view.
+        Shares the sector wheel's daily closes and their once-a-session refresh."""
+        from . import sector_coil
+        _kick_daily_close_refresh(self)
+        key = (base, step, measure)
+        cache = self.__dict__.setdefault("_sector_coil_cache", {})
+        if key in cache and time.monotonic() - cache[key][0] < 60:
+            return cache[key][1]
+        live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
+        symbols = [s for s in self._wheel_symbols() if s.endswith("-INDEX") and "VIX" not in s]
+        result = await asyncio.to_thread(sector_coil.build, self.settings.research_database_path, symbols, live,
+                                         None, base, step, measure)
+        result["refreshing"] = not self._wheel_refresh_task.done()
+        if result["rows"]:
+            cache[key] = (time.monotonic(), result)
         return result
 
     async def trend_rotation(self, kind: str, timeframe: int) -> dict:

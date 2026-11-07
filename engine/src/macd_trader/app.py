@@ -281,6 +281,16 @@ async def sector_wheel():
     return await engine.sector_wheel()
 
 
+@app.get("/api/sector-coil", dependencies=[Depends(authorize)])
+async def sector_coil(base: str = "YTD", step: str = "M", measure: str = "own"):
+    """Each index and sector's return from a base close (YTD, 1Y, 6M, 3M, 1M) at every checkpoint (month ends,
+    fortnights, weeks, or one month ago), own or relative to NIFTY 50: the data behind the Sector coil chart."""
+    from . import sector_coil as coil
+    if base not in coil.BASES or step not in coil.STEPS or measure not in coil.MEASURES:
+        raise HTTPException(status_code=422, detail=f"base in {sorted(coil.BASES)}, step in {sorted(coil.STEPS)}, measure in {sorted(coil.MEASURES)}")
+    return await engine.sector_coil(base, step, measure)
+
+
 @app.get("/api/trend-rotation", dependencies=[Depends(authorize)])
 async def trend_rotation(kind: Literal["CE", "PE", "SPOT"] = "CE",
                          timeframe_seconds: int = Query(default=1800)):
