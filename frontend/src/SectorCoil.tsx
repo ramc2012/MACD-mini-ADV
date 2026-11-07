@@ -95,7 +95,6 @@ export function SectorCoil() {
       <text x={labelRight ? maxX : minX} y={top + 0.5} className="coil-label" textAnchor={labelRight ? "start" : "end"} dominantBaseline="middle">
         {name} <tspan className="coil-value">{pct(last)}</tspan></text>
       {annotate && <>
-        <text x={x0 - 6} y={top} className="coil-note" textAnchor="end" dominantBaseline="middle">{fmtDay(dates[0])}</text>
         <text x={xs[xs.length - 1] + (xs[xs.length - 1] >= xs[xs.length - 2] ? 10 : -10)} y={top + blockH + 1} className="coil-note coil-note-now"
           textAnchor={xs[xs.length - 1] >= xs[xs.length - 2] ? "start" : "end"} dominantBaseline="middle">{fmtDay(dates[dates.length - 1])}{data?.live ? " (live)" : ""}</text>
       </>}
@@ -129,7 +128,8 @@ export function SectorCoil() {
         </defs>
         <text x={x0 - 8} y={TOP - 30} className="coil-dir" fill={DOWN} textAnchor="end">← Down</text>
         <text x={x0 + 8} y={TOP - 30} className="coil-dir" fill={UP}>{relative ? "Ahead of NIFTY 50" : prefs.base === "YTD" ? "Up year to date" : "Up since base"} →</text>
-        {ax.ticks.map((t) => <line key={t} x1={x(t)} x2={x(t)} y1={TOP - 18} y2={height - 22} className={t === 0 ? "coil-zero" : "coil-grid"} />)}
+        {dates.length > 0 && <text x={x0} y={TOP - 12} className="coil-note" textAnchor="middle">0 = close of {fmtDayYear(dates[0])}</text>}
+        {ax.ticks.map((t) => <line key={t} x1={x(t)} x2={x(t)} y1={TOP - 4} y2={height - 22} className={t === 0 ? "coil-zero" : "coil-grid"} />)}
         {ax.ticks.map((t, i) => <text key={`l${t}`} x={x(t)} y={height - 6} className="coil-tick" textAnchor="middle">{t}{i === ax.ticks.length - 1 ? (relative ? " pts" : "%") : ""}</text>)}
         {showBench && bench && <>
           {block(bench, filled(bench.values), benchTop, "bench", true)}
