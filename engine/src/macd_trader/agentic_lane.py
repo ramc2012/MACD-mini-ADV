@@ -111,6 +111,9 @@ def _now() -> datetime:
 
 def in_session(now: datetime) -> bool:
     local = now.astimezone(IST)
+    special = market_calendar.special_session(local.date())
+    if special:
+        return special[0] <= local.time().replace(tzinfo=None) < special[1]
     return market_calendar.is_trading_day(local.date()) and SESSION_OPEN <= local.time() < SESSION_CLOSE
 
 

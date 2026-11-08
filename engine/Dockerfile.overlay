@@ -1,0 +1,5 @@
+# Offline overlay deploy: the running image plus this tree's Python package (no network, no pip).
+ARG BASE=macd-mini-parallel-engine:latest
+FROM ${BASE}
+COPY src /app/src
+COPY src/macd_trader /usr/local/lib/python3.12/site-packages/macd_trader

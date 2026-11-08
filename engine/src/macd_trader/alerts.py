@@ -36,7 +36,8 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def market_hours(now: datetime | None = None) -> bool:
     moment = (now or datetime.now(IST)).astimezone(IST)
-    return is_trading_day(moment.date()) and dtime(9, 15) <= moment.time() <= market_close(moment.date())
+    from .market_calendar import session_open_time
+    return is_trading_day(moment.date()) and session_open_time(moment.date()) <= moment.time() <= market_close(moment.date())
 
 
 class AlertManager:

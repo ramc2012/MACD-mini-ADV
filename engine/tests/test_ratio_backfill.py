@@ -29,7 +29,8 @@ IST = ZoneInfo("Asia/Kolkata")
 
 
 def _today_open() -> datetime:
-    return datetime.now(IST).replace(hour=9, minute=15, second=0, microsecond=0)
+    """Today's continuous open (09:15, or a special session's own open such as Muhurat's 14:20)."""
+    return datetime.fromtimestamp(session_open_epoch(), IST)
 
 
 def _bars(symbol: str, start: datetime, count: int, price: float = 100.0) -> list[Candle]:

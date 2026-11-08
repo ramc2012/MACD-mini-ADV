@@ -7,8 +7,9 @@ from macd_trader.models import Tick
 def _session(hh, mm, ss=0):
     """A timestamp inside today's trading session — the aggregator ignores
     ticks outside 09:15-15:30 IST, so fixtures must sit within it."""
+    from datetime import date
     from macd_trader.candles import IST
-    today = datetime.now(IST).date()
+    today = date(2026, 11, 9)       # a regular session (today's date could be a special session with other hours)
     return datetime(today.year, today.month, today.day, hh, mm, ss, tzinfo=IST).astimezone(UTC)
 
 

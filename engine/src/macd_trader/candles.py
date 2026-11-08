@@ -14,7 +14,7 @@ from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .models import Candle, Tick
-from .sessions import session_close
+from .sessions import session_close, session_open
 
 IST = ZoneInfo("Asia/Kolkata")
 SESSION_OPEN = time(9, 15)
@@ -31,9 +31,9 @@ def session_bucket(epoch: int, timeframe_seconds: int, symbol: str | None = None
     """
     moment = datetime.fromtimestamp(epoch, UTC).astimezone(IST)
     close = session_close(symbol, moment.date()) if symbol else SESSION_CLOSE
-    if not (SESSION_OPEN <= moment.timetz().replace(tzinfo=None) < close):
+    if not (session_open(moment.date()) <= moment.timetz().replace(tzinfo=None) < close):
         return None
-    open_at = datetime.combine(moment.date(), SESSION_OPEN, IST)
+    open_at = datetime.combine(moment.date(), SESSION_OPEN, IST)   # buckets stay anchored at 09:15
     elapsed = int((moment - open_at).total_seconds())
     return int((open_at + timedelta(seconds=(elapsed // timeframe_seconds) * timeframe_seconds)).timestamp())
 

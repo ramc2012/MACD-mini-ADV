@@ -36,6 +36,9 @@ REPAIR_TIMEOUT_SECONDS = 15 * 60
 
 
 def _session(day: date) -> tuple[datetime, datetime]:
+    special = market_calendar.special_session(day)
+    if special:
+        return datetime.combine(day, special[0], IST), datetime.combine(day, special[1], IST)
     open_ = datetime.combine(day, datetime.min.time().replace(hour=SESSION_OPEN[0], minute=SESSION_OPEN[1]), IST)
     close = datetime.combine(day, datetime.min.time().replace(hour=SESSION_CLOSE[0], minute=SESSION_CLOSE[1]), IST)
     return open_, close

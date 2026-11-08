@@ -14,13 +14,15 @@ the equity and equity-derivatives segments. It must be extended every year:
 ``market_holidays_csv`` adds dates without a release, and health reports
 ``calendar_covers_year: false`` once the current year has no entries, so an
 unmaintained calendar is visible rather than silently weekday-only again.
-Special sessions on non-trading days (Muhurat trading, 8 Nov 2026) are not
-modelled; the desk simply does not trade them.
+Special sessions (Muhurat trading) are trading days with their own hours:
+SPECIAL_SESSIONS gives each one's continuous-session open and close, and
+sessions.py / candles.py gate prints by them, so every lane trades them like
+a short ordinary session. Added 8 Nov 2026 at the owner's request.
 """
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 
 # NSE trading holidays, Equity and Equity Derivatives segments, calendar 2026.
 NSE_TRADING_HOLIDAYS: dict[date, str] = {
@@ -42,7 +44,29 @@ NSE_TRADING_HOLIDAYS: dict[date, str] = {
     date(2026, 12, 25): "Christmas",
 }
 
+# Special sessions on otherwise closed days: (continuous open, close for every segment, name), IST.
+# 8 Nov 2026: NSE circular NSE/CMTR/76941 (19 Oct 2026) -- pre-open 14:05, normal market 14:20-15:30.
+SPECIAL_SESSIONS: dict[date, tuple[time, time, str]] = {
+    date(2026, 11, 8): (time(14, 20), time(15, 30), "Muhurat trading"),
+}
+REGULAR_OPEN = time(9, 15)
+
 _extra: dict[date, str] = {}
+
+
+def special_session(day: date) -> tuple[time, time, str] | None:
+    return SPECIAL_SESSIONS.get(day)
+
+
+def session_open_time(day: date) -> time:
+    """The continuous session's open on ``day``: 09:15, or a special session's own open."""
+    special = SPECIAL_SESSIONS.get(day)
+    return special[0] if special else REGULAR_OPEN
+
+
+def special_close(day: date) -> time | None:
+    special = SPECIAL_SESSIONS.get(day)
+    return special[1] if special else None
 
 
 def configure(extra_csv: str | None) -> list[str]:
@@ -69,6 +93,8 @@ def holiday_name(day: date) -> str | None:
 
 
 def is_trading_day(day: date) -> bool:
+    if day in SPECIAL_SESSIONS:
+        return True
     return day.weekday() < 5 and day not in holidays()
 
 
@@ -100,7 +126,9 @@ def holiday_list() -> list[str]:
 def status(today: date) -> dict:
     return {
         "trading_day": is_trading_day(today),
-        "holiday": holiday_name(today),
+        "holiday": None if today in SPECIAL_SESSIONS else holiday_name(today),
+        "special_session": ({"name": SPECIAL_SESSIONS[today][2], "open": SPECIAL_SESSIONS[today][0].strftime("%H:%M"),
+                             "close": SPECIAL_SESSIONS[today][1].strftime("%H:%M")} if today in SPECIAL_SESSIONS else None),
         "next_trading_day": next_trading_day(today).isoformat(),
         "calendar_covers_year": covers_year(today.year),
         "configured_extra_holidays": sorted(day.isoformat() for day in _extra),

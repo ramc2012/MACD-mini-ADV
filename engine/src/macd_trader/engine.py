@@ -187,6 +187,9 @@ def fo_session_open(moment: datetime | None = None) -> bool:
     "close" OI that is ten minutes stale.
     """
     local = (moment or datetime.now(IST)).astimezone(IST)
+    special = market_calendar.special_session(local.date())
+    if special:
+        return (special[0].hour, special[0].minute) <= (local.hour, local.minute) <= (special[1].hour, special[1].minute)
     hour, minute = (int(part) for part in regime_for(local.date()).session_end.split(":"))
     return market_calendar.is_trading_day(local.date()) and (9, 15) <= (local.hour, local.minute) <= (hour, minute)
 
@@ -199,12 +202,17 @@ def session_open_epoch(moment: datetime | None = None) -> int:
     stored today.
     """
     local = (moment or datetime.now(IST)).astimezone(IST)
-    return int(local.replace(hour=9, minute=15, second=0, microsecond=0).timestamp())
+    opened = market_calendar.session_open_time(local.date())
+    return int(local.replace(hour=opened.hour, minute=opened.minute, second=0, microsecond=0).timestamp())
 
 
 def preopen_window(moment: datetime | None = None) -> bool:
     """True during the NSE pre-open, when feed faults must surface early."""
     local = (moment or datetime.now(IST)).astimezone(IST)
+    special = market_calendar.special_session(local.date())
+    if special:                                   # a special session's pre-open: the 15 minutes before its open
+        opened = special[0].hour * 60 + special[0].minute
+        return opened - 15 <= local.hour * 60 + local.minute < opened
     return market_calendar.is_trading_day(local.date()) and PREOPEN_WATCH_START <= (local.hour, local.minute) < (9, 15)
 
 
@@ -1479,7 +1487,13 @@ class TradingEngine(DeskMixin):
         moment = datetime.now(IST)
         if not market_calendar.is_trading_day(moment.date()):
             return False
-        if not (PREOPEN_REFRESH_AT <= (moment.hour, moment.minute) < (9, 15)):
+        special = market_calendar.special_session(moment.date())
+        refresh_at, opens = PREOPEN_REFRESH_AT, (9, 15)
+        if special:                               # the same refresh, 5 minutes before a special session's open
+            opens = (special[0].hour, special[0].minute)
+            total = special[0].hour * 60 + special[0].minute - 5
+            refresh_at = (total // 60, total % 60)
+        if not (refresh_at <= (moment.hour, moment.minute) < opens):
             return False
         today = moment.date().isoformat()
         if self._preopen_refresh_day == today:

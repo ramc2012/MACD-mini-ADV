@@ -47,6 +47,9 @@ def _clock(value: str) -> time:
 
 @lru_cache(maxsize=4096)
 def _close_for(kind: str, day: date) -> time:
+    special = market_calendar.special_close(day)
+    if special is not None:                       # a special session closes every segment at its own time
+        return special
     regime = regime_for(day)
     if kind == "fo":
         return _clock(regime.session_end)
@@ -72,7 +75,13 @@ def in_session(symbol: str, moment: datetime) -> bool:
     local = moment.astimezone(IST)
     if not market_calendar.is_trading_day(local.date()):
         return False
-    return SESSION_OPEN <= local.time().replace(tzinfo=None) < session_close(symbol, local.date())
+    return session_open(local.date()) <= local.time().replace(tzinfo=None) < session_close(symbol, local.date())
+
+
+def session_open(day: date | str) -> time:
+    """When continuous trading starts on ``day``: 09:15, or a special session's (Muhurat) open."""
+    day = date.fromisoformat(day) if isinstance(day, str) else day
+    return market_calendar.session_open_time(day)
 
 
 def market_open(moment: datetime | None = None) -> bool:
@@ -80,7 +89,7 @@ def market_open(moment: datetime | None = None) -> bool:
     local = (moment or datetime.now(IST)).astimezone(IST)
     if not market_calendar.is_trading_day(local.date()):
         return False
-    return SESSION_OPEN <= local.time().replace(tzinfo=None) < market_close(local.date())
+    return session_open(local.date()) <= local.time().replace(tzinfo=None) < market_close(local.date())
 
 
 def closing_auction(symbol: str, day: date | str) -> tuple[time, time] | None:
@@ -89,7 +98,7 @@ def closing_auction(symbol: str, day: date | str) -> tuple[time, time] | None:
         return None
     day = date.fromisoformat(day) if isinstance(day, str) else day
     regime = regime_for(day)
-    if not regime.closing_auction_end:
+    if not regime.closing_auction_end or market_calendar.special_session(day):
         return None
     return _clock(regime.cash_continuous_end), _clock(regime.closing_auction_end)
 
@@ -104,5 +113,5 @@ def session_bounds(symbol: str | None, day: str) -> tuple[int, int]:
     """Epoch seconds [open, close) of ``symbol``'s session; the whole market when None."""
     when = date.fromisoformat(day)
     close = session_close(symbol, when) if symbol else market_close(when)
-    opened = datetime.combine(when, SESSION_OPEN, IST)
+    opened = datetime.combine(when, session_open(when), IST)
     return int(opened.timestamp()), int(datetime.combine(when, close, IST).timestamp())
