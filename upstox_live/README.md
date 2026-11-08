@@ -18,6 +18,7 @@ The lane starts as a **dry run**: it journals what it would order and sends noth
 
 ```bash
 echo yes > runtime/upstox_live/ARMED     # arm: real orders from the next signal
+# or Settings → Upstox live: Arm real orders / Kill (disarm) / Exit all lane positions
 rm runtime/upstox_live/ARMED             # disarm: back to dry run within 5 s
 docker compose stop upstox-live          # stop the lane entirely
 ```
