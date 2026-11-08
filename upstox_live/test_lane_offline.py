@@ -50,3 +50,31 @@ assert abs(snap["realized"] - 1450) < 0.01 and not snap["positions"]
 world["signals"].append(sig(4, "NSE:CHEAP26NOV100CE", 20.0, 600))
 n = len(sent); lane.step(); assert len(sent) == n
 print("OK, decisions:", [d["kind"] for d in lane.state["decisions"]])
+# 4. owner controls: kill cancels a pending real entry and disarms; arm refused while the order API is blocked;
+#    exit-all sells a held position even while disarmed; HTTP refuses other origins.
+world["signals"].append(sig(5, "NSE:CHEAP26NOV100CE", 20.0, 1))
+lane.step(); pending = [o for o in lane.state["orders"].values() if o["side"] == "BUY" and o.get("open")]
+assert pending, "entry should be pending"
+r = lane.set_armed(False, "test"); assert not lane.armed() and r["cancelled_entries"] == [pending[0]["order_id"]] and sent[-1][0] == "/v3/order/cancel"
+lane.state["positions"]["NSE:CHEAP26NOV100CE"] = {"symbol": "NSE:CHEAP26NOV100CE", "instrument": "NSE_FO|1", "quantity": 500, "average_price": 21.4,
+                                                  "lot_size": 500, "tick": 0.05, "opened_at": now.isoformat(), "macd_seen": True, "realized": 0.0}
+r = lane.exit_all("test"); assert r["sent"] == ["NSE:CHEAP26NOV100CE"] and sent[-1][1]["transaction_type"] == "SELL" and sent[-1][1]["price"] == 24.25
+import threading, urllib.request, urllib.error
+from http.server import ThreadingHTTPServer
+srv = ThreadingHTTPServer(("127.0.0.1", 0), lane.Handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
+def post(path, body, origin):
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/upstox-live{path}", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", **({"Origin": origin} if origin else {})})
+    try:
+        with urllib.request.urlopen(req) as resp: return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e: return e.code, json.loads(e.read())
+assert post("/arm", {"confirm": "ARM"}, "https://evil.example")[0] == 403
+assert post("/arm", {"confirm": "ARM"}, None)[0] == 403
+lane.cache["order_api"] = {"ok": False, "detail": "read-only token"}
+assert post("/arm", {"confirm": "ARM"}, "http://localhost:3200")[0] == 409 and not lane.armed()
+assert post("/arm", {}, "http://localhost:3200")[0] == 400
+lane.cache["order_api"] = {"ok": True, "detail": "ok"}
+assert post("/arm", {"confirm": "ARM"}, "http://localhost:3200")[0] == 200 and lane.armed()
+assert post("/kill", {}, "http://127.0.0.1:3200")[0] == 200 and not lane.armed()
+srv.shutdown()
+print("controls OK")

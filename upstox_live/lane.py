@@ -254,8 +254,8 @@ def count_order() -> bool:
     return True
 
 
-def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: str) -> None:
-    live = armed()
+def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: str, force_live: bool = False) -> None:
+    live = armed() or force_live
     body = {"quantity": qty, "product": "D", "validity": "DAY", "price": price, "tag": TAG,
             "instrument_token": inst["upstox"], "order_type": "LIMIT", "transaction_type": side,
             "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False, "slice": False}
@@ -432,6 +432,46 @@ def loop() -> None:
 
 # ---------------------------------------------------------------- REST
 
+# ---------------------------------------------------------------- owner controls (Settings page)
+
+def set_armed(on: bool, who: str) -> dict:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if on:
+        tmp = ARM_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("yes\n")
+        os.replace(tmp, ARM_FILE)
+        journal("ARMED", by=who)
+        return {"armed": True}
+    try:
+        os.remove(ARM_FILE)
+    except FileNotFoundError:
+        pass
+    cancelled = [o["order_id"] for o in list(state["orders"].values())
+                 if o["side"] == "BUY" and o.get("open") and not o.get("dry") and cancel(o, "kill switch")]
+    journal("KILLED", by=who, cancelled_entries=cancelled)
+    return {"armed": False, "cancelled_entries": cancelled}
+
+
+def exit_all(who: str) -> dict:
+    """Sell every lane position now (LIMIT 3% under the last price), armed or not: the owner pressed it."""
+    sent, waiting = [], []
+    for sym, p in list(state["positions"].items()):
+        if p["quantity"] <= 0 or any(o["symbol"] == sym and o["side"] == "SELL" and o.get("open") for o in state["orders"].values()):
+            continue
+        last = ltp(sym)
+        if last is None:
+            waiting.append(sym)
+            continue
+        place(sym, {"upstox": p["instrument"], "lot_size": p.get("lot_size"), "tick_size": p.get("tick")}, "SELL",
+              int(p["quantity"]), tick_round(last * (1 - EXIT_BUFFERS[0]), p.get("tick") or 0.05, up=False),
+              "owner: exit all", force_live=True)
+        p["macd_seen"] = True
+        sent.append(sym)
+    journal("EXIT_ALL", by=who, sent=sent, no_price=waiting)
+    return {"sent": sent, "no_price": waiting}
+
+
 def snapshot() -> dict:
     with lock:
         lane_instruments = {o["instrument"] for o in state["orders"].values()} | {p["instrument"] for p in state["positions"].values()}
@@ -468,7 +508,55 @@ def snapshot() -> dict:
         }
 
 
+LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def allowed(headers) -> bool:
+    """Browser calls from this Mac's own pages (localhost origin) or a client holding the MACD API token."""
+    if ENGINE_TOKEN and headers.get("X-Macd-Token") == ENGINE_TOKEN:
+        return True
+    origin = headers.get("Origin") or ""
+    return bool(origin) and (urllib.parse.urlparse(origin).hostname or "") in LOOPBACK
+
+
 class Handler(BaseHTTPRequestHandler):
+    def reply(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload, default=str).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        path = self.path.split("?")[0].removeprefix("/api/upstox-live")
+        if path not in ("/arm", "/kill", "/exit-all"):
+            return self.reply(404, {"detail": "Not Found"})
+        if not allowed(self.headers) or "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self.reply(403, {"detail": "Only this Mac's own MACD page (or the API token) can change the lane"})
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        except ValueError:
+            return self.reply(400, {"detail": "Body must be JSON"})
+        who = self.headers.get("Origin") or "api token"
+        with lock:
+            if path == "/arm":
+                if body.get("confirm") != "ARM":
+                    return self.reply(400, {"detail": 'Type ARM to confirm real orders'})
+                api = cache.get("order_api") or {}
+                if not api.get("ok"):
+                    return self.reply(409, {"detail": "Not armed: the Upstox order API is blocked: " + str(api.get("detail") or "not checked yet")})
+                result = set_armed(True, who)
+            elif path == "/kill":
+                result = set_armed(False, who)
+            else:
+                if body.get("confirm") != "EXIT":
+                    return self.reply(400, {"detail": "Confirm the exit"})
+                result = exit_all(who)
+            save_state(state)
+        return self.reply(200, {**result, "snapshot": snapshot()})
+
     def do_GET(self):
         if self.path.split("?")[0] in ("/api/upstox-live/snapshot", "/snapshot"):
             body = json.dumps(snapshot(), default=str).encode()

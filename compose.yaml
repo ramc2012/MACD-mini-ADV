@@ -183,9 +183,10 @@ services:
     volumes:
       - ./upstox_live:/lane:ro
       - ./runtime/upstox_live:/app/runtime/upstox_live
-      - /Users/ramachandran/CLAUDE PROJECTS/market-intelligence/secrets/upstox.token:/secrets/upstox.token:ro
-      # The daily OAuth access token (orders); the platform console writes it on each Upstox login.
-      - /Users/ramachandran/CLAUDE PROJECTS/market-intelligence/secrets/upstox-trade.token:/secrets/upstox-trade.token:ro
+      # The platform's secrets FOLDER, read-only: the console replaces upstox.token / upstox-trade.token atomically on
+      # every login, and a single-file bind mount keeps showing the deleted old file (8 Nov 2026, 13:32 login).
+      # The lane reads only upstox.token (reads) and upstox-trade.token (the daily OAuth token, for orders).
+      - /Users/ramachandran/CLAUDE PROJECTS/market-intelligence/secrets:/secrets:ro
     restart: unless-stopped
 
   # One local review worker; it has no order interface or access to trading books.

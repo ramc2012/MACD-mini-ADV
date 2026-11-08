@@ -49,7 +49,7 @@ type RuntimeSettings = {
 
 const headers = { "content-type": "application/json", ...(API_TOKEN ? { "x-macd-token": API_TOKEN } : {}) };
 
-type PanelTab = "FYERS" | "ALERTS" | "STRATEGY";
+type PanelTab = "FYERS" | "UPSTOX" | "ALERTS" | "STRATEGY";
 type LiveBroker = { status: string; error?: string | null; token_expires_at?: string | null; symbol_count?: number };
 
 const IST_EXPIRY = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
@@ -316,7 +316,8 @@ export function SettingsPanel({ open, onClose, initialTab = "FYERS" }: { open: b
     <section ref={panelRef} className="settings-panel" role="dialog" aria-modal="true" aria-label="Trading settings">
       <div className="settings-heading"><div><h2>Trading settings</h2><p>Real broker data · local paper execution</p></div><button aria-label="Close settings" onClick={onClose}>×</button></div>
       {!settings ? <div className="settings-loading">{error ? <><strong>Settings unavailable</strong><p>{error}</p><button onClick={() => window.location.reload()}>Retry</button></> : "Loading settings…"}</div> : <div className="settings-body">
-        <div className="watch-tabs settings-tabs">{(["FYERS", "ALERTS", "STRATEGY"] as const).map((key) => <button key={key} className={panelTab === key ? "active" : ""} onClick={() => setPanelTab(key)}>{key === "FYERS" ? "Fyers login" : key === "ALERTS" ? "Alerts" : "Strategy"}</button>)}</div>
+        <div className="watch-tabs settings-tabs">{(["FYERS", "UPSTOX", "ALERTS", "STRATEGY"] as const).map((key) => <button key={key} className={panelTab === key ? "active" : ""} onClick={() => setPanelTab(key)}>{key === "FYERS" ? "Fyers login" : key === "UPSTOX" ? "Upstox live" : key === "ALERTS" ? "Alerts" : "Strategy"}</button>)}</div>
+        {panelTab === "UPSTOX" && <UpstoxControls />}
         {panelTab === "FYERS" && <FyersLogin
           settings={settings} live={live} clock={clock} saving={saving} progress={progress} message={message} error={error}
           appSecret={appSecret} setAppSecret={setAppSecret} authInput={authInput} setAuthInput={setAuthInput}
@@ -466,5 +467,75 @@ function FyersLogin(props: FyersLoginProps) {
       {/auth_code=|:\/\//.test(props.accessToken) && <small className="login-detect bad">This is the redirect address, not an access token — it will be exchanged as an auth code (step 2 does the same).</small>}
     </details>
     <p className="field-help">Tokens are stored only in the local Docker runtime volume and never returned to the browser. Automatic refresh is not used. Watchlist: 210 F&O stocks plus NIFTY, SENSEX, BANKNIFTY and MIDCPNIFTY, with ATM, adjacent and next-series index contracts.</p>
+  </div>;
+}
+
+type UpstoxState = { armed: boolean; capital: number; free: number; deployed: number; realized: number;
+  upstox_funds?: { available_margin?: number } | null; positions: { symbol: string; quantity: number }[];
+  orders: { order_id: string; side: string; open?: boolean; dry?: boolean }[];
+  order_api?: { ok: boolean; detail: string; checked_at: string } | null; read_error?: string | null; read_at?: string | null;
+  orders_today?: { day: string; count: number }; max_orders_per_day?: number };
+
+/** The Upstox live lane's owner switches (upstox_live/lane.py): arm real orders, kill, exit every lane position. */
+function UpstoxControls() {
+  const [lane, setLane] = useState<UpstoxState>();
+  const [busy, setBusy] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await fetch("/api/upstox-live/snapshot", { cache: "no-store" });
+        if (!r.ok) throw new Error(`Upstox lane service returned HTTP ${r.status}`);
+        const body = await r.json();
+        if (alive) { setLane(body); setError((old) => old.startsWith("Upstox lane service") ? "" : old); }
+      } catch (e) { if (alive) setError(e instanceof Error ? e.message : String(e)); }
+    };
+    void load(); const id = window.setInterval(load, 5_000);
+    return () => { alive = false; window.clearInterval(id); };
+  }, []);
+  const act = async (path: "arm" | "kill" | "exit-all", body: Record<string, string>, done: (r: Record<string, unknown>) => string) => {
+    setBusy(path); setMessage(""); setError("");
+    try {
+      const r = await fetch(`/api/upstox-live/${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      const result = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(result.detail || `HTTP ${r.status}`);
+      if (result.snapshot) setLane(result.snapshot);
+      setMessage(done(result));
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(""); }
+  };
+  const arm = () => {
+    const typed = window.prompt(`ARM the Upstox live lane?\n\nReal Upstox orders will be sent for MACD signals inside the ₹${(lane?.capital ?? 25000).toLocaleString("en-IN")} fund, from the next signal on.\n\nType ARM to confirm.`);
+    if (typed?.trim().toUpperCase() !== "ARM") { setMessage("Not armed."); return; }
+    void act("arm", { confirm: "ARM" }, () => "Armed: real orders from the next MACD signal.");
+  };
+  const kill = () => void act("kill", {}, (r) => `Killed: dry run, no new orders.${Array.isArray(r.cancelled_entries) && r.cancelled_entries.length ? ` Cancelled ${r.cancelled_entries.length} unfilled entry order(s).` : ""} Open positions are not sold — use Exit all.`);
+  const exitAll = () => {
+    if (!window.confirm(`Sell EVERY Upstox lane position now (${lane?.positions.length ?? 0} open) with LIMIT orders 3% under the last price?\n\nThis sends real orders even while the lane is disarmed.`)) return;
+    void act("exit-all", { confirm: "EXIT" }, (r) => `Exit orders sent for ${Array.isArray(r.sent) ? r.sent.length : 0} position(s)${Array.isArray(r.no_price) && r.no_price.length ? `; no Upstox price yet for ${r.no_price.join(", ")}` : ""}.`);
+  };
+  const apiOk = !!lane?.order_api?.ok;
+  const pendingEntries = (lane?.orders ?? []).filter((o) => o.side === "BUY" && o.open && !o.dry).length;
+  const tone = !lane ? "pending" : lane.armed ? "down" : "ok";
+  return <div className="settings-section fyers-login upstox-controls">
+    <div className={`login-status ${tone}`}>
+      <b>{!lane ? "Reading the Upstox lane…" : lane.armed ? "ARMED — real Upstox orders" : "Dry run — nothing is sent"}</b>
+      <span style={{ display: "block", fontWeight: 400 }}>{lane ? `Order API ${apiOk ? "ok" : "blocked"} · account read ${lane.read_error ? "failing" : "ok"} · ${lane.positions.length} open · ${pendingEntries} pending entr${pendingEntries === 1 ? "y" : "ies"} · orders today ${lane.orders_today?.count ?? 0}/${lane.max_orders_per_day ?? "—"}` : ""}</span>
+    </div>
+    {lane?.order_api && !apiOk && <div className="settings-error">Order API: {lane.order_api.detail}</div>}
+    {lane?.read_error && <div className="settings-error">Account read: {lane.read_error}</div>}
+    <h3>Switches</h3>
+    <div className="settings-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
+      <button className="primary" disabled={!lane || lane.armed || !apiOk || !!busy} title={apiOk ? "Send real orders from the next MACD signal" : "The Upstox order API is blocked"} onClick={arm}>{busy === "arm" ? "Arming…" : "Arm real orders"}</button>
+      <button className="secondary" style={{ borderColor: "var(--negative, #e5484d)", color: "var(--negative, #e5484d)" }} disabled={!lane || !!busy} title="Back to dry run at once and cancel unfilled entry orders" onClick={kill}>{busy === "kill" ? "Killing…" : "Kill (disarm)"}</button>
+      <button className="secondary" disabled={!lane || !lane.positions.length || !!busy} title="Sell every lane position now" onClick={exitAll}>{busy === "exit-all" ? "Sending…" : "Exit all lane positions"}</button>
+    </div>
+    {message && <div className="settings-message">{message}</div>}{error && <div className="settings-error">{error}</div>}
+    <p className="field-help">
+      Fund ₹{(lane?.capital ?? 25000).toLocaleString("en-IN")} · free ₹{Math.round(lane?.free ?? 0).toLocaleString("en-IN")} · Upstox available {lane?.upstox_funds?.available_margin == null ? "—" : `₹${Math.round(lane.upstox_funds.available_margin).toLocaleString("en-IN")}`}.
+      Arm sends real orders for the next MACD BUY signal whose one lot fits the fund; exits follow the MACD lane. Kill stops new orders at once and cancels unfilled entries, but keeps open positions (their MACD exits are then not sent — use Exit all).
+      Arming is refused while the order API is blocked. Only this Mac's own page can press these. Order API checked {lane?.order_api?.checked_at ? new Date(lane.order_api.checked_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) + " IST" : "—"}.
+    </p>
   </div>;
 }
