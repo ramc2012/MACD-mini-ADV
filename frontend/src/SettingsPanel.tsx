@@ -505,14 +505,16 @@ function UpstoxControls() {
       setMessage(done(result));
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); } finally { setBusy(""); }
   };
+  const [armText, setArmText] = useState("");
+  const [exitAsk, setExitAsk] = useState(false);
   const arm = () => {
-    const typed = window.prompt(`ARM the Upstox live lane?\n\nReal Upstox orders will be sent for MACD signals inside the ₹${(lane?.capital ?? 25000).toLocaleString("en-IN")} fund, from the next signal on.\n\nType ARM to confirm.`);
-    if (typed?.trim().toUpperCase() !== "ARM") { setMessage("Not armed."); return; }
-    void act("arm", { confirm: "ARM" }, () => "Armed: real orders from the next MACD signal.");
+    if (armText.trim().toUpperCase() !== "ARM") { setError("Type ARM in the box first."); return; }
+    void act("arm", { confirm: "ARM" }, () => "Armed: real orders from the next MACD signal.").then(() => setArmText(""));
   };
   const kill = () => void act("kill", {}, (r) => `Killed: dry run, no new orders.${Array.isArray(r.cancelled_entries) && r.cancelled_entries.length ? ` Cancelled ${r.cancelled_entries.length} unfilled entry order(s).` : ""} Open positions are not sold — use Exit all.`);
   const exitAll = () => {
-    if (!window.confirm(`Sell EVERY Upstox lane position now (${lane?.positions.length ?? 0} open) with LIMIT orders 3% under the last price?\n\nThis sends real orders even while the lane is disarmed.`)) return;
+    if (!exitAsk) { setExitAsk(true); return; }
+    setExitAsk(false);
     void act("exit-all", { confirm: "EXIT" }, (r) => `Exit orders sent for ${Array.isArray(r.sent) ? r.sent.length : 0} position(s)${Array.isArray(r.no_price) && r.no_price.length ? `; no Upstox price yet for ${r.no_price.join(", ")}` : ""}.`);
   };
   const apiOk = !!lane?.order_api?.ok;
@@ -527,9 +529,12 @@ function UpstoxControls() {
     {lane?.read_error && <div className="settings-error">Account read: {lane.read_error}</div>}
     <h3>Switches</h3>
     <div className="settings-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
-      <button className="primary" disabled={!lane || lane.armed || !apiOk || !!busy} title={apiOk ? "Send real orders from the next MACD signal" : "The Upstox order API is blocked"} onClick={arm}>{busy === "arm" ? "Arming…" : "Arm real orders"}</button>
+      {!lane?.armed && <input aria-label="Type ARM to confirm real orders" placeholder="type ARM" value={armText} onChange={(e) => setArmText(e.target.value)}
+        onKeyDown={(e) => { if (e.key === "Enter") arm(); }} style={{ width: 110 }} />}
+      <button className="primary" disabled={!lane || lane.armed || !apiOk || !!busy || armText.trim().toUpperCase() !== "ARM"} title={apiOk ? "Send real orders from the next MACD signal (type ARM first)" : "The Upstox order API is blocked"} onClick={arm}>{busy === "arm" ? "Arming…" : lane?.armed ? "Armed" : "Arm real orders"}</button>
       <button className="secondary" style={{ borderColor: "var(--negative, #e5484d)", color: "var(--negative, #e5484d)" }} disabled={!lane || !!busy} title="Back to dry run at once and cancel unfilled entry orders" onClick={kill}>{busy === "kill" ? "Killing…" : "Kill (disarm)"}</button>
-      <button className="secondary" disabled={!lane || !lane.positions.length || !!busy} title="Sell every lane position now" onClick={exitAll}>{busy === "exit-all" ? "Sending…" : "Exit all lane positions"}</button>
+      <button className="secondary" disabled={!lane || !lane.positions.length || !!busy} title="Sell every lane position now" onClick={exitAll}>{busy === "exit-all" ? "Sending…" : exitAsk ? `Confirm: sell all ${lane?.positions.length ?? 0} now` : "Exit all lane positions"}</button>
+      {exitAsk && <button className="secondary" onClick={() => setExitAsk(false)}>Cancel</button>}
     </div>
     {message && <div className="settings-message">{message}</div>}{error && <div className="settings-error">{error}</div>}
     <p className="field-help">

@@ -16,6 +16,7 @@ The Upstox access token is read from a file and never logged, printed or served.
 from __future__ import annotations
 
 import json
+import re
 import math
 import os
 import sys
@@ -54,6 +55,7 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 JOURNAL_FILE = os.path.join(STATE_DIR, "journal.jsonl")
 
 lock = threading.RLock()
+OPTION_RE = re.compile(r"\d(CE|PE)$")
 
 
 def now() -> datetime:
@@ -391,6 +393,9 @@ def step() -> None:
         sym = s["symbol"]
         if s.get("side") != "BUY":
             journal("SKIP", symbol=sym, reason=f"{s.get('side')} signal; the lane only buys options to open")
+            continue
+        if not OPTION_RE.search(sym):
+            journal("SKIP", symbol=sym, reason="not an option contract; the lane buys index/stock options only")
             continue
         if sym in state["positions"] or any(o["symbol"] == sym and o.get("open") for o in state["orders"].values()):
             journal("SKIP", symbol=sym, reason="already held or ordering")
