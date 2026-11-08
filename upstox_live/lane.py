@@ -194,8 +194,9 @@ def record_fills() -> None:
                                "quantity": qty, "price": price, "at": t.get("exchange_timestamp") or t.get("order_timestamp") or iso()}
         p = state["positions"].setdefault(o["symbol"], {"symbol": o["symbol"], "instrument": o["instrument"], "quantity": 0,
                                                        "average_price": 0.0, "lot_size": o.get("lot_size"), "tick": o.get("tick"),
-                                                       "opened_at": None, "macd_seen": False, "realized": 0.0})
+                                                       "opened_at": None, "macd_seen": False, "realized": 0.0, "bought": 0})
         if side == "BUY":
+            p["bought"] = p.get("bought", 0) + qty
             total = p["average_price"] * p["quantity"] + price * qty
             p["quantity"] += qty
             p["average_price"] = total / p["quantity"] if p["quantity"] else 0.0
@@ -207,7 +208,8 @@ def record_fills() -> None:
             p["quantity"] = max(0, p["quantity"] - qty)
             if p["quantity"] == 0:
                 journal("CLOSED", symbol=o["symbol"], realized=round(p["realized"], 2))
-                state.setdefault("closed", []).append({**p, "closed_at": state["fills"][tid]["at"], "exit_price": price})
+                state.setdefault("closed", []).append({**p, "quantity": p.get("bought") or qty, "closed_at": state["fills"][tid]["at"],
+                                                       "exit_price": price})
                 del state["positions"][o["symbol"]]
         journal("FILL", symbol=o["symbol"], side=side, quantity=qty, price=price, order_id=oid)
     # order status from the book
@@ -289,6 +291,32 @@ def cancel(o: dict, why: str) -> bool:
     except Exception as e:
         journal("CANCEL_ERROR", symbol=o["symbol"], order_id=o["order_id"], error=str(e)[:300])
         return False
+
+
+def probe_order_api() -> None:
+    """Can this token reach the ORDER API? Cancels an order id that cannot exist (nothing is placed or changed)."""
+    try:
+        mtime = os.path.getmtime(TOKEN_FILE)
+    except OSError:
+        mtime = 0
+    last = cache.get("order_api") or {}
+    if last.get("token_mtime") == mtime and time.time() - last.get("checked", 0) < 900:
+        return
+    result = {"token_mtime": mtime, "checked": time.time(), "checked_at": iso()}
+    try:
+        upstox("DELETE", ORDER_HOST, "/v3/order/cancel", query={"order_id": "000000000000000"})
+        result.update(ok=True, detail="order API reachable")
+    except Exception as e:
+        text = str(e)
+        if "UDAPI100067" in text:
+            result.update(ok=False, detail="the Upstox token is READ-ONLY: orders are refused (log in for a trading token)")
+        elif "UDAPI1221" in text:
+            result.update(ok=False, detail="this IP is not registered as the app's static IP (UDAPI1221)")
+        elif " 401" in text or "-> 401" in text:
+            result.update(ok=False, detail="token not accepted by the order API: " + text[-200:])
+        else:   # e.g. order not found: the request got through to the order system
+            result.update(ok=True, detail="order API reachable (test cancel of a non-existent order id was answered)")
+    cache["order_api"] = result
 
 
 def ltp(symbol: str) -> float | None:
@@ -389,6 +417,7 @@ def loop() -> None:
         try:
             if time.time() - last_read >= READ_SECONDS:
                 read_upstox()
+                probe_order_api()
                 last_read = time.time()
             with lock:
                 step()
@@ -425,6 +454,8 @@ def snapshot() -> dict:
                         "lane_instruments": sorted(lane_instruments)},
             "macd_open": cache["macd_open"], "macd_checked_at": cache["macd_checked_at"],
             "read_at": cache["read_at"], "read_error": cache["read_error"], "engine_error": cache["engine_error"],
+            "order_api": {k: v for k, v in (cache.get("order_api") or {}).items() if k in ("ok", "detail", "checked_at")} or None,
+            "orders_today": state["orders_today"], "max_orders_per_day": MAX_ORDERS_PER_DAY, "started_at": state["started_at"],
             "rules": {"entry": f"First new MACD BUY signal whose 1-lot LIMIT cost (signal price +{ENTRY_BUFFER*100:.0f}%) fits the free fund; cancelled if unfilled in {int(ENTRY_TIMEOUT)} s",
                       "exit": "LIMIT SELL of the whole quantity when the MACD paper lane closes the contract (or never takes it within 10 min); 3% under the last price, then 6%, then 10%",
                       "fund": f"Rs {CAPITAL:,.0f} plus booked P&L, never more than Upstox's available margin",

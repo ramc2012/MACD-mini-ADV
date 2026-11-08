@@ -9,6 +9,10 @@ const PREOPEN = 9 * 60;          // 09:00
 const OPEN = 9 * 60 + 15;        // 09:15
 const CLOSE = 15 * 60 + 30;      // 15:30 (F&O runs to 15:40; the index session ends here)
 const WEEKDAY = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+// Special sessions (mirror of engine market_calendar.SPECIAL_SESSIONS): pre-open, open, last (F&O) close, name.
+const SPECIAL: Record<string, [number, number, number, string]> = {
+  "2026-11-08": [14 * 60 + 5, 14 * 60 + 20, 15 * 60 + 40, "Muhurat"],
+};
 
 function istParts(now: Date) {
   const shifted = new Date(now.getTime() + IST_OFFSET_MIN * 60_000);
@@ -30,6 +34,13 @@ export function duration(minutes: number): string {
 export function sessionState(now: Date, holidays: string[] = []): SessionState {
   const set = new Set(holidays);
   const { day, weekday, minutes } = istParts(now);
+  const special = SPECIAL[day];
+  if (special) {
+    const [pre, open, close, name] = special;
+    if (minutes >= open && minutes < close) return { phase: "open", label: `${name} open`, detail: `F&O closes in ${duration(close - minutes)}`, minutesToNext: close - minutes };
+    if (minutes >= pre && minutes < open) return { phase: "preopen", label: `${name} pre-open`, detail: `opens in ${duration(open - minutes)}`, minutesToNext: open - minutes };
+    if (minutes < pre) return { phase: "closed", label: "Market closed", detail: `${name} opens ${String(Math.floor(open / 60)).padStart(2, "0")}:${String(open % 60).padStart(2, "0")}`, minutesToNext: open - minutes };
+  }
   const trading = isTradingDay(day, weekday, set);
   if (trading && minutes >= OPEN && minutes < CLOSE) {
     return { phase: "open", label: "Market open", detail: `closes in ${duration(CLOSE - minutes)}`, minutesToNext: CLOSE - minutes };
