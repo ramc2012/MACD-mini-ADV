@@ -472,6 +472,8 @@ function FyersLogin(props: FyersLoginProps) {
 
 type UpstoxState = { armed: boolean; capital: number; free: number; deployed: number; realized: number;
   cap?: number | null; fund_basis?: string; armed_since?: string | null;
+  settings?: { sides: "BOTH" | "CE" | "PE"; changed_at?: string | null; changed_by?: string | null };
+  weekly_index_roots?: string[]; prefer_wait_seconds?: number;
   upstox_funds?: { available_margin?: number } | null; positions: { symbol: string; quantity: number }[];
   orders: { order_id: string; side: string; open?: boolean; dry?: boolean }[];
   order_api?: { ok: boolean; detail: string; checked_at: string } | null; read_error?: string | null; read_at?: string | null;
@@ -496,7 +498,7 @@ function UpstoxControls() {
     void load(); const id = window.setInterval(load, 5_000);
     return () => { alive = false; window.clearInterval(id); };
   }, []);
-  const act = async (path: "arm" | "kill" | "exit-all", body: Record<string, string>, done: (r: Record<string, unknown>) => string) => {
+  const act = async (path: "arm" | "kill" | "exit-all" | "settings", body: Record<string, string>, done: (r: Record<string, unknown>) => string) => {
     setBusy(path); setMessage(""); setError("");
     try {
       const r = await fetch(`/api/upstox-live/${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -518,6 +520,12 @@ function UpstoxControls() {
     setExitAsk(false);
     void act("exit-all", { confirm: "EXIT" }, (r) => `Exit orders sent for ${Array.isArray(r.sent) ? r.sent.length : 0} position(s)${Array.isArray(r.no_price) && r.no_price.length ? `; no Upstox price yet for ${r.no_price.join(", ")}` : ""}.`);
   };
+  const sides = lane?.settings?.sides ?? "BOTH";
+  const SIDE_LABEL = { BOTH: "Calls and puts", CE: "Calls only", PE: "Puts only" } as const;
+  const setSides = (value: "BOTH" | "CE" | "PE") => {
+    if (value === sides) return;
+    void act("settings", { sides: value }, () => `Saved: the lane now trades ${SIDE_LABEL[value].toLowerCase()} from the next signal. Open positions are not affected.`);
+  };
   const apiOk = !!lane?.order_api?.ok;
   const pendingEntries = (lane?.orders ?? []).filter((o) => o.side === "BUY" && o.open && !o.dry).length;
   const tone = !lane ? "pending" : lane.armed ? "down" : "ok";
@@ -537,6 +545,16 @@ function UpstoxControls() {
       <button className="secondary" disabled={!lane || !lane.positions.length || !!busy} title="Sell every lane position now" onClick={exitAll}>{busy === "exit-all" ? "Sending…" : exitAsk ? `Confirm: sell all ${lane?.positions.length ?? 0} now` : "Exit all lane positions"}</button>
       {exitAsk && <button className="secondary" onClick={() => setExitAsk(false)}>Cancel</button>}
     </div>
+    <h3>Signals the lane trades</h3>
+    <div className="settings-actions" role="radiogroup" aria-label="Option side" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>
+      {(["BOTH", "CE", "PE"] as const).map((value) => <button key={value} role="radio" aria-checked={sides === value}
+        className={sides === value ? "primary" : "secondary"} disabled={!lane || !!busy} onClick={() => setSides(value)}>{SIDE_LABEL[value]}</button>)}
+    </div>
+    <p className="field-help">
+      {SIDE_LABEL[sides]}{sides !== "BOTH" ? ` — ${sides === "CE" ? "put" : "call"} signals are ignored and not shown in the lane` : ""}.
+      Weekly-index signals ({(lane?.weekly_index_roots ?? ["NIFTY", "SENSEX"]).join(", ")}) get first preference: other signals wait {lane?.prefer_wait_seconds ?? 10} s, so a weekly-index signal arriving meanwhile is funded first.
+      {lane?.settings?.changed_at ? ` Last changed ${new Date(lane.settings.changed_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST.` : ""}
+    </p>
     {message && <div className="settings-message">{message}</div>}{error && <div className="settings-error">{error}</div>}
     <p className="field-help">
       Free for the next entry ₹{Math.round(lane?.free ?? 0).toLocaleString("en-IN")} ({lane?.fund_basis ?? "—"}{lane?.cap ? `, cap ₹${lane.cap.toLocaleString("en-IN")}` : ", no lane cap"}) · Upstox available {lane?.upstox_funds?.available_margin == null ? "—" : `₹${Math.round(lane.upstox_funds.available_margin).toLocaleString("en-IN")}`}.

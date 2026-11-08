@@ -8,6 +8,10 @@ app → **Upstox live** (`/api/upstox-live/snapshot`).
 - **Entry:** every new MACD option BUY signal whose one-lot cost (signal price + 2 %, tick-rounded LIMIT) plus ₹60 for
   charges fits the free fund = Upstox available margin − entries sent since that read. No entries when the funds read is
   older than 90 s or the order API is blocked. Product D, DAY, tag `MACDLIVE`. Unfilled after 90 s → cancelled.
+- **Side filter and priority** (Settings → Upstox live, saved in `runtime/upstox_live/settings.json`): *Calls and
+  puts* / *Calls only* / *Puts only*. Signals of the other side are ignored and not shown. Weekly-index signals
+  (`WEEKLY_INDEX_ROOTS`, default NIFTY, SENSEX) come first: other signals wait `PREFER_WAIT_SECONDS` (10 s) so a
+  weekly-index signal arriving meanwhile is funded first.
 - **Exit:** LIMIT SELL of the whole quantity when the MACD paper lane closes the contract (or never takes it within
   10 min): 3 % under the last price, then 6 %, then 10 % if unfilled after 60 s.
 - **Limits:** one position per contract, at most 30 orders a day, never sells more than it holds, ignores signals older

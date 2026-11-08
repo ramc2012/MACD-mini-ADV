@@ -20,6 +20,7 @@ type LaneFill = { order_id: string; symbol: string; side: string; quantity: numb
 type Decision = { at: string; kind: string; symbol?: string; [k: string]: unknown };
 type Snapshot = { label: string; armed: boolean; mode: string; capital: number; deployed: number; free: number; realized: number;
   cap?: number | null; fund_basis?: string; in_flight?: number; charges_allowance?: number; armed_since?: string | null;
+  settings?: { sides: "BOTH" | "CE" | "PE" }; weekly_index_roots?: string[];
   unrealized: number; equity: number; upstox_funds?: { available_margin?: number; used_margin?: number; payin_amount?: number } | null;
   positions: LanePos[]; closed: LaneClosed[]; orders: LaneOrder[]; fills: LaneFill[]; decisions: Decision[];
   account: { positions: Record<string, unknown>[]; orders: Record<string, unknown>[]; trades: Record<string, unknown>[]; lane_instruments?: string[] };
@@ -177,7 +178,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   return <section className="ledger-page blast-page spot-page upstox-page">
     <div className="page-heading blast-heading">
       <div><h1>Upstox live lane</h1>
-        <p>MACD lane signals traded with real Upstox orders sized from the account's available funds{d?.cap ? ` (capped at ₹${rupeeText(d.cap)})` : ""} · every new option BUY signal whose one lot fits is bought (LIMIT, product D) · sold when the MACD lane closes the contract · armed once, until Kill</p></div>
+        <p>MACD lane signals traded with real Upstox orders sized from the account's available funds{d?.cap ? ` (capped at ₹${rupeeText(d.cap)})` : ""} · {d?.settings?.sides === "CE" ? "calls only" : d?.settings?.sides === "PE" ? "puts only" : "calls and puts"}, weekly-index ({(d?.weekly_index_roots ?? ["NIFTY", "SENSEX"]).join(", ")}) signals first · every new option BUY signal whose one lot fits is bought (LIMIT, product D) · sold when the MACD lane closes the contract · armed once, until Kill</p></div>
       <div className="blast-badges">
         <span className={d?.armed ? "mode alert" : "feed-badge"} title={d?.armed ? `Armed${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill (Settings → Upstox live)` : "Not armed: no orders are sent"}>
           {d ? (d.armed ? "ARMED · real money" : "Not armed · no orders") : "…"}</span>

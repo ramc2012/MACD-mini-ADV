@@ -64,6 +64,48 @@ JOURNAL_FILE = os.path.join(STATE_DIR, "journal.jsonl")
 
 lock = threading.RLock()
 OPTION_RE = re.compile(r"\d(CE|PE)$")
+# The option's underlying: NSE:NIFTY26N1024000CE (weekly) / NSE:NIFTY26NOV24000CE (monthly) / NSE:HAL26NOV4950CE -> root.
+ROOT_RE = re.compile(r"^[A-Z]+:([A-Z&-]+?)\d{2}(?:[1-9OND]\d{2}|[A-Z]{3})\d")
+# Indices with WEEKLY expiries (owner, 8 Nov 2026: their signals come first). In an expiry's own week the nearest
+# contract carries the monthly ticker, so the index, not the ticker format, decides.
+WEEKLY_INDEX_ROOTS = {r.strip() for r in os.environ.get("WEEKLY_INDEX_ROOTS", "NIFTY,SENSEX").split(",") if r.strip()}
+PREFER_WAIT = float(os.environ.get("PREFER_WAIT_SECONDS", "10"))
+SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
+SIDE_CHOICES = {"BOTH": ("CE", "PE"), "CE": ("CE",), "PE": ("PE",)}
+
+
+def option_root(symbol: str) -> str | None:
+    m = ROOT_RE.match(symbol)
+    return m.group(1) if m else None
+
+
+def weekly_index(symbol: str) -> bool:
+    return option_root(symbol) in WEEKLY_INDEX_ROOTS
+
+
+def lane_settings() -> dict:
+    """Owner settings from the Settings page (runtime/upstox_live/settings.json)."""
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    sides = str(data.get("sides") or "BOTH").upper()
+    return {"sides": sides if sides in SIDE_CHOICES else "BOTH", "changed_at": data.get("changed_at"), "changed_by": data.get("changed_by")}
+
+
+def save_lane_settings(sides: str, who: str) -> dict:
+    sides = sides.upper()
+    if sides not in SIDE_CHOICES:
+        raise ValueError("sides must be BOTH, CE or PE")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    data = {"sides": sides, "changed_at": iso(), "changed_by": who}
+    tmp = SETTINGS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, SETTINGS_FILE)
+    journal("SETTINGS", by=who, sides=sides)
+    return data
 
 
 def now() -> datetime:
@@ -419,16 +461,23 @@ def step() -> None:
         place(sym, {"upstox": p["instrument"], "lot_size": p.get("lot_size"), "tick_size": p.get("tick")}, "SELL",
               int(p["quantity"]), tick_round(last * (1 - buffer), p.get("tick") or 0.05, up=False), why)
 
-    # Entries: new BUY signals in time order; the first that fits the fund is taken.
+    # Entries: weekly-index signals (NIFTY, SENSEX) first, then the rest, each in time order; the first that fits the
+    # fund is taken. Other signals wait PREFER_WAIT seconds so a weekly-index signal arriving meanwhile gets the money.
+    sides = SIDE_CHOICES[lane_settings()["sides"]]
     fresh = [s for s in signals if s.get("signal_id") and s["signal_id"] not in seen]
-    for s in sorted(fresh, key=lambda s: s.get("timestamp", "")):
-        seen.add(s["signal_id"])
+    ordered = sorted(fresh, key=lambda s: (not weekly_index(str(s.get("symbol") or "")), s.get("timestamp", "")))
+    for s in ordered:
         at = parse_time(s.get("timestamp"))
+        sym = str(s.get("symbol") or "")
+        if at and not weekly_index(sym) and (now() - at).total_seconds() < PREFER_WAIT and OPTION_RE.search(sym):
+            continue   # not marked seen: looked at again next loop, after any weekly-index signal
+        seen.add(s["signal_id"])
         if not at or at < started or (now() - at).total_seconds() > MAX_SIGNAL_AGE:
             continue   # never act on signals from before the lane started or that are stale
-        sym = s["symbol"]
         if s.get("side") != "BUY" or not OPTION_RE.search(sym) or "REENTRY" in str(s.get("kind") or ""):
             continue    # not offered to this lane: spot/SELL signals, and re-entries (MACD paper lane until promoted)
+        if OPTION_RE.search(sym).group(1) not in sides:
+            continue    # the owner's side filter (Settings): calls only or puts only
         if not armed():
             journal("SKIP", symbol=sym, signal_kind=s.get("kind"), price=s.get("price"), reason="lane not armed: no order sent")
             continue
@@ -547,6 +596,7 @@ def snapshot() -> dict:
             "read_at": cache["read_at"], "read_error": cache["read_error"], "engine_error": cache["engine_error"],
             "order_api": {k: v for k, v in (cache.get("order_api") or {}).items() if k in ("ok", "detail", "checked_at")} or None,
             "orders_today": state["orders_today"], "max_orders_per_day": MAX_ORDERS_PER_DAY, "started_at": state["started_at"],
+            "settings": lane_settings(), "weekly_index_roots": sorted(WEEKLY_INDEX_ROOTS), "prefer_wait_seconds": PREFER_WAIT,
             "rules": {"entry": f"Every new MACD BUY option signal whose 1-lot LIMIT cost (signal price +{ENTRY_BUFFER*100:.0f}%) plus Rs {CHARGES_ALLOWANCE:,.0f} charges fits the free fund; cancelled if unfilled in {int(ENTRY_TIMEOUT)} s",
                       "exit": "LIMIT SELL of the whole quantity when the MACD paper lane closes the contract (or never takes it within 10 min); 3% under the last price, then 6%, then 10%",
                       "fund": ("Upstox available margin, read every 15 s (top-ups count at the next read), minus entries sent since that read"
@@ -554,7 +604,11 @@ def snapshot() -> dict:
                                + f"; no entries if the read is older than {int(FUNDS_MAX_AGE)} s"),
                       "orders": f"product D (carry forward), DAY validity, tag {TAG}, at most {MAX_ORDERS_PER_DAY} orders a day",
                       "arming": "Arm once: real orders until Kill is pressed, across days, restarts and Upstox re-logins (an expired token only pauses entries). Not armed: nothing is sent or recorded as an order",
-                      "signals": "MACD lane option BUY signals only; re-entry signals stay in the MACD paper lane until promoted"},
+                      "signals": ("MACD lane option BUY signals only ("
+                                  + {"BOTH": "calls and puts", "CE": "calls only", "PE": "puts only"}[lane_settings()["sides"]]
+                                  + "); re-entry signals stay in the MACD paper lane until promoted"),
+                      "priority": (f"Weekly-index signals ({', '.join(sorted(WEEKLY_INDEX_ROOTS))}) first; other signals wait "
+                                   f"{int(PREFER_WAIT)} s so a weekly-index signal arriving meanwhile is funded first")},
             "checked_at": iso(),
         }
 
@@ -587,7 +641,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0].removeprefix("/api/upstox-live")
-        if path not in ("/arm", "/kill", "/exit-all"):
+        if path not in ("/arm", "/kill", "/exit-all", "/settings"):
             return self.reply(404, {"detail": "Not Found"})
         if not allowed(self.headers) or "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.reply(403, {"detail": "Only this Mac's own MACD page (or the API token) can change the lane"})
@@ -606,6 +660,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = set_armed(True, who)
             elif path == "/kill":
                 result = set_armed(False, who)
+            elif path == "/settings":
+                try:
+                    result = {"settings": save_lane_settings(str(body.get("sides") or ""), who)}
+                except ValueError as e:
+                    return self.reply(400, {"detail": str(e)})
             else:
                 if body.get("confirm") != "EXIT":
                     return self.reply(400, {"detail": "Confirm the exit"})

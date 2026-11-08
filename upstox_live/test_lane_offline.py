@@ -22,6 +22,7 @@ def upstox(method, host, path, body=None, query=None):
     return {"data": world["positions"]}
 lots = {"NSE:CHEAP26NOV100CE": (500, "NSE_FO|1"), "NSE:DEAR26NOV900CE": (300, "NSE_FO|2")}
 lane.engine, lane.upstox = engine, upstox
+lane.PREFER_WAIT = 0       # sections 1-7 test entry mechanics; the weekly-index preference is tested in 8
 lane.resolve = lambda s: {"upstox": lots[s][1], "lot_size": lots[s][0], "tick_size": 0.05}
 # 1. not armed: offered option signals are journalled as skipped, nothing is sent and no would-be order is kept;
 #    spot, SELL and re-entry signals are not this lane's and leave no record at all
@@ -132,3 +133,53 @@ lane2.step(); lane2.step()
 assert len(sent) == n and [d["kind"] for d in lane2.state["decisions"]].count("EXIT_NOT_SENT") == 1
 assert not any(o.get("dry") for o in lane2.state["orders"].values())
 print("not-armed exit OK")
+
+# 8. owner settings: side filter (calls only / puts only) and weekly-index preference
+L = lane2
+lots.update({"NSE:NIFTY26N1024000CE": (65, "NSE_FO|9"), "NSE:NIFTY26N1024000PE": (65, "NSE_FO|10"), "NSE:HAL26NOV4950PE": (150, "NSE_FO|11")})
+L.resolve = lambda s: {"upstox": lots[s][1], "lot_size": lots[s][0], "tick_size": 0.05}
+open(L.ARM_FILE, "w").write("yes"); L.cache["order_api"] = {"ok": True}
+L.state.update(orders={}, positions={}, decisions=[], started_at=(now - timedelta(minutes=5)).isoformat())
+world.update(macd=[], margin=30000.0); L.read_upstox()
+fresh_now = lambda i, sym, price, ago: {**sig(i, sym, price, 0), "timestamp": (datetime.now(timezone.utc) - timedelta(seconds=ago)).isoformat()}
+assert L.weekly_index("NSE:NIFTY26N1024000CE") and L.weekly_index("NSE:NIFTY26NOV24000CE") and L.weekly_index("BSE:SENSEX26O0172500PE")
+assert not L.weekly_index("NSE:BANKNIFTY26NOV54500CE") and not L.weekly_index("NSE:HAL26NOV4950CE")
+# calls only: a put signal leaves no record, a call is taken
+L.save_lane_settings("CE", "test")
+world["signals"] = [fresh_now(100, "NSE:HAL26NOV4950PE", 50.0, 30), fresh_now(101, "NSE:CHEAP26NOV100CE", 20.0, 30)]
+n = len(sent); L.step()
+assert [b["instrument_token"] for _, b in sent[n:]] == ["NSE_FO|1"], sent[n:]
+assert not [d for d in L.state["decisions"] if d.get("symbol") == "NSE:HAL26NOV4950PE"]
+# puts only
+L.save_lane_settings("PE", "test"); L.state["orders"] = {}
+world["signals"] = [fresh_now(102, "NSE:CHEAP26NOV100CE", 20.0, 30), fresh_now(103, "NSE:HAL26NOV4950PE", 50.0, 30)]
+n = len(sent); L.step(); assert [b["instrument_token"] for _, b in sent[n:]] == ["NSE_FO|11"]
+try:
+    L.save_lane_settings("ALL", "test"); raise AssertionError("bad value accepted")
+except ValueError:
+    pass
+# weekly index first: an OLDER stock signal and a NIFTY weekly signal compete for money that fits one lot
+L.save_lane_settings("BOTH", "test"); L.state["orders"] = {}; L.PREFER_WAIT = 10
+world["margin"] = 12000.0; L.read_upstox()
+world["signals"] = [fresh_now(104, "NSE:CHEAP26NOV100CE", 20.0, 3)]              # 20.4 x 500 = 10,200
+n = len(sent); L.step(); assert len(sent) == n, "a stock signal waits PREFER_WAIT for a weekly-index one"
+world["signals"].append(fresh_now(105, "NSE:NIFTY26N1024000CE", 150.0, 1))     # 153 x 65 = 9,945
+L.step(); assert [b["instrument_token"] for _, b in sent[n:]] == ["NSE_FO|9"], "weekly index first"
+world["signals"] = [{**s, "timestamp": (datetime.now(timezone.utc) - timedelta(seconds=12)).isoformat()} if s["signal_id"] == "s104" else s
+                    for s in world["signals"]]
+L.step()
+assert len(sent) == n + 1 and L.state["decisions"][-1]["kind"] == "SKIP_FUNDS" and L.state["decisions"][-1]["symbol"] == "NSE:CHEAP26NOV100CE"
+# the HTTP switch
+srv = ThreadingHTTPServer(("127.0.0.1", 0), L.Handler); threading.Thread(target=srv.serve_forever, daemon=True).start()
+def post2(path, body, origin):
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/upstox-live{path}", data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", **({"Origin": origin} if origin else {})})
+    try:
+        with urllib.request.urlopen(req) as resp: return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e: return e.code, json.loads(e.read())
+assert post2("/settings", {"sides": "CE"}, "https://evil.example")[0] == 403
+assert post2("/settings", {"sides": "XX"}, "http://localhost:3200")[0] == 400
+code, body = post2("/settings", {"sides": "CE"}, "http://localhost:3200")
+assert code == 200 and body["snapshot"]["settings"]["sides"] == "CE" and "calls only" in body["snapshot"]["rules"]["signals"]
+srv.shutdown(); L.set_armed(False, "test")
+print("side filter + weekly-index preference OK")
