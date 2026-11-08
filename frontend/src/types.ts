@@ -79,7 +79,7 @@ export type Snapshot = {
   candles: Record<string, Candle[]>;
   history_errors: Record<string, string>;
   strategy: { indicator_history: Record<string, Indicator[]>; signals: Signal[] };
-  execution: { mode: string; live_orders_unlocked: boolean; orders: Order[]; trades: Trade[]; portfolio: Portfolio; closed_positions?: ClosedPosition[]; risk: { hard_stop_pct: number; trailing_stop_pct: number; max_positions?: number; min_cash_reserve?: number; slippage_bps?: number; target_position_notional?: number; max_trade_lots?: number; entry_filter?: string } };
+  execution: { mode: string; live_orders_unlocked: boolean; orders: Order[]; trades: Trade[]; portfolio: Portfolio; closed_positions?: ClosedPosition[]; reentry?: ReentryBook | null; risk: { hard_stop_pct: number; trailing_stop_pct: number; max_positions?: number; min_cash_reserve?: number; slippage_bps?: number; target_position_notional?: number; max_trade_lots?: number; entry_filter?: string } };
   // Optional so a frame from a backend without the blast lane still type-checks.
   blast?: BlastSnapshot;
 };
@@ -400,4 +400,14 @@ export type BlastJournalResponse = { rows: BlastCandidate[]; summary: BlastJourn
 export type BlastBook = {
   orders: Order[]; trades: Trade[]; signals: Signal[]; equity: LiveEquityPoint[];
   portfolio: Portfolio; closed_positions: ClosedPosition[];
+};
+
+/** The MACD lane's re-entry tracker (engine reentry.py, owner 8 Nov 2026): tagged PREMIUM_MACD_REENTRY, paper only. */
+export type ReentryBook = {
+  kind: string; rule: string; fired: number; pending: number; closed: number; open: number; wins: number;
+  realized_pnl: number; profit_factor: number | null; avg_return_pct: number | null; error?: string | null;
+  cleared: Record<string, number>; position_ids: string[];
+  eligible: { key: string; symbol: string; exit_reason: string; exit_at: string; exit_price?: number; armed_on: string }[];
+  positions: { position_id: string; symbol: string; at: string; entry_price: number; after?: string | null; realized_pnl?: number;
+    closed_at?: string; exit_reason?: string | null }[];
 };

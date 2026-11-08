@@ -23,11 +23,16 @@ def upstox(method, host, path, body=None, query=None):
 lots = {"NSE:CHEAP26NOV100CE": (500, "NSE_FO|1"), "NSE:DEAR26NOV900CE": (300, "NSE_FO|2")}
 lane.engine, lane.upstox = engine, upstox
 lane.resolve = lambda s: {"upstox": lots[s][1], "lot_size": lots[s][0], "tick_size": 0.05}
-# 1. dry run: expensive signal skipped, cheap one would be ordered, nothing sent
-world["signals"] = [sig(1, "NSE:DEAR26NOV900CE", 120.0, 8), sig(2, "NSE:CHEAP26NOV100CE", 20.0, 4)]
+# 1. not armed: offered option signals are journalled as skipped, nothing is sent and no would-be order is kept;
+#    spot, SELL and re-entry signals are not this lane's and leave no record at all
+world["signals"] = [sig(1, "NSE:DEAR26NOV900CE", 120.0, 8), sig(2, "NSE:CHEAP26NOV100CE", 20.0, 4),
+                    {**sig(90, "NSE:CHEAP-EQ", 20.0, 4)}, {**sig(91, "NSE:CHEAP26NOV100CE", 20.0, 4), "side": "SELL"},
+                    {**sig(92, "NSE:CHEAP26NOV100CE", 20.0, 3), "kind": "PREMIUM_MACD_REENTRY"}]
 lane.read_upstox(); lane.step()
-print("dry:", [(d["kind"], d.get("symbol")) for d in lane.state["decisions"]], "sent", sent)
-assert not sent
+print("not armed:", [(d["kind"], d.get("symbol"), d.get("reason")) for d in lane.state["decisions"]], "sent", sent)
+assert not sent and not lane.state["orders"]
+assert [(d["kind"], d["symbol"]) for d in lane.state["decisions"]] == [("SKIP", "NSE:DEAR26NOV900CE"), ("SKIP", "NSE:CHEAP26NOV100CE")]
+assert all(d["reason"].startswith("lane not armed") for d in lane.state["decisions"])
 # 2. armed: new cheap signal -> real order (fake), fill, MACD holds, then MACD closes -> sell
 os.makedirs(S + "/state", exist_ok=True); open(lane.ARM_FILE, "w").write("yes")
 lane.state["orders"] = {}
@@ -46,6 +51,10 @@ world["trades"].append({"order_id": "OID2", "trade_id": "T2", "quantity": 500, "
 lane.read_upstox(); lane.step()
 snap = lane.snapshot(); print("after exit: realized", snap["realized"], "positions", snap["positions"], "closed", len(snap["closed"]))
 assert abs(snap["realized"] - 1450) < 0.01 and not snap["positions"]
+# 2b. armed: a re-entry signal is still not taken (MACD paper lane only until promoted)
+n = len(sent); k = len(lane.state["decisions"])
+world["signals"].append({**sig(93, "NSE:DEAR26NOV900CE", 20.0, 1), "kind": "PREMIUM_MACD_REENTRY"})
+lane.step(); assert len(sent) == n and len(lane.state["decisions"]) == k
 # 3. old signal (before start) and stale ones ignored; a second identical signal while ordering skipped
 world["signals"].append(sig(4, "NSE:CHEAP26NOV100CE", 20.0, 600))
 n = len(sent); lane.step(); assert len(sent) == n
@@ -113,3 +122,13 @@ lane2.recover_armed_since() if lane2.armed() else None
 assert lane2.armed(), "restart must not disarm"
 lane2.set_armed(False, "test"); assert not lane2.armed()
 print("funds + arming OK")
+# 7. not armed with a held position: the MACD exit is NOT sent, journalled once (no would-be order is kept)
+lane2.state["positions"]["NSE:CHEAP26NOV100CE"] = {"symbol": "NSE:CHEAP26NOV100CE", "instrument": "NSE_FO|1", "quantity": 500,
+    "average_price": 21.4, "lot_size": 500, "tick": 0.05, "opened_at": now.isoformat(), "macd_seen": True, "realized": 0.0}
+lane2.engine, lane2.upstox = engine, upstox
+lane2.cache["positions"] = [{"instrument_token": "NSE_FO|1", "last_price": 25.0}]
+world["macd"] = []; n = len(sent); lane2.state["orders"] = {}
+lane2.step(); lane2.step()
+assert len(sent) == n and [d["kind"] for d in lane2.state["decisions"]].count("EXIT_NOT_SENT") == 1
+assert not any(o.get("dry") for o in lane2.state["orders"].values())
+print("not-armed exit OK")

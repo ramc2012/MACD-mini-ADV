@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import type { ClosedBook, ClosedPosition, Excursion, Order, Portfolio, Position, Signal, Trade } from "./types";
-import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPositions, indexUnderlying, INDEX_UNDERLYINGS, observedExcursion, optionSide, roundStats, visibleClosedRows, type RoundStats, type RoundTrip } from "./ledgerMath";
+import type { ClosedBook, ClosedPosition, Excursion, Order, Portfolio, Position, ReentryBook, Signal, Trade } from "./types";
+import { BOOK_ROLL_LABEL, closedBookStart, completedRoundTrips, distinctPositions, indexUnderlying, INDEX_UNDERLYINGS, observedExcursion, optionSide, roundStats, splitReentryRounds, visibleClosedRows, type RoundStats, type RoundTrip } from "./ledgerMath";
 
 import { bookFillCounts } from "./ledgerMath";
 import { LedgerCounts } from "./LedgerCounts";
@@ -48,8 +48,10 @@ const initialSorts: Record<LedgerTab, SortState> = {
   SIGNALS: { key: "time", direction: "desc" },
 };
 
-export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true, books = "options", marginRate }: {
+export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenPosition, holidays, ledgerReady = true, books = "options", marginRate, reentry }: {
   tab: LedgerTab;
+  /** The MACD lane's re-entry tracker: Statistics shows the tagged re-entries on their own. */
+  reentry?: ReentryBook | null;
   books?: LedgerBooks;
   /** Futures: the share of notional a position blocks as margin. The books then show margin blocked and notional,
    *  not money invested, and P&L % is on margin. */
@@ -225,7 +227,7 @@ export function TradingLedger({ tab, orders, trades, portfolio, signals, onOpenP
           : activeGroup && <PositionBook title={activeGroup.title} rows={activeGroup.positions} summary={activeGroup.summary} labels={labels} columns={positionColumns} sort={sort} onSort={updateSort} toFocus={toFocus} onOpenPosition={onOpenPosition} />}
       </div><SummaryStrip title="Combined open-position summary" summary={liveSummary} labels={labels} /></div>}
       {tab === "SIGNALS" && <SortableTable rows={signals} columns={signalColumns} sort={sort} onSort={updateSort} empty="No MACD signals recorded" />}
-      {tab === "STATISTICS" && <Statistics orders={orders} trades={trades} portfolio={portfolio} rounds={rounds} sides={books === "sides"} />}
+      {tab === "STATISTICS" && <Statistics orders={orders} trades={trades} portfolio={portfolio} rounds={rounds} sides={books === "sides"} reentry={reentry} />}
     </div>
   </section>;
 }
@@ -302,7 +304,7 @@ export function SortableTable<Row>({ rows, columns, sort, onSort, empty, rowActi
   return <div className="ledger-table-wrap"><table className="ledger-table"><thead><tr>{columns.map((column) => <th key={column.key}><button onClick={() => onSort(column.key)}>{column.label}<span className={sort.key === column.key ? "sort active" : "sort"}>{sort.key === column.key ? (sort.direction === "asc" ? "▲" : "▼") : "↕"}</span></button></th>)}</tr></thead><tbody>{sorted.length ? sorted.map((row, index) => <tr key={index} className={rowAction ? "openable-row" : ""} onClick={() => rowAction?.(row)}>{columns.map((column, columnIndex) => <td key={column.key} className={column.tone?.(row) || ""}>{rowAction && columnIndex === 0 ? <button type="button" className="ledger-row-open" aria-label={`Open position chart for ${String(column.value(row))}`} onClick={(event) => { event.stopPropagation(); rowAction(row); }}>{column.render ? column.render(row) : String(column.value(row))}</button> : column.render ? column.render(row) : String(column.value(row))}</td>)}</tr>) : <tr><td colSpan={columns.length} className="empty">{empty}</td></tr>}</tbody></table></div>;
 }
 
-function Statistics({ orders, trades, portfolio, rounds, sides = false }: { orders: Order[]; trades: Trade[]; portfolio: Portfolio; rounds: RoundTrip[]; sides?: boolean }) {
+function Statistics({ orders, trades, portfolio, rounds, sides = false, reentry }: { orders: Order[]; trades: Trade[]; portfolio: Portfolio; rounds: RoundTrip[]; sides?: boolean; reentry?: ReentryBook | null }) {
   const winners = rounds.filter((row) => row.pnl > 0);
   const losers = rounds.filter((row) => row.pnl < 0);
   const grossProfit = winners.reduce((sum, row) => sum + row.pnl, 0);
@@ -332,6 +334,7 @@ function Statistics({ orders, trades, portfolio, rounds, sides = false }: { orde
   ];
   return <div className="statistics"><h2>Agent paper book</h2><div className="statistics-note">One trade runs from first entry until fully flat. Partial exits in open cycles are excluded from win rate and completed-trade returns. Returns include recorded fees; realized P&L in open cycles includes their entry fees.</div><div className="statistics-grid">{stats.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
     {sides ? <SideStatistics rounds={rounds} portfolio={portfolio} /> : <IndexStatistics rounds={rounds} portfolio={portfolio} bookNet={net} />}
+    {reentry && <ReentryStatistics rounds={rounds} portfolio={portfolio} reentry={reentry} />}
     <Rejections orders={orders} />
     <h2>Completed trades · entry to flat</h2>
     <table className="ledger-table"><thead><tr><th>Symbol</th>{sides && <th>Side</th>}<th>Entry (IST)</th><th>Exit (IST)</th><th>Entries</th><th>Exits</th><th>Net P&L</th><th>Return</th></tr></thead><tbody>
@@ -385,6 +388,55 @@ function IndexStatistics({ rounds, portfolio, bookNet }: { rounds: RoundTrip[]; 
         <td className={row.net >= 0 ? "positive" : "negative"}>{currency(row.net)}</td><td>{ratio(row.profitFactor)}</td><td>{money(row.avgWin)}</td><td>{money(row.avgLoss)}</td>
         <td>{ratio(row.payoff)}</td><td>{pct(row.avgReturn)}</td><td>{row.medianHeldMs === null ? "—" : heldLabel(row.medianHeldMs)}</td></tr>)}
     </tbody></table>}
+  </>;
+}
+
+/** The MACD lane's re-entries (PREMIUM_MACD_REENTRY, paper only until promoted) against its other entries. */
+function ReentryStatistics({ rounds, portfolio, reentry }: { rounds: RoundTrip[]; portfolio: Portfolio; reentry: ReentryBook }) {
+  const { reentry: again, other } = useMemo(() => splitReentryRounds(rounds, reentry.position_ids), [rounds, reentry.position_ids]);
+  const ids = useMemo(() => new Set(reentry.position_ids), [reentry.position_ids]);
+  const open = portfolio.positions.filter((row) => row.position_id && ids.has(row.position_id));
+  const openPnl = open.reduce((sum, row) => sum + row.unrealized_pnl, 0);
+  const ratio = (value: number | null) => value === null ? "—" : Number.isFinite(value) ? value.toFixed(2) : "∞";
+  const money = (value: number | null) => value === null ? "—" : currency(value);
+  const rate = (value: number | null) => value === null ? "—" : `${(100 * value).toFixed(1)}%`;
+  const all = roundStats(again);
+  const stats = [
+    ["Re-entry signals fired", number.format(reentry.fired)],
+    ["Completed re-entries", number.format(all.trades)],
+    ["Winning / losing", `${all.wins} / ${all.losses}`],
+    ["Win rate", rate(all.winRate)],
+    ["Re-entry net P&L", currency(all.net)],
+    ["Profit factor", ratio(all.profitFactor)],
+    ["Winner ÷ loser size", ratio(all.payoff)],
+    ["Average return", pct(all.avgReturn)],
+    ["Open re-entries", number.format(open.length)],
+    ["Open re-entry P&L", currency(openPnl)],
+    ["Stocks eligible now", number.format(reentry.eligible.length)],
+  ];
+  const rows: [string, RoundStats][] = [["Re-entries", all], ["Other entries", roundStats(other)],
+    ...(["CE", "PE"] as const).map((side) => [`Re-entries ${side}`, roundStats(again.filter((row) => optionSide(row.symbol) === side))] as [string, RoundStats])];
+  return <>
+    <h2>Re-entries <small>paper only · tag PREMIUM_MACD_REENTRY</small></h2>
+    <div className="statistics-note">{reentry.rule}. One re-entry per eligibility; it ends at the re-entry, any new entry on that stock and side, MACD closing at or below zero, or after 5 sessions. Not sent to the Upstox live lane until promoted.{reentry.error ? ` Last error: ${reentry.error}` : ""}</div>
+    <div className="statistics-grid">{stats.map(([label, value]) => <Stat key={label} label={label} value={value} />)}</div>
+    <table className="ledger-table index-stats"><thead><tr><th>Entries</th><th>Trades</th><th>Win rate</th><th>Net P&L</th><th>Profit factor</th><th>Avg winner</th><th>Avg loser</th><th>Winner ÷ loser</th><th>Avg return</th><th>Median hold</th></tr></thead><tbody>
+      {rows.map(([label, row]) => <tr key={label} className={label.includes(" ") && label !== "Other entries" ? "" : "index-stats-total"}><td>{label}</td><td>{number.format(row.trades)}</td><td>{rate(row.winRate)}</td>
+        <td className={row.net >= 0 ? "positive" : "negative"}>{currency(row.net)}</td><td>{ratio(row.profitFactor)}</td><td>{money(row.avgWin)}</td><td>{money(row.avgLoss)}</td>
+        <td>{ratio(row.payoff)}</td><td>{pct(row.avgReturn)}</td><td>{row.medianHeldMs === null ? "—" : heldLabel(row.medianHeldMs)}</td></tr>)}
+    </tbody></table>
+    <h2>Re-entry trades</h2>
+    <table className="ledger-table"><thead><tr><th>Contract</th><th>Entered (IST)</th><th>Entry</th><th>After</th><th>Status</th><th>P&L</th></tr></thead><tbody>
+      {reentry.positions.map((row) => { const live = open.find((p) => p.position_id === row.position_id); const pnl = live ? live.unrealized_pnl : row.realized_pnl ?? 0;
+        return <tr key={row.position_id}><td>{row.symbol}</td><td>{entryStamp(row.at)}</td><td>{row.entry_price.toFixed(2)}</td><td>{row.after ?? "—"}</td>
+          <td>{live ? "open" : row.closed_at ? `closed ${entryStamp(row.closed_at)} · ${row.exit_reason ?? ""}` : "open"}</td><td className={pnl >= 0 ? "positive" : "negative"}>{currency(pnl)}</td></tr>; })}
+      {!reentry.positions.length && <tr><td colSpan={6}>No re-entries yet</td></tr>}
+    </tbody></table>
+    <h2>Eligible for a re-entry now</h2>
+    <table className="ledger-table"><thead><tr><th>Stock · side</th><th>Exited contract</th><th>Exit</th><th>Exit time (IST)</th><th>Armed on</th></tr></thead><tbody>
+      {reentry.eligible.map((row) => <tr key={row.key}><td>{row.key.replace("|", " · ")}</td><td>{row.symbol}</td><td>{row.exit_reason}</td><td>{entryStamp(row.exit_at)}</td><td>{row.armed_on}</td></tr>)}
+      {!reentry.eligible.length && <tr><td colSpan={5}>None: a stock becomes eligible after a trailing or hard stop exit while its MACD is above zero</td></tr>}
+    </tbody></table>
   </>;
 }
 

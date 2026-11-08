@@ -30,7 +30,8 @@ from .contracts import ContractSelector
 from .events import EventHub, json_value
 from .greeks import contract_gex
 from .execution import ExecutionManager, ExitRetryWait
-from .models import Candle, Tick, Trade
+from .models import Candle, Signal, Tick, Trade
+from .reentry import REENTRY_KIND, ReentryTracker
 from . import market_calendar
 from .blast_engine import BlastEngine
 from .smart_lane import SmartLanes
@@ -274,6 +275,8 @@ class TradingEngine(DeskMixin):
         self.repository = TradeRepository(settings.database_path)
         self.portfolio = Portfolio(settings.initial_capital)
         self.execution = ExecutionManager(settings, self.broker, self.portfolio, self.repository, self.events)
+        self.reentry = ReentryTracker(str(Path(settings.database_path).parent / "macd_reentry.json"))
+        self.execution.reentry = self.reentry
         self.strategy = MACDStrategyManager(settings, self.events)
         self.candles = CandleAggregator(settings.timeframe_seconds)
         self.history: dict[str, deque[Candle]] = defaultdict(lambda: deque(maxlen=500))
@@ -1946,6 +1949,8 @@ class TradingEngine(DeskMixin):
             if signal and self._signal_bar_is_current(signal) and self.repository.save_signal(signal):
                 self.signals_emitted += 1
                 await self._route_signal(signal)
+            elif signal is None and point is not None:
+                await self._maybe_reenter(closed, point)
         # Commit the prior bar before previewing the new one. Otherwise the
         # boundary tick skips a close and can duplicate the prior zero-cross.
         signal = (None if current.symbol in self._warming_symbols
@@ -1973,6 +1978,41 @@ class TradingEngine(DeskMixin):
                 spot.admit(signal)
         except Exception as exc:  # noqa: BLE001 -- a lane fault must never stop the feed
             spot.error = f"intake {symbol}: {type(exc).__name__}: {exc}"[:300]
+
+    async def _maybe_reenter(self, closed, point) -> None:
+        """The MACD lane's re-entry on a closed bar of today's ATM option (reentry.py). MACD paper lane only:
+        not offered to the entry gate or the smart lanes; the Upstox live lane ignores the kind."""
+        tracker = getattr(self, "reentry", None)
+        symbol = closed.symbol
+        if (tracker is None or not self.settings.macd_reentry_enabled or not self.settings.auto_trade
+                or not tracker.eligible or symbol not in self.execution.tradable_symbols):
+            return
+        try:
+            indicator = self.strategy.indicators.get(symbol)
+            history = self.strategy.point_history.get(symbol)
+            candles = self.history.get(symbol)
+            if indicator is None or indicator.count <= self.settings.slow_period or not history or not candles:
+                return
+            macds = [p.macd for p in list(history)[-3:]]
+            highs = [c.high for c in list(candles)[-2:]]
+            flat = symbol not in self.portfolio.positions and self.execution.entry_block(symbol) is None
+            row = tracker.check(symbol, int(closed.timestamp), int(self.settings.timeframe_seconds), macds, highs,
+                                float(closed.close), self.execution.entry_universe, flat)
+            if row is None:
+                return
+            signal = Signal(symbol, "BUY", REENTRY_KIND, float(closed.close), point.macd, point.signal, point.histogram,
+                            evaluated_candle_timestamp=int(closed.timestamp))
+            if not self._signal_bar_is_current(signal):
+                return
+            tracker.note_fired(signal.signal_id, symbol, row)
+            if self.repository.save_signal(signal):
+                self.signals_emitted += 1
+                self.strategy.signals.insert(0, signal)
+                self.strategy.signals = self.strategy.signals[:200]
+                self.events.publish("signal", signal)
+                await self.execution.on_signal(signal)
+        except Exception as exc:  # noqa: BLE001 -- a re-entry fault must never stop the feed
+            tracker.error = f"{symbol}: {type(exc).__name__}: {exc}"[:200]
 
     async def _route_signal(self, signal) -> None:
         """Option BUY signals go through the entry gate; everything else straight to execution.

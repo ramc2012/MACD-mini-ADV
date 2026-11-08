@@ -204,3 +204,13 @@ test("a book that sells short closes its shorts on the cover; option books skip 
   // Without shorts the orphan SELL is skipped: the three buys form one long that the last sell does not flatten.
   assert.deepEqual(completedRoundTrips(trades), []);
 });
+
+test("re-entry rounds are matched by symbol and opening time from the tracker's position ids", async () => {
+  const { splitReentryRounds } = await import("../src/ledgerMath.ts");
+  const round = (symbol: string, entryTime: string) => ({ symbol, entryTime } as import("../src/ledgerMath.ts").RoundTrip);
+  const rows = [round("NSE:HAL26NOV4950CE", "2026-11-09T05:15:03.100000+00:00"), round("NSE:HAL26NOV4950CE", "2026-11-06T05:15:03+00:00"),
+    round("NSE:KEI26NOV3900CE", "2026-11-09T05:15:03+00:00")];
+  const { reentry, other } = splitReentryRounds(rows, ["NSE:HAL26NOV4950CE|2026-11-09T05:15:01.900000+00:00", "garbage", "NSE:X|not-a-date"]);
+  assert.deepEqual(reentry.map((r) => r.entryTime), ["2026-11-09T05:15:03.100000+00:00"]);
+  assert.equal(other.length, 2);
+});

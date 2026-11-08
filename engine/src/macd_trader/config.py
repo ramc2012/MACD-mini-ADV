@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     # is at +30%. At a 10% gate the rule closed 56 losers for +481,522 and
     # touched no winner. Off by default: it changes live exit behaviour.
     macd_invalidation_exit: bool = False
+    # Re-entry (owner 8 Nov 2026, reentry.py): after a trailing/hard stop exit, buy the stock's ATM option once more
+    # while its 30-min premium MACD stays above zero and rising. MACD paper lane only, tagged PREMIUM_MACD_REENTRY.
+    macd_reentry_enabled: bool = True
     macd_invalidation_max_mfe_pct: float = Field(default=0.10, ge=0.0, le=1.0)
     # Entry gate (entry_scorer.py): score each option signal, SIZE it by its score, spend cash best-first.
     # No score cut-offs (owner, 26 Oct 2026): the weakest of the day's signals buys macd_entry_min_size_fraction

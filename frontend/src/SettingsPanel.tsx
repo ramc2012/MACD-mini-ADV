@@ -512,7 +512,7 @@ function UpstoxControls() {
     if (armText.trim().toUpperCase() !== "ARM") { setError("Type ARM in the box first."); return; }
     void act("arm", { confirm: "ARM" }, () => "Armed: real orders from the next MACD signal, and it stays armed (across days and restarts) until you press Kill.").then(() => setArmText(""));
   };
-  const kill = () => void act("kill", {}, (r) => `Killed: dry run, no new orders.${Array.isArray(r.cancelled_entries) && r.cancelled_entries.length ? ` Cancelled ${r.cancelled_entries.length} unfilled entry order(s).` : ""} Open positions are not sold — use Exit all.`);
+  const kill = () => void act("kill", {}, (r) => `Killed: not armed, no new orders.${Array.isArray(r.cancelled_entries) && r.cancelled_entries.length ? ` Cancelled ${r.cancelled_entries.length} unfilled entry order(s).` : ""} Open positions are not sold — use Exit all.`);
   const exitAll = () => {
     if (!exitAsk) { setExitAsk(true); return; }
     setExitAsk(false);
@@ -523,7 +523,7 @@ function UpstoxControls() {
   const tone = !lane ? "pending" : lane.armed ? "down" : "ok";
   return <div className="settings-section fyers-login upstox-controls">
     <div className={`login-status ${tone}`}>
-      <b>{!lane ? "Reading the Upstox lane…" : lane.armed ? `ARMED — real Upstox orders until Kill${lane.armed_since ? ` (since ${new Date(lane.armed_since).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST)` : ""}` : "Dry run — nothing is sent"}</b>
+      <b>{!lane ? "Reading the Upstox lane…" : lane.armed ? `ARMED — real Upstox orders until Kill${lane.armed_since ? ` (since ${new Date(lane.armed_since).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST)` : ""}` : "Not armed — no orders are sent"}</b>
       <span style={{ display: "block", fontWeight: 400 }}>{lane ? `Order API ${apiOk ? "ok" : "blocked"} · account read ${lane.read_error ? "failing" : "ok"} · ${lane.positions.length} open · ${pendingEntries} pending entr${pendingEntries === 1 ? "y" : "ies"} · orders today ${lane.orders_today?.count ?? 0}/${lane.max_orders_per_day ?? "—"}` : ""}</span>
     </div>
     {lane?.order_api && !apiOk && <div className="settings-error">Order API: {lane.order_api.detail}</div>}
@@ -533,7 +533,7 @@ function UpstoxControls() {
       {!lane?.armed && <input aria-label="Type ARM to confirm real orders" placeholder="type ARM" value={armText} onChange={(e) => setArmText(e.target.value)}
         onKeyDown={(e) => { if (e.key === "Enter") arm(); }} style={{ width: 110 }} />}
       <button className="primary" disabled={!lane || lane.armed || !apiOk || !!busy || armText.trim().toUpperCase() !== "ARM"} title={apiOk ? "Send real orders from the next MACD signal (type ARM first)" : "The Upstox order API is blocked"} onClick={arm}>{busy === "arm" ? "Arming…" : lane?.armed ? "Armed" : "Arm real orders"}</button>
-      <button className="secondary" style={{ borderColor: "var(--negative, #e5484d)", color: "var(--negative, #e5484d)" }} disabled={!lane || !!busy} title="Back to dry run at once and cancel unfilled entry orders" onClick={kill}>{busy === "kill" ? "Killing…" : "Kill (disarm)"}</button>
+      <button className="secondary" style={{ borderColor: "var(--negative, #e5484d)", color: "var(--negative, #e5484d)" }} disabled={!lane || !!busy} title="Disarm at once and cancel unfilled entry orders" onClick={kill}>{busy === "kill" ? "Killing…" : "Kill (disarm)"}</button>
       <button className="secondary" disabled={!lane || !lane.positions.length || !!busy} title="Sell every lane position now" onClick={exitAll}>{busy === "exit-all" ? "Sending…" : exitAsk ? `Confirm: sell all ${lane?.positions.length ?? 0} now` : "Exit all lane positions"}</button>
       {exitAsk && <button className="secondary" onClick={() => setExitAsk(false)}>Cancel</button>}
     </div>

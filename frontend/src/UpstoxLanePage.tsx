@@ -49,7 +49,7 @@ const words = (text: string | null | undefined) => (text || "—").replace(/_/g,
 const rupeeText = (value: number) => new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 }).format(value);
 const DECISION_TONE: Record<string, string> = { ORDER_SENT: "positive", FILL: "positive", CLOSED: "positive",
   ORDER_ERROR: "negative", ORDER_REJECTED: "negative", CANCEL_ERROR: "negative" };
-const ENTRY_KINDS = ["ORDER_SENT", "DRY_RUN_ORDER", "SKIP", "SKIP_FUNDS", "ORDER_ERROR", "ORDER_LIMIT"];
+const ENTRY_KINDS = ["ORDER_SENT", "SKIP", "SKIP_FUNDS", "ORDER_ERROR", "ORDER_LIMIT"];
 const detail = (d: Decision) => Object.entries(d).filter(([k]) => !["at", "kind", "symbol"].includes(k))
   .map(([k, v]) => `${k.replace(/_/g, " ")}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`).join(" · ");
 
@@ -96,11 +96,11 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
       average_price: p.average_price, last_price: last, unrealized_pnl: (last - p.average_price) * p.quantity,
       return_pct: p.average_price ? (last / p.average_price - 1) * 100 : 0, opened_at: p.opened_at || d?.checked_at || "" };
   }), [d, ticks, lotOf]);
-  const orders = useMemo<Order[]>(() => (d?.orders ?? []).map((o) => {
+  const orders = useMemo<Order[]>(() => (d?.orders ?? []).filter((o) => !o.dry).map((o) => {
     const lot = lotOf(o.symbol, o.lot_size);
     const fill = d?.fills.find((f) => f.order_id === o.order_id);
     return { order_id: o.order_id, symbol: o.symbol, side: o.side, quantity: o.quantity, lots: Math.max(1, Math.round(o.quantity / lot)), lot_size: lot,
-      order_type: o.dry ? "LIMIT · dry run" : "LIMIT", status: (o.status || (o.open ? "open" : "—")).toUpperCase(), fill_price: fill?.price,
+      order_type: "LIMIT", status: (o.status || (o.open ? "open" : "—")).toUpperCase(), fill_price: fill?.price,
       created_at: o.placed_at, reject_reason: o.message || (o.reason ? `${o.reason} · limit ${o.price.toFixed(2)}` : null) };
   }), [d, lotOf]);
   const trades = useMemo<Trade[]>(() => (d?.fills ?? []).map((f, i) => {
@@ -179,8 +179,8 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
       <div><h1>Upstox live lane</h1>
         <p>MACD lane signals traded with real Upstox orders sized from the account's available funds{d?.cap ? ` (capped at ₹${rupeeText(d.cap)})` : ""} · every new option BUY signal whose one lot fits is bought (LIMIT, product D) · sold when the MACD lane closes the contract · armed once, until Kill</p></div>
       <div className="blast-badges">
-        <span className={d?.armed ? "mode alert" : "feed-badge"} title={d?.armed ? `Armed${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill (Settings → Upstox live)` : "Not armed: orders are journalled, nothing is sent"}>
-          {d ? (d.armed ? "ARMED · real money" : "Dry run · nothing sent") : "…"}</span>
+        <span className={d?.armed ? "mode alert" : "feed-badge"} title={d?.armed ? `Armed${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill (Settings → Upstox live)` : "Not armed: no orders are sent"}>
+          {d ? (d.armed ? "ARMED · real money" : "Not armed · no orders") : "…"}</span>
         <span className={orderApi && !orderApi.ok ? "mode alert" : "feed-badge"} title={orderApi ? `${orderApi.detail} · checked ${when(orderApi.checked_at)}` : "Not checked yet"}>
           Order API {orderApi ? (orderApi.ok ? "ok" : "blocked") : "…"}</span>
         <span className={d?.read_error ? "mode alert" : "feed-badge"} title={d?.read_error || `Account read ${when(d?.read_at)}`}>Account read {d ? (d.read_error ? "failing" : "ok") : "…"}</span>
@@ -244,7 +244,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
         <section className="panel agent-panel">
           <div className="panel-title">Lane health</div>
           <table className="live-table agent-table"><tbody>
-            <tr><th>Mode</th><td className={d.armed ? "negative" : ""}>{d.armed ? `ARMED${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill` : "Dry run: decisions are journalled, nothing is sent"}</td></tr>
+            <tr><th>Mode</th><td className={d.armed ? "negative" : ""}>{d.armed ? `ARMED${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill` : "Not armed: offered signals are journalled as skipped, no order is sent"}</td></tr>
             <tr><th>Order API</th><td className={orderApi && !orderApi.ok ? "negative" : ""}>{orderApi ? `${orderApi.detail} · ${when(orderApi.checked_at)}` : "not checked yet"}</td></tr>
             <tr><th>Account read</th><td className={d.read_error ? "negative" : ""}>{d.read_error || "ok"} · {when(d.read_at)}</td></tr>
             <tr><th>Upstox funds</th><td>{available == null ? "—" : `₹${rupeeText(available)} available`}{d.upstox_funds?.used_margin ? ` · ₹${rupeeText(d.upstox_funds.used_margin)} used` : ""}</td></tr>

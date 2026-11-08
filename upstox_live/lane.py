@@ -12,7 +12,9 @@ What it does, every few seconds:
   * reads the Upstox order book, trades, positions and funds, and serves the lane at /api/upstox-live/snapshot.
 
 Real orders go out ONLY while the arm file exists and contains "yes" (runtime/upstox_live/ARMED). Without it the lane
-runs dry: it journals exactly what it would have ordered. Arming is one-time: it stays on across days, restarts and
+sends nothing and keeps no would-be orders (owner, 8 Nov 2026: no dry-run records); a signal it is offered is journalled
+as skipped ("lane not armed"). Re-entry signals (PREMIUM_MACD_REENTRY) stay in the MACD paper lane until promoted, and
+spot or SELL signals are not this lane's, so none of those is journalled here. Arming is one-time: it stays on across days, restarts and
 Upstox re-logins until the owner presses Kill. Nothing here disarms it (an expired token only pauses entries).
 The Upstox access token is read from a file and never logged, printed or served.
 """
@@ -291,16 +293,11 @@ def count_order() -> bool:
 
 def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: str, force_live: bool = False) -> None:
     live = armed() or force_live
+    if not live:        # callers check armed() first; nothing is recorded for an order that is not sent
+        return
     body = {"quantity": qty, "product": "D", "validity": "DAY", "price": price, "tag": TAG,
             "instrument_token": inst["upstox"], "order_type": "LIMIT", "transaction_type": side,
             "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False, "slice": False}
-    if not live:
-        oid = f"DRY-{int(time.time() * 1000)}"
-        state["orders"][oid] = {"order_id": oid, "symbol": symbol, "instrument": inst["upstox"], "side": side, "quantity": qty,
-                                "price": price, "placed_at": iso(), "reason": reason, "dry": True, "open": False,
-                                "status": "dry run (not sent)", "lot_size": inst.get("lot_size"), "tick": inst.get("tick_size")}
-        journal("DRY_RUN_ORDER", symbol=symbol, side=side, quantity=qty, price=price, reason=reason)
-        return
     if not count_order():
         journal("ORDER_LIMIT", symbol=symbol, side=side, reason=f"{MAX_ORDERS_PER_DAY} orders already sent today")
         return
@@ -406,6 +403,12 @@ def step() -> None:
             continue
         if any(o["symbol"] == sym and o["side"] == "SELL" and o.get("open") for o in state["orders"].values()):
             continue
+        if not armed():
+            if not p.get("exit_unsent_noted"):
+                p["exit_unsent_noted"] = True
+                journal("EXIT_NOT_SENT", symbol=sym, reason="the MACD lane closed it, but the lane is not armed: use Exit all")
+            continue
+        p.pop("exit_unsent_noted", None)
         attempts = sum(1 for o in state["orders"].values() if o["symbol"] == sym and o["side"] == "SELL" and not o.get("dry"))
         last = ltp(sym)
         if last is None:
@@ -424,11 +427,10 @@ def step() -> None:
         if not at or at < started or (now() - at).total_seconds() > MAX_SIGNAL_AGE:
             continue   # never act on signals from before the lane started or that are stale
         sym = s["symbol"]
-        if s.get("side") != "BUY":
-            journal("SKIP", symbol=sym, reason=f"{s.get('side')} signal; the lane only buys options to open")
-            continue
-        if not OPTION_RE.search(sym):
-            journal("SKIP", symbol=sym, reason="not an option contract; the lane buys index/stock options only")
+        if s.get("side") != "BUY" or not OPTION_RE.search(sym) or "REENTRY" in str(s.get("kind") or ""):
+            continue    # not offered to this lane: spot/SELL signals, and re-entries (MACD paper lane until promoted)
+        if not armed():
+            journal("SKIP", symbol=sym, signal_kind=s.get("kind"), price=s.get("price"), reason="lane not armed: no order sent")
             continue
         if sym in state["positions"] or any(o["symbol"] == sym and o.get("open") for o in state["orders"].values()):
             journal("SKIP", symbol=sym, reason="already held or ordering")
@@ -441,9 +443,9 @@ def step() -> None:
         limit = tick_round(price * (1 + ENTRY_BUFFER), float(inst.get("tick_size") or 0.05), up=True)
         cost, (free, basis) = limit * lot, fund_status()
         if price <= 0 or cost + CHARGES_ALLOWANCE > free:
-            journal("SKIP_FUNDS", symbol=sym, price=price, lot_size=lot, cost=round(cost, 2), free=round(free, 2), basis=basis)
+            journal("SKIP_FUNDS", symbol=sym, signal_kind=s.get("kind"), price=price, lot_size=lot, cost=round(cost, 2), free=round(free, 2), basis=basis)
             continue
-        if armed() and not (cache.get("order_api") or {}).get("ok", True):
+        if not (cache.get("order_api") or {}).get("ok", True):
             journal("SKIP", symbol=sym, reason="armed, but the Upstox order API is blocked: " + str((cache.get("order_api") or {}).get("detail")))
             continue
         place(sym, inst, "BUY", lot, limit, f"{s.get('kind')} at {price}")
@@ -528,7 +530,7 @@ def snapshot() -> dict:
         f = cache.get("funds") or {}
         free, basis = fund_status()
         return {
-            "lane": "upstox_live", "label": "Upstox live", "armed": armed(), "mode": "LIVE" if armed() else "DRY RUN",
+            "lane": "upstox_live", "label": "Upstox live", "armed": armed(), "mode": "LIVE" if armed() else "NOT ARMED",
             "capital": START_FUND, "cap": CAPITAL or None, "fund_basis": basis, "in_flight": round(in_flight(), 2),
             "charges_allowance": CHARGES_ALLOWANCE, "armed_since": state.get("armed_since"),
             "deployed": round(deployed(), 2), "free": round(free, 2),
@@ -536,9 +538,9 @@ def snapshot() -> dict:
             "equity": round(START_FUND + state["realized"] + unreal, 2),
             "upstox_funds": (f.get("equity") if isinstance(f, dict) else None),
             "positions": positions, "closed": state.get("closed", [])[-100:],
-            "orders": sorted(state["orders"].values(), key=lambda o: o["placed_at"], reverse=True)[:200],
+            "orders": sorted((o for o in state["orders"].values() if not o.get("dry")), key=lambda o: o["placed_at"], reverse=True)[:200],
             "fills": sorted(state["fills"].values(), key=lambda f: str(f["at"]), reverse=True)[:200],
-            "decisions": list(reversed(state["decisions"][-200:])),
+            "decisions": list(reversed([d for d in state["decisions"] if d.get("kind") != "DRY_RUN_ORDER"][-200:])),
             "account": {"positions": cache["positions"], "orders": cache["orders"], "trades": cache["trades"],
                         "lane_instruments": sorted(lane_instruments)},
             "macd_open": cache["macd_open"], "macd_checked_at": cache["macd_checked_at"],
@@ -551,7 +553,8 @@ def snapshot() -> dict:
                                + (f"; capped at Rs {CAPITAL:,.0f} + booked P&L - deployed" if CAPITAL > 0 else "; no lane cap")
                                + f"; no entries if the read is older than {int(FUNDS_MAX_AGE)} s"),
                       "orders": f"product D (carry forward), DAY validity, tag {TAG}, at most {MAX_ORDERS_PER_DAY} orders a day",
-                      "arming": "Arm once: real orders until Kill is pressed, across days, restarts and Upstox re-logins (an expired token only pauses entries)"},
+                      "arming": "Arm once: real orders until Kill is pressed, across days, restarts and Upstox re-logins (an expired token only pauses entries). Not armed: nothing is sent or recorded as an order",
+                      "signals": "MACD lane option BUY signals only; re-entry signals stay in the MACD paper lane until promoted"},
             "checked_at": iso(),
         }
 
@@ -646,6 +649,6 @@ if __name__ == "__main__":
     os.makedirs(STATE_DIR, exist_ok=True)
     recover_armed_since()
     print(f"upstox-live: fund = Upstox available margin{f' (cap Rs {CAPITAL:,.0f})' if CAPITAL > 0 else ''}, "
-          f"{'ARMED (real orders, until Kill)' if armed() else 'dry run'}, port {PORT}", flush=True)
+          f"{'ARMED (real orders, until Kill)' if armed() else 'not armed (no orders)'}, port {PORT}", flush=True)
     threading.Thread(target=loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

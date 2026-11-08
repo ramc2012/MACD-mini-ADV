@@ -87,6 +87,8 @@ class ExecutionManager:
         # Exchange lot revisions adopted for open positions (correct_lot_sizes), newest last.
         self.lot_corrections: list[dict] = []
         self.exit_reasons: dict[str, str] = {}
+        # The MACD lane's re-entry tracker (reentry.ReentryTracker); None for every other lane's book.
+        self.reentry = None
         # Symbols whose next SELL was armed by an automated exit. A SELL that
         # arrives without one is a manual ticket and is labelled MANUAL, so a
         # stale HARD_STOP from a previous position can no longer be stamped
@@ -425,6 +427,8 @@ class ExecutionManager:
                 position.exit_stage = exit_stage
             if order.side == "BUY" and existing_position is None and self.entry_context is not None:
                 self._record_entry_context(order)
+            if order.side == "BUY" and existing_position is None and position is not None:
+                self._note_reentry_entry(order, position)
             if closed is not None:
                 closed.exit_reason = self.exit_reasons.get(order.symbol)
             portfolio_snapshot = self.portfolio_snapshot()
@@ -444,6 +448,7 @@ class ExecutionManager:
             raise
         if closed is not None:
             self.closed_positions.insert(0, json_value(closed))
+            self._note_reentry_close(closed)
             self.events.publish("position_closed", closed)
         self.events.publish("order", order)
         self.events.publish("trade", trade)
@@ -524,8 +529,26 @@ class ExecutionManager:
             if closed is not None:
                 snapshot["closed_positions"] = [json_value(closed), *snapshot["closed_positions"]]
             self.repository.save_paper_fill(order, trade, self.portfolio.positions.values(), closed, snapshot)
+        if closed is not None:
+            self._note_reentry_close(closed)
         self.events.publish("portfolio", self.portfolio_snapshot())
         return json_value(closed) if closed is not None else {}
+
+    def _note_reentry_entry(self, order: Order, position) -> None:
+        if self.reentry is None:
+            return
+        try:
+            self.reentry.on_entry(order.symbol, order.signal_id, position.position_id, float(order.fill_price or 0))
+        except Exception as exc:  # noqa: BLE001 -- bookkeeping only, never blocks a fill
+            self.reentry.error = f"entry {order.symbol}: {type(exc).__name__}: {exc}"[:200]
+
+    def _note_reentry_close(self, closed) -> None:
+        if self.reentry is None:
+            return
+        try:
+            self.reentry.on_closed(closed)
+        except Exception as exc:  # noqa: BLE001
+            self.reentry.error = f"close {closed.symbol}: {type(exc).__name__}: {exc}"[:200]
 
     def _record_entry_context(self, order: Order) -> None:
         """Log the underlying's session order flow at a new position's entry. Never blocks the fill."""
@@ -689,6 +712,7 @@ class ExecutionManager:
             "trades": self.repository.rows("trades"),
             "portfolio": self.portfolio_snapshot(),
             "closed_positions": self.visible_closed_positions(),
+            "reentry": self.reentry.snapshot() if self.reentry is not None else None,
             "risk": {
                 "hard_stop_pct": self.settings.hard_stop_pct * 100,
                 "trailing_activation_profit_pct": self.settings.trailing_activation_pct * 100,

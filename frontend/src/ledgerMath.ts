@@ -195,3 +195,23 @@ export function roundStats(rounds: readonly RoundTrip[]): RoundStats {
     medianHeldMs: held.length ? (held.length % 2 ? held[middle] : (held[middle - 1] + held[middle]) / 2) : null,
   };
 }
+
+/** Split completed trades into re-entries and the rest. A re-entry is named by its position id ("SYMBOL|opened ISO");
+ *  a round trip is that position when the symbol matches and it opened within 10 s of that time. */
+export function splitReentryRounds(rounds: readonly RoundTrip[], positionIds: readonly string[]): { reentry: RoundTrip[]; other: RoundTrip[] } {
+  const opened = new Map<string, number[]>();
+  for (const id of positionIds) {
+    const cut = id.lastIndexOf("|");
+    if (cut < 0) continue;
+    const at = Date.parse(id.slice(cut + 1));
+    if (!Number.isFinite(at)) continue;
+    const symbol = id.slice(0, cut);
+    opened.set(symbol, [...(opened.get(symbol) ?? []), at]);
+  }
+  const reentry: RoundTrip[] = [], other: RoundTrip[] = [];
+  for (const row of rounds) {
+    const at = Date.parse(row.entryTime);
+    (opened.get(row.symbol)?.some((t) => Math.abs(t - at) <= 10_000) ? reentry : other).push(row);
+  }
+  return { reentry, other };
+}
