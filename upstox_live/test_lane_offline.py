@@ -1,0 +1,52 @@
+import os, sys, json, importlib
+from datetime import datetime, timezone, timedelta
+import tempfile; S = tempfile.mkdtemp()
+os.environ.update(STATE_DIR=S + "/state", UPSTOX_TOKEN_FILE="/nonexistent")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lane
+sent = []
+now = datetime.now(timezone.utc)
+sig = lambda i, sym, price, ago=5: {"signal_id": f"s{i}", "symbol": sym, "side": "BUY", "kind": "PREMIUM_MACD_ZERO_CROSS_UP", "price": price,
+                                    "timestamp": (now - timedelta(seconds=ago)).isoformat()}
+world = {"signals": [], "macd": [], "trades": [], "orders": [], "positions": []}
+lane.state["started_at"] = (now - timedelta(minutes=1)).isoformat()
+def engine(path):
+    return world["signals"] if path.startswith("/api/signals") else {"positions": [{"symbol": s} for s in world["macd"]]}
+def upstox(method, host, path, body=None, query=None):
+    if method == "POST":
+        oid = f"OID{len(sent)+1}"; sent.append((path, body)); return {"data": {"order_ids": [oid]}}
+    if method == "DELETE": sent.append((path, query)); return {"data": {}}
+    if "funds" in path: return {"data": {"equity": {"available_margin": 30000.0}}}
+    if "retrieve-all" in path: return {"data": world["orders"]}
+    if "trades" in path: return {"data": world["trades"]}
+    return {"data": world["positions"]}
+lots = {"NSE:CHEAP26NOV100CE": (500, "NSE_FO|1"), "NSE:DEAR26NOV900CE": (300, "NSE_FO|2")}
+lane.engine, lane.upstox = engine, upstox
+lane.resolve = lambda s: {"upstox": lots[s][1], "lot_size": lots[s][0], "tick_size": 0.05}
+# 1. dry run: expensive signal skipped, cheap one would be ordered, nothing sent
+world["signals"] = [sig(1, "NSE:DEAR26NOV900CE", 120.0, 8), sig(2, "NSE:CHEAP26NOV100CE", 20.0, 4)]
+lane.read_upstox(); lane.step()
+print("dry:", [(d["kind"], d.get("symbol")) for d in lane.state["decisions"]], "sent", sent)
+assert not sent
+# 2. armed: new cheap signal -> real order (fake), fill, MACD holds, then MACD closes -> sell
+os.makedirs(S + "/state", exist_ok=True); open(lane.ARM_FILE, "w").write("yes")
+lane.state["orders"] = {}
+world["signals"].append(sig(3, "NSE:CHEAP26NOV100CE", 21.0, 2))
+lane.step(); print("armed entry sent:", sent[-1]); assert sent[-1][1]["transaction_type"] == "BUY" and sent[-1][1]["quantity"] == 500 and sent[-1][1]["price"] == 21.45
+world["orders"] = [{"order_id": "OID1", "status": "complete", "filled_quantity": 500}]
+world["trades"] = [{"order_id": "OID1", "trade_id": "T1", "quantity": 500, "average_price": 21.4, "transaction_type": "BUY"}]
+world["positions"] = [{"instrument_token": "NSE_FO|1", "last_price": 25.0, "quantity": 500}]
+world["macd"] = ["NSE:CHEAP26NOV100CE"]
+lane.read_upstox(); lane.step()
+snap = lane.snapshot(); print("held:", [(p["symbol"], p["quantity"], p["average_price"], p["unrealized_pnl"]) for p in snap["positions"]], "free", snap["free"])
+world["macd"] = []
+lane.step(); print("exit sent:", sent[-1]); assert sent[-1][1]["transaction_type"] == "SELL" and sent[-1][1]["quantity"] == 500 and sent[-1][1]["price"] == 24.25
+world["orders"].append({"order_id": "OID2", "status": "complete", "filled_quantity": 500})
+world["trades"].append({"order_id": "OID2", "trade_id": "T2", "quantity": 500, "average_price": 24.3, "transaction_type": "SELL"})
+lane.read_upstox(); lane.step()
+snap = lane.snapshot(); print("after exit: realized", snap["realized"], "positions", snap["positions"], "closed", len(snap["closed"]))
+assert abs(snap["realized"] - 1450) < 0.01 and not snap["positions"]
+# 3. old signal (before start) and stale ones ignored; a second identical signal while ordering skipped
+world["signals"].append(sig(4, "NSE:CHEAP26NOV100CE", 20.0, 600))
+n = len(sent); lane.step(); assert len(sent) == n
+print("OK, decisions:", [d["kind"] for d in lane.state["decisions"]])
