@@ -514,14 +514,19 @@ def snapshot() -> dict:
 
 
 LOOPBACK = {"localhost", "127.0.0.1", "::1", "[::1]"}
+ALLOWED_ORIGINS = {o.strip().rstrip("/") for o in os.environ.get("MACD_ALLOWED_ORIGINS_CSV", "").split(",") if o.strip()}
 
 
 def allowed(headers) -> bool:
     """Browser calls from this Mac's own pages (localhost origin) or a client holding the MACD API token."""
     if ENGINE_TOKEN and headers.get("X-Macd-Token") == ENGINE_TOKEN:
         return True
-    origin = headers.get("Origin") or ""
-    return bool(origin) and (urllib.parse.urlparse(origin).hostname or "") in LOOPBACK
+    origin = (headers.get("Origin") or "").rstrip("/")
+    if not origin:
+        return False
+    if origin in ALLOWED_ORIGINS:          # the engine's own list: the Tailscale address and machine names
+        return True
+    return (urllib.parse.urlparse(origin).hostname or "") in LOOPBACK
 
 
 class Handler(BaseHTTPRequestHandler):

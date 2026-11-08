@@ -176,6 +176,7 @@ services:
     environment:
       ENGINE_URL: http://gateway:8100
       MACD_API_TOKEN: ${MACD_API_TOKEN:-}
+      MACD_ALLOWED_ORIGINS_CSV: ${MACD_ALLOWED_ORIGINS_CSV:-}
       HUB_URL: http://host.docker.internal:8400
       UPSTOX_TOKEN_FILE: /secrets/upstox.token
       STATE_DIR: /app/runtime/upstox_live

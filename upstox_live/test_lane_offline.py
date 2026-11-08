@@ -76,5 +76,9 @@ assert post("/arm", {}, "http://localhost:3200")[0] == 400
 lane.cache["order_api"] = {"ok": True, "detail": "ok"}
 assert post("/arm", {"confirm": "ARM"}, "http://localhost:3200")[0] == 200 and lane.armed()
 assert post("/kill", {}, "http://127.0.0.1:3200")[0] == 200 and not lane.armed()
+lane.ALLOWED_ORIGINS.add("http://100.119.170.94:3200")
+assert post("/arm", {"confirm": "ARM"}, "http://100.119.170.94:3200")[0] == 200 and lane.armed()
+assert post("/kill", {}, "http://100.119.170.94:3200")[0] == 200 and not lane.armed()
+assert post("/arm", {"confirm": "ARM"}, "http://100.119.170.95:3200")[0] == 403
 srv.shutdown()
 print("controls OK")
