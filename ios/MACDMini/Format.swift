@@ -78,6 +78,9 @@ enum Fmt {
         return sign + "₹" + body
     }
 
+    /// 6,150 or 1,12,500 (Indian grouping), no sign.
+    static func qty(_ v: Double) -> String { indian.string(from: NSNumber(value: abs(v).rounded())) ?? "\(Int(abs(v)))" }
+
     static func price(_ v: Double?) -> String {
         guard let v, v.isFinite else { return "—" }
         return indianPrice.string(from: NSNumber(value: v)) ?? String(format: "%.2f", v)

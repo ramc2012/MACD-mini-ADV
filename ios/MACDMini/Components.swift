@@ -59,9 +59,13 @@ struct HealthBanner: View {
                     }
                 }
                 Text(market(h)).font(.caption).foregroundStyle(.secondary)
-                if h.tokenExpired == true {
-                    Text("The Fyers token has expired. Refresh it from the web app (Fyers settings) or POST /api/auth/fyers/refresh.")
-                        .font(.caption).foregroundStyle(.orange)
+                if h.tokenExpired == true || h.socketAuthFailed == true {
+                    Button { model.tab = .brokers } label: {
+                        Label(h.tokenExpired == true ? "The Fyers token has expired. Log in again on the Brokers tab."
+                                                     : "Fyers refused the feed socket's token. Log in again on the Brokers tab.",
+                              systemImage: "key.horizontal")
+                    }
+                    .font(.caption).foregroundStyle(.orange)
                 } else if let err = h.error, !err.isEmpty, h.status != "connected" {
                     Text(err).font(.caption).foregroundStyle(.orange)
                 }

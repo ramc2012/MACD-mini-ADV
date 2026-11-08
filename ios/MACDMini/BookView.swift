@@ -1,100 +1,146 @@
 import SwiftUI
 
-/// The MACD lane's open positions (/api/portfolio).
-struct BookView: View {
+/// A lane's open positions in full: sortable and searchable. Pushed from the lane page.
+struct PositionsListView: View {
     enum Sort: String, CaseIterable, Identifiable {
         case pnl = "P&L", ret = "Return", newest = "Newest"
         var id: String { rawValue }
     }
 
-    @Environment(AppModel.self) private var model
-    @State private var book = Loader<Portfolio>()
+    let title: String
+    let positions: [BookPosition]
     @State private var sort = Sort.pnl
     @State private var search = ""
 
     var body: some View {
-        NavigationStack {
-            List {
-                if let p = book.value {
-                    Section {
-                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
-                            GridRow {
-                                Stat(title: "Equity", value: Fmt.rupees(p.equity))
-                                Stat(title: "Booked", value: Fmt.rupees(p.realizedPnl, signed: true), color: .pnl(p.realizedPnl))
-                                Stat(title: "Open P&L", value: Fmt.rupees(p.unrealizedPnl, signed: true), color: .pnl(p.unrealizedPnl))
-                            }
-                            GridRow {
-                                Stat(title: "Cash", value: Fmt.rupees(p.cash))
-                                Stat(title: "In positions", value: Fmt.rupees(p.marketValue))
-                                Stat(title: "Positions", value: "\(p.positions.count)")
-                            }
-                        }
-                        .padding(.vertical, 4)
-                        StaleNote(error: book.error, updated: book.updated)
-                    }
-                    Section {
-                        Picker("Sort", selection: $sort) {
-                            ForEach(Sort.allCases) { Text($0.rawValue).tag($0) }
-                        }
-                        .pickerStyle(.segmented)
-                        .listRowBackground(Color.clear)
-                        .listRowInsets(EdgeInsets())
-                        let shown = rows(p.positions)
-                        ForEach(shown) { PositionRow(position: $0) }
-                        if shown.isEmpty {
-                            Text(search.isEmpty ? "No open positions." : "No open position matches “\(search)”.")
-                                .font(.callout).foregroundStyle(.secondary)
-                        }
-                    } header: {
-                        Text("Open positions")
-                    }
+        List {
+            Section {
+                Picker("Sort", selection: $sort) {
+                    ForEach(Sort.allCases) { Text($0.rawValue).tag($0) }
                 }
+                .pickerStyle(.segmented)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
+                let shown = rows
+                ForEach(shown) { PositionRow(position: $0) }
+                if shown.isEmpty {
+                    Text(search.isEmpty ? "No open positions." : "No open position matches “\(search)”.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("\(positions.count) open")
             }
-            .overlay { LoadState(loader: book, retry: load) }
-            .searchable(text: $search, prompt: "Symbol")
-            .navigationTitle("MACD book")
-            .refreshable { await load() }
-            .polling(every: 20, id: model.version) { await load() }
         }
+        .searchable(text: $search, prompt: "Symbol")
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
     }
 
-    private func rows(_ all: [Position]) -> [Position] {
+    private var rows: [BookPosition] {
         let q = search.trimmingCharacters(in: .whitespaces).uppercased()
-        let shown = q.isEmpty ? all : all.filter { $0.symbol.uppercased().contains(q) }
-        switch sort {
-        case .pnl: return shown.sorted { ($0.unrealizedPnl ?? 0) > ($1.unrealizedPnl ?? 0) }
-        case .ret: return shown.sorted { ($0.returnPct ?? 0) > ($1.returnPct ?? 0) }
-        case .newest: return shown.sorted { (Fmt.date($0.openedAt) ?? .distantPast) > (Fmt.date($1.openedAt) ?? .distantPast) }
-        }
+        let shown = q.isEmpty ? positions : positions.filter { $0.symbol.uppercased().contains(q) }
+        return PositionsListView.sorted(shown, by: sort)
     }
 
-    private func load() async {
-        await book.load { try await model.api().get("api/portfolio") }
+    static func sorted(_ rows: [BookPosition], by sort: Sort) -> [BookPosition] {
+        switch sort {
+        case .pnl: return rows.sorted { ($0.pnl ?? 0) > ($1.pnl ?? 0) }
+        case .ret: return rows.sorted { ($0.returnPct ?? 0) > ($1.returnPct ?? 0) }
+        case .newest: return rows.sorted { (Fmt.date($0.openedAt) ?? .distantPast) > (Fmt.date($1.openedAt) ?? .distantPast) }
+        }
+    }
+}
+
+/// A lane's exits in full, newest first, searchable.
+struct ExitsListView: View {
+    let title: String
+    let exits: [BookExit]
+    let note: String?
+    @State private var search = ""
+
+    var body: some View {
+        List {
+            let q = search.trimmingCharacters(in: .whitespaces).uppercased()
+            let shown = q.isEmpty ? exits : exits.filter { $0.symbol.uppercased().contains(q) || ($0.reason ?? "").contains(q) }
+            Section {
+                ForEach(shown) { ExitRow(exit: $0) }
+                if shown.isEmpty {
+                    Text(search.isEmpty ? "No exits." : "No exit matches “\(search)”.").font(.callout).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("\(exits.count) exits · net \(Fmt.rupees(exits.compactMap(\.pnl).reduce(0, +), signed: true))")
+            } footer: {
+                if let note { Text(note) }
+            }
+        }
+        .searchable(text: $search, prompt: "Symbol or exit reason")
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
 struct PositionRow: View {
-    let position: Position
+    let position: BookPosition
 
     var body: some View {
+        let p = position
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
-                Text(Fmt.symbol(position.symbol)).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                Text(Fmt.symbol(p.symbol)).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                if p.quantity < 0 { Badge(text: "SHORT", color: .loss) }
+                if let note = p.note { Badge(text: note.uppercased(), color: .secondary) }
                 Spacer()
-                Text(Fmt.rupees(position.unrealizedPnl, signed: true)).font(.subheadline.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(Color.pnl(position.unrealizedPnl))
+                Text(Fmt.rupees(p.pnl, signed: true)).font(.subheadline.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(Color.pnl(p.pnl))
             }
             HStack(alignment: .firstTextBaseline) {
-                Text("\(Int(position.quantity)) qty\(position.lots.map { " · \(Int($0)) lot\($0 == 1 ? "" : "s")" } ?? "") · \(Fmt.price(position.averagePrice)) → \(Fmt.price(position.lastPrice))")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                Text("\(Fmt.qty(p.quantity)) qty\(p.lots.map { " · \(Int($0)) lot\($0 == 1 ? "" : "s")" } ?? "") · \(Fmt.price(p.entry)) → \(Fmt.price(p.last))")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
                 Spacer()
-                Text(Fmt.pct(position.returnPct)).font(.caption.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(Color.pnl(position.returnPct))
+                Text(Fmt.pct(p.returnPct)).font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(Color.pnl(p.returnPct))
             }
-            Text("Opened \(Fmt.dateTime(position.openedAt))\(position.trailingStop.map { " · trail \(Fmt.price($0))" } ?? "")")
+            Text("Opened \(Fmt.dateTime(p.openedAt))\(p.stop.map { " · \(p.stopLabel) \(Fmt.price($0))" } ?? "")")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
+    }
+}
+
+struct ExitRow: View {
+    let exit: BookExit
+
+    var body: some View {
+        let e = exit
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(Fmt.symbol(e.symbol)).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+                if e.side == "SHORT" { Badge(text: "SHORT", color: .loss) }
+                Spacer()
+                Text(Fmt.rupees(e.pnl, signed: true)).font(.subheadline.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(Color.pnl(e.pnl))
+            }
+            HStack(alignment: .firstTextBaseline) {
+                Text("\(e.quantity.map { "\(Fmt.qty($0)) qty · " } ?? "")\(Fmt.price(e.entry)) → \(Fmt.price(e.exit)) · \(Fmt.words(e.reason))")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(2)
+                Spacer()
+                Text(Fmt.pct(e.returnPct)).font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(Color.pnl(e.returnPct))
+            }
+            Text("\(Fmt.dateTime(e.entryTime)) → \(Fmt.dateTime(e.exitTime))")
+                .font(.caption2).foregroundStyle(.tertiary).lineLimit(1).minimumScaleFactor(0.7)
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct Badge: View {
+    let text: String
+    let color: Color
+    var body: some View {
+        Text(text).font(.caption2.weight(.bold)).padding(.horizontal, 4).padding(.vertical, 1)
+            .background(color.opacity(0.16), in: .rect(cornerRadius: 3)).foregroundStyle(color)
     }
 }

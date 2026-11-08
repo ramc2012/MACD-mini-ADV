@@ -5,9 +5,10 @@ import SwiftUI
 struct LanesView: View {
     @Environment(AppModel.self) private var model
     @State private var board = Loader<Scoreboard>()
+    @State private var path: [LaneScore] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             List {
                 Section { HealthBanner() }
                 if let lanes = board.value?.lanes {
@@ -39,6 +40,10 @@ struct LanesView: View {
     private func load() async {
         await model.refreshHealth()
         await board.load { try await model.api().get("api/scoreboard") }
+        if let name = model.launchLane, let lane = board.value?.lanes.first(where: { $0.lane == name }) {
+            model.launchLane = nil
+            path = [lane]
+        }
     }
 }
 
@@ -84,7 +89,10 @@ struct LaneRow: View {
 
 struct LaneDetailView: View {
     let lane: LaneScore
+    @Environment(AppModel.self) private var model
+    @State private var book = Loader<LaneBook>()
     @State private var showAllExits = false
+    private let preview = 6
 
     var body: some View {
         List {
@@ -109,6 +117,8 @@ struct LaneDetailView: View {
                 .padding(.vertical, 4)
                 if let note = lane.note, !note.isEmpty { Text(note).font(.caption).foregroundStyle(.secondary) }
             }
+
+            bookSections
 
             if let curve = lane.curve, curve.count > 1 {
                 Section("Equity") {
@@ -201,5 +211,52 @@ struct LaneDetailView: View {
         }
         .navigationTitle(lane.label)
         .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await loadBook() }
+        .polling(every: LaneBooks.refreshSeconds(lane.lane), id: "\(model.version)|\(lane.lane)") { await loadBook() }
+    }
+
+    @ViewBuilder
+    private var bookSections: some View {
+        if let b = book.value {
+            Section {
+                let top = Array(PositionsListView.sorted(b.positions, by: .pnl).prefix(preview))
+                ForEach(top) { PositionRow(position: $0) }
+                if b.positions.isEmpty { Text("No open positions.").font(.callout).foregroundStyle(.secondary) }
+                if b.positions.count > preview {
+                    NavigationLink("All \(b.positions.count) open positions") {
+                        PositionsListView(title: "\(lane.label) · open", positions: b.positions)
+                    }
+                }
+            } header: {
+                Text("Open positions · \(Fmt.rupees(b.unrealized, signed: true))")
+            } footer: {
+                StaleNote(error: book.error, updated: book.updated)
+            }
+            Section {
+                ForEach(b.exits.prefix(preview)) { ExitRow(exit: $0) }
+                if b.exits.isEmpty { Text("No recent exits.").font(.callout).foregroundStyle(.secondary) }
+                if b.exits.count > preview {
+                    NavigationLink("All \(b.exits.count) exits") {
+                        ExitsListView(title: "\(lane.label) · exits", exits: b.exits, note: b.exitsNote)
+                    }
+                }
+            } header: {
+                Text("Recent exits")
+            } footer: {
+                if let note = b.exitsNote { Text(note) }
+            }
+        } else if let error = book.error {
+            Section("Book") {
+                Label(error, systemImage: "exclamationmark.triangle").font(.callout).foregroundStyle(.orange)
+                Button("Try again") { Task { await loadBook() } }
+            }
+        } else {
+            Section("Book") { HStack { ProgressView(); Text("Loading positions…").foregroundStyle(.secondary) } }
+        }
+    }
+
+    private func loadBook() async {
+        let name = lane.lane
+        await book.load { try await LaneBooks.load(name, api: model.api()) }
     }
 }

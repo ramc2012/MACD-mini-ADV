@@ -105,22 +105,21 @@ struct SectorCoilView: View {
     private let steps = [("M", "Monthly"), ("2W", "Fortnightly"), ("W", "Weekly"), ("TEMPLATE", "One month ago")]
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    controls
-                    if let c = coil.value { chart(c) }
-                }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 24)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                controls
+                if let c = coil.value { chart(c) }
             }
-            .overlay { LoadState(loader: coil, retry: load) }
-            .navigationTitle("Sector coil")
-            .refreshable { await load() }
-            .polling(every: 60, id: "\(model.version)|\(base)|\(step)|\(measure)") { await load() }
-            .sheet(item: $picked) { row in
-                if let c = coil.value { CoilRowDetail(row: row, days: [c.baseDay ?? ""] + c.points, unit: unit(c)) }
-            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 24)
+        }
+        .overlay { LoadState(loader: coil, retry: load) }
+        .navigationTitle("Sector coil")
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await load() }
+        .polling(every: 60, id: "\(model.version)|\(base)|\(step)|\(measure)") { await load() }
+        .sheet(item: $picked) { row in
+            if let c = coil.value { CoilRowDetail(row: row, days: [c.baseDay ?? ""] + c.points, unit: unit(c)) }
         }
     }
 

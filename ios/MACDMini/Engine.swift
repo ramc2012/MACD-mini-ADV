@@ -10,31 +10,49 @@ struct APIError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+/// One HTTP service: the MACD engine (X-Macd-Token) or the platform console (no token, local only).
 struct EngineAPI {
     let base: URL
-    let token: String
+    let token: String?
+    var name = "engine"
 
     func get<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> T {
+        try await send("GET", path, query: query, body: nil)
+    }
+
+    /// POST with a JSON body. Bodies may carry secrets the owner typed (PIN, broker secret, pasted token):
+    /// they go only to this service and are never logged or kept.
+    func post<T: Decodable>(_ path: String, body: [String: Any]? = nil) async throws -> T {
+        try await send("POST", path, query: [:], body: body)
+    }
+
+    private func send<T: Decodable>(_ method: String, _ path: String, query: [String: String], body: [String: Any]?) async throws -> T {
         guard var comps = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false) else {
-            throw APIError("Bad engine address")
+            throw APIError("Bad \(name) address")
         }
         if !query.isEmpty { comps.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) } }
-        guard let url = comps.url else { throw APIError("Bad engine address") }
-        var request = URLRequest(url: url, timeoutInterval: 25)
-        request.setValue(token, forHTTPHeaderField: "X-Macd-Token")
+        guard let url = comps.url else { throw APIError("Bad \(name) address") }
+        var request = URLRequest(url: url, timeoutInterval: method == "POST" ? 60 : 25)
+        request.httpMethod = method
+        if let token { request.setValue(token, forHTTPHeaderField: "X-Macd-Token") }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await URLSession.shared.data(for: request)
         } catch let error as URLError where error.code == .cannotConnectToHost || error.code == .timedOut
                     || error.code == .cannotFindHost || error.code == .networkConnectionLost {
-            throw APIError("Can't reach the engine at \(base.absoluteString). Is the macd-mini-parallel stack running?")
+            throw APIError(name == "engine"
+                ? "Can't reach the engine at \(base.absoluteString). Is the macd-mini-parallel stack running?"
+                : "Can't reach the platform console at \(base.absoluteString). Is the market-intelligence stack running?")
         }
         guard let http = response as? HTTPURLResponse else { throw APIError("No HTTP response") }
-        if http.statusCode == 401 { throw APIError("The engine refused the API token. Check it in Settings.") }
+        if http.statusCode == 401 && name == "engine" { throw APIError("The engine refused the API token. Check it in Settings.") }
         guard (200..<300).contains(http.statusCode) else {
-            let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
-            throw APIError("Engine answered \(http.statusCode)\(detail.map { ": \($0)" } ?? "")")
+            throw APIError("\(name.prefix(1).uppercased() + name.dropFirst()) answered \(http.statusCode)\(Self.detail(data).map { ": \($0)" } ?? "")")
         }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -44,7 +62,20 @@ struct EngineAPI {
             throw APIError("Unexpected reply from \(path): \(error)")
         }
     }
+
+    /// FastAPI's error text: `detail` as a string, or a validation list of {msg}.
+    private static func detail(_ data: Data) -> String? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if let s = obj["detail"] as? String { return s }
+        if let list = obj["detail"] as? [[String: Any]] {
+            return list.compactMap { $0["msg"] as? String }.joined(separator: "; ")
+        }
+        return nil
+    }
 }
+
+/// Any JSON object, when only success matters.
+struct Ignored: Decodable {}
 
 enum Keychain {
     private static let service = "local.macdmini.client"
@@ -73,17 +104,23 @@ enum Keychain {
     static func clear() { SecItemDelete(query as CFDictionary) }
 }
 
-enum AppTab: Hashable { case lanes, book, signals, sectors, settings }
+enum AppTab: Hashable { case lanes, signals, breadth, brokers, settings }
+enum BreadthPage: String, Hashable, CaseIterable { case highs, wheel, coil, atm, rrg }
 
 @MainActor @Observable
 final class AppModel {
     static let defaultBase = "http://localhost:8201"
+    static let defaultConsole = "http://localhost:8410"
 
     private(set) var baseURL: String
+    private(set) var consoleURL: String
     private(set) var hasToken: Bool
     /// Bumped when the address or token changes, so every screen's polling restarts.
     private(set) var version = 0
     var tab: AppTab = .lanes
+    /// Screens a simulator UI test asks to open on launch (lane detail, breadth page).
+    var launchLane: String?
+    var launchBreadth: BreadthPage?
 
     var health: Health?
     var healthError: String?
@@ -94,16 +131,21 @@ final class AppModel {
         // SIMCTL_CHILD_MACD_UITEST_BASE / _TOKEN / _TAB. Compiled out of release and device builds.
         let env = ProcessInfo.processInfo.environment
         if let base = env["MACD_UITEST_BASE"] { UserDefaults.standard.set(base, forKey: "engineBaseURL") }
+        if let console = env["MACD_UITEST_CONSOLE"] { UserDefaults.standard.set(console, forKey: "consoleBaseURL") }
         if let token = env["MACD_UITEST_TOKEN"], !token.isEmpty { Keychain.save(token) }
         switch env["MACD_UITEST_TAB"] {
-        case "book": tab = .book
         case "signals": tab = .signals
-        case "sectors": tab = .sectors
+        case "breadth": tab = .breadth
+        case "brokers": tab = .brokers
         case "settings": tab = .settings
         default: break
         }
+        launchLane = env["MACD_UITEST_LANE"]
+        if let page = env["MACD_UITEST_VIEW"].flatMap(BreadthPage.init(rawValue:)) { tab = .breadth; launchBreadth = page }
+        if env["MACD_UITEST_LANE"] != nil { tab = .lanes }
         #endif
         baseURL = UserDefaults.standard.string(forKey: "engineBaseURL") ?? AppModel.defaultBase
+        consoleURL = UserDefaults.standard.string(forKey: "consoleBaseURL") ?? AppModel.defaultConsole
         hasToken = !(Keychain.read() ?? "").isEmpty
     }
 
@@ -111,6 +153,13 @@ final class AppModel {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         baseURL = trimmed.isEmpty ? AppModel.defaultBase : trimmed
         UserDefaults.standard.set(baseURL, forKey: "engineBaseURL")
+        version += 1
+    }
+
+    func setConsoleURL(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        consoleURL = trimmed.isEmpty ? AppModel.defaultConsole : trimmed
+        UserDefaults.standard.set(consoleURL, forKey: "consoleBaseURL")
         version += 1
     }
 
@@ -137,6 +186,14 @@ final class AppModel {
             throw APIError("The engine address “\(baseURL)” isn't a URL. Fix it in Settings.")
         }
         return EngineAPI(base: url, token: token)
+    }
+
+    /// The market-intelligence console (Upstox login). It has no token and listens on the Mac only.
+    func console() throws -> EngineAPI {
+        guard let url = URL(string: consoleURL), url.scheme != nil, url.host != nil else {
+            throw APIError("The console address “\(consoleURL)” isn't a URL. Fix it in Settings.")
+        }
+        return EngineAPI(base: url, token: nil, name: "console")
     }
 
     func refreshHealth() async {

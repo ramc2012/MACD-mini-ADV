@@ -3,6 +3,7 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @State private var address = ""
+    @State private var console = ""
     @State private var token = ""
     @State private var checking = false
     @State private var result: String?
@@ -19,6 +20,17 @@ struct SettingsView: View {
                     Text("Engine address")
                 } footer: {
                     Text("The simulator reaches the Mac's engine at localhost:8201. A real iPhone needs the Mac's address, and the engine port is published on 127.0.0.1 only.")
+                }
+
+                Section {
+                    TextField("http://localhost:8410", text: $console)
+                        .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Button("Save console address") { model.setConsoleURL(console); console = model.consoleURL }
+                        .disabled(console == model.consoleURL)
+                } header: {
+                    Text("Platform console")
+                } footer: {
+                    Text("The market-intelligence console, used only for the Upstox login on the Brokers tab. It has no token, so keep it on the Mac (localhost).")
                 }
 
                 Section {
@@ -58,13 +70,13 @@ struct SettingsView: View {
                 }
 
                 Section("About") {
-                    Text("A read-only client for the MACD mini paper-trading engine. It shows lanes, the MACD book, signals and the Sector coil. It never places, changes or closes trades.")
+                    Text("A read-only client for the MACD mini paper-trading engine. It shows every lane's book, signals and market breadth, and lets you log in to Fyers and Upstox for market data. It never places, changes or closes trades.")
                         .font(.callout).foregroundStyle(.secondary)
                     LabeledContent("Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
                 }
             }
             .navigationTitle("Settings")
-            .onAppear { address = model.baseURL }
+            .onAppear { address = model.baseURL; console = model.consoleURL }
         }
     }
 }

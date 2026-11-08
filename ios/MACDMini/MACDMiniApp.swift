@@ -18,9 +18,9 @@ struct RootView: View {
         @Bindable var model = model
         TabView(selection: $model.tab) {
             Tab("Lanes", systemImage: "chart.line.uptrend.xyaxis", value: AppTab.lanes) { LanesView() }
-            Tab("MACD book", systemImage: "list.bullet.rectangle", value: AppTab.book) { BookView() }
             Tab("Signals", systemImage: "bolt", value: AppTab.signals) { SignalsView() }
-            Tab("Sectors", systemImage: "arrow.uturn.down.circle", value: AppTab.sectors) { SectorCoilView() }
+            Tab("Breadth", systemImage: "chart.bar.xaxis", value: AppTab.breadth) { BreadthView() }
+            Tab("Brokers", systemImage: "key.horizontal", value: AppTab.brokers) { BrokersView() }
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) { SettingsView() }
         }
         .onAppear { if !model.hasToken { model.tab = .settings } }
