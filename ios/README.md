@@ -27,6 +27,29 @@ The simulator reaches the engine at `http://localhost:8201`. A physical iPhone n
 compose.yaml publishes the engine on `127.0.0.1` only, so that would need a deliberate port change (and the token
 then travels over plain HTTP on the LAN).
 
+## Testing on several simulators
+
+Tested 8 Nov 2026 on the iOS 27.2 simulator: iPhone 16, 16e, 16 Plus, 16 Pro, 16 Pro Max, 17, 17e, 17 Pro,
+17 Pro Max, Air, 18 Pro, 18 Pro Max (all tabs), and the iPhone Duo's outer screen (the system shows the tab bar as a
+side rail there; the unfolded inner screen was not reachable from `simctl`).
+
+Debug simulator builds read three launch variables, so a sweep doesn't need typing into Settings. They are
+compiled out of release and device builds:
+
+```bash
+SIMCTL_CHILD_MACD_UITEST_BASE=http://localhost:8201 \
+SIMCTL_CHILD_MACD_UITEST_TOKEN="$(grep '^MACD_API_TOKEN=' .env | cut -d= -f2-)" \
+SIMCTL_CHILD_MACD_UITEST_TAB=sectors \
+xcrun simctl launch booted local.macdmini.client
+```
+
+`MACD_UITEST_TAB` is one of `lanes`, `book`, `signals`, `sectors`, `settings`. The base and token are saved as if
+typed in Settings. Screenshot with `xcrun simctl io booted screenshot out.png` (a foldable needs `--display=N`;
+`xcrun simctl io <udid> enumerate` lists them).
+
+If every `simctl` command hangs after an Xcode update, Xcode's simulator components are older than it expects;
+run `sudo xcodebuild -runFirstLaunch` once.
+
 ## Layout
 
 - `MACDMini.xcodeproj`: one app target; the `MACDMini/` folder is a synchronized group, so new `.swift` files are

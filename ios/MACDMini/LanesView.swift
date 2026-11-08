@@ -60,8 +60,17 @@ struct LaneRow: View {
                     Text(Fmt.pct(lane.returnPct)).font(.subheadline.weight(.semibold).monospacedDigit())
                         .foregroundStyle(Color.pnl(lane.returnPct))
                 }
-                Text("\(lane.openPositions ?? 0) open · booked \(Fmt.rupees(lane.realized, signed: true)) · open \(Fmt.rupees(lane.unrealized, signed: true))")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
+                let count = "\(lane.openPositions ?? 0) open"
+                let booked = "booked \(Fmt.rupees(lane.realized, signed: true))"
+                let open = "open P&L \(Fmt.rupees(lane.unrealized, signed: true))"
+                ViewThatFits(in: .horizontal) {                         // one line where it fits, two on narrow phones
+                    Text("\(count) · \(booked) · \(open)").lineLimit(1)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("\(count) · \(booked)").lineLimit(1)
+                        Text(open).lineLimit(1)
+                    }
+                }
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
             if let curve = lane.curve, curve.count > 1 {
@@ -94,7 +103,7 @@ struct LaneDetailView: View {
                     GridRow {
                         Stat(title: "Open positions", value: "\(lane.openPositions ?? 0)\(lane.slots.map { " / \($0)" } ?? "")")
                         Stat(title: "Max drawdown", value: Fmt.pct(lane.maxDrawdownPct.map { -$0 }), color: .loss)
-                        Stat(title: "Since", value: Fmt.day(lane.since))
+                        Stat(title: "Since", value: Fmt.dayMonthYear(lane.since))
                     }
                 }
                 .padding(.vertical, 4)

@@ -61,7 +61,10 @@ enum CoilMath {
     static func rowHeight(_ segments: Int) -> CGFloat { max(2.6, min(11, 52 / CGFloat(max(1, segments)))) }
 
     /// One-line reading: the biggest give-back from a positive peak and the biggest gain over the last step.
-    static func story(_ rows: [CoilRow], days: [String]) -> (title: String, text: String) {
+    static func story(_ rows: [CoilRow], days: [String], relative: Bool = false) -> (title: String, text: String) {
+        // Own return reads in %; vs NIFTY 50 reads in points of outperformance.
+        let val = { (v: Double) in relative ? Fmt.pct(v).replacingOccurrences(of: "%", with: " pts") : Fmt.pct(v) }
+        let ahead = relative ? " ahead of NIFTY 50" : ""
         let sectors = rows.filter { $0.kind != "benchmark" }
         guard !sectors.isEmpty, days.count >= 3 else { return ("Sector progress", "") }
         let n = days.count - 1
@@ -79,10 +82,10 @@ enum CoilMath {
         }
         var parts: [String] = []
         if let g = giver, g.drop >= 1 {
-            parts.append("On \(Fmt.day(days[g.at])) \(g.label) was \(Fmt.pct(g.peak)) since \(Fmt.day(days[0])); it is \(Fmt.pct(g.now)) now.")
+            parts.append("On \(Fmt.day(days[g.at])) \(g.label) was \(val(g.peak))\(ahead) since \(Fmt.day(days[0])); it is \(val(g.now)) now.")
         }
         if let g = gainer, g.gain > 0 {
-            parts.append("\(g.label) made up the most ground since \(Fmt.day(days[n - 1])): \(Fmt.pct(g.gain).replacingOccurrences(of: "%", with: " pts")), to \(Fmt.pct(g.now)).")
+            parts.append("\(g.label) made up the most ground since \(Fmt.day(days[n - 1])): \(Fmt.pct(g.gain).replacingOccurrences(of: "%", with: " pts")), to \(val(g.now)).")
         }
         let title = (giver?.drop ?? 0) >= 5 && (gainer?.gain ?? 0) >= 3 ? "The big reversal"
             : (giver?.drop ?? 0) >= 5 ? "Leaders giving back" : "Sector progress"
@@ -152,7 +155,7 @@ struct SectorCoilView: View {
     @ViewBuilder
     private func chart(_ c: SectorCoil) -> some View {
         let days = [c.baseDay ?? ""] + c.points
-        let story = CoilMath.story(c.rows, days: days)
+        let story = CoilMath.story(c.rows, days: days, relative: c.measure == "relative")
         let bench = c.rows.filter { $0.kind == "benchmark" }
         let others = c.rows.filter { $0.kind != "benchmark" }.sorted { $0.latest > $1.latest }
         let axis = CoilMath.axis(c.rows.flatMap(\.filled))
@@ -226,7 +229,10 @@ private struct CoilAxis: View {
                     let x = CGFloat((t - axis.lo) / (axis.hi - axis.lo)) * size.width
                     let text = Text(t == 0 ? "0" : "\(t > 0 ? "+" : "−")\(abs(t).formatted())")
                         .font(.caption2.monospacedDigit()).foregroundStyle(t == 0 ? .primary : .secondary)
-                    ctx.draw(text, at: CGPoint(x: min(max(x, 10), size.width - 10), y: size.height / 2))
+                    // Ticks on the plot's edges keep their gridline but no label: a centred label would
+                    // be clipped and an inset one crowds its neighbour.
+                    if x < 12 || x > size.width - 12 { continue }
+                    ctx.draw(text, at: CGPoint(x: x, y: size.height / 2))
                 }
             }
             .frame(height: 18)

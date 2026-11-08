@@ -42,10 +42,12 @@ enum Fmt {
     private static let dateTimeF = formatter("EEE d MMM yyyy, HH:mm 'IST'")
     private static let dayF = formatter("d MMM")
     private static let dayYearF = formatter("EEE d MMM yyyy")
+    private static let dayMonthYearF = formatter("d MMM yyyy")
 
     static func dateTime(_ d: Date?) -> String { d.map(dateTimeF.string) ?? "—" }
     static func dateTime(_ s: String?) -> String { dateTime(date(s)) }
     static func day(_ s: String?) -> String { date(s).map(dayF.string) ?? (s ?? "—") }
+    static func dayMonthYear(_ s: String?) -> String { date(s).map(dayMonthYearF.string) ?? (s ?? "—") }
     static func dayYear(_ s: String?) -> String { date(s).map(dayYearF.string) ?? (s ?? "—") }
 
     private static let indian: NumberFormatter = {
@@ -96,12 +98,15 @@ enum Fmt {
     private static let acronyms: Set<String> = ["MACD", "ATR", "EOD", "CE", "PE", "ATM", "OTM", "ITM", "IB", "MP", "HMA",
                                                 "KAMA", "RSI", "ROC", "OI", "VWAP", "EMA", "BTST", "CBE", "PCT", "IV"]
 
-    /// "EXTREME_BOOK_CALL_INDEX_1.5ATR_UP_EOD" → "Extreme book call index 1.5ATR up EOD"
+    /// "EXTREME_BOOK_CALL_INDEX_1.5ATR_UP_EOD" → "Extreme book call index 1.5ATR up EOD";
+    /// "TRAILING_STOP_25_PCT" → "Trailing stop 25%".
     static func words(_ code: String?) -> String {
         guard let code, !code.isEmpty else { return "—" }
-        let parts = code.split(separator: "_").map { p -> String in
+        var parts: [String] = []
+        for p in code.split(separator: "_") {
             let s = String(p)
-            return acronyms.contains(s) || s.contains(where: \.isNumber) ? s : s.lowercased()
+            if s == "PCT", let last = parts.last, Double(last) != nil { parts[parts.count - 1] = last + "%"; continue }
+            parts.append(acronyms.contains(s) || s.contains(where: \.isNumber) ? s : s.lowercased())
         }
         guard let first = parts.first else { return code }
         return ([first.prefix(1).uppercased() + first.dropFirst()] + parts.dropFirst()).joined(separator: " ")

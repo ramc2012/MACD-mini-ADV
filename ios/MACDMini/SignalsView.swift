@@ -23,7 +23,13 @@ struct SignalsView: View {
                         .pickerStyle(.segmented)
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets())
+                    }
+                    Section {
                         StaleNote(error: signals.error, updated: signals.updated)
+                        if days.isEmpty {
+                            Text(search.isEmpty ? "No \(side == .all ? "" : side.rawValue.lowercased() + " ")signals." : "No signal matches “\(search)”.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
                     }
                     ForEach(days, id: \.day) { group in
                         Section(Fmt.dayYear(group.day)) {

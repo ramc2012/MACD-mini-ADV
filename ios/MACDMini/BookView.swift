@@ -39,7 +39,12 @@ struct BookView: View {
                         .pickerStyle(.segmented)
                         .listRowBackground(Color.clear)
                         .listRowInsets(EdgeInsets())
-                        ForEach(rows(p.positions)) { PositionRow(position: $0) }
+                        let shown = rows(p.positions)
+                        ForEach(shown) { PositionRow(position: $0) }
+                        if shown.isEmpty {
+                            Text(search.isEmpty ? "No open positions." : "No open position matches “\(search)”.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
                     } header: {
                         Text("Open positions")
                     }

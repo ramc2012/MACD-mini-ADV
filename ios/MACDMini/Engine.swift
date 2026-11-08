@@ -89,6 +89,20 @@ final class AppModel {
     var healthError: String?
 
     init() {
+        #if DEBUG && targetEnvironment(simulator)
+        // UI-test hook for simulator runs against a local mock engine: `simctl launch` with
+        // SIMCTL_CHILD_MACD_UITEST_BASE / _TOKEN / _TAB. Compiled out of release and device builds.
+        let env = ProcessInfo.processInfo.environment
+        if let base = env["MACD_UITEST_BASE"] { UserDefaults.standard.set(base, forKey: "engineBaseURL") }
+        if let token = env["MACD_UITEST_TOKEN"], !token.isEmpty { Keychain.save(token) }
+        switch env["MACD_UITEST_TAB"] {
+        case "book": tab = .book
+        case "signals": tab = .signals
+        case "sectors": tab = .sectors
+        case "settings": tab = .settings
+        default: break
+        }
+        #endif
         baseURL = UserDefaults.standard.string(forKey: "engineBaseURL") ?? AppModel.defaultBase
         hasToken = !(Keychain.read() ?? "").isEmpty
     }
