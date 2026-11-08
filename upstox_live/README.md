@@ -1,11 +1,13 @@
 # Upstox live lane
 
-Follows the MACD lane's signals with **real Upstox orders** inside a fixed fund (`UPSTOX_LIVE_CAPITAL`, default
-₹25,000). Container `upstox-live` in this stack; page: web app → **Upstox live** (`/api/upstox-live/snapshot`).
+Follows the MACD lane's signals with **real Upstox orders**, sized from the account's **available margin** (read every
+15 s, so a top-up is used within seconds). Optional cap: `UPSTOX_LIVE_CAPITAL` in `.env` (> 0 limits the lane to cap +
+booked P&L − deployed; default 0 = no cap). Return % is shown on the ₹25,000 start. Container `upstox-live`; page: web
+app → **Upstox live** (`/api/upstox-live/snapshot`).
 
-- **Entry:** the first new MACD BUY signal whose one-lot cost (signal price + 2 %, tick-rounded LIMIT) fits the free fund
-  (fund + booked P&L − deployed, never above Upstox's available margin). Product D, DAY, tag `MACDLIVE`. Unfilled
-  after 90 s → cancelled.
+- **Entry:** every new MACD option BUY signal whose one-lot cost (signal price + 2 %, tick-rounded LIMIT) plus ₹60 for
+  charges fits the free fund = Upstox available margin − entries sent since that read. No entries when the funds read is
+  older than 90 s or the order API is blocked. Product D, DAY, tag `MACDLIVE`. Unfilled after 90 s → cancelled.
 - **Exit:** LIMIT SELL of the whole quantity when the MACD paper lane closes the contract (or never takes it within
   10 min): 3 % under the last price, then 6 %, then 10 % if unfilled after 60 s.
 - **Limits:** one position per contract, at most 30 orders a day, never sells more than it holds, ignores signals older
@@ -14,7 +16,8 @@ Follows the MACD lane's signals with **real Upstox orders** inside a fixed fund 
 ## Arming (owner only)
 
 The lane starts as a **dry run**: it journals what it would order and sends nothing. Real orders go out only while
-`runtime/upstox_live/ARMED` contains `yes`:
+`runtime/upstox_live/ARMED` contains `yes`. **Arming is one-time:** it stays on across days, restarts and Upstox
+re-logins until Kill (an expired daily token only pauses entries until the next login):
 
 ```bash
 echo yes > runtime/upstox_live/ARMED     # arm: real orders from the next signal

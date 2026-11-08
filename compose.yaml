@@ -167,8 +167,9 @@ services:
       - gateway
     restart: unless-stopped
 
-  # The Upstox live lane (upstox_live/lane.py): follows MACD signals with REAL Upstox orders inside LANE_CAPITAL,
-  # but only while runtime/upstox_live/ARMED contains "yes" (the owner creates it); otherwise it is a dry run that
+  # The Upstox live lane (upstox_live/lane.py): follows MACD signals with REAL Upstox orders sized from the account's
+  # available margin (UPSTOX_LIVE_CAPITAL > 0 adds a cap; 0 = none), only while runtime/upstox_live/ARMED says "yes"
+  # (armed once from Settings, stays on until Kill); otherwise it is a dry run that
   # journals what it would order. It reads signals through the gateway and never touches the engine or desk.
   upstox-live:
     image: macd-mini-parallel-engine
@@ -180,7 +181,7 @@ services:
       HUB_URL: http://host.docker.internal:8400
       UPSTOX_TOKEN_FILE: /secrets/upstox.token
       STATE_DIR: /app/runtime/upstox_live
-      LANE_CAPITAL: ${UPSTOX_LIVE_CAPITAL:-25000}
+      LANE_CAPITAL: ${UPSTOX_LIVE_CAPITAL:-0}
     volumes:
       - ./upstox_live:/lane:ro
       - ./runtime/upstox_live:/app/runtime/upstox_live

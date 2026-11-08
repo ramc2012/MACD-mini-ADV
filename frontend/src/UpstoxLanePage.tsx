@@ -7,10 +7,10 @@ import { fillMarkers, positionLevels } from "./laneChartMarks";
 import type { ClosedPosition, Order, Portfolio, Position, Tick, Trade } from "./types";
 
 // The Upstox live lane (upstox_live/lane.py, served at /api/upstox-live/ by nginx): MACD lane signals traded with
-// REAL Upstox orders inside a Rs 25,000 fund. Laid out like the MACD and Spot lanes -- summary cards, then
+// REAL Upstox orders sized from the account's available margin (return % is on the Rs 25,000 start). Laid out like the MACD and Spot lanes -- summary cards, then
 // Terminal / Portfolio / Status / Orders / Trades / Performance / Journal -- and fed into the same ledger tables.
-// Read-only: this page never places, changes or cancels an order and has no arming control (the owner arms the
-// lane on the Mac: runtime/upstox_live/ARMED).
+// Read-only: this page never places, changes or cancels an order; the owner arms once (Settings -> Upstox live) and
+// the lane stays armed until Kill.
 type LanePos = { symbol: string; instrument: string; quantity: number; average_price: number; last_price?: number | null;
   unrealized_pnl?: number | null; return_pct?: number | null; opened_at?: string | null; macd_seen?: boolean; realized?: number; lot_size?: number | null; bought?: number };
 type LaneClosed = LanePos & { closed_at?: string; exit_price?: number };
@@ -19,6 +19,7 @@ type LaneOrder = { order_id: string; symbol: string; side: string; quantity: num
 type LaneFill = { order_id: string; symbol: string; side: string; quantity: number; price: number; at: string };
 type Decision = { at: string; kind: string; symbol?: string; [k: string]: unknown };
 type Snapshot = { label: string; armed: boolean; mode: string; capital: number; deployed: number; free: number; realized: number;
+  cap?: number | null; fund_basis?: string; in_flight?: number; charges_allowance?: number; armed_since?: string | null;
   unrealized: number; equity: number; upstox_funds?: { available_margin?: number; used_margin?: number; payin_amount?: number } | null;
   positions: LanePos[]; closed: LaneClosed[]; orders: LaneOrder[]; fills: LaneFill[]; decisions: Decision[];
   account: { positions: Record<string, unknown>[]; orders: Record<string, unknown>[]; trades: Record<string, unknown>[]; lane_instruments?: string[] };
@@ -122,7 +123,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   const marketValue = positions.reduce((sum, p) => sum + p.last_price * p.quantity, 0);
   const realized = d?.realized ?? 0;
   const equity = capital + realized + unrealized;
-  const portfolio = useMemo<Portfolio>(() => ({ equity, cash: capital + realized - (d?.deployed ?? 0), market_value: marketValue,
+  const portfolio = useMemo<Portfolio>(() => ({ equity, cash: d?.free ?? 0, market_value: marketValue,
     realized_pnl: realized, unrealized_pnl: unrealized, positions, closed_positions: closedRows, lane: "upstox_live" }),
   [equity, capital, realized, d, marketValue, unrealized, positions, closedRows]);
   const curve = useMemo(() => {
@@ -176,9 +177,9 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   return <section className="ledger-page blast-page spot-page upstox-page">
     <div className="page-heading blast-heading">
       <div><h1>Upstox live lane</h1>
-        <p>MACD lane signals traded with real Upstox orders inside a ₹{rupeeText(capital)} fund · the first new BUY signal whose one lot fits is bought (LIMIT, product D) · sold when the MACD lane closes the contract</p></div>
+        <p>MACD lane signals traded with real Upstox orders sized from the account's available funds{d?.cap ? ` (capped at ₹${rupeeText(d.cap)})` : ""} · every new option BUY signal whose one lot fits is bought (LIMIT, product D) · sold when the MACD lane closes the contract · armed once, until Kill</p></div>
       <div className="blast-badges">
-        <span className={d?.armed ? "mode alert" : "feed-badge"} title={d?.armed ? "runtime/upstox_live/ARMED says yes: orders go to Upstox" : "No ARMED file: orders are journalled, nothing is sent"}>
+        <span className={d?.armed ? "mode alert" : "feed-badge"} title={d?.armed ? `Armed${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill (Settings → Upstox live)` : "Not armed: orders are journalled, nothing is sent"}>
           {d ? (d.armed ? "ARMED · real money" : "Dry run · nothing sent") : "…"}</span>
         <span className={orderApi && !orderApi.ok ? "mode alert" : "feed-badge"} title={orderApi ? `${orderApi.detail} · checked ${when(orderApi.checked_at)}` : "Not checked yet"}>
           Order API {orderApi ? (orderApi.ok ? "ok" : "blocked") : "…"}</span>
@@ -188,7 +189,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
 
     <section className="blast-metrics" aria-label="Upstox lane book">
       <Metric label="Equity" value={`₹${rupeeText(equity)}`} />
-      <Metric label={`Return on ₹${rupeeText(capital)}`} value={percent((equity / capital - 1) * 100, 2)} tone={equity - capital} />
+      <Metric label={`Return on ₹${rupeeText(capital)} start`} value={percent((equity / capital - 1) * 100, 2)} tone={equity - capital} />
       <Metric label="Realized · lifetime" value={rupees(realized)} tone={realized} />
       <Metric label="Open P&L · current marks" value={rupees(unrealized)} tone={unrealized} />
       <Metric label="Open positions" value={`${positions.length} · ₹${rupeeText(Math.round(marketValue))}`} />
@@ -243,11 +244,11 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
         <section className="panel agent-panel">
           <div className="panel-title">Lane health</div>
           <table className="live-table agent-table"><tbody>
-            <tr><th>Mode</th><td className={d.armed ? "negative" : ""}>{d.armed ? "ARMED: real orders are sent" : "Dry run: decisions are journalled, nothing is sent"}</td></tr>
+            <tr><th>Mode</th><td className={d.armed ? "negative" : ""}>{d.armed ? `ARMED${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill` : "Dry run: decisions are journalled, nothing is sent"}</td></tr>
             <tr><th>Order API</th><td className={orderApi && !orderApi.ok ? "negative" : ""}>{orderApi ? `${orderApi.detail} · ${when(orderApi.checked_at)}` : "not checked yet"}</td></tr>
             <tr><th>Account read</th><td className={d.read_error ? "negative" : ""}>{d.read_error || "ok"} · {when(d.read_at)}</td></tr>
             <tr><th>Upstox funds</th><td>{available == null ? "—" : `₹${rupeeText(available)} available`}{d.upstox_funds?.used_margin ? ` · ₹${rupeeText(d.upstox_funds.used_margin)} used` : ""}</td></tr>
-            <tr><th>Lane fund</th><td>₹{rupeeText(capital)} + booked ₹{rupeeText(realized)} − deployed ₹{rupeeText(d.deployed)} → free ₹{rupeeText(d.free)}</td></tr>
+            <tr><th>Free for next entry</th><td>₹{rupeeText(d.free)} · {d.fund_basis ?? "—"}{d.in_flight ? ` (less ₹${rupeeText(d.in_flight)} sent since the last read)` : ""}{d.cap ? ` · cap ₹${rupeeText(d.cap)}` : " · no lane cap"} · ₹{rupeeText(d.charges_allowance ?? 0)} kept back per order for charges</td></tr>
             <tr><th>MACD engine</th><td className={d.engine_error ? "negative" : ""}>{d.engine_error || `ok · MACD lane holds ${d.macd_open.length} contracts`} · {when(d.macd_checked_at)}</td></tr>
             <tr><th>Orders today</th><td>{d.orders_today?.day === today ? d.orders_today.count : 0} of {d.max_orders_per_day ?? "—"} sent</td></tr>
             <tr><th>Started</th><td>{when(d.started_at)}</td></tr>

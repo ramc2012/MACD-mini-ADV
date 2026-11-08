@@ -471,6 +471,7 @@ function FyersLogin(props: FyersLoginProps) {
 }
 
 type UpstoxState = { armed: boolean; capital: number; free: number; deployed: number; realized: number;
+  cap?: number | null; fund_basis?: string; armed_since?: string | null;
   upstox_funds?: { available_margin?: number } | null; positions: { symbol: string; quantity: number }[];
   orders: { order_id: string; side: string; open?: boolean; dry?: boolean }[];
   order_api?: { ok: boolean; detail: string; checked_at: string } | null; read_error?: string | null; read_at?: string | null;
@@ -509,7 +510,7 @@ function UpstoxControls() {
   const [exitAsk, setExitAsk] = useState(false);
   const arm = () => {
     if (armText.trim().toUpperCase() !== "ARM") { setError("Type ARM in the box first."); return; }
-    void act("arm", { confirm: "ARM" }, () => "Armed: real orders from the next MACD signal.").then(() => setArmText(""));
+    void act("arm", { confirm: "ARM" }, () => "Armed: real orders from the next MACD signal, and it stays armed (across days and restarts) until you press Kill.").then(() => setArmText(""));
   };
   const kill = () => void act("kill", {}, (r) => `Killed: dry run, no new orders.${Array.isArray(r.cancelled_entries) && r.cancelled_entries.length ? ` Cancelled ${r.cancelled_entries.length} unfilled entry order(s).` : ""} Open positions are not sold — use Exit all.`);
   const exitAll = () => {
@@ -522,7 +523,7 @@ function UpstoxControls() {
   const tone = !lane ? "pending" : lane.armed ? "down" : "ok";
   return <div className="settings-section fyers-login upstox-controls">
     <div className={`login-status ${tone}`}>
-      <b>{!lane ? "Reading the Upstox lane…" : lane.armed ? "ARMED — real Upstox orders" : "Dry run — nothing is sent"}</b>
+      <b>{!lane ? "Reading the Upstox lane…" : lane.armed ? `ARMED — real Upstox orders until Kill${lane.armed_since ? ` (since ${new Date(lane.armed_since).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST)` : ""}` : "Dry run — nothing is sent"}</b>
       <span style={{ display: "block", fontWeight: 400 }}>{lane ? `Order API ${apiOk ? "ok" : "blocked"} · account read ${lane.read_error ? "failing" : "ok"} · ${lane.positions.length} open · ${pendingEntries} pending entr${pendingEntries === 1 ? "y" : "ies"} · orders today ${lane.orders_today?.count ?? 0}/${lane.max_orders_per_day ?? "—"}` : ""}</span>
     </div>
     {lane?.order_api && !apiOk && <div className="settings-error">Order API: {lane.order_api.detail}</div>}
@@ -538,8 +539,8 @@ function UpstoxControls() {
     </div>
     {message && <div className="settings-message">{message}</div>}{error && <div className="settings-error">{error}</div>}
     <p className="field-help">
-      Fund ₹{(lane?.capital ?? 25000).toLocaleString("en-IN")} · free ₹{Math.round(lane?.free ?? 0).toLocaleString("en-IN")} · Upstox available {lane?.upstox_funds?.available_margin == null ? "—" : `₹${Math.round(lane.upstox_funds.available_margin).toLocaleString("en-IN")}`}.
-      Arm sends real orders for the next MACD BUY signal whose one lot fits the fund; exits follow the MACD lane. Kill stops new orders at once and cancels unfilled entries, but keeps open positions (their MACD exits are then not sent — use Exit all).
+      Free for the next entry ₹{Math.round(lane?.free ?? 0).toLocaleString("en-IN")} ({lane?.fund_basis ?? "—"}{lane?.cap ? `, cap ₹${lane.cap.toLocaleString("en-IN")}` : ", no lane cap"}) · Upstox available {lane?.upstox_funds?.available_margin == null ? "—" : `₹${Math.round(lane.upstox_funds.available_margin).toLocaleString("en-IN")}`}.
+      The fund is the account's available margin, so a top-up is used within about 15 s. Arm once: real orders go out for every MACD option BUY signal whose one lot fits, and the lane stays armed across days, restarts and Upstox re-logins until Kill (an expired Upstox token only pauses entries). Exits follow the MACD lane. Kill stops new orders at once and cancels unfilled entries, but keeps open positions (their MACD exits are then not sent — use Exit all).
       Arming is refused while the order API is blocked. Only this Mac's own page can press these. Order API checked {lane?.order_api?.checked_at ? new Date(lane.order_api.checked_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) + " IST" : "—"}.
     </p>
   </div>;

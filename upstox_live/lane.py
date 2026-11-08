@@ -1,16 +1,19 @@
-"""Upstox live lane: follows the MACD lane's signals with real Upstox orders inside a fixed fund (default Rs 25,000).
+"""Upstox live lane: follows the MACD lane's signals with real Upstox orders, sized from the account's available funds.
 
 What it does, every few seconds:
   * reads new MACD signals from the engine (through the gateway) and the MACD paper lane's open positions;
   * maps each signal's Fyers symbol to its Upstox instrument key and lot size through the platform hub;
-  * ENTRY: the first new BUY signal whose one-lot cost fits the lane's free funds (lane fund minus what is deployed,
-    plus booked P&L, and never more than Upstox's available margin) gets a 1-lot LIMIT BUY (product D);
+  * ENTRY: every new BUY signal whose one-lot cost fits the free fund gets a 1-lot LIMIT BUY (product D). The free
+    fund is Upstox's AVAILABLE MARGIN as read from the account (a top-up is used at the next read), minus entries sent
+    since that read and a small charges allowance per order. An optional cap (LANE_CAPITAL > 0) also limits it to
+    cap + booked P&L - deployed; the default 0 means no cap. A stale or failed funds read means no new entries;
   * EXIT: when the MACD paper lane closes that contract (or never took it within 10 minutes), a LIMIT SELL of the
     whole held quantity at a small discount to the last price, re-priced up to three times;
   * reads the Upstox order book, trades, positions and funds, and serves the lane at /api/upstox-live/snapshot.
 
 Real orders go out ONLY while the arm file exists and contains "yes" (runtime/upstox_live/ARMED). Without it the lane
-runs dry: it journals exactly what it would have ordered. The owner arms and disarms it; nothing here does.
+runs dry: it journals exactly what it would have ordered. Arming is one-time: it stays on across days, restarts and
+Upstox re-logins until the owner presses Kill. Nothing here disarms it (an expired token only pauses entries).
 The Upstox access token is read from a file and never logged, printed or served.
 """
 from __future__ import annotations
@@ -35,7 +38,10 @@ ENGINE_TOKEN = os.environ.get("MACD_API_TOKEN", "")
 HUB_URL = os.environ.get("HUB_URL", "http://host.docker.internal:8400").rstrip("/")
 TOKEN_FILE = os.environ.get("UPSTOX_TOKEN_FILE", "/secrets/upstox.token")
 STATE_DIR = os.environ.get("STATE_DIR", "/app/runtime/upstox_live")
-CAPITAL = float(os.environ.get("LANE_CAPITAL", "25000"))
+CAPITAL = float(os.environ.get("LANE_CAPITAL") or 0)          # optional cap; 0 = use the whole available margin
+START_FUND = float(os.environ.get("LANE_START_FUND") or 25000)  # reference for return %, not a limit
+FUNDS_MAX_AGE = float(os.environ.get("FUNDS_MAX_AGE_SECONDS", "90"))
+CHARGES_ALLOWANCE = float(os.environ.get("CHARGES_ALLOWANCE", "60"))  # brokerage + taxes kept back per entry
 PORT = int(os.environ.get("PORT", "8440"))
 LOOP_SECONDS = float(os.environ.get("LOOP_SECONDS", "5"))
 READ_SECONDS = float(os.environ.get("READ_SECONDS", "15"))
@@ -170,14 +176,14 @@ def resolve(symbol: str) -> dict | None:
 # ---------------------------------------------------------------- reads
 
 def read_upstox() -> None:
-    out = {}
+    out, asked = {}, time.time()   # orders sent after `asked` are not in this funds figure
     try:
         out["funds"] = upstox("GET", READ_HOST, "/v2/user/get-funds-and-margin", query={"segment": "SEC"}).get("data")
         out["orders"] = upstox("GET", READ_HOST, "/v2/order/retrieve-all").get("data") or []
         out["trades"] = upstox("GET", READ_HOST, "/v2/order/trades/get-trades-for-day").get("data") or []
         out["positions"] = upstox("GET", READ_HOST, "/v2/portfolio/short-term-positions").get("data") or []
         with lock:
-            cache.update(out, read_at=iso(), read_error=None)
+            cache.update(out, read_at=iso(), read_error=None, funds_at=asked)
             record_fills()
     except Exception as e:  # keep the last good read on screen
         with lock:
@@ -236,14 +242,41 @@ def deployed() -> float:
     return held + pending
 
 
-def free_funds() -> float:
-    lane = CAPITAL + state["realized"] - deployed()
-    margin = None
+def available_margin() -> float | None:
     f = cache.get("funds") or {}
     eq = f.get("equity") if isinstance(f, dict) else None
     if eq and eq.get("available_margin") is not None:
-        margin = float(eq["available_margin"])
-    return min(lane, margin) if margin is not None else lane
+        return float(eq["available_margin"])
+    return None
+
+
+def in_flight() -> float:
+    """Entries sent after the last funds read: Upstox has blocked their margin but that read cannot show it yet."""
+    read = cache.get("funds_at") or 0
+    return sum(o["price"] * o["quantity"] for o in state["orders"].values()
+               if o["side"] == "BUY" and not o.get("dry")
+               and o.get("placed_ts", (parse_time(o["placed_at"]) or now()).timestamp()) >= read)
+
+
+def fund_status() -> tuple[float, str]:
+    """(free rupees for the next entry, why). Live: Upstox's available margin, so a top-up counts at the next read."""
+    margin = available_margin()
+    age = time.time() - (cache.get("funds_at") or 0)
+    if margin is None:
+        return 0.0, "no Upstox funds read yet"
+    if age > FUNDS_MAX_AGE:
+        return 0.0, f"Upstox funds read is {int(age)} s old (limit {int(FUNDS_MAX_AGE)} s)" + (f": {cache['read_error'][:120]}" if cache.get("read_error") else "")
+    free = margin - in_flight()
+    why = "Upstox available margin"
+    if CAPITAL > 0:
+        capped = CAPITAL + state["realized"] - deployed()
+        if capped < free:
+            free, why = capped, f"lane cap Rs {CAPITAL:,.0f} + booked - deployed"
+    return max(0.0, free), why
+
+
+def free_funds() -> float:
+    return fund_status()[0]
 
 
 def count_order() -> bool:
@@ -276,7 +309,7 @@ def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: st
         ids = (r.get("data") or {}).get("order_ids") or [(r.get("data") or {}).get("order_id")]
         for oid in filter(None, ids):
             state["orders"][str(oid)] = {"order_id": str(oid), "symbol": symbol, "instrument": inst["upstox"], "side": side,
-                                         "quantity": qty, "price": price, "placed_at": iso(), "reason": reason, "open": True,
+                                         "quantity": qty, "price": price, "placed_at": iso(), "placed_ts": time.time(), "reason": reason, "open": True,
                                          "status": "sent", "lot_size": inst.get("lot_size"), "tick": inst.get("tick_size"),
                                          "attempt": 0}
         journal("ORDER_SENT", symbol=symbol, side=side, quantity=qty, price=price, order_ids=ids, reason=reason)
@@ -406,9 +439,12 @@ def step() -> None:
             continue
         lot, price = int(inst.get("lot_size") or 1), float(s.get("price") or 0)
         limit = tick_round(price * (1 + ENTRY_BUFFER), float(inst.get("tick_size") or 0.05), up=True)
-        cost, free = limit * lot, free_funds()
-        if price <= 0 or cost > free:
-            journal("SKIP_FUNDS", symbol=sym, price=price, lot_size=lot, cost=round(cost, 2), free=round(free, 2))
+        cost, (free, basis) = limit * lot, fund_status()
+        if price <= 0 or cost + CHARGES_ALLOWANCE > free:
+            journal("SKIP_FUNDS", symbol=sym, price=price, lot_size=lot, cost=round(cost, 2), free=round(free, 2), basis=basis)
+            continue
+        if armed() and not (cache.get("order_api") or {}).get("ok", True):
+            journal("SKIP", symbol=sym, reason="armed, but the Upstox order API is blocked: " + str((cache.get("order_api") or {}).get("detail")))
             continue
         place(sym, inst, "BUY", lot, limit, f"{s.get('kind')} at {price}")
     state["seen_signals"] = list(seen)[-2000:]
@@ -446,6 +482,7 @@ def set_armed(on: bool, who: str) -> dict:
         with open(tmp, "w") as f:
             f.write("yes\n")
         os.replace(tmp, ARM_FILE)
+        state["armed_since"] = iso()
         journal("ARMED", by=who)
         return {"armed": True}
     try:
@@ -454,6 +491,7 @@ def set_armed(on: bool, who: str) -> dict:
         pass
     cancelled = [o["order_id"] for o in list(state["orders"].values())
                  if o["side"] == "BUY" and o.get("open") and not o.get("dry") and cancel(o, "kill switch")]
+    state["armed_since"] = None
     journal("KILLED", by=who, cancelled_entries=cancelled)
     return {"armed": False, "cancelled_entries": cancelled}
 
@@ -488,11 +526,14 @@ def snapshot() -> dict:
                               "return_pct": round((last / p["average_price"] - 1) * 100, 2) if last and p["average_price"] else None})
         unreal = sum(p["unrealized_pnl"] or 0 for p in positions)
         f = cache.get("funds") or {}
+        free, basis = fund_status()
         return {
             "lane": "upstox_live", "label": "Upstox live", "armed": armed(), "mode": "LIVE" if armed() else "DRY RUN",
-            "capital": CAPITAL, "deployed": round(deployed(), 2), "free": round(free_funds(), 2),
+            "capital": START_FUND, "cap": CAPITAL or None, "fund_basis": basis, "in_flight": round(in_flight(), 2),
+            "charges_allowance": CHARGES_ALLOWANCE, "armed_since": state.get("armed_since"),
+            "deployed": round(deployed(), 2), "free": round(free, 2),
             "realized": round(state["realized"], 2), "unrealized": round(unreal, 2),
-            "equity": round(CAPITAL + state["realized"] + unreal, 2),
+            "equity": round(START_FUND + state["realized"] + unreal, 2),
             "upstox_funds": (f.get("equity") if isinstance(f, dict) else None),
             "positions": positions, "closed": state.get("closed", [])[-100:],
             "orders": sorted(state["orders"].values(), key=lambda o: o["placed_at"], reverse=True)[:200],
@@ -504,11 +545,13 @@ def snapshot() -> dict:
             "read_at": cache["read_at"], "read_error": cache["read_error"], "engine_error": cache["engine_error"],
             "order_api": {k: v for k, v in (cache.get("order_api") or {}).items() if k in ("ok", "detail", "checked_at")} or None,
             "orders_today": state["orders_today"], "max_orders_per_day": MAX_ORDERS_PER_DAY, "started_at": state["started_at"],
-            "rules": {"entry": f"First new MACD BUY signal whose 1-lot LIMIT cost (signal price +{ENTRY_BUFFER*100:.0f}%) fits the free fund; cancelled if unfilled in {int(ENTRY_TIMEOUT)} s",
+            "rules": {"entry": f"Every new MACD BUY option signal whose 1-lot LIMIT cost (signal price +{ENTRY_BUFFER*100:.0f}%) plus Rs {CHARGES_ALLOWANCE:,.0f} charges fits the free fund; cancelled if unfilled in {int(ENTRY_TIMEOUT)} s",
                       "exit": "LIMIT SELL of the whole quantity when the MACD paper lane closes the contract (or never takes it within 10 min); 3% under the last price, then 6%, then 10%",
-                      "fund": f"Rs {CAPITAL:,.0f} plus booked P&L, never more than Upstox's available margin",
+                      "fund": ("Upstox available margin, read every 15 s (top-ups count at the next read), minus entries sent since that read"
+                               + (f"; capped at Rs {CAPITAL:,.0f} + booked P&L - deployed" if CAPITAL > 0 else "; no lane cap")
+                               + f"; no entries if the read is older than {int(FUNDS_MAX_AGE)} s"),
                       "orders": f"product D (carry forward), DAY validity, tag {TAG}, at most {MAX_ORDERS_PER_DAY} orders a day",
-                      "arming": "Real orders only while runtime/upstox_live/ARMED contains 'yes'; otherwise a dry run"},
+                      "arming": "Arm once: real orders until Kill is pressed, across days, restarts and Upstox re-logins (an expired token only pauses entries)"},
             "checked_at": iso(),
         }
 
@@ -587,8 +630,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def recover_armed_since() -> None:
+    """A lane armed before armed_since existed: take the time from the last ARMED row in the journal."""
+    if not armed() or state.get("armed_since"):
+        return
+    try:
+        with open(JOURNAL_FILE) as f:
+            rows = [json.loads(line) for line in f if '"ARMED"' in line]
+        state["armed_since"] = next((r["at"] for r in reversed(rows) if r.get("kind") == "ARMED"), None)
+    except (OSError, ValueError):
+        pass
+
+
 if __name__ == "__main__":
     os.makedirs(STATE_DIR, exist_ok=True)
-    print(f"upstox-live: fund Rs {CAPITAL:,.0f}, {'ARMED (real orders)' if armed() else 'dry run'}, port {PORT}", flush=True)
+    recover_armed_since()
+    print(f"upstox-live: fund = Upstox available margin{f' (cap Rs {CAPITAL:,.0f})' if CAPITAL > 0 else ''}, "
+          f"{'ARMED (real orders, until Kill)' if armed() else 'dry run'}, port {PORT}", flush=True)
     threading.Thread(target=loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

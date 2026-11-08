@@ -8,7 +8,7 @@ sent = []
 now = datetime.now(timezone.utc)
 sig = lambda i, sym, price, ago=5: {"signal_id": f"s{i}", "symbol": sym, "side": "BUY", "kind": "PREMIUM_MACD_ZERO_CROSS_UP", "price": price,
                                     "timestamp": (now - timedelta(seconds=ago)).isoformat()}
-world = {"signals": [], "macd": [], "trades": [], "orders": [], "positions": []}
+world = {"signals": [], "macd": [], "trades": [], "orders": [], "positions": [], "margin": 30000.0}
 lane.state["started_at"] = (now - timedelta(minutes=1)).isoformat()
 def engine(path):
     return world["signals"] if path.startswith("/api/signals") else {"positions": [{"symbol": s} for s in world["macd"]]}
@@ -16,7 +16,7 @@ def upstox(method, host, path, body=None, query=None):
     if method == "POST":
         oid = f"OID{len(sent)+1}"; sent.append((path, body)); return {"data": {"order_ids": [oid]}}
     if method == "DELETE": sent.append((path, query)); return {"data": {}}
-    if "funds" in path: return {"data": {"equity": {"available_margin": 30000.0}}}
+    if "funds" in path: return {"data": {"equity": {"available_margin": world["margin"]}}}
     if "retrieve-all" in path: return {"data": world["orders"]}
     if "trades" in path: return {"data": world["trades"]}
     return {"data": world["positions"]}
@@ -82,3 +82,34 @@ assert post("/kill", {}, "http://100.119.170.94:3200")[0] == 200 and not lane.ar
 assert post("/arm", {"confirm": "ARM"}, "http://100.119.170.95:3200")[0] == 403
 srv.shutdown()
 print("controls OK")
+# 5. the fund is Upstox's available margin: a top-up is used at the next read, entries sent since the read are
+#    held back, a stale read blocks entries, and the optional cap still limits.
+assert lane.CAPITAL == 0, "default: no lane cap"
+lane.state["orders"], lane.state["positions"] = {}, {}
+open(lane.ARM_FILE, "w").write("yes"); lane.cache["order_api"] = {"ok": True}
+world.update(orders=[], trades=[], positions=[], macd=[], margin=30000.0)
+lane.read_upstox()
+world["signals"].append(sig(6, "NSE:DEAR26NOV900CE", 120.0, 1))     # 1 lot = 122.4 x 300 = 36,720
+n = len(sent); lane.step(); assert len(sent) == n and lane.state["decisions"][-1]["kind"] == "SKIP_FUNDS"
+world["margin"] = 50000.0; lane.read_upstox()                        # owner topped up
+world["signals"].append(sig(7, "NSE:DEAR26NOV900CE", 120.0, 1))
+lane.step(); assert sent[-1][1]["transaction_type"] == "BUY" and sent[-1][1]["quantity"] == 300, "top-up must be used"
+assert abs(lane.free_funds() - (50000 - 36720)) < 0.01, lane.fund_status()
+world["signals"].append(sig(8, "NSE:CHEAP26NOV100CE", 30.0, 1))     # 30.6 x 500 = 15,300 > 13,280 left
+n = len(sent); lane.step(); assert len(sent) == n and lane.state["decisions"][-1]["kind"] == "SKIP_FUNDS"
+world["margin"] = 13280.0; lane.read_upstox()                         # Upstox now shows the blocked margin
+assert abs(lane.free_funds() - 13280) < 0.01, lane.fund_status()      # not subtracted twice
+lane.cache["funds_at"] -= 1000
+assert lane.fund_status()[0] == 0 and "old" in lane.fund_status()[1]
+lane.read_upstox(); lane.CAPITAL = 20000.0
+assert lane.fund_status()[1].startswith("lane cap"), lane.fund_status()
+lane.CAPITAL = 0.0
+# 6. arming is one-time: steps, day changes and a restart (re-import) leave it armed; only Kill removes it
+for _ in range(3): lane.step()
+lane.state["orders_today"] = {"day": "2000-01-01", "count": 0}; lane.step()
+assert lane.armed()
+del sys.modules["lane"]; import lane as lane2
+lane2.recover_armed_since() if lane2.armed() else None
+assert lane2.armed(), "restart must not disarm"
+lane2.set_armed(False, "test"); assert not lane2.armed()
+print("funds + arming OK")
