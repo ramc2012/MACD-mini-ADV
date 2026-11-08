@@ -47,8 +47,8 @@ def _clock(value: str) -> time:
 
 @lru_cache(maxsize=4096)
 def _close_for(kind: str, day: date) -> time:
-    special = market_calendar.special_close(day)
-    if special is not None:                       # a special session closes every segment at its own time
+    special = market_calendar.special_close(day, kind)
+    if special is not None:                       # a special session: F&O 15:40, cash and index 15:30 (8 Nov 2026)
         return special
     regime = regime_for(day)
     if kind == "fo":

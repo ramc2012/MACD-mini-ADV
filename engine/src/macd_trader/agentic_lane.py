@@ -118,14 +118,17 @@ def in_session(now: datetime) -> bool:
 
 
 def sessions_held(opened_at: str | None, now: datetime) -> int:
-    """Trading sessions from the entry day to today, both counted (an entry today = 1)."""
+    """Regular trading sessions from the entry day to today, both counted (an entry today = 1).
+
+    A special session (Muhurat) is part of the regular session before it, so it adds no session of its own.
+    """
     try:
-        start = datetime.fromisoformat(str(opened_at)).astimezone(IST).date()
+        start = market_calendar.logical_day(datetime.fromisoformat(str(opened_at)).astimezone(IST).date())
     except ValueError:
         return 1
     day, count = start, 0
     while day <= now.astimezone(IST).date():
-        count += market_calendar.is_trading_day(day)
+        count += market_calendar.is_regular_trading_day(day)
         day += timedelta(days=1)
     return max(count, 1)
 

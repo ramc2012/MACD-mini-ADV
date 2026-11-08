@@ -15,9 +15,17 @@ the equity and equity-derivatives segments. It must be extended every year:
 ``calendar_covers_year: false`` once the current year has no entries, so an
 unmaintained calendar is visible rather than silently weekday-only again.
 Special sessions (Muhurat trading) are trading days with their own hours:
-SPECIAL_SESSIONS gives each one's continuous-session open and close, and
-sessions.py / candles.py gate prints by them, so every lane trades them like
-a short ordinary session. Added 8 Nov 2026 at the owner's request.
+SPECIAL_SESSIONS gives each one's continuous-session open and its last close
+(F&O to 15:40; SPECIAL_SEGMENT_CLOSES holds cash 15:30 and index 15:30), and
+sessions.py / candles.py gate prints by them, so every lane trades them.
+
+For everything that COUNTS sessions a special session is an extension of the
+regular session before it (owner, 8 Nov 2026): next_trading_day /
+previous_trading_day step over it, so Monday's previous session is Friday,
+holding periods count Friday + Muhurat once, and a Muhurat trade settles with
+Friday's (settlement_day, T+1 on the regular calendar). logical_day maps the
+special date onto that Friday. is_trading_day stays True for it, because that
+gates the feed, bars and entries.
 """
 
 from __future__ import annotations
@@ -44,10 +52,14 @@ NSE_TRADING_HOLIDAYS: dict[date, str] = {
     date(2026, 12, 25): "Christmas",
 }
 
-# Special sessions on otherwise closed days: (continuous open, close for every segment, name), IST.
-# 8 Nov 2026: NSE circular NSE/CMTR/76941 (19 Oct 2026) -- pre-open 14:05, normal market 14:20-15:30.
+# Special sessions on otherwise closed days: (continuous open, last segment close, name), IST.
+# 8 Nov 2026: NSE circular NSE/CMTR/76941 (19 Oct 2026) -- pre-open 14:05, equity normal market 14:20-15:30,
+# equity derivatives 14:20-15:40.
 SPECIAL_SESSIONS: dict[date, tuple[time, time, str]] = {
-    date(2026, 11, 8): (time(14, 20), time(15, 30), "Muhurat trading"),
+    date(2026, 11, 8): (time(14, 20), time(15, 40), "Muhurat trading"),
+}
+SPECIAL_SEGMENT_CLOSES: dict[date, dict[str, time]] = {
+    date(2026, 11, 8): {"fo": time(15, 40), "cash": time(15, 30), "index": time(15, 30)},
 }
 REGULAR_OPEN = time(9, 15)
 
@@ -64,9 +76,14 @@ def session_open_time(day: date) -> time:
     return special[0] if special else REGULAR_OPEN
 
 
-def special_close(day: date) -> time | None:
+def special_close(day: date, kind: str | None = None) -> time | None:
+    """A special session's close for one segment ("fo", "cash", "index"), or its last close when ``kind`` is None."""
     special = SPECIAL_SESSIONS.get(day)
-    return special[1] if special else None
+    if not special:
+        return None
+    if kind is None:
+        return special[1]
+    return SPECIAL_SEGMENT_CLOSES.get(day, {}).get(kind, special[1])
 
 
 def configure(extra_csv: str | None) -> list[str]:
@@ -98,20 +115,37 @@ def is_trading_day(day: date) -> bool:
     return day.weekday() < 5 and day not in holidays()
 
 
+def is_regular_trading_day(day: date) -> bool:
+    """A regular session: the unit every session count, hold and settlement uses (special sessions extend one)."""
+    return day.weekday() < 5 and day not in holidays()
+
+
+def logical_day(day: date) -> date:
+    """The regular session ``day`` belongs to: a special session counts as part of the regular session before it."""
+    if day in SPECIAL_SESSIONS and not is_regular_trading_day(day):
+        return previous_trading_day(day)
+    return day
+
+
 def next_trading_day(day: date) -> date:
-    """The first trading day strictly after ``day``."""
+    """The first regular trading day strictly after ``day`` (special sessions are not counted)."""
     candidate = day + timedelta(days=1)
-    while not is_trading_day(candidate):
+    while not is_regular_trading_day(candidate):
         candidate += timedelta(days=1)
     return candidate
 
 
 def previous_trading_day(day: date) -> date:
-    """The last trading day strictly before ``day``."""
+    """The last regular trading day strictly before ``day`` (special sessions are not counted)."""
     candidate = day - timedelta(days=1)
-    while not is_trading_day(candidate):
+    while not is_regular_trading_day(candidate):
         candidate -= timedelta(days=1)
     return candidate
+
+
+def settlement_day(trade_day: date) -> date:
+    """T+1 settlement on the regular calendar; a special session settles with the session it extends."""
+    return next_trading_day(logical_day(trade_day))
 
 
 def covers_year(year: int) -> bool:
@@ -128,7 +162,11 @@ def status(today: date) -> dict:
         "trading_day": is_trading_day(today),
         "holiday": None if today in SPECIAL_SESSIONS else holiday_name(today),
         "special_session": ({"name": SPECIAL_SESSIONS[today][2], "open": SPECIAL_SESSIONS[today][0].strftime("%H:%M"),
-                             "close": SPECIAL_SESSIONS[today][1].strftime("%H:%M")} if today in SPECIAL_SESSIONS else None),
+                             "close": SPECIAL_SESSIONS[today][1].strftime("%H:%M"),
+                             "closes": {k: v.strftime("%H:%M") for k, v in SPECIAL_SEGMENT_CLOSES.get(today, {}).items()},
+                             "extends": logical_day(today).isoformat()} if today in SPECIAL_SESSIONS else None),
+        "logical_day": logical_day(today).isoformat(),
+        "settlement_day": settlement_day(today).isoformat(),
         "next_trading_day": next_trading_day(today).isoformat(),
         "calendar_covers_year": covers_year(today.year),
         "configured_extra_holidays": sorted(day.isoformat() for day in _extra),
