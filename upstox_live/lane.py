@@ -46,6 +46,11 @@ FUNDS_MAX_AGE = float(os.environ.get("FUNDS_MAX_AGE_SECONDS", "90"))
 CHARGES_ALLOWANCE = float(os.environ.get("CHARGES_ALLOWANCE", "60"))  # brokerage + taxes kept back per entry
 PORT = int(os.environ.get("PORT", "8440"))
 LOOP_SECONDS = float(os.environ.get("LOOP_SECONDS", "5"))
+# Orders are sent only inside this IST window (any day: special sessions such as Muhurat trade on holidays). Outside
+# it an exit simply waits for the next session; nothing is sent after hours (9 Nov 2026: a restart after the close
+# must not fire a SELL into a closed market).
+_WINDOW = os.environ.get("ORDER_WINDOW", "09:15-15:40").strip()
+ORDER_WINDOW = tuple(_WINDOW.split("-")) if _WINDOW else None
 READ_SECONDS = float(os.environ.get("READ_SECONDS", "15"))
 MAX_SIGNAL_AGE = float(os.environ.get("MAX_SIGNAL_AGE_SECONDS", "120"))
 ENTRY_BUFFER = float(os.environ.get("ENTRY_BUFFER_PCT", "2")) / 100
@@ -117,12 +122,22 @@ def iso(d: datetime | None = None) -> str:
 
 
 def parse_time(s: str | None) -> datetime | None:
+    """Always time-zone aware. Upstox trade timestamps carry no zone ("2026-11-09 14:45:16"): read as IST, never
+    compared raw (9 Nov 2026: a naive fill time crashed every loop from 13:46 IST and left a real position unmanaged)."""
     if not s:
         return None
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        d = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except ValueError:
         return None
+    return d if d.tzinfo else d.replace(tzinfo=IST)
+
+
+def in_order_window(at: datetime | None = None) -> bool:
+    if not ORDER_WINDOW:
+        return True
+    t = (at or now()).astimezone(IST).strftime("%H:%M")
+    return ORDER_WINDOW[0] <= t <= ORDER_WINDOW[1]
 
 
 def armed() -> bool:
@@ -153,6 +168,10 @@ def load_state() -> dict:
             s = json.load(f)
         for k, v in blank_state().items():
             s.setdefault(k, v)
+        for sym, p in s["positions"].items():     # fills recorded before 9 Nov 2026 carry Upstox's zone-less stamp
+            if p.get("opened_at") and "+" not in str(p["opened_at"])[10:] and not str(p["opened_at"]).endswith("Z"):
+                buys = sorted(o["placed_at"] for o in s["orders"].values() if o.get("symbol") == sym and o.get("side") == "BUY")
+                p["opened_at"] = buys[-1] if buys else None
         return s
     except (OSError, ValueError):
         return blank_state()
@@ -241,12 +260,16 @@ def record_fills() -> None:
         oid, tid = str(t.get("order_id")), str(t.get("trade_id") or t.get("exchange_order_id", "")) + "|" + str(t.get("order_id"))
         if oid not in ours or tid in state["fills"]:
             continue
+        if f"recovered|{oid}" in state["fills"]:   # recorded by hand from the lane's memory (9 Nov 2026): same fill
+            state["fills"][tid] = state["fills"].pop(f"recovered|{oid}")
+            continue
         o = state["orders"][oid]
         qty = int(t.get("quantity") or 0)
         price = float(t.get("average_price") or t.get("price") or 0)
         side = (t.get("transaction_type") or o["side"]).upper()
         state["fills"][tid] = {"order_id": oid, "symbol": o["symbol"], "instrument": o["instrument"], "side": side,
-                               "quantity": qty, "price": price, "at": t.get("exchange_timestamp") or t.get("order_timestamp") or iso()}
+                               "quantity": qty, "price": price, "at": iso(),
+                               "exchange_at": t.get("exchange_timestamp") or t.get("order_timestamp")}
         p = state["positions"].setdefault(o["symbol"], {"symbol": o["symbol"], "instrument": o["instrument"], "quantity": 0,
                                                        "average_price": 0.0, "lot_size": o.get("lot_size"), "tick": o.get("tick"),
                                                        "opened_at": None, "macd_seen": False, "realized": 0.0, "bought": 0})
@@ -336,6 +359,9 @@ def count_order() -> bool:
 def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: str, force_live: bool = False) -> None:
     live = armed() or force_live
     if not live:        # callers check armed() first; nothing is recorded for an order that is not sent
+        return
+    if not in_order_window():
+        cache["held_outside_window"] = {"symbol": symbol, "side": side, "at": iso()}
         return
     body = {"quantity": qty, "product": "D", "validity": "DAY", "price": price, "tag": TAG,
             "instrument_token": inst["upstox"], "order_type": "LIMIT", "transaction_type": side,
@@ -515,8 +541,10 @@ def loop() -> None:
                 probe_order_api()
                 last_read = time.time()
             with lock:
-                step()
-                save_state(state)
+                try:
+                    step()
+                finally:
+                    save_state(state)     # a failing step must not leave recorded fills unsaved
         except Exception:
             traceback.print_exc()
         time.sleep(LOOP_SECONDS)

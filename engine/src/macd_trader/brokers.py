@@ -306,6 +306,53 @@ def _make_resilient_symbol_conversion(original):
     return convert
 
 
+def _retire_sdk_socket(socket_cls) -> None:
+    """Stop the previous FYERS data socket for good and forget it, so the next stream gets a FRESH SDK object.
+
+    9 Nov 2026: ``FyersDataSocket`` is a process-wide singleton whose topic-number -> symbol map is shared by every
+    websocket it opens. When the engine rebuilt the stream while the SDK was mid-reconnect (``close_connection`` is a
+    no-op then: no socket object, ``restart_flag`` left on), or two closes fired together, a second websocket came up
+    on the same map. Its topic numbers named other contracts, so from 13:10 IST ~975 option contracts received each
+    other's prices (NMDC 70 CE at 267, HDFCBANK 690 CE at 1,340) and every paper lane traded on them until the close.
+    """
+    old = getattr(socket_cls, "_instance", None)
+    if old is None:
+        return
+    old.restart_flag = False
+    # A reconnect already sleeping inside the SDK's close handler calls self.connect() / subscribe() when it wakes:
+    # make both dead ends on the retired object.
+    old.connect = lambda *a, **k: None
+    old.subscribe = lambda *a, **k: None
+    try:
+        ws = getattr(old, "_FyersDataSocket__ws_object", None)
+        if ws is not None:
+            ws.close()
+    except Exception:  # noqa: BLE001 -- retiring must never block the new stream
+        pass
+    socket_cls._instance = None
+
+
+def _serialise_sdk_reconnects(socket, window: float = 3.0) -> None:
+    """At most one websocket per SDK object: a second connect() while one is still opening is dropped.
+
+    Two close events in the same millisecond (seen 9 Nov 15:42:31 IST) each ran the SDK's reconnect and each opened
+    a websocket before either had registered itself.
+    """
+    original = socket.connect
+    lock = Lock()
+    last = {"at": -1e9}
+
+    def connect(*args, **kwargs):
+        with lock:
+            opening = getattr(socket, "_FyersDataSocket__ws_object", None) is None and time.monotonic() - last["at"] < window
+            if opening:
+                return None
+            last["at"] = time.monotonic()
+        return original(*args, **kwargs)
+
+    socket.connect = connect
+
+
 _INDEX_DEPTH_NOTICE = "Index does not have market depth"
 
 
@@ -1096,6 +1143,7 @@ class FyersBroker(Broker):
                 subscription_error = str(details[0])[:500] if details else "unknown FYERS subscription error"
             loop.call_soon_threadsafe(socket_error.set)
 
+        _retire_sdk_socket(data_ws.FyersDataSocket)
         self._socket = data_ws.FyersDataSocket(
             access_token=self.authorization,
             log_path="",
@@ -1107,6 +1155,7 @@ class FyersBroker(Broker):
             on_error=on_error,
             on_message=on_message,
         )
+        _serialise_sdk_reconnects(self._socket)
         await _in_sdk_pool(self._socket.connect)
         deadline = loop.time() + 20
         while not connected.is_set():
@@ -1187,6 +1236,11 @@ class FyersBroker(Broker):
                 if close:
                     await _in_sdk_pool(close)
                     break
+            # close_connection does nothing while the SDK is between sockets: retire the object as well so a
+            # reconnect sleeping inside it cannot open a socket after this close.
+            socket_cls = type(self._socket)
+            if getattr(socket_cls, "_instance", None) is self._socket:
+                _retire_sdk_socket(socket_cls)
 
 
 def create_broker(settings: Settings) -> Broker:

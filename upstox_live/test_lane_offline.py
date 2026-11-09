@@ -1,7 +1,7 @@
 import os, sys, json, importlib
 from datetime import datetime, timezone, timedelta
 import tempfile; S = tempfile.mkdtemp()
-os.environ.update(STATE_DIR=S + "/state", UPSTOX_TOKEN_FILE="/nonexistent")
+os.environ.update(STATE_DIR=S + "/state", UPSTOX_TOKEN_FILE="/nonexistent", ORDER_WINDOW="")  # window gate: section 9
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane
 sent = []
@@ -183,3 +183,49 @@ code, body = post2("/settings", {"sides": "CE"}, "http://localhost:3200")
 assert code == 200 and body["snapshot"]["settings"]["sides"] == "CE" and "calls only" in body["snapshot"]["rules"]["signals"]
 srv.shutdown(); L.set_armed(False, "test")
 print("side filter + weekly-index preference OK")
+
+# 9. (9 Nov 2026) Upstox's zone-less fill time must not crash the loop; a position the MACD lane never held is sold
+#    after MACD_ADOPT_SECONDS; nothing is sent outside the order window; a failing step still saves state
+L.set_armed(True, "test"); L.state["orders"] = {}; L.state["positions"] = {}
+assert L.parse_time("2026-11-09 14:45:16").tzinfo is not None
+L.state["positions"]["NSE:ORPHAN26NOV970CE"] = {"symbol": "NSE:ORPHAN26NOV970CE", "instrument": "NSE_FO|77", "quantity": 700,
+    "average_price": 17.0, "lot_size": 700, "tick": 0.05, "opened_at": "2026-11-09 19:16:30", "macd_seen": False,
+    "realized": 0.0, "bought": 700}
+L.state["orders"]["o77"] = {"order_id": "o77", "symbol": "NSE:ORPHAN26NOV970CE", "instrument": "NSE_FO|77", "side": "BUY",
+    "quantity": 700, "price": 17.25, "placed_at": (datetime.now(timezone.utc) - timedelta(minutes=30)).astimezone(L.IST).isoformat(timespec="seconds"),
+    "open": False, "status": "complete"}
+L.save_state(L.state); L.state.update(L.load_state())       # restart: the naive stamp is replaced by the BUY's placed_at
+assert "+05:30" in L.state["positions"]["NSE:ORPHAN26NOV970CE"]["opened_at"]
+L.cache["positions"] = [{"instrument_token": "NSE_FO|77", "last_price": 15.4}]
+world["signals"] = []
+L.ORDER_WINDOW = ("00:00", "00:00") if datetime.now(L.IST).strftime("%H:%M") != "00:00" else ("23:59", "23:59")
+n = len(sent); L.step(); assert len(sent) == n, "nothing is sent outside the order window"
+L.ORDER_WINDOW = None
+L.step(); assert [(b["instrument_token"], b["transaction_type"]) for _, b in sent[n:]] == [("NSE_FO|77", "SELL")]
+saved = []
+orig_step, orig_save = L.step, L.save_state
+L.step = lambda: (_ for _ in ()).throw(RuntimeError("boom")); L.save_state = lambda s: saved.append(1)
+L.LOOP_SECONDS = 0; L.READ_SECONDS = 1e9
+import itertools
+calls = itertools.count()
+orig_sleep = L.time.sleep
+def stop_after_one(_):
+    if next(calls) >= 0: raise KeyboardInterrupt
+L.time.sleep = stop_after_one
+try:
+    L.loop()
+except KeyboardInterrupt:
+    pass
+L.time.sleep, L.step, L.save_state = orig_sleep, orig_step, orig_save
+assert saved, "state is saved even when step() fails"
+# a fill recovered by hand ("recovered|<order id>") is not counted again when Upstox's trade list is read
+L.state["orders"]["o88"] = {"order_id": "o88", "symbol": "NSE:REC26NOV100CE", "instrument": "NSE_FO|88", "side": "BUY",
+    "quantity": 100, "price": 10.0, "placed_at": L.iso(), "open": False, "status": "complete"}
+L.state["fills"]["recovered|o88"] = {"order_id": "o88", "symbol": "NSE:REC26NOV100CE", "side": "BUY", "quantity": 100, "price": 10.0}
+L.state["positions"]["NSE:REC26NOV100CE"] = {"symbol": "NSE:REC26NOV100CE", "instrument": "NSE_FO|88", "quantity": 100,
+    "average_price": 10.0, "opened_at": L.iso(), "macd_seen": False, "realized": 0.0, "bought": 100}
+L.cache["trades"] = [{"order_id": "o88", "trade_id": "T88", "quantity": 100, "average_price": 10.0, "transaction_type": "BUY"}]
+L.record_fills()
+assert L.state["positions"]["NSE:REC26NOV100CE"]["quantity"] == 100 and "T88|o88" in L.state["fills"]
+L.set_armed(False, "test")
+print("naive fill time + order window + save-on-failure + recovered fill OK")
