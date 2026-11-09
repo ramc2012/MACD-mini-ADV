@@ -283,3 +283,15 @@ def test_nightly_rebuilds_windows_and_the_close_when_snapshots_exist(tmp_path):
     # report — not one the size of the whole book. Both strikes are skipped.
     assert connection.execute(
         "SELECT d_call_oi, history_days, d_oi_skipped FROM whale_eod").fetchone() == (0, 0, 2)
+
+
+def test_nightly_hold_file_holds_a_day(tmp_path):
+    """9 Nov 2026: the owner held that session's nightly (cross-wired option prices)."""
+    import json
+    from macd_trader.desk import nightly_held
+    assert nightly_held(str(tmp_path), "2026-11-09") is None
+    (tmp_path / "nightly_hold.json").write_text(json.dumps({"days": {"2026-11-09": "cross-wired prices"}}))
+    assert nightly_held(str(tmp_path), "2026-11-09") == "cross-wired prices"
+    assert nightly_held(str(tmp_path), "2026-11-11") is None
+    (tmp_path / "nightly_hold.json").write_text("not json")
+    assert nightly_held(str(tmp_path), "2026-11-09") is None

@@ -140,6 +140,16 @@ def in_order_window(at: datetime | None = None) -> bool:
     return ORDER_WINDOW[0] <= t <= ORDER_WINDOW[1]
 
 
+def hand_to_owner(symbol: str, who: str) -> dict:
+    """The owner manages this contract by hand: the lane stops managing it (no exit, no new entry, no rebuild)."""
+    p = state["positions"].pop(symbol, None)
+    row = {"since": iso(), "by": who, "quantity": (p or {}).get("quantity"), "average_price": (p or {}).get("average_price"),
+           "instrument": (p or {}).get("instrument")}
+    state["owner_managed"][symbol] = row
+    journal("HANDED_TO_OWNER", symbol=symbol, quantity=row["quantity"], average_price=row["average_price"], by=who)
+    return row
+
+
 def armed() -> bool:
     try:
         with open(ARM_FILE) as f:
@@ -159,7 +169,7 @@ def tick_round(price: float, tick: float, up: bool) -> float:
 
 def blank_state() -> dict:
     return {"created_at": iso(), "seen_signals": [], "positions": {}, "orders": {}, "fills": {}, "decisions": [],
-            "realized": 0.0, "orders_today": {"day": "", "count": 0}, "started_at": iso()}
+            "realized": 0.0, "orders_today": {"day": "", "count": 0}, "started_at": iso(), "owner_managed": {}}
 
 
 def load_state() -> dict:
@@ -264,6 +274,11 @@ def record_fills() -> None:
             state["fills"][tid] = state["fills"].pop(f"recovered|{oid}")
             continue
         o = state["orders"][oid]
+        if o["symbol"] in state["owner_managed"]:   # handed to the owner: recorded, never rebuilt as a lane position
+            state["fills"][tid] = {"order_id": oid, "symbol": o["symbol"], "side": (t.get("transaction_type") or o["side"]).upper(),
+                                   "quantity": int(t.get("quantity") or 0), "price": float(t.get("average_price") or t.get("price") or 0),
+                                   "at": iso(), "owner_managed": True}
+            continue
         qty = int(t.get("quantity") or 0)
         price = float(t.get("average_price") or t.get("price") or 0)
         side = (t.get("transaction_type") or o["side"]).upper()
@@ -507,6 +522,9 @@ def step() -> None:
         if not armed():
             journal("SKIP", symbol=sym, signal_kind=s.get("kind"), price=s.get("price"), reason="lane not armed: no order sent")
             continue
+        if sym in state["owner_managed"]:
+            journal("SKIP", symbol=sym, reason="owner manages this contract")
+            continue
         if sym in state["positions"] or any(o["symbol"] == sym and o.get("open") for o in state["orders"].values()):
             journal("SKIP", symbol=sym, reason="already held or ordering")
             continue
@@ -615,8 +633,9 @@ def snapshot() -> dict:
             "equity": round(START_FUND + state["realized"] + unreal, 2),
             "upstox_funds": (f.get("equity") if isinstance(f, dict) else None),
             "positions": positions, "closed": state.get("closed", [])[-100:],
+            "owner_managed": [{"symbol": k, **v} for k, v in state["owner_managed"].items()],
             "orders": sorted((o for o in state["orders"].values() if not o.get("dry")), key=lambda o: o["placed_at"], reverse=True)[:200],
-            "fills": sorted(state["fills"].values(), key=lambda f: str(f["at"]), reverse=True)[:200],
+            "fills": sorted(state["fills"].values(), key=lambda f: str(f.get("at") or ""), reverse=True)[:200],
             "decisions": list(reversed([d for d in state["decisions"] if d.get("kind") != "DRY_RUN_ORDER"][-200:])),
             "account": {"positions": cache["positions"], "orders": cache["orders"], "trades": cache["trades"],
                         "lane_instruments": sorted(lane_instruments)},

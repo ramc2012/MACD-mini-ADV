@@ -227,5 +227,19 @@ L.state["positions"]["NSE:REC26NOV100CE"] = {"symbol": "NSE:REC26NOV100CE", "ins
 L.cache["trades"] = [{"order_id": "o88", "trade_id": "T88", "quantity": 100, "average_price": 10.0, "transaction_type": "BUY"}]
 L.record_fills()
 assert L.state["positions"]["NSE:REC26NOV100CE"]["quantity"] == 100 and "T88|o88" in L.state["fills"]
+# owner-managed: handed over, the lane never exits it, never re-enters it, and a re-read trade does not rebuild it
+L.state["orders"]["o99"] = {"order_id": "o99", "symbol": "NSE:OWN26NOV970CE", "instrument": "NSE_FO|99", "side": "BUY",
+    "quantity": 700, "price": 17.25, "placed_at": L.iso(), "open": False, "status": "complete"}
+L.state["positions"]["NSE:OWN26NOV970CE"] = {"symbol": "NSE:OWN26NOV970CE", "instrument": "NSE_FO|99", "quantity": 700,
+    "average_price": 17.0, "opened_at": "2026-11-01T10:00:00+05:30", "macd_seen": False, "realized": 0.0, "bought": 700}
+L.hand_to_owner("NSE:OWN26NOV970CE", "test")
+L.cache["trades"] = [{"order_id": "o99", "trade_id": "T99", "quantity": 700, "average_price": 17.0, "transaction_type": "BUY"}]
+L.record_fills(); assert "NSE:OWN26NOV970CE" not in L.state["positions"]
+L.cache["positions"] = [{"instrument_token": "NSE_FO|99", "last_price": 15.4}]
+L.PREFER_WAIT = 0
+world["signals"] = [fresh_now(199, "NSE:OWN26NOV970CE", 15.0, 1)]
+n = len(sent); L.step(); assert len(sent) == n, "owner-managed contract: no exit, no entry"
+assert L.state["decisions"][-1]["reason"] == "owner manages this contract"
+assert L.snapshot()["owner_managed"][0]["symbol"] == "NSE:OWN26NOV970CE"
 L.set_armed(False, "test")
-print("naive fill time + order window + save-on-failure + recovered fill OK")
+print("naive fill time + order window + save-on-failure + recovered fill + owner-managed OK")

@@ -16,6 +16,7 @@ status fields initialised by ``init_desk_state``.
 from __future__ import annotations
 
 import asyncio
+import os
 import math
 import time
 from dataclasses import replace
@@ -45,6 +46,24 @@ NIGHTLY_MAX_ATTEMPTS = 60
 # contract trades. Waiting for "complete" kept 19 Oct's nightly waiting for good. After this time the nightly runs
 # on what it has and records the coverage as partial.
 NIGHTLY_DEADLINE = (21, 30)
+
+
+def nightly_held(runtime_dir: str, day: str) -> str | None:
+    """The owner's hold on a session's nightly run: runtime/nightly_hold.json {"days": {"2026-11-09": "reason"}}.
+
+    9 Nov 2026: option prices were cross-wired from 13:10 IST, so that session's bars must not be turned into
+    profiles, whale baselines or refit thresholds until they are repaired. A held day is skipped by both the
+    evening run and the next morning's catch-up; removing it from the file releases it.
+    """
+    import json
+    import os
+    try:
+        with open(os.path.join(runtime_dir, "nightly_hold.json")) as f:
+            days = (json.load(f) or {}).get("days") or {}
+    except (OSError, ValueError, AttributeError):
+        return None
+    reason = days.get(day) if isinstance(days, dict) else (day if day in days else None)
+    return str(reason or "held") if day in days else None
 # Raw ticks are condensed outside market hours; check periodically.
 TICK_MAINTENANCE_INTERVAL_SECONDS = 900
 # The option agent summarises the earlier sessions at 14:30 (they do not change
@@ -373,7 +392,11 @@ class DeskMixin:
             trading_today = market_calendar.is_trading_day(now.date())
             if trading_today and (9, 0) <= (now.hour, now.minute) < (15, 50):
                 continue
+            runtime_dir = os.path.dirname(self.settings.contract_snapshot_path)
             missed = await asyncio.to_thread(self._missed_nightly_day, now)
+            if missed and nightly_held(runtime_dir, missed):
+                self.nightly_report = {"day": missed, "held": nightly_held(runtime_dir, missed)}
+                missed = None
             if missed:
                 self.__dict__.setdefault("_nightly_caught_up", set()).add(missed)
                 try:
@@ -384,6 +407,10 @@ class DeskMixin:
                     self.nightly_report = {"day": missed, "error": str(exc), "caught_up": True}
                 continue
             if not trading_today or self._nightly_done == today or (now.hour, now.minute) < (15, 50):
+                continue
+            held = nightly_held(runtime_dir, today)
+            if held:
+                self.nightly_report = {"day": today, "held": held}
                 continue
             coverage = await asyncio.to_thread(session_history_coverage,
                 self.settings.research_database_path, now.date(), self.nightly_symbols())
