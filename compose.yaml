@@ -63,6 +63,10 @@ services:
       retries: 12
       start_period: 20s
     restart: unless-stopped
+    # Docker on this Mac kills a container 3 s after SIGTERM unless told otherwise (measured 10 Nov 2026), and the
+    # engine needs longer than that to close the feed and its stores: every stop was a kill mid-shutdown, and the
+    # next start then checked every store for ~70 s. It leaves on its own as soon as the stores are closed.
+    stop_grace_period: 180s
 
   # The Market Profile / order-flow lane: the auction desk and its book, tick
   # capture, the whale tracker and nightly memory. Same image, fed by the tick
@@ -101,6 +105,7 @@ services:
       retries: 12
       start_period: 30s
     restart: unless-stopped
+    stop_grace_period: 120s        # as for the engine: time to close its stores before Docker kills it
 
   # Tick bus. Core NATS, no persistence: the engine's SQLite capture and the
   # archive are the durable records; the bus only fans ticks out. (QuestDB was

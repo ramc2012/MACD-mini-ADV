@@ -40,6 +40,16 @@ class MACDStrategyManager:
         # has an "as of last close" answer immediately after (re)connect.
         self.evaluations: dict[str, dict] = {}
 
+    def forget(self, symbol: str) -> None:
+        """Drop one symbol's indicator state: it is rebuilt by a fresh warm-up replay, or it left the watchlist.
+
+        Emitted signals stay (they are history); only the running state goes.
+        """
+        for store in (self.indicators, self.bollinger, self.kama, self.kama_rsi, self.kama_roc, self.previous_kama,
+                      self.volumes, self.points, self.point_history, self.evaluations):
+            store.pop(symbol, None)
+        self.intrabar_fired = {key for key in self.intrabar_fired if key[0] != symbol}
+
     def on_closed_candle(self, candle: Candle, *, warmup: bool = False) -> Signal | None:
         if candle.symbol not in self.indicators:
             self.indicators[candle.symbol] = IncrementalMACD(self.settings.fast_period, self.settings.slow_period, self.settings.signal_period)

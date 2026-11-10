@@ -184,6 +184,13 @@ class Broker(ABC):
         """Open interest for one derivative: {"oi", "prev_oi", "ltp", "volume"}, or None when the broker has none."""
         return None
 
+    async def add_symbols(self, symbols: list[str]) -> bool:
+        """Subscribe more symbols on the RUNNING stream, without closing it.
+
+        False when this broker cannot (or has no live stream): the caller then restarts the socket instead.
+        """
+        return False
+
     async def validate_session(self) -> bool:
         """Confirm that the broker session is still authenticated.
 
@@ -206,10 +213,17 @@ class SimulationBroker(Broker):
         self.connected = False
         self._prices: dict[str, float] = {}
         self._stopped = asyncio.Event()
+        self._stream_symbols: list[str] = []
 
     async def connect(self) -> None:
         self.connected = True
         self._stopped.clear()
+
+    async def add_symbols(self, symbols: list[str]) -> bool:
+        if not self.connected:
+            return False
+        self._stream_symbols.extend(s for s in dict.fromkeys(symbols) if s not in self._stream_symbols)
+        return True
 
     def _seed(self, symbol: str) -> float:
         if "BANK" in symbol:
@@ -235,8 +249,9 @@ class SimulationBroker(Broker):
 
     async def stream(self, symbols: list[str], handler: TickHandler) -> None:
         rng = random.Random(481516)
+        self._stream_symbols = list(dict.fromkeys(symbols))
         while not self._stopped.is_set():
-            for symbol in symbols:
+            for symbol in list(self._stream_symbols):
                 previous = self._prices.setdefault(symbol, self._seed(symbol))
                 next_price = max(1.0, previous * (1 + rng.gauss(0, 0.00008)))
                 self._prices[symbol] = next_price
@@ -406,6 +421,12 @@ class FyersBroker(Broker):
         self.settings = settings
         self.connected = False
         self._socket = None
+        # What the running stream is subscribed to. It grows through add_symbols(); the SDK's own reconnect
+        # resubscribes this list, so a symbol added mid-session survives a socket drop.
+        self._stream_symbols: list[str] = []
+        # One subscribe() at a time per socket: the SDK builds each subscription in shared instance attributes
+        # (channel_symbol, scrips_count), so an add racing a reconnect's resubscribe would mix the two lists.
+        self._subscribe_lock: Lock | None = None
         self._tick_buffer: _ThreadsafeTickBuffer | None = None
         self.handler_errors = 0
         self.last_handler_error: str | None = None
@@ -1047,6 +1068,9 @@ class FyersBroker(Broker):
         self._tick_buffer = tick_buffer
         self.rejected_symbols = []
         self.subscription_notices = []
+        self._stream_symbols = list(dict.fromkeys(symbols))
+        subscribe_lock = Lock()
+        self._subscribe_lock = subscribe_lock
 
         def on_message(message: dict) -> None:
             if isinstance(message, dict) and message.get("type") == "cn" and message.get("s") == "ok":
@@ -1109,7 +1133,10 @@ class FyersBroker(Broker):
             subscribing = True
             subscription_error = None
             try:
-                self._socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
+                with subscribe_lock:
+                    # The list as it stands NOW: an SDK reconnect must bring back the symbols added since the
+                    # stream started (add_symbols), not only the ones it started with.
+                    self._socket.subscribe(symbols=list(self._stream_symbols), data_type="SymbolUpdate")
             except Exception as exc:
                 subscription_error = str(exc)[:500]
                 loop.call_soon_threadsafe(socket_error.set)
@@ -1227,6 +1254,36 @@ class FyersBroker(Broker):
         if result.get("s") != "ok":
             raise RuntimeError(result.get("message", "Fyers rejected order"))
         return str(result.get("id"))
+
+    async def add_symbols(self, symbols: list[str]) -> bool:
+        """Subscribe more symbols on the live socket -- an intraday ladder refresh -- without closing it.
+
+        Until 10 Nov 2026 a changed ladder closed the socket and rebuilt the whole feed: 25-56 s without a tick,
+        about every 30 minutes of every session (15 gaps on 6 Nov, 18 on 9 Nov), and each rebuild was one more
+        chance for the stream-rebuild / SDK-reconnect race that crossed option prices on 9 Nov. The SDK's
+        subscribe() is incremental on an open socket, so only the new symbols are sent.
+
+        True when the request went out (or the SDK is between sockets, where its reconnect subscribes the grown
+        list). The SDK swallows its own subscribe errors, so the caller confirms with the snapshot ticks.
+        """
+        socket, lock = self._socket, self._subscribe_lock
+        if socket is None or lock is None or not self.connected:
+            return False
+        known = set(self._stream_symbols)
+        new = [symbol for symbol in dict.fromkeys(symbols) if symbol not in known]
+        if not new:
+            return True
+        # Before the request: a reconnect from this moment on resubscribes the grown list.
+        self._stream_symbols.extend(new)
+
+        def subscribe() -> None:
+            with lock:
+                if self._socket is not socket or getattr(socket, "_FyersDataSocket__ws_object", None) is None:
+                    return                      # between sockets: the reconnect's on_connect subscribes them
+                socket.subscribe(symbols=new, data_type="SymbolUpdate")
+
+        await _in_sdk_pool(subscribe)
+        return self._socket is socket and self.connected
 
     async def close(self) -> None:
         self.connected = False

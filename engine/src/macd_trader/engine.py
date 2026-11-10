@@ -8,7 +8,8 @@ from collections import defaultdict, deque
 from contextlib import suppress
 import json
 import math
-from dataclasses import asdict
+import os
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -263,6 +264,29 @@ def _kick_daily_close_refresh(engine) -> None:
         engine._sector_wheel_cache = None
         engine.__dict__.get("_sector_coil_cache", {}).clear()
     engine._wheel_refresh_task = asyncio.create_task(run())
+
+
+# A ladder refresh waits this long for the first quotes of the strikes it subscribed on the running socket; the
+# SDK reports nothing when a subscribe request is lost, so their arrival is the only confirmation there is.
+LIVE_SUBSCRIBE_CONFIRM_SECONDS = 15.0
+
+
+def live_contract_refresh_enabled() -> bool:
+    """MACD_CONTRACT_REFRESH_LIVE=false puts the intraday ladder refresh back on the full feed rebuild."""
+    return os.environ.get("MACD_CONTRACT_REFRESH_LIVE", "true").strip().lower() not in ("false", "0", "off", "no")
+
+
+@dataclass
+class _WarmupRun:
+    """What one warm-up pass shares between its symbols: the two queues and what the pass found."""
+    new_contracts: set[str]
+    expiry_by_symbol: dict[str, str]
+    # Two lanes (boot, 16 Oct 2026): stored-history loads are ~0.1 s each and must not queue behind
+    # broker downloads, which take seconds each and are retried with back-off when Fyers is flaky.
+    load_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(WARMUP_LOAD_CONCURRENCY))
+    download_slots: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(WARMUP_DOWNLOAD_CONCURRENCY))
+    history_backfill: list[str] = field(default_factory=list)
+    downloaded: set[str] = field(default_factory=set)
 
 
 class TradingEngine(DeskMixin):
@@ -984,49 +1008,7 @@ class TradingEngine(DeskMixin):
                  *(self.spot_lane.feed_symbols() if getattr(self, "spot_lane", None) is not None else [])])),
                 {row.symbol: row.expiry for row in contracts}, datetime.now(IST).date())
             self.strategy = MACDStrategyManager(self.settings, self.events, self.option_symbols)
-            tradable = {row.symbol: row.lot_size for row in contracts if row.symbol in self.option_symbols}
-            # New signal entries: today's ATM legs only, one position per stock (execution.entry_block). Held
-            # contracts stay tradable above so they can be added to and exited.
-            atm = {row.symbol for row in self.contract_selector.todays_atm()}
-            self.execution.set_tradable_contracts(tradable)
-            self.execution.set_entry_universe(atm)
-            self.execution.set_contract_expiries({row.symbol: row.expiry for row in contracts})
-            self.blast.set_tradable_contracts(tradable)
-            self.blast.execution.set_entry_universe(atm)
-            self.blast.set_contract_context({
-                row.symbol: {
-                    "spot_symbol": row.spot_symbol, "option_type": row.option_type,
-                    "strike": row.strike, "expiry": row.expiry,
-                    # Selection-time liquidity, the same reading the ladder's
-                    # ATM leg was chosen on. Dropping it here left the blast
-                    # screen unable to tell a contract that trades from one
-                    # that does not, and it sized both at the full ticket.
-                    "volume": row.volume, "oi": row.oi,
-                }
-                for row in contracts if row.symbol in self.option_symbols
-            })
-            self.blast.set_resolvers(spot_price=self.spot_price,
-                                     vix_quote=lambda: self.latest_ticks.get(self.settings.vix_symbol))
-            lane_context = {
-                row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
-                             "expiry": row.expiry, "volume": row.volume, "oi": row.oi}
-                for row in contracts if row.symbol in self.option_symbols
-            }
-            for lane in _smart_lanes(self):
-                lane.set_tradable_contracts(tradable)
-                if lane is not getattr(self, "spot_lane", None):       # stock futures: its own one-per-stock rule
-                    lane.execution.set_entry_universe(atm)
-                lane.set_contract_context(lane_context)
-                lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
-                                   entry_context=self._smart_entry_context, whale=self.whale_interest.reading)
-            if getattr(self, "agentic", None) is not None:
-                # The agentic lane may pick any selected index strike or roll to the next expiry.
-                self.agentic.set_index_universe({
-                    row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
-                                 "expiry": row.expiry, "volume": row.volume, "oi": row.oi, "lot_size": row.lot_size,
-                                 "moneyness": row.moneyness}
-                    for row in contracts if row.underlying in AGENTIC_INDICES})
-            self.configure_desk(tradable)
+            self._wire_contract_universe(contracts)
             # Before trading the new selection: every held contract's lot size against the exchange's
             # current one (owner, 30 Oct 2026). Never blocks the feed.
             try:
@@ -1046,123 +1028,9 @@ class TradingEngine(DeskMixin):
             except Exception as exc:  # noqa: BLE001 -- a repair must never block the feed
                 self.outage_repair = {"error": f"{type(exc).__name__}: {exc}"[:300]}
 
-            # Two lanes (boot, 16 Oct 2026): stored-history loads are ~0.1 s each and must not queue behind
-            # broker downloads, which take seconds each and are retried with back-off when Fyers is flaky.
-            load_slots = asyncio.Semaphore(WARMUP_LOAD_CONCURRENCY)
-            download_slots = asyncio.Semaphore(WARMUP_DOWNLOAD_CONCURRENCY)
-            new_contracts = set(self.contract_selector.new_symbols)
-            expiry_by_symbol = {row.symbol: row.expiry for row in contracts}
-            history_backfill: list[str] = []
-            downloaded: set[str] = set()
+            run = _WarmupRun(new_contracts=set(self.contract_selector.new_symbols),
+                             expiry_by_symbol={row.symbol: row.expiry for row in contracts})
             self.chain_seeded = {}
-
-            async def warm(symbol: str) -> None:
-                partial: list[Candle] = []
-                for attempt in range(WARMUP_ATTEMPTS):
-                    try:
-                        async with load_slots:
-                            stored = await asyncio.to_thread(
-                                load_chart_history,
-                                self.settings.research_database_path,
-                                symbol,
-                                self.settings.timeframe_seconds,
-                                self.settings.fast_period,
-                                self.settings.slow_period,
-                                self.settings.signal_period,
-                                self.settings.bb_period,
-                                self.settings.bb_deviations,
-                                self.settings.kama_period,
-                                self.settings.kama_fast,
-                                self.settings.kama_slow,
-                                self.settings.kama_rsi_period,
-                                self.settings.kama_roc_period,
-                                source_row_limit=LIVE_WARMUP_SOURCE_ROWS,
-                            )
-                        broker_rows = []
-                        minute_rows = []
-                        needed = self.minimum_warmup_bars()
-                        if len(stored["candles"]) < needed:
-                            # Too few stored bars (a strike chosen around today's price): seed from the option-chain
-                            # marks already on disk before asking the broker, whose history may be switched off.
-                            seeded = await asyncio.to_thread(chain_candles, self.settings.research_database_path,
-                                                             symbol, self.settings.timeframe_seconds)
-                            if seeded:
-                                by_time = {row.timestamp: row for row in seeded}
-                                by_time.update({row.timestamp: row for row in stored["candles"]})
-                                stored["candles"] = [by_time[key] for key in sorted(by_time)]
-                                self.chain_seeded[symbol] = len(seeded)
-                        partial = stored["candles"]
-                        if symbol in new_contracts:
-                            # The rest of its 90 days follows in the
-                            # background once the feed is warm.
-                            history_backfill.append(symbol)
-                        if symbol in new_contracts and self.new_contract_needs_history(stored["candles"]):
-                            try:
-                                async with download_slots:
-                                    broker_rows, minute_rows = await self._download_warmup_history(symbol)
-                                    await asyncio.sleep(WARMUP_DOWNLOAD_PACING_SECONDS)
-                            except Exception:
-                                if len(stored["candles"]) < needed:
-                                    raise
-                        elif symbol not in new_contracts and (
-                                not stored["candles"] or (self.stored_history_is_stale(stored["candles"])
-                                                          and not self._history_checked_current(symbol))):
-                            if stored["candles"]:
-                                self.history_gaps[symbol] = datetime.fromtimestamp(
-                                    stored["candles"][-1].timestamp, UTC).astimezone(IST).date().isoformat()
-                            try:
-                                async with download_slots:
-                                    broker_rows, minute_rows = await self._download_warmup_history(symbol)
-                                    await asyncio.sleep(WARMUP_DOWNLOAD_PACING_SECONDS)
-                                # A quiet contract can have nothing newer to give: remember that it was
-                                # asked, or every boot downloads it again (35 of 71 downloads on 16 Oct).
-                                self._mark_history_checked(symbol)
-                            except Exception:
-                                # A restart warms hundreds of contracts at once.  If
-                                # Fyers rate-limits a supplemental request, retain the
-                                # already durable research history rather than dropping
-                                # the whole symbol from the live strategy state.
-                                if not stored["candles"]:
-                                    raise
-                        if minute_rows:
-                            downloaded.add(symbol)
-                            # Persist per symbol: a 90-day minute download for
-                            # every rolled contract is millions of rows, too
-                            # many to hold until the whole warm-up finishes.
-                            try:
-                                await asyncio.to_thread(
-                                    store_historical_candles,
-                                    self.settings.research_database_path,
-                                    minute_rows,
-                                    None,
-                                    expiry_by_symbol,
-                                )
-                            except Exception as exc:  # noqa: BLE001 - cache failure must not kill the feed
-                                self.candle_writer.last_error = f"history cache failed: {exc}"
-                        rows_by_time = {row.timestamp: row for row in stored["candles"]}
-                        rows_by_time.update({row.timestamp: row for row in broker_rows})
-                        rows = [rows_by_time[key] for key in sorted(rows_by_time)]
-                        if not rows:
-                            raise RuntimeError("Fyers returned no historical candles")
-                        self._finish_symbol_warmup(symbol, rows)
-                        self.history_errors.pop(symbol, None)
-                        return
-                    except Exception as exc:
-                        self.history_errors[symbol] = str(exc)
-                        # A 429 is a RATE limit, not a concurrency limit: retrying
-                        # 0.5s later just spends another request inside the same
-                        # window. Back off past the window instead — giving up
-                        # after 1.5s left 138 contracts with no indicator state
-                        # and no scheduled retry to recover them.
-                        if attempt < WARMUP_ATTEMPTS - 1:
-                            rate_limited = "429" in str(exc) or "Too Many Requests" in str(exc)
-                            delay = WARMUP_RATE_LIMIT_BACKOFF[attempt] if rate_limited else 0.5 * (attempt + 1)
-                            await asyncio.sleep(delay)
-                # No broker history was available. Release the symbol with the
-                # stored / chain-seeded bars it has (short of the full warm-up,
-                # so its indicators mature with each live bar) plus whatever
-                # closed live bars arrived while FYERS was retried.
-                self._finish_symbol_warmup(symbol, partial)
 
             # The blast lane runs on one-minute bars, so it seeds from the
             # stored minute bars rather than this strategy-timeframe replay.
@@ -1186,28 +1054,16 @@ class TradingEngine(DeskMixin):
             self._stream_task = asyncio.create_task(self._run_broker_stream())
             step("stream")
             warm_started = time.monotonic()
-            await asyncio.gather(*(warm(symbol) for symbol in warm_symbols))
+            await asyncio.gather(*(self._warm_symbol(symbol, run) for symbol in warm_symbols))
             self.warmup_report = {
                 "finished_at": datetime.now(IST).isoformat(timespec="seconds"),
                 "seconds": round(time.monotonic() - warm_started, 1),
-                "symbols": len(warm_symbols), "new_contracts": len(new_contracts & set(warm_symbols)),
-                "downloaded": len(downloaded), "chain_seeded": len(self.chain_seeded),
+                "symbols": len(warm_symbols), "new_contracts": len(run.new_contracts & set(warm_symbols)),
+                "downloaded": len(run.downloaded), "chain_seeded": len(self.chain_seeded),
                 "selection": dict(self.contract_selector.selection_source),
                 "connect_steps": connect_steps,
             }
-            if downloaded:
-                # The blast lane seeded from the store before these strikes'
-                # bars landed; fold them in now (it reads only newer bars).
-                try:
-                    await self.blast.warm_from_store(self.settings.research_database_path, sorted(downloaded))
-                except Exception as exc:  # noqa: BLE001
-                    self.blast.error = f"minute-bar warm-up failed: {exc}"
-            if history_backfill:
-                backfill = getattr(self, "_history_backfill_task", None)
-                if backfill and not backfill.done():
-                    backfill.cancel()
-                self._history_backfill_task = asyncio.create_task(
-                    self._backfill_contract_history(list(dict.fromkeys(history_backfill)), expiry_by_symbol))
+            await self._after_warmup(run)
             if self.context_indices:
                 self._context_backfill_task = asyncio.create_task(self._backfill_context_indices())
         except Exception as exc:
@@ -1215,6 +1071,286 @@ class TradingEngine(DeskMixin):
             self.error = str(exc)
         finally:
             self.events.publish("broker", self.broker_status())
+
+    def _wire_contract_universe(self, contracts: list) -> None:
+        """Hand every lane the current contract selection: tradable lots, today's ATM entry legs, contract context.
+
+        Runs at each feed connect and, since 10 Nov 2026, after an intraday ladder refresh applied on the running
+        feed. It reads self.option_symbols, so that list is set first.
+        """
+        tradable = {row.symbol: row.lot_size for row in contracts if row.symbol in self.option_symbols}
+        # New signal entries: today's ATM legs only, one position per stock (execution.entry_block). Held
+        # contracts stay tradable above so they can be added to and exited.
+        atm = {row.symbol for row in self.contract_selector.todays_atm()}
+        self.execution.set_tradable_contracts(tradable)
+        self.execution.set_entry_universe(atm)
+        self.execution.set_contract_expiries({row.symbol: row.expiry for row in contracts})
+        self.blast.set_tradable_contracts(tradable)
+        self.blast.execution.set_entry_universe(atm)
+        self.blast.set_contract_context({
+            row.symbol: {
+                "spot_symbol": row.spot_symbol, "option_type": row.option_type,
+                "strike": row.strike, "expiry": row.expiry,
+                # Selection-time liquidity, the same reading the ladder's
+                # ATM leg was chosen on. Dropping it here left the blast
+                # screen unable to tell a contract that trades from one
+                # that does not, and it sized both at the full ticket.
+                "volume": row.volume, "oi": row.oi,
+            }
+            for row in contracts if row.symbol in self.option_symbols
+        })
+        self.blast.set_resolvers(spot_price=self.spot_price,
+                                 vix_quote=lambda: self.latest_ticks.get(self.settings.vix_symbol))
+        lane_context = {
+            row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
+                         "expiry": row.expiry, "volume": row.volume, "oi": row.oi}
+            for row in contracts if row.symbol in self.option_symbols
+        }
+        for lane in _smart_lanes(self):
+            lane.set_tradable_contracts(tradable)
+            if lane is not getattr(self, "spot_lane", None):       # stock futures: its own one-per-stock rule
+                lane.execution.set_entry_universe(atm)
+            lane.set_contract_context(lane_context)
+            lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
+                               entry_context=self._smart_entry_context, whale=self.whale_interest.reading)
+        if getattr(self, "agentic", None) is not None:
+            # The agentic lane may pick any selected index strike or roll to the next expiry.
+            self.agentic.set_index_universe({
+                row.symbol: {"spot_symbol": row.spot_symbol, "option_type": row.option_type, "strike": row.strike,
+                             "expiry": row.expiry, "volume": row.volume, "oi": row.oi, "lot_size": row.lot_size,
+                             "moneyness": row.moneyness}
+                for row in contracts if row.underlying in AGENTIC_INDICES})
+        self.configure_desk(tradable)
+
+    async def _warm_symbol(self, symbol: str, run: _WarmupRun) -> None:
+        """Load one symbol's strategy history (stored bars, chain marks, then the broker) and replay it.
+
+        The symbol must already be in _warming_symbols: its closed live bars are buffered until this finishes.
+        """
+        partial: list[Candle] = []
+        for attempt in range(WARMUP_ATTEMPTS):
+            try:
+                async with run.load_slots:
+                    stored = await asyncio.to_thread(
+                        load_chart_history,
+                        self.settings.research_database_path,
+                        symbol,
+                        self.settings.timeframe_seconds,
+                        self.settings.fast_period,
+                        self.settings.slow_period,
+                        self.settings.signal_period,
+                        self.settings.bb_period,
+                        self.settings.bb_deviations,
+                        self.settings.kama_period,
+                        self.settings.kama_fast,
+                        self.settings.kama_slow,
+                        self.settings.kama_rsi_period,
+                        self.settings.kama_roc_period,
+                        source_row_limit=LIVE_WARMUP_SOURCE_ROWS,
+                    )
+                broker_rows = []
+                minute_rows = []
+                needed = self.minimum_warmup_bars()
+                if len(stored["candles"]) < needed:
+                    # Too few stored bars (a strike chosen around today's price): seed from the option-chain
+                    # marks already on disk before asking the broker, whose history may be switched off.
+                    seeded = await asyncio.to_thread(chain_candles, self.settings.research_database_path,
+                                                     symbol, self.settings.timeframe_seconds)
+                    if seeded:
+                        by_time = {row.timestamp: row for row in seeded}
+                        by_time.update({row.timestamp: row for row in stored["candles"]})
+                        stored["candles"] = [by_time[key] for key in sorted(by_time)]
+                        self.chain_seeded[symbol] = len(seeded)
+                partial = stored["candles"]
+                if symbol in run.new_contracts:
+                    # The rest of its 90 days follows in the
+                    # background once the feed is warm.
+                    run.history_backfill.append(symbol)
+                if symbol in run.new_contracts and self.new_contract_needs_history(stored["candles"]):
+                    try:
+                        async with run.download_slots:
+                            broker_rows, minute_rows = await self._download_warmup_history(symbol)
+                            await asyncio.sleep(WARMUP_DOWNLOAD_PACING_SECONDS)
+                    except Exception:
+                        if len(stored["candles"]) < needed:
+                            raise
+                elif symbol not in run.new_contracts and (
+                        not stored["candles"] or (self.stored_history_is_stale(stored["candles"])
+                                                  and not self._history_checked_current(symbol))):
+                    if stored["candles"]:
+                        self.history_gaps[symbol] = datetime.fromtimestamp(
+                            stored["candles"][-1].timestamp, UTC).astimezone(IST).date().isoformat()
+                    try:
+                        async with run.download_slots:
+                            broker_rows, minute_rows = await self._download_warmup_history(symbol)
+                            await asyncio.sleep(WARMUP_DOWNLOAD_PACING_SECONDS)
+                        # A quiet contract can have nothing newer to give: remember that it was
+                        # asked, or every boot downloads it again (35 of 71 downloads on 16 Oct).
+                        self._mark_history_checked(symbol)
+                    except Exception:
+                        # A restart warms hundreds of contracts at once.  If
+                        # Fyers rate-limits a supplemental request, retain the
+                        # already durable research history rather than dropping
+                        # the whole symbol from the live strategy state.
+                        if not stored["candles"]:
+                            raise
+                if minute_rows:
+                    run.downloaded.add(symbol)
+                    # Persist per symbol: a 90-day minute download for
+                    # every rolled contract is millions of rows, too
+                    # many to hold until the whole warm-up finishes.
+                    try:
+                        await asyncio.to_thread(
+                            store_historical_candles,
+                            self.settings.research_database_path,
+                            minute_rows,
+                            None,
+                            run.expiry_by_symbol,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - cache failure must not kill the feed
+                        self.candle_writer.last_error = f"history cache failed: {exc}"
+                rows_by_time = {row.timestamp: row for row in stored["candles"]}
+                rows_by_time.update({row.timestamp: row for row in broker_rows})
+                rows = [rows_by_time[key] for key in sorted(rows_by_time)]
+                if not rows:
+                    raise RuntimeError("Fyers returned no historical candles")
+                self._finish_symbol_warmup(symbol, rows)
+                self.history_errors.pop(symbol, None)
+                return
+            except Exception as exc:
+                self.history_errors[symbol] = str(exc)
+                # A 429 is a RATE limit, not a concurrency limit: retrying
+                # 0.5s later just spends another request inside the same
+                # window. Back off past the window instead — giving up
+                # after 1.5s left 138 contracts with no indicator state
+                # and no scheduled retry to recover them.
+                if attempt < WARMUP_ATTEMPTS - 1:
+                    rate_limited = "429" in str(exc) or "Too Many Requests" in str(exc)
+                    delay = WARMUP_RATE_LIMIT_BACKOFF[attempt] if rate_limited else 0.5 * (attempt + 1)
+                    await asyncio.sleep(delay)
+        # No broker history was available. Release the symbol with the
+        # stored / chain-seeded bars it has (short of the full warm-up,
+        # so its indicators mature with each live bar) plus whatever
+        # closed live bars arrived while FYERS was retried.
+        self._finish_symbol_warmup(symbol, partial)
+
+    async def _after_warmup(self, run: _WarmupRun, *, queue: bool = False) -> None:
+        """Fold freshly downloaded minutes into the blast lane and start the new contracts' background history.
+
+        ``queue`` (a live ladder refresh): a fill still running for earlier contracts is finished first instead
+        of being cancelled half-way, which the full connect does because it starts the whole list again.
+        """
+        if run.downloaded:
+            # The blast lane seeded from the store before these strikes'
+            # bars landed; fold them in now (it reads only newer bars).
+            try:
+                await self.blast.warm_from_store(self.settings.research_database_path, sorted(run.downloaded))
+            except Exception as exc:  # noqa: BLE001
+                self.blast.error = f"minute-bar warm-up failed: {exc}"
+        if not run.history_backfill:
+            return
+        symbols = list(dict.fromkeys(run.history_backfill))
+        previous = getattr(self, "_history_backfill_task", None)
+        running = previous is not None and not previous.done()
+        if running and not queue:
+            previous.cancel()
+
+        async def fill() -> None:
+            if running and queue:
+                with suppress(Exception):          # its own errors are in its report; a cancel passes through
+                    await previous
+            await self._backfill_contract_history(symbols, run.expiry_by_symbol)
+
+        self._history_backfill_task = asyncio.create_task(fill())
+
+    async def _apply_ladder_refresh_live(self) -> dict:
+        """Apply a changed contract selection on the RUNNING feed. Call with _reconfigure_lock held.
+
+        Until 10 Nov 2026 every intraday ladder refresh closed the socket, cleared every bar and indicator and ran
+        the whole connect_feed(): 25-56 s without one tick, 15 times on 6 Nov and 18 times on 9 Nov, and each of
+        them a stream rebuild of the kind that crossed option prices on 9 Nov. Only the new strikes need anything:
+        they are subscribed on the open socket and warmed like any contract at connect, while every other symbol
+        keeps its ticks, bars and indicator state. Returns the fields for contract_refresh_status; "mode" is
+        "live", or "socket_restart" when the strikes' first quotes did not arrive and the socket was reopened
+        (bars and indicators still kept).
+        """
+        started = time.monotonic()
+        contracts = list(self.contract_selector.contracts.values())
+        strategy_held = set(self.portfolio.positions) | set(self.desk_holdings())
+        old_options, old_feed = set(self.option_symbols), set(self.all_symbols)
+        option_symbols = [row.symbol for row in contracts if not row.analysis_only or row.symbol in strategy_held]
+        # New strikes, and legs coming back from context-only: both start from a fresh history replay.
+        fresh = [symbol for symbol in option_symbols if symbol not in old_options]
+        demoted = old_options - set(option_symbols)
+        # The blast lane seeds them from stored minute bars BEFORE they join its universe: after one live minute
+        # bar it would skip the stored ones (it reads only bars newer than the last it holds).
+        try:
+            await self.blast.warm_from_store(self.settings.research_database_path, fresh)
+        except Exception as exc:  # noqa: BLE001 - the lane must not block the feed
+            self.blast.error = f"minute-bar warm-up failed: {exc}"
+        # ---- no await between here and the subscription: a tick must never meet half of the change ----
+        self.option_symbols = option_symbols
+        # The selection only grows during a session, so the old context legs and the option agent's picks stay.
+        self.analysis_option_symbols = (
+            (self.analysis_option_symbols | {row.symbol for row in contracts}) - set(option_symbols))
+        self.all_symbols = _drop_expired(
+            list(dict.fromkeys([*self.all_symbols, *option_symbols, *self.analysis_option_symbols])),
+            {row.symbol: row.expiry for row in contracts}, datetime.now(IST).date())
+        feed_new = [symbol for symbol in self.all_symbols if symbol not in old_feed]
+        self._wire_contract_universe(contracts)
+        for symbol in (*fresh, *demoted):
+            # A returning leg's forming bar and indicators are hours old, a demoted one's would go stale on
+            # screen: both go. The fresh ones are rebuilt by the replay below.
+            self.candles.current.pop(symbol, None)
+            self._warm_live_candles.pop(symbol, None)
+            self.strategy.forget(symbol)
+        self._warming_symbols.update(fresh)          # their closed live bars wait for the replay
+        asyncio.create_task(self.entry_gate.refresh_reference(
+            [*self.option_symbols, *{row.spot_symbol for row in contracts}]))
+        subscribed = False
+        try:
+            subscribed = await asyncio.wait_for(self.broker.add_symbols(feed_new), FEED_STEP_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - the socket restart below is the answer to any failure here
+            self.error = f"live subscribe failed: {exc}"
+        subscribe_seconds = round(time.monotonic() - started, 1)
+        run = _WarmupRun(new_contracts=set(self.contract_selector.new_symbols) - old_feed,
+                         expiry_by_symbol={row.symbol: row.expiry for row in contracts})
+        try:
+            await asyncio.gather(*(self._warm_symbol(symbol, run) for symbol in fresh))
+        finally:
+            # Whatever happened, no strike may stay parked: a symbol left "warming" never signals again.
+            for symbol in fresh:
+                if symbol in self._warming_symbols:
+                    self._finish_symbol_warmup(symbol, [])
+        await self._after_warmup(run, queue=True)
+        # The SDK swallows subscribe errors, so the proof is the strikes' first quotes (Fyers sends a snapshot per
+        # subscribed symbol at once, traded or not).
+        needed = max(1, len(feed_new) // 2) if feed_new else 0
+        deadline = time.monotonic() + LIVE_SUBSCRIBE_CONFIRM_SECONDS
+
+        def arrived() -> int:
+            return sum(1 for symbol in feed_new if symbol in self.latest_ticks)
+
+        while subscribed and arrived() < needed and time.monotonic() < deadline:
+            await asyncio.sleep(0.25)
+        outcome = {"mode": "live", "subscribed": len(feed_new), "quoted": arrived(), "warmed": len(fresh),
+                   "demoted": len(demoted), "subscribe_seconds": subscribe_seconds, "feed_down_seconds": 0.0}
+        if not subscribed or arrived() < needed:
+            # Reopen the socket with the grown list: seconds without ticks, as before, but no state is lost.
+            down_from = time.monotonic()
+            outcome["mode"] = "socket_restart"
+            try:
+                await self.restart_stream()
+                outcome["feed_down_seconds"] = round(time.monotonic() - down_from, 1)
+            except Exception as exc:  # noqa: BLE001 - the feed watchdog retries a socket that stays down
+                self.error = f"contract refresh socket restart failed: {exc}"
+                outcome["feed_down_seconds"] = None
+                outcome["error"] = str(exc)[:200]
+            self.events.publish("broker", self.broker_status())
+        elif self.error and self.error.startswith("live subscribe failed"):
+            self.error = None
+        outcome["seconds"] = round(time.monotonic() - started, 1)
+        return outcome
 
     async def _backfill_contract_history(self, symbols: list[str], expiry_by_symbol: dict[str, str]) -> None:
         """The older part of each new contract's 90 days, one request at a time, after warm-up.
@@ -1685,67 +1821,70 @@ class TradingEngine(DeskMixin):
             self.events.publish("snapshot_required", {"reason": "strategy_settings_changed"})
 
     async def stop(self) -> None:
-        for name in ("_startup_task", "_expiry_flatten_task", "_tick_maintenance_task",
-                     "_blast_task", "_history_prune_task", "_desk_status_task", "_self_heal_task"):
+        """Close every loop, the feed and the stores, then leave the clean-shutdown marker.
+
+        Every step runs whatever the one before it did (10 Nov 2026). A loop task that had already died with an
+        error used to re-raise here and end the shutdown on the spot: stores left open, no marker, and the next
+        start spent ~70 s checking every store. The marker is written only when each step closed properly.
+        """
+        started = time.monotonic()
+        failures: list[str] = []
+
+        async def end(name: str) -> None:
             task = getattr(self, name, None)
-            if task:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-                setattr(self, name, None)
-        if self._rollover_task:
-            self._rollover_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._rollover_task
-            self._rollover_task = None
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._watchdog_task
-            self._watchdog_task = None
-        if self._session_close_task:
-            self._session_close_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._session_close_task
-            self._session_close_task = None
-        for name in ("_nightly_task", "_chain_task", "_stock_chain_task"):
-            task = getattr(self, name)
-            if task:
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-                setattr(self, name, None)
-        if self._dispersion_task:
-            self._dispersion_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._dispersion_task
-            self._dispersion_task = None
-        if self._lag_task:
-            self._lag_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._lag_task
-            self._lag_task = None
-        await self.candle_writer.stop()
-        await self.tick_store.stop()
-        await self.disconnect_feed()
-        await self.mp.stop()
-        await self.blast.stop()
+            if task is None:
+                return
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, FEED_STEP_TIMEOUT)
+            except asyncio.CancelledError:
+                pass
+            except TimeoutError:
+                failures.append(f"{name}: still running after {FEED_STEP_TIMEOUT:g} s")
+            except Exception:  # noqa: BLE001 - it had already failed; its error was reported when it happened
+                pass
+            setattr(self, name, None)
+
+        async def step(name: str, call, limit: float = FEED_STEP_TIMEOUT * 2) -> None:
+            try:
+                await asyncio.wait_for(call(), limit)
+            except Exception as exc:  # noqa: BLE001 - the remaining stores must still be closed
+                failures.append(f"{name}: {type(exc).__name__}: {exc}"[:200])
+
+        for name in ("_startup_task", "_expiry_flatten_task", "_tick_maintenance_task", "_blast_task",
+                     "_history_prune_task", "_desk_status_task", "_self_heal_task", "_rollover_task",
+                     "_watchdog_task", "_session_close_task", "_nightly_task", "_chain_task", "_stock_chain_task",
+                     "_dispersion_task", "_lag_task", "_context_backfill_task"):
+            await end(name)
+        await step("candle writer", self.candle_writer.stop)
+        await step("tick store", self.tick_store.stop)
+        await step("feed", self.disconnect_feed, FEED_STEP_TIMEOUT * 3)
+        await step("desk", self.mp.stop)
+        await step("blast", self.blast.stop)
         if getattr(self, "smart_lanes", None) is not None:
-            await self.smart_lanes.stop()
+            await step("smart lanes", self.smart_lanes.stop)
         if getattr(self, "agentic", None) is not None:
-            await self.agentic.stop()
+            await step("agentic", self.agentic.stop)
             if self.agentic.telegram is not None:
-                await self.agentic.telegram.stop()
+                await step("telegram", self.agentic.telegram.stop)
         if getattr(self, "spot_lane", None) is not None:
-            await self.spot_lane.stop()
+            await step("spot lane", self.spot_lane.stop)
         if self.bus is not None:
-            await self.bus.stop()
+            await step("bus", self.bus.stop)
             if self.flow_snapshots is not None:
-                await self.flow_snapshots.stop()
+                await step("flow snapshots", self.flow_snapshots.stop)
         with suppress(Exception):
             self.repository.save_position_excursions(self.portfolio.positions.values())
-        self.repository.close()
+        try:
+            self.repository.close()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"repository: {type(exc).__name__}: {exc}"[:200])
         self.status = "stopped"
+        self.shutdown_report = {"seconds": round(time.monotonic() - started, 1), "failures": failures}
+        if failures:
+            print(f"shutdown: NOT clean after {self.shutdown_report['seconds']} s: " + "; ".join(failures), flush=True)
+            return
+        print(f"shutdown: stores closed in {self.shutdown_report['seconds']} s", flush=True)
         self_heal.mark_clean_shutdown(self.settings.database_path, self.settings.engine_role)
 
     async def _manage_analysis_holdings(self, tick: Tick, exchange_at: datetime) -> None:
@@ -2717,8 +2856,9 @@ class TradingEngine(DeskMixin):
         """Swap a spot's ladder for one around the live price when its ATM contract is not trading (owner, 28 Oct).
 
         Runs inside the F&O session window only, at most every contract_refresh_minutes, and only after the feed
-        has been live long enough to judge inactivity. A changed ladder re-runs the same feed reconfiguration the
-        daily rollover uses: held contracts stay subscribed, new ones warm from stored bars and option-chain marks.
+        has been live long enough to judge inactivity. A changed ladder is applied on the running feed (10 Nov
+        2026): the new strikes are subscribed on the open socket and warmed from stored bars and option-chain
+        marks; nothing else is touched. The full rebuild the daily rollover uses remains as the fallback.
         """
         every = int(getattr(self.settings, "contract_refresh_minutes", 0) or 0)
         inactive = int(getattr(self.settings, "contract_inactive_minutes", 15)) * 60
@@ -2748,17 +2888,26 @@ class TradingEngine(DeskMixin):
                                         "replaced": sorted(changed)}
         if changed:
             async with self._reconfigure_lock:
-                down_from = time.monotonic()
-                await self.disconnect_feed()
-                self.history.clear()
-                self.history_errors.clear()
-                self.latest_ticks.clear()
-                closed = time.monotonic() - down_from
-                await self.connect_feed()
-            steps = getattr(self, "connect_steps", {})
-            self.contract_refresh_status["feed_down_seconds"] = (
-                round(closed + steps["stream"], 1) if "stream" in steps else None)
-            self.contract_refresh_status["disconnect_seconds"] = round(closed, 1)
+                outcome = None
+                stream = self._stream_task
+                if live_contract_refresh_enabled() and stream is not None and not stream.done():
+                    try:
+                        outcome = await self._apply_ladder_refresh_live()
+                    except Exception as exc:  # noqa: BLE001 - anything unexpected: the full rebuild below
+                        self.contract_refresh_status["live_error"] = f"{type(exc).__name__}: {exc}"[:300]
+                if outcome is None:
+                    # The feed rebuild the daily rollover uses: socket closed, everything warmed again.
+                    down_from = time.monotonic()
+                    await self.disconnect_feed()
+                    self.history.clear()
+                    self.history_errors.clear()
+                    self.latest_ticks.clear()
+                    closed = time.monotonic() - down_from
+                    await self.connect_feed()
+                    steps = getattr(self, "connect_steps", {})
+                    outcome = {"mode": "rebuild", "disconnect_seconds": round(closed, 1),
+                               "feed_down_seconds": round(closed + steps["stream"], 1) if "stream" in steps else None}
+            self.contract_refresh_status.update(outcome)
             self.events.publish("snapshot_required", {"reason": "contract_refresh", "spots": sorted(changed)})
         return changed
 
