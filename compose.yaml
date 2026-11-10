@@ -119,6 +119,8 @@ services:
     volumes:
       - nats_data:/data
     restart: unless-stopped
+    # Docker's stop grace on this host is 3 s (10 Nov 2026): give JetStream time to flush its file store
+    stop_grace_period: 30s
 
   analytics:
     build:
@@ -195,6 +197,9 @@ services:
       # The lane reads only upstox.token (reads) and upstox-trade.token (the daily OAuth token, for orders).
       - /Users/ramachandran/CLAUDE PROJECTS/market-intelligence/secrets:/secrets:ro
     restart: unless-stopped
+    # lane.py handles SIGTERM: it lets the step in progress (possibly a real order and its fill check) finish and
+    # saves the state, waiting up to STOP_WAIT_SECONDS (45 s). Docker's default grace on this host is 3 s.
+    stop_grace_period: 60s
 
   # One local review worker; it has no order interface or access to trading books.
   local-decisions:
@@ -264,6 +269,7 @@ services:
       timeout: 5s
       retries: 4
     restart: unless-stopped
+    stop_grace_period: 30s         # uvicorn's own shutdown (book saves) instead of the 3 s kill
 
   us-backend:
     profiles: ["us"]

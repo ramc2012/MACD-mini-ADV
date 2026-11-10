@@ -24,6 +24,7 @@ import json
 import re
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -552,20 +553,56 @@ def loop() -> None:
             state["seen_signals"] = [s["signal_id"] for s in engine("/api/signals?limit=200") if s.get("signal_id")]
         except Exception:
             pass
-    while True:
+    while not stopping.is_set():
         try:
             if time.time() - last_read >= READ_SECONDS:
                 read_upstox()
                 probe_order_api()
                 last_read = time.time()
             with lock:
+                if stopping.is_set():     # a stop arrived while waiting: no new step, no new order
+                    break
                 try:
                     step()
                 finally:
                     save_state(state)     # a failing step must not leave recorded fills unsaved
         except Exception:
             traceback.print_exc()
-        time.sleep(LOOP_SECONDS)
+        stopping.wait(LOOP_SECONDS)
+
+
+stopping = threading.Event()
+STOP_WAIT_SECONDS = float(os.environ.get("STOP_WAIT_SECONDS", "45"))
+
+
+def stop_cleanly(signum=None, frame=None, leave=os._exit) -> None:
+    """SIGTERM / SIGINT (docker stop): finish the step in progress, save, leave.
+
+    As PID 1 with no handler the process ignored SIGTERM and Docker killed it when the stop grace ran out (3 s on
+    this host until 10 Nov 2026) -- possibly between an order going out and its record being saved. Now the step
+    that is running keeps the lock until its own save; this waits for it (STOP_WAIT_SECONDS, inside the compose
+    stop_grace_period), saves once more and exits 0. No new step starts after the signal. Arming is untouched.
+    """
+    if stopping.is_set():
+        return
+    stopping.set()
+
+    def finish() -> None:
+        code = 0
+        if lock.acquire(timeout=STOP_WAIT_SECONDS):
+            try:
+                save_state(state)
+                print("upstox-live: stopped cleanly (step finished, state saved)", flush=True)
+            except Exception:
+                traceback.print_exc()
+                code = 1
+        else:   # never save over a step that is still changing the state
+            print(f"upstox-live: a step was still running after {STOP_WAIT_SECONDS:.0f} s; leaving without a "
+                  "final save (the step's own save did not happen)", flush=True)
+            code = 1
+        leave(code)
+
+    threading.Thread(target=finish, name="stop", daemon=True).start()
 
 
 # ---------------------------------------------------------------- REST
@@ -756,5 +793,7 @@ if __name__ == "__main__":
     recover_armed_since()
     print(f"upstox-live: fund = Upstox available margin{f' (cap Rs {CAPITAL:,.0f})' if CAPITAL > 0 else ''}, "
           f"{'ARMED (real orders, until Kill)' if armed() else 'not armed (no orders)'}, port {PORT}", flush=True)
+    signal.signal(signal.SIGTERM, stop_cleanly)
+    signal.signal(signal.SIGINT, stop_cleanly)
     threading.Thread(target=loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

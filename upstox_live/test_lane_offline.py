@@ -206,17 +206,15 @@ saved = []
 orig_step, orig_save = L.step, L.save_state
 L.step = lambda: (_ for _ in ()).throw(RuntimeError("boom")); L.save_state = lambda s: saved.append(1)
 L.LOOP_SECONDS = 0; L.READ_SECONDS = 1e9
-import itertools
-calls = itertools.count()
-orig_sleep = L.time.sleep
-def stop_after_one(_):
-    if next(calls) >= 0: raise KeyboardInterrupt
-L.time.sleep = stop_after_one
+class OnePass:                      # the loop waits on the stop event between steps (10 Nov 2026): end it after one
+    def is_set(self): return False
+    def wait(self, _): raise KeyboardInterrupt
+orig_stopping, L.stopping = L.stopping, OnePass()
 try:
     L.loop()
 except KeyboardInterrupt:
     pass
-L.time.sleep, L.step, L.save_state = orig_sleep, orig_step, orig_save
+L.stopping, L.step, L.save_state = orig_stopping, orig_step, orig_save
 assert saved, "state is saved even when step() fails"
 # a fill recovered by hand ("recovered|<order id>") is not counted again when Upstox's trade list is read
 L.state["orders"]["o88"] = {"order_id": "o88", "symbol": "NSE:REC26NOV100CE", "instrument": "NSE_FO|88", "side": "BUY",
@@ -243,3 +241,23 @@ assert L.state["decisions"][-1]["reason"] == "owner manages this contract"
 assert L.snapshot()["owner_managed"][0]["symbol"] == "NSE:OWN26NOV970CE"
 L.set_armed(False, "test")
 print("naive fill time + order window + save-on-failure + recovered fill + owner-managed OK")
+lane = L
+# 12. docker stop (SIGTERM): the running step finishes and saves, then the process leaves with 0; no new step starts
+import threading, time as _time
+left = []
+lane.stopping.clear(); os.remove(lane.STATE_FILE) if os.path.exists(lane.STATE_FILE) else None
+lane.lock.acquire()                                    # a step is in progress
+lane.stop_cleanly(leave=left.append); _time.sleep(0.3)
+assert lane.stopping.is_set() and not left and not os.path.exists(lane.STATE_FILE), "must wait for the running step"
+lane.lock.release(); _time.sleep(0.5)
+assert left == [0] and os.path.exists(lane.STATE_FILE), left
+lane.stop_cleanly(leave=left.append); _time.sleep(0.2); assert left == [0], "a second signal does nothing"
+calls = []; real_step = lane.step; lane.step = lambda: calls.append(1); lane.loop(); lane.step = real_step
+assert not calls, "no step after the stop signal"
+lane.stopping.clear(); lane.STOP_WAIT_SECONDS = 0.3; left.clear(); os.remove(lane.STATE_FILE)
+holder = threading.Thread(target=lambda: (lane.lock.acquire(), _time.sleep(1.2), lane.lock.release())); holder.start(); _time.sleep(0.1)
+lane.stop_cleanly(leave=left.append); _time.sleep(0.7)
+assert left == [1] and not os.path.exists(lane.STATE_FILE), "a stuck step: exit 1, no save over it"
+holder.join(); lane.stopping.clear()
+print("stop: waits for the running step, saves, exits 0; stuck step exits 1 without saving")
+
