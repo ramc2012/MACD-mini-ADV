@@ -43,7 +43,7 @@ export type LedgerBooks = "options" | "sides";
 const initialSorts: Record<LedgerTab, SortState> = {
   ORDERS: { key: "time", direction: "desc" },
   TRADES: { key: "time", direction: "desc" },
-  PORTFOLIO: { key: "pnl", direction: "desc" },
+  PORTFOLIO: { key: "opened", direction: "desc" },   // the last entered position first (owner, 11 Nov 2026)
   STATISTICS: { key: "value", direction: "desc" },
   SIGNALS: { key: "time", direction: "desc" },
 };

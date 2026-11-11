@@ -207,10 +207,13 @@ class AlertManager:
 
     @property
     def chat_is_bot(self) -> bool:
-        """The chat id is the bot's own id (the token's prefix): Telegram refuses with 403, the 3 Nov 2026 state."""
+        """The chat id names a bot, which Telegram never lets a bot message (403 "can't send messages to the bot"):
+        the bot's own id (the token's prefix, 3 Nov 2026) or a bot's @username, which always ends in "bot" (11 Nov)."""
         settings = self.engine.settings
         token, chat = str(settings.telegram_bot_token or ""), str(settings.telegram_chat_id or "").strip()
-        return bool(token and chat) and chat == token.split(":", 1)[0]
+        if not (token and chat):
+            return False
+        return chat == token.split(":", 1)[0] or (chat.startswith("@") and chat.lower().endswith("bot"))
 
     def status(self) -> dict:
         return {

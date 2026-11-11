@@ -55,6 +55,7 @@ import { rowTapeSymbol } from "@/lib/marketSymbols";
 import { RrgScatter, QUADRANT_COLOR, type RrgPoint } from "./RrgScatter";
 import { SectorRotation, type SectorRow } from "./SectorRotation";
 import { Sparkline } from "@/components/desk-ui";
+import { newestFirst } from "../../../../positionOrder";
 
 const TABS = [
   { key: "portfolio", label: "Paper trading", icon: Briefcase },
@@ -266,7 +267,7 @@ export default function CbeDesk() {
 
   const spotMarks = useMemo(() => buildSpotMarkMap(results), [results]);
   const markedOpenBook = useMemo(
-    () => markOpenPositions(positions?.open_positions ?? [], spotMarks, scan?.scan_date ?? null),
+    () => newestFirst(markOpenPositions(positions?.open_positions ?? [], spotMarks, scan?.scan_date ?? null)),   // last entered first
     [positions?.open_positions, scan?.scan_date, spotMarks],
   );
   const markedPositions = useMemo<PositionsPayload | undefined>(

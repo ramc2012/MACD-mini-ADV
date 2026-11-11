@@ -449,6 +449,26 @@ class TestEngineHandoff:
         assert seen[0].timestamp == int(base.timestamp())
         asyncio.run(engine.blast.stop())
 
+    def test_a_held_contract_is_judged_on_the_print_that_closed_its_bar(self, tmp_path: Path, monkeypatch):
+        """11 Nov 2026: a thin contract's bar was judged before its closing print reached the book, so the exit saw
+        the previous trade (minutes old) and was refused as stale."""
+        from macd_trader.models import Position, Tick
+
+        engine = self._engine(tmp_path, monkeypatch, timeframe_seconds=1800)
+        engine.blast.portfolio.positions[SYMBOL] = Position(SYMBOL, 100, 5.0, 5.0)
+        quotes: list = []
+
+        async def judged(candle, closed_at):
+            quotes.append((engine.blast.execution.last_prices.get(SYMBOL), engine.blast.execution.last_price_at.get(SYMBOL)))
+
+        engine.blast.on_minute_bar = judged
+        base = datetime(2026, 9, 11, 4, 0, tzinfo=UTC)
+        asyncio.run(engine.on_tick(Tick(SYMBOL, 6.0, 10, base)))
+        asyncio.run(engine.on_tick(Tick(SYMBOL, 6.4, 10, base + timedelta(minutes=7))))   # the next trade, 7 min on
+        assert quotes and quotes[0][0] == 6.4
+        assert quotes[0][1] == engine.last_tick_at
+        asyncio.run(engine.blast.stop())
+
 
 async def _record(sink: list, candle, point):
     sink.append(candle)

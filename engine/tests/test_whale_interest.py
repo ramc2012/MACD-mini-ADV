@@ -163,3 +163,44 @@ def test_a_full_smart_book_gives_the_weakest_slot_to_a_whale_signal(tmp_path, mo
     taken = [r for r in lane.journal_rows() if r["symbol"] == symbols[3]][0]
     assert taken["decision"] == "TAKEN" and taken["detail"]["replaced"] == symbols[1]
     assert taken["detail"]["replaced_return_pct"] == -20.0 and taken["detail"]["whale"]["multiple"] == 40.0
+
+
+def test_concurrent_exports_never_collide(tmp_path):
+    """9-11 Nov 2026: two exports shared one '.tmp', so the second rename failed with 'No such file'."""
+    import threading
+
+    from macd_trader.whale_interest import write_export
+
+    target = tmp_path / "shadow_lanes" / "whale_interest.json"
+    errors: list = []
+
+    def write(n: int) -> None:
+        try:
+            for i in range(40):
+                write_export(target, {"writer": n, "i": i})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(n,)) for n in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    assert json.loads(target.read_text())["i"] == 39
+    assert not list(target.parent.glob("*.tmp"))
+
+
+def test_a_good_export_clears_an_earlier_export_error():
+    from macd_trader.engine import TradingEngine
+
+    interest = SimpleNamespace(error="export: [Errno 2] No such file or directory")
+    ok = SimpleNamespace(cancelled=lambda: False, exception=lambda: None)
+    TradingEngine._whale_export_done(interest, ok)
+    assert interest.error is None
+    interest.error = "baseline: OperationalError"                   # other errors are not this callback's to clear
+    TradingEngine._whale_export_done(interest, ok)
+    assert interest.error == "baseline: OperationalError"
+    failed = SimpleNamespace(cancelled=lambda: False, exception=lambda: FileNotFoundError("gone"))
+    TradingEngine._whale_export_done(interest, failed)
+    assert interest.error == "export: gone"

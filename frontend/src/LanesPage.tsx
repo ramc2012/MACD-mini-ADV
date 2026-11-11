@@ -6,6 +6,7 @@ import { fillMarkers, positionLevels } from "./laneChartMarks";
 import type { Tick, Trade as Fill } from "./types";
 import { currentSmartBook } from "./laneMarks";
 import { API_TOKEN, API_URL } from "./runtime";
+import { newestFirst } from "./positionOrder";
 
 type Stats = { trades: number; wins: number; win_rate: number | null; net: number; gross_profit: number; gross_loss: number; profit_factor: number | null; avg_win: number | null; avg_loss: number | null };
 type Summary = {
@@ -121,7 +122,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
   const books=Object.fromEntries(lanes.map(lane=>[lane.lane,currentSmartBook(
     lane.lane===selected&&snapshot?.lane===selected?snapshot:snapshots[lane.lane],portfolios[lane.lane],ticks)]));
   const marked = selected ? books[selected] : null;
-  const positions: Position[] = marked?.positions || [];
+  const positions: Position[] = newestFirst(marked?.positions || []);
   const openPosition = (index: number) => setFocus({ index, list: positions.map((p) => ({
     symbol: p.symbol, title: short(p.symbol), subtitle: `${p.lots} lots @ ₹${p.average_price.toFixed(2)} · ${p.source} · opened ${when(p.opened_at)}`,
     markers: fillMarkers(fills, p.symbol, p.opened_at), levels: positionLevels(p) })) });

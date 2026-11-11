@@ -478,7 +478,7 @@ function Positions({ positions, closed, entryState, portfolio, retentionHour }: 
   const until = `${String(retentionHour).padStart(2, "0")}:00 IST`;
   return <div className="panel mp-full mp-split mp-positions-split">
     <section className="book-section"><div className="book-heading"><b>Open positions</b><span>{positions.length}</span></div>
-      <div className="book-body"><SortTable rows={positions} cols={cols} initial="pnl" empty="No open desk positions" /></div></section>
+      <div className="book-body"><SortTable rows={positions} cols={cols} initial="opened" empty="No open desk positions" /></div></section>
     <section className="book-section"><div className="book-heading"><b>Closed today</b>
       <span>{closed.length ? `${closed.length} · shown until ${until} tomorrow` : "—"}</span></div>
       <div className="book-body"><SortTable rows={closed} cols={closedCols} initial="exit_time" empty={`Nothing closed since ${until}`} /></div></section>

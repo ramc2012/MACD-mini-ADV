@@ -384,6 +384,11 @@ class BlastEngine:
         self._forming: dict[str, Candle] = {}
         self._high_times: dict[str, deque[int]] = {}
         self.late_bars_skipped = 0
+        # A closed-bar exit (HMA below KAMA) that the book refused, e.g. for a stale price, waits here and is retried
+        # on the contract's next trade. Without it the exit was only re-judged at the next 30-min close: on 11 Nov
+        # 2026 CGPOWER 790 CE, HCLTECH 1400 PE and NESTLEIND 1250 CE kept positions their exit had already closed.
+        self._pending_exits: dict[str, str] = {}
+        self.pending_exit_fills = 0
         self.warmed_symbols = 0
         self.last_warm_at: str | None = None
         # Verdict rows nobody is watching are written in batches off the event
@@ -1192,6 +1197,7 @@ class BlastEngine:
             return
         if session_open:
             await self.execution.on_tick(symbol, price, timestamp)
+            await self.retry_pending_exit(symbol)
         else:
             # Off-session re-broadcasts of the previous close are a valid mark
             # but never a valid trigger, exactly as on the MACD lane.
@@ -1248,8 +1254,25 @@ class BlastEngine:
             await self.execution.submit(symbol, "SELL", position.quantity)
         except (ValueError, RuntimeError, PermissionError) as exc:
             self.error = f"flatten {symbol}: {exc}"
+            if reason == EXIT_HK:
+                self._pending_exits[symbol] = reason
             return False
+        self._pending_exits.pop(symbol, None)
         return True
+
+    async def retry_pending_exit(self, symbol: str) -> bool:
+        """Retry a refused closed-bar exit on this contract's trade (the execution back-off still applies)."""
+        reason = self._pending_exits.get(symbol)
+        if reason is None:
+            return False
+        position = self.portfolio.positions.get(symbol)
+        if not position or position.quantity <= 0:
+            self._pending_exits.pop(symbol, None)        # closed some other way: a stop, expiry or the owner
+            return False
+        done = await self.flatten(symbol, reason)
+        if done:
+            self.pending_exit_fills += 1
+        return done
 
     def apply_settings(self, settings: Settings) -> None:
         self.settings = settings
@@ -1306,6 +1329,8 @@ class BlastEngine:
             "warmed_symbols": self.warmed_symbols,
             "last_warm_at": self.last_warm_at,
             "late_bars_skipped": self.late_bars_skipped,
+            "pending_exits": dict(self._pending_exits),
+            "pending_exit_fills": self.pending_exit_fills,
             "last_candidate_at": self.last_candidate_at,
             "broker_access": "orders only",
             "entry_policy": self.entry_policy(),

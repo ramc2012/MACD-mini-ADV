@@ -20,6 +20,14 @@ def test_a_chat_id_equal_to_the_bot_id_is_flagged():
     assert manager(token="", chat="").status()["configured"] is False
 
 
+def test_a_bot_username_as_the_chat_is_flagged():
+    """11 Nov 2026: the chat id was a bot's @username; every alert got 403 "the bot can't send messages to the bot"."""
+    assert manager(chat="@macd_alerts_bot").status()["chat_is_bot"] is True
+    assert manager(chat="@Some_Bot").status()["chat_is_bot"] is True
+    assert manager(chat="@owner_channel").status()["chat_is_bot"] is False
+    assert manager(chat="-100123456").status()["chat_is_bot"] is False
+
+
 def test_the_bot_token_never_leaves_in_an_error():
     alerts = manager(chat="987")
     alerts.last_error = "ConnectError for https://api.telegram.org/bot123456:abc-DEF/sendMessage"

@@ -1903,6 +1903,8 @@ class TradingEngine(DeskMixin):
             try:
                 if current_print:
                     await manager.on_tick(tick.symbol, tick.ltp, self.last_tick_at)
+                    if name == "blast":
+                        await self.blast.retry_pending_exit(tick.symbol)
                 else:
                     manager.portfolio.mark(tick.symbol, tick.ltp)
             except ExitRetryWait:
@@ -1987,6 +1989,13 @@ class TradingEngine(DeskMixin):
                 # timeframe is; that is the resolution its screen was measured at.
                 # A holding that left today's ladder still needs its bars: its
                 # HMA-below-KAMA exit is judged on them.
+                if (tick.symbol in self.blast.portfolio.positions
+                        and exchange_at.astimezone(IST).date() == self.last_tick_at.astimezone(IST).date()
+                        and in_session(tick.symbol, exchange_at) and in_session(tick.symbol, self.last_tick_at)):
+                    # The print that closed the bar is the price an exit judged on that bar can take. Without it a
+                    # thin contract's last recorded trade (minutes old) failed the freshness check and the exit was
+                    # refused (11 Nov 2026: CGPOWER 790 CE, HCLTECH 1400 PE, NESTLEIND 1250 CE).
+                    self.blast.execution.set_quote(tick.symbol, tick.ltp, self.last_tick_at)
                 await self.blast.on_minute_bar(minute_closed, tick.timestamp)
         if analysis_only:
             await self._manage_analysis_holdings(tick, exchange_at)
@@ -2212,8 +2221,17 @@ class TradingEngine(DeskMixin):
             task = asyncio.create_task(asyncio.to_thread(write_export, path, interest.export_payload()))
             self._whale_tasks.add(task)
             task.add_done_callback(self._whale_tasks.discard)
-            task.add_done_callback(lambda done: done.cancelled() or done.exception() is None
-                                   or setattr(interest, "error", f"export: {done.exception()}"[:200]))
+            task.add_done_callback(lambda done: self._whale_export_done(interest, done))
+
+    @staticmethod
+    def _whale_export_done(interest, done) -> None:
+        """Record a failed export; a later good one clears it (an export error was sticky until restart)."""
+        if done.cancelled():
+            return
+        if done.exception() is not None:
+            interest.error = f"export: {done.exception()}"[:200]
+        elif str(interest.error or "").startswith("export:"):
+            interest.error = None
 
     async def _load_whale_interest(self, today: str) -> None:
         try:

@@ -9,6 +9,7 @@ import {paperMark,paperQuote} from '../laneMarks';
 import {LaneChartModal,type LaneChartFocus} from '../LaneChart';
 import {EquityChart} from '../LaneEquityChart';
 import type {ChartLevel,ChartMarker} from '../types';
+import {newestFirst} from '../positionOrder';
 export const positionQuote=paperQuote;
 type Paper={enabled:boolean;account_id:string;lane:string;mode:string;initial_capital:number;cash:number;unsettled_cash:number;equity:number;
  realized_pnl:number;unrealized_pnl:number;return_pct:number;max_drawdown_pct:number;open_count:number;closed_count:number;
@@ -56,9 +57,10 @@ export function usePaper(lane:string){return useQuery({queryKey:['macd-paper',la
 export function PaperLanePanel({lane,performance=false}:{lane:string;performance?:boolean}){
  const live=useLaneLive();
  const query=usePaper(lane),raw=query.data;
- const marks=raw?.positions.map(r=>paperMark(r,raw.policy,positionQuote(r,live)))??[];
+ const held=newestFirst(raw?.positions??[]);   // the last entered position first (owner, 11 Nov 2026)
+ const marks=raw?held.map(r=>paperMark(r,raw.policy,positionQuote(r,live))):[];
  const equity=raw?raw.cash+raw.unsettled_cash+marks.reduce((v,m)=>v+m.netValue,0):0;
- const p=raw?{...raw,equity,unrealized_pnl:marks.reduce((v,m)=>v+m.pnl,0),return_pct:(equity/raw.initial_capital-1)*100}:undefined;const [tab,setTab]=useState(performance?'Equity':lane==='vanguard'?'List tests':'Positions');const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [focus,setFocus]=useState<{list:LaneChartFocus[];index:number}|null>(null);
+ const p=raw?{...raw,positions:held,equity,unrealized_pnl:marks.reduce((v,m)=>v+m.pnl,0),return_pct:(equity/raw.initial_capital-1)*100}:undefined;const [tab,setTab]=useState(performance?'Equity':lane==='vanguard'?'List tests':'Positions');const [busy,setBusy]=useState(false);const [error,setError]=useState('');const [focus,setFocus]=useState<{list:LaneChartFocus[];index:number}|null>(null);
  const control=async()=>{if(!p)return;setBusy(true);setError('');try{const r=await fetch(`${API_URL}/api/paper-lanes/${lane}/control`,{method:'POST',headers:{'Content-Type':'application/json',...(API_TOKEN?{'X-Macd-Token':API_TOKEN}:{})},body:JSON.stringify({action:p.paused?'resume':'pause'})});if(!r.ok)throw Error('Paper entry control failed');await query.refetch();}catch(e){setError((e as Error).message);}finally{setBusy(false);}};
  if(query.isError)return <Section title="MACD paper account"><p role="alert">The paper account is unavailable. No financial values have been substituted.</p></Section>;
  if(!p?.enabled)return <Section title="MACD paper account"><p>Loading the independent paper book…</p></Section>;

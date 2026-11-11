@@ -21,6 +21,8 @@ before today; the live minute bars are the engine's own.
 from __future__ import annotations
 
 import json
+import os
+import threading
 import re
 import sqlite3
 from datetime import UTC, datetime
@@ -191,6 +193,8 @@ def from_file(path: Path, root: str, until: datetime, window: int = WINDOW_SECON
 
 def write_export(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
+    # One temporary file per writer: exports from two closed minutes can run at once, and with a shared ".tmp" the
+    # second rename found nothing ("No such file", 9-11 Nov 2026) and left a standing error in health.
+    temporary = path.with_name(f"{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(json.dumps(payload))
     temporary.replace(path)

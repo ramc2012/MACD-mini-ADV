@@ -832,7 +832,7 @@ function AlertChips({ health }: { health?: HealthInfo }) {
   const failing = !!alerts?.last_error || !!alerts?.chat_is_bot;
   const text = !alerts ? "" : !alerts.configured ? "Alerts off" : alerts.chat_is_bot ? "Alerts misconfigured" : failing ? "Alerts failing" : alerts.sent_total ? "Alerts ok" : "Alerts idle";
   const title = !alerts ? "" : !alerts.configured ? "Telegram bot token or chat id not set: no alert can be sent"
-    : alerts.chat_is_bot ? "The Telegram chat id is the bot's own id, so Telegram refuses every alert (HTTP 403). Set your own chat id in Settings."
+    : alerts.chat_is_bot ? "The Telegram chat id is a bot (its own id or a @…bot username), and Telegram never lets a bot message a bot (HTTP 403). Set your own numeric chat id in Settings."
     : failing ? `Last Telegram send failed: ${alerts.last_error}` : alerts.sent_total ? `${alerts.sent_total} sent since start · last: ${alerts.last_message ?? ""}`
     : "Telegram configured; nothing has needed an alert since the engine started";
   return <>

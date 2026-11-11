@@ -196,3 +196,48 @@ def test_warm_up_folds_the_chain_filled_days_on_the_hma_kama_strategy(tmp_path):
     macd_lane = build(tmp_path / "macd", blast_signal_bar_seconds=1800, blast_strategy="macd_screen")
     asyncio.run(macd_lane.warm_from_store(path, [SYMBOL]))
     assert macd_lane._hk_value.get(SYMBOL, (None, None))[0] is None   # the MACD screen keeps reading stored minutes only
+
+
+def _enter(lane):
+    drive(lane, [20 - i * 0.25 for i in range(40)])
+    drive(lane, [10 + i * 0.6 for i in range(1, 9)], start=40)
+    assert lane.portfolio.positions[SYMBOL].quantity > 0
+
+
+def test_a_refused_hma_exit_is_retried_on_the_next_trade(tmp_path, monkeypatch):
+    """11 Nov 2026: the exit was refused for a stale price and never retried, so the position stayed open."""
+    from macd_trader import execution as execution_module
+    lane = build(tmp_path)
+    _enter(lane)
+    now = datetime.now(UTC)
+    lane.execution.set_quote(SYMBOL, 14.0, now - timedelta(minutes=5))       # a thin contract's last trade
+    assert asyncio.run(lane.flatten(SYMBOL, EXIT_HK)) is False
+    assert lane.health()["pending_exits"] == {SYMBOL: EXIT_HK}
+    assert lane.execution.exit_failures[SYMBOL]["count"] == 1
+    clock = [execution_module.time.monotonic() + 20]                         # past the 15 s back-off
+    monkeypatch.setattr(execution_module.time, "monotonic", lambda: clock[0])
+    asyncio.run(lane.on_tick(SYMBOL, 14.2, now))                             # the next trade
+    assert SYMBOL not in lane.portfolio.positions
+    closed = lane.execution.portfolio_snapshot()["closed_positions"]
+    assert closed[-1]["exit_reason"] == EXIT_HK and abs(closed[-1]["exit_price"] - 14.2) < 1e-6
+    assert lane.health()["pending_exits"] == {} and lane.health()["pending_exit_fills"] == 1
+    assert SYMBOL not in lane.execution.exit_failures                        # the header chip clears
+
+
+def test_a_pending_exit_is_dropped_when_the_position_closes_another_way(tmp_path):
+    lane = build(tmp_path)
+    _enter(lane)
+    now = datetime.now(UTC)
+    lane.execution.set_quote(SYMBOL, 14.0, now - timedelta(minutes=5))
+    asyncio.run(lane.flatten(SYMBOL, EXIT_HK))
+    lane.portfolio.positions.pop(SYMBOL)                                     # e.g. the owner closed it
+    assert asyncio.run(lane.retry_pending_exit(SYMBOL)) is False
+    assert lane.health()["pending_exits"] == {}
+
+
+def test_other_refused_exits_are_not_kept_pending(tmp_path):
+    lane = build(tmp_path)
+    _enter(lane)
+    lane.execution.set_quote(SYMBOL, 14.0, datetime.now(UTC) - timedelta(minutes=5))
+    asyncio.run(lane.flatten(SYMBOL, "EXPIRY_EXIT_15_20_IST"))              # re-judged on every tick anyway
+    assert lane.health()["pending_exits"] == {}

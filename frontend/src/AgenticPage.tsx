@@ -5,6 +5,7 @@ import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
 import { EquityChart } from "./LaneEquityChart";
 import { fillMarkers } from "./laneChartMarks";
 import type { ClosedPosition, Trade as Fill } from "./types";
+import { newestFirst } from "./positionOrder";
 
 // The agentic lane: a Grok-run paper options book. Every cycle the model reads the market and the book and
 // answers with actions and its reasoning; code validates and executes them. This page shows the book with
@@ -423,7 +424,7 @@ export function AgenticPage() {
       {p && p.positions.filter((x) => x.quantity > 0).length === 0 && <div className="agentic-empty">Flat.</div>}
       {p && p.positions.some((x) => x.quantity > 0) && <table className="ledger-table agentic-table"><thead><tr>
         <th>Contract</th><th>Lots</th><th>Avg → now</th><th>P&amp;L</th><th>Best / worst</th><th>Stop / target</th><th>Thesis and latest comment</th><th></th></tr></thead>
-        <tbody>{p.positions.filter((x) => x.quantity > 0).map((row, index, open) => <tr key={row.symbol}>
+        <tbody>{newestFirst(p.positions.filter((x) => x.quantity > 0)).map((row, index, open) => <tr key={row.symbol}>
           <td className="openable-row" onClick={() => setFocus({ index, list: open.map((x) => ({ symbol: x.symbol, title: x.symbol.split(":")[1],
             subtitle: `${x.lots} lots @ ₹${x.average_price.toFixed(2)}${x.setup ? ` · ${x.setup.replace(/_/g, " ")}` : ""}`,
             markers: fillMarkers(fills, x.symbol, x.opened_at ?? undefined),
