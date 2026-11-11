@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { readableUpstreamError } from "./apiError";
 import { rupees, tone } from "./agentMath";
 import { TradingLedger, type FocusRow } from "./Ledger";
 import { LaneChart, LaneChartModal, type LaneChartFocus } from "./LaneChart";
@@ -167,13 +168,14 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   }, [focusFor]);
 
   const orderApi = d?.order_api;
+  const orderDetail = readableUpstreamError(orderApi?.detail);
   const available = d?.upstox_funds?.available_margin;
   const wins = closedRows.filter((c) => c.realized_pnl > 0);
   const losses = closedRows.filter((c) => c.realized_pnl < 0);
   const grossWin = wins.reduce((s, c) => s + c.realized_pnl, 0);
   const grossLoss = -losses.reduce((s, c) => s + c.realized_pnl, 0);
   const problems = [error, d?.read_error && `Upstox read failed: ${d.read_error}`, d?.engine_error && `MACD engine read failed: ${d.engine_error}`,
-    orderApi && !orderApi.ok && `Upstox order API: ${orderApi.detail}`].filter(Boolean) as string[];
+    orderApi && !orderApi.ok && `Upstox order API: ${orderDetail}`].filter(Boolean) as string[];
 
   return <section className="ledger-page blast-page spot-page upstox-page">
     <div className="page-heading blast-heading">
@@ -182,7 +184,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
       <div className="blast-badges">
         <span className={d?.armed ? "mode alert" : "feed-badge"} title={d?.armed ? `Armed${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill (Settings → Upstox live)` : "Not armed: no orders are sent"}>
           {d ? (d.armed ? "ARMED · real money" : "Not armed · no orders") : "…"}</span>
-        <span className={orderApi && !orderApi.ok ? "mode alert" : "feed-badge"} title={orderApi ? `${orderApi.detail} · checked ${when(orderApi.checked_at)}` : "Not checked yet"}>
+        <span className={orderApi && !orderApi.ok ? "mode alert" : "feed-badge"} title={orderApi ? `${orderDetail} · checked ${when(orderApi.checked_at)}` : "Not checked yet"}>
           Order API {orderApi ? (orderApi.ok ? "ok" : "blocked") : "…"}</span>
         <span className={d?.read_error ? "mode alert" : "feed-badge"} title={d?.read_error || `Account read ${when(d?.read_at)}`}>Account read {d ? (d.read_error ? "failing" : "ok") : "…"}</span>
       </div>
@@ -204,7 +206,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
       </button>)}
     </div>
     {problems.map((text) => <div key={text} className="settings-error" role="alert">{text}</div>)}
-    {!d && !error && <div className="agent-empty" role="status">Loading the Upstox lane…</div>}
+    {!d && !error && <div className="agent-empty state-loading" role="status">Loading the Upstox lane…</div>}
 
     {d && <div className="blast-body" role="tabpanel">
       {tab === "TERMINAL" && <div className="workspace terminal-workspace spot-terminal">
@@ -246,7 +248,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
           <div className="panel-title">Lane health</div>
           <table className="live-table agent-table"><tbody>
             <tr><th>Mode</th><td className={d.armed ? "negative" : ""}>{d.armed ? `ARMED${d.armed_since ? ` since ${when(d.armed_since)}` : ""}: real orders until Kill` : "Not armed: offered signals are journalled as skipped, no order is sent"}</td></tr>
-            <tr><th>Order API</th><td className={orderApi && !orderApi.ok ? "negative" : ""}>{orderApi ? `${orderApi.detail} · ${when(orderApi.checked_at)}` : "not checked yet"}</td></tr>
+            <tr><th>Order API</th><td className={orderApi && !orderApi.ok ? "negative" : ""}>{orderApi ? `${orderDetail} · ${when(orderApi.checked_at)}` : "not checked yet"}</td></tr>
             <tr><th>Account read</th><td className={d.read_error ? "negative" : ""}>{d.read_error || "ok"} · {when(d.read_at)}</td></tr>
             <tr><th>Upstox funds</th><td>{available == null ? "—" : `₹${rupeeText(available)} available`}{d.upstox_funds?.used_margin ? ` · ₹${rupeeText(d.upstox_funds.used_margin)} used` : ""}</td></tr>
             <tr><th>Free for next entry</th><td>₹{rupeeText(d.free)} · {d.fund_basis ?? "—"}{d.in_flight ? ` (less ₹${rupeeText(d.in_flight)} sent since the last read)` : ""}{d.cap ? ` · cap ₹${rupeeText(d.cap)}` : " · no lane cap"} · ₹{rupeeText(d.charges_allowance ?? 0)} kept back per order for charges</td></tr>

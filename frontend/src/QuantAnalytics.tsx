@@ -227,7 +227,7 @@ function CrossSection({ whales, selected, onSelect }: { whales: Map<string, Whal
     </div>
     <div className="live-table-wrap"><table className="live-table">
       <thead><tr><th>Symbol</th><th>LTP</th><th>MACD</th><th>Hist</th><th>Vol %</th><th>Whale P</th><th>Lean</th><th>Pattern</th></tr></thead>
-      <tbody>{shown.map((r) => { const w = whales.get(r.symbol); return <tr key={r.symbol} className={r.symbol === selected ? "selected" : ""} onClick={() => onSelect(r.symbol)}>
+      <tbody>{shown.map((r, i) => { const w = whales.get(r.symbol); return <tr key={`${r.symbol}:${i}`}className={r.symbol === selected ? "selected" : ""} onClick={() => onSelect(r.symbol)}>
         <td title={r.symbol}>{short(r.symbol)}{r.warm ? "" : " ·"}</td><td>{fmt(r.ltp)}</td>
         <td className={tone(r.macd)}>{fmt(r.macd)}</td><td className={tone(r.histogram)}>{fmt(r.histogram)}</td>
         <td>{fmt(r.realized_volatility_pct, 1)}</td>

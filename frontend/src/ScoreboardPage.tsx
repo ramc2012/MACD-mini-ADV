@@ -51,11 +51,19 @@ export function ScoreboardPage() {
       trades: Object.values(cells).reduce((s, c) => s + c.trades, 0) })).sort((a, b) => a.net - b.net);
   }, [book]);
 
+  const head = <div className="agent-head panel-row">
+    <div><b>Lanes scoreboard</b><span className="agent-sub">every paper book, same measures{board ? ` · as of ${stamp(board.as_of)}` : ""}</span></div>
+    <div className="agent-actions"><button className="settings-button" onClick={() => void load(true)}>Refresh</button></div>
+  </div>;
+  // Until the first answer arrives there is nothing to tabulate: say so instead of drawing empty tables.
+  if (!board) return <div className="agent-page lanes-page">
+    {head}
+    {error ? <div className="agent-error" role="alert">{error}</div>
+      : <div className="agent-empty state-loading" role="status">Loading the scoreboard…</div>}
+  </div>;
+
   return <div className="agent-page lanes-page">
-    <div className="agent-head panel-row">
-      <div><b>Lanes scoreboard</b><span className="agent-sub">every paper book, same measures · as of {stamp(board?.as_of)}</span></div>
-      <div className="agent-actions"><button className="settings-button" onClick={() => void load(true)}>Refresh</button></div>
-    </div>
+    {head}
     <section className="panel agent-panel">
       <details><summary>ⓘ How the numbers are made</summary><p>A trade runs from its first entry until the position is flat; partial exits count toward weekly P&amp;L and the exit table, not toward win rate or PF. Weeks are IST weeks (Monday) of the exit. "Without best week" removes the single best week to show how much rests on it. Drawdown is the largest fall from a running peak over the whole stored equity curve. Book full: every slot is used or cash is below one ticket. Paper fills; costs as each lane records them. Short samples are not proof either way.</p></details>
     </section>

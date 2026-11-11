@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { responseErrorMessage } from "./apiError";
+import { readableUpstreamError, responseErrorMessage } from "./apiError";
 import { extractAuthCode, tokenLeft } from "./sessionClock";
 import { API_TOKEN, API_URL } from "./runtime";
 
@@ -534,7 +534,7 @@ function UpstoxControls() {
       <b>{!lane ? "Reading the Upstox lane…" : lane.armed ? `ARMED — real Upstox orders until Kill${lane.armed_since ? ` (since ${new Date(lane.armed_since).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} IST)` : ""}` : "Not armed — no orders are sent"}</b>
       <span style={{ display: "block", fontWeight: 400 }}>{lane ? `Order API ${apiOk ? "ok" : "blocked"} · account read ${lane.read_error ? "failing" : "ok"} · ${lane.positions.length} open · ${pendingEntries} pending entr${pendingEntries === 1 ? "y" : "ies"} · orders today ${lane.orders_today?.count ?? 0}/${lane.max_orders_per_day ?? "—"}` : ""}</span>
     </div>
-    {lane?.order_api && !apiOk && <div className="settings-error">Order API: {lane.order_api.detail}</div>}
+    {lane?.order_api && !apiOk && <div className="settings-error">Order API: {readableUpstreamError(lane.order_api.detail)}</div>}
     {lane?.read_error && <div className="settings-error">Account read: {lane.read_error}</div>}
     <h3>Switches</h3>
     <div className="settings-actions" style={{ justifyContent: "flex-start", flexWrap: "wrap" }}>

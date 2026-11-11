@@ -1,0 +1,147 @@
+/* Shared component rules, imported after styles.css.
+   One definition each for: base type, focus, scrollbars, the three tab levels, page headers,
+   status chips, disclosure rows and empty/loading/error states. Colours and sizes come from tokens.css. */
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+:root { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+body { font-variant-numeric: tabular-nums; text-rendering: optimizeLegibility; }
+button, input, select, textarea { font-family: inherit; }
+code, pre, kbd, samp { font-family: var(--font-mono); }
+::selection { background: #2a4f8f; color: #fff; }
+
+* { scrollbar-width: thin; scrollbar-color: var(--line-emphasis) transparent; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: var(--line-emphasis); background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+a:focus-visible, textarea:focus-visible, [tabindex]:focus-visible, [role="button"]:focus-visible, [role="tab"]:focus-visible {
+  outline: 2px solid #8ab7ff; outline-offset: 2px; }
+:focus:not(:focus-visible) { outline: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}
+
+/* ── Tabs, level 1 and 2: application chrome (underline) ──────────────── */
+.main-tabs button, .sub-tabs button { font-size: var(--fs-xs); letter-spacing: .04em; transition: color .12s, background-color .12s, border-color .12s; }
+.main-tabs button.active, .main-tabs button[aria-current="page"] { color: var(--text-1); }
+.sub-tabs button { font-weight: 600; }
+.sub-tabs button.active, .sub-tabs button[aria-current="page"] { color: var(--accent-text); }
+.main-tabs button span, .sub-tabs button span { border-radius: var(--radius-pill); font-weight: 600; letter-spacing: 0; }
+.main-tabs button.active span, .sub-tabs button.active span { background: var(--bg-accent-soft); color: var(--accent-text-soft); }
+
+/* A row that scrolls sideways shows a soft edge where more tabs are hidden. */
+.main-tabs:not(.mp-main-tabs), .sub-tabs {
+  background:
+    linear-gradient(to right, var(--scroll-cover, var(--bg-chrome)) 40%, transparent) left / 36px 100% no-repeat local,
+    linear-gradient(to left, var(--scroll-cover, var(--bg-chrome)) 40%, transparent) right / 36px 100% no-repeat local,
+    linear-gradient(to right, #4d91ff40, transparent) left / 14px 100% no-repeat scroll,
+    linear-gradient(to left, #4d91ff40, transparent) right / 14px 100% no-repeat scroll,
+    var(--scroll-cover, var(--bg-chrome));
+  scrollbar-width: none; }
+.main-tabs:not(.mp-main-tabs)::-webkit-scrollbar, .sub-tabs::-webkit-scrollbar { display: none; }
+.sub-tabs.lane-views { --scroll-cover: var(--bg-panel); }
+
+/* ── Tabs, level 3: sections inside a page (segmented control) ────────── */
+.agent-tabs, .auction-tabs, .watch-tabs.blast-tabs {
+  position: static; display: inline-flex; flex: none; flex-wrap: wrap; align-self: flex-start; gap: 2px; width: fit-content; max-width: 100%;
+  margin: 0 0 10px; padding: 2px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--bg-panel); overflow: visible; }
+.agent-tabs button, .auction-tabs button, .watch-tabs.blast-tabs button {
+  display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; gap: 6px; min-height: 26px; padding: 0 12px;
+  border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-3);
+  font-size: var(--fs-sm); font-weight: 500; letter-spacing: 0; text-transform: none; white-space: nowrap; cursor: pointer;
+  transition: color .12s, background-color .12s; }
+.agent-tabs button:hover, .auction-tabs button:hover, .watch-tabs.blast-tabs button:hover { background: var(--bg-raised); color: var(--text-1); }
+.agent-tabs button.active, .auction-tabs button.active, .watch-tabs.blast-tabs button.active,
+.agent-tabs button[aria-selected="true"], .auction-tabs button[aria-selected="true"], .watch-tabs.blast-tabs button[aria-selected="true"] {
+  border: 0; background: var(--bg-control); color: var(--text-1); font-weight: 600; box-shadow: inset 0 0 0 1px var(--line-emphasis); }
+.agent-tabs button span, .auction-tabs button span, .watch-tabs.blast-tabs button span {
+  margin: 0; min-width: 18px; padding: 1px 6px; border-radius: var(--radius-pill); background: var(--bg-accent-soft); color: var(--accent-text-soft);
+  font-size: var(--fs-micro); font-weight: 600; text-align: center; }
+
+/* ── Page headers ─────────────────────────────────────────────────────── */
+.page-heading h1, .agent-head b, .mp-head h1 { color: var(--text-1); font-size: var(--fs-title); font-weight: 650; letter-spacing: -.005em; line-height: 1.25; }
+.page-heading p { max-width: 120ch; margin-top: 5px; color: var(--text-3); font-size: var(--fs-sm); line-height: 1.45; }
+.agent-sub { color: var(--text-3); font-size: var(--fs-sm); }
+.agent-head.panel-row { display: flex; align-items: center; gap: 8px 12px; min-height: 36px; }
+.agent-head.panel-row > div:first-child { flex: 1 1 320px; min-width: 0; line-height: 1.5; }
+.agent-head.panel-row > .agent-actions { flex: none; margin-left: auto; }
+
+/* ── Status chips: one shape in the header and on pages ───────────────── */
+.mode, .feed-badge, .agent-chip, .session-chip, .fyers-chip, .fyers-login-cta, .page-heading > span,
+.mp-head .rrg-controls .mode, .mp-head .rrg-controls .feed-badge {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 22px; padding: 2px 9px; border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill); font-size: var(--fs-xs); font-weight: 600; line-height: 1.2; letter-spacing: 0; white-space: nowrap; }
+.mode, .feed-badge { text-transform: none; }
+.mode { background: var(--bg-control); border-color: var(--line-control); color: var(--text-2); }
+.feed-badge { background: var(--bg-up-soft); border-color: var(--line-up); color: var(--up-soft); }
+.mode.alert { background: var(--bg-down-soft); border-color: var(--line-down); color: var(--down-soft); }
+.agent-chip, .page-heading > span { background: var(--bg-accent-soft); border-color: var(--line-accent); color: var(--text-2); font-weight: 500; }
+.session-chip, .fyers-chip { background: transparent; }
+.agent-chip, .blast-badges > span { white-space: normal; }
+
+/* ── Disclosure rows ──────────────────────────────────────────────────── */
+summary { cursor: pointer; color: var(--text-3); font-size: var(--fs-sm); }
+summary:hover { color: var(--text-1); }
+summary::marker { color: var(--text-4); }
+details[open] > summary { color: var(--text-1); }
+
+/* ── States: loading, empty, error ────────────────────────────────────── */
+.agent-empty, .state-note { padding: 18px 12px; color: var(--text-3); font-size: var(--fs-sm); line-height: 1.5; }
+.state-loading { display: flex; align-items: center; gap: 10px; }
+.state-loading::before { content: ""; flex: none; width: 12px; height: 12px; border: 2px solid var(--line-emphasis); border-top-color: var(--accent);
+  border-radius: 50%; animation: state-spin .8s linear infinite; }
+@keyframes state-spin { to { transform: rotate(360deg); } }
+.settings-error { display: flex; align-items: flex-start; gap: 8px; padding: 9px 12px; border-radius: var(--radius); font-size: var(--fs-sm); line-height: 1.45; overflow-wrap: anywhere; }
+.settings-error::before { content: "!"; flex: none; display: grid; place-items: center; width: 16px; height: 16px; margin-top: 1px; border-radius: 50%;
+  background: var(--down); color: #1a0a0d; font-size: var(--fs-xs); font-weight: 800; }
+
+/* ── Ported Vanguard / CBE pages: same palette and type as the rest ───── */
+main .nomad-port {
+  --bg-primary: 7 10 15; --bg-secondary: 11 16 24; --bg-card: 13 20 30; --bg-tertiary: 17 26 39; --bg-hover: 27 38 54;
+  --bg-border: 38 49 68; --bg-active: 43 58 78;
+  --accent-green: 34 200 147; --accent-red: 241 91 108; --accent-amber: 245 184 75; --accent-blue: 77 145 255;
+  --text-primary: 220 229 241; --text-secondary: 163 179 200; --text-muted: 129 146 169;
+  font-family: var(--font-sans); font-variant-numeric: tabular-nums; }
+
+/* ── Toggle groups and toolbar fields: one size on every page ─────────── */
+.risk-tabs { gap: 6px; text-transform: none; }
+.risk-tabs button {
+  padding: 4px 9px; border: 1px solid var(--line-control); border-radius: var(--radius-sm); background: transparent; color: var(--text-4);
+  font-size: var(--fs-micro); font-weight: 400; letter-spacing: .04em; text-transform: uppercase; cursor: pointer; }
+.risk-tabs button b { color: inherit; font-weight: 700; }
+.radar-filter button, .risk-tabs button { transition: color .12s, background-color .12s, border-color .12s; }
+.radar-filter button:not(.active):hover, .risk-tabs button:not([aria-pressed="true"]):hover { border-color: var(--line-emphasis); color: var(--text-1); }
+.risk-tabs button[aria-pressed="true"] { border-color: var(--accent); background: var(--bg-accent-soft); color: var(--accent-text); }
+.heatmap-search, .coil-sort select {
+  min-height: 24px; padding: 3px 8px; border: 1px solid var(--line-control); border-radius: var(--radius-sm); background: var(--bg-panel); color: var(--text-1);
+  font-size: var(--fs-xs); }
+.heatmap-search::placeholder { color: var(--text-4); }
+.coil-sort { color: var(--text-4); font-size: var(--fs-xs); }
+
+/* Market pages that had no page gutter */
+.panel.sector-wheel, .panel.sector-coil { padding: 12px 16px; }
+@media (max-width: 700px) { .panel.sector-wheel, .panel.sector-coil { padding: 8px; } }
+.coil-title { font-size: var(--fs-title); font-weight: 650; }
+.coil-table-toggle {
+  min-height: 24px; padding: 4px 9px; border: 1px solid var(--line-control); border-radius: var(--radius-sm); background: transparent; color: var(--text-3);
+  font-size: var(--fs-micro); letter-spacing: .04em; text-transform: uppercase; }
+.coil-table-toggle:hover { border-color: var(--line-emphasis); color: var(--text-1); }
+.trend-state-filters button { padding: 5px 11px; border-radius: var(--radius); font-size: var(--fs-sm); }
+.trend-state-filters button.active { background: var(--bg-control); border-color: var(--text-4); color: var(--text-1); }
+@media (min-width: 701px) { .trend-page { padding: 12px 18px; } }
+
+/* ── Settings dialog: its tabs share one row however many there are ───── */
+.settings-tabs { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); margin: 0 0 12px; border-bottom: 1px solid var(--line); }
+@media (max-width: 520px) { .settings-tabs { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-columns: auto; } }
+
+/* ── Phone widths: the header chips wrap instead of pushing the page wide ─ */
+@media (max-width: 600px) {
+  header .status { flex: 1 1 100%; flex-wrap: wrap; min-width: 0; margin-left: 0; gap: 6px; }
+  header .status .settings-button { margin-left: auto; }
+}
+@media (max-width: 700px) { .spot-page .blast-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .index-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

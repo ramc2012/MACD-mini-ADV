@@ -581,7 +581,7 @@ export default function App() {
           : <button className="fyers-chip" onClick={() => openSettings("FYERS")} title={`${feedTitle(snapshot, health, brokerStatus)} · stream ${connected ? "linked" : "reconnecting"} · token ${token.text}`}>
               <span className={`feed-dot${feedTone(brokerStatus, health)}`} aria-hidden="true">●</span>Fyers<small>{connected ? token.text : "reconnecting"}</small>
             </button>}
-        <span className="mode">{snapshot?.execution.mode || "—"}</span>
+        <span className="mode" title="Execution mode">{sentenceCase(snapshot?.execution.mode) || "—"}</span>
         <AlertChips health={health} />
         <span className="header-date">{IST_HEADER_DAY.format(new Date())}</span>
         <button className="settings-button settings-glyph" onClick={() => openSettings("FYERS")} aria-label="Settings" title="Settings">⚙</button>
@@ -820,6 +820,11 @@ function compareWatch(a: SpotWatchRow | OptionWatchRow, b: SpotWatchRow | Option
 }
 
 /** Telegram alert health and rejected exits backing off, in the header (review 3 Nov 2026: a 403 went unseen). */
+function sentenceCase(text?: string | null) {
+  const value = (text ?? "").trim();
+  return value ? value[0].toUpperCase() + value.slice(1).toLowerCase() : "";
+}
+
 function AlertChips({ health }: { health?: HealthInfo }) {
   const alerts = health?.alerts;
   const exits = health?.exit_failures ?? [];

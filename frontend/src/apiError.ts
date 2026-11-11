@@ -34,3 +34,17 @@ export async function responseErrorMessage(response: Response, fallback: string)
   }
   return `${fallback} (HTTP ${response.status})`;
 }
+
+// Services sometimes pass along a slice of a broker's JSON error body inside a sentence, for example
+//   token not accepted by the order API: error","errors":[{"errorCode":"UDAPI100050","message":"Invalid token…
+// For display keep the sentence, the broker's message and its code; text without such a fragment is returned as is.
+export function readableUpstreamError(text: string | null | undefined): string {
+  const raw = (text ?? "").trim();
+  const start = raw.search(/[{[]|"\s*,\s*"/);
+  if (start < 0) return raw;
+  const message = /"message"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(raw)?.[1]?.replace(/\\(.)/g, "$1").trim();
+  if (!message) return raw;
+  const code = /"(?:errorCode|error_code)"\s*:\s*"([\w.-]+)"/.exec(raw)?.[1];
+  const lead = raw.slice(0, start).replace(/[\s:,"]+$/, "").replace(/:\s*(?:error|failure|failed)$/i, "");
+  return `${lead ? `${lead}: ` : ""}${message}${code ? ` (${code})` : ""}`;
+}
