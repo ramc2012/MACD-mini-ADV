@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import auction_views, straddle_views
+from . import auction_views, options_desk, straddle_views
 from .api_models import OrderInput, _as_json
 from .desk import AGENT_JOB_LOCK as _agent_lock
 from .profile_scale import cached_scale, profile_scale
@@ -392,6 +392,23 @@ async def straddle_series(underlying: str, expiry: str | None = None,
     """ATM (or fixed-strike) straddle with day/week/month VWAPs and ATM CE/PE open interest for one expiry."""
     return await asyncio.to_thread(straddle_views.series, engine.settings.research_database_path,
                                    underlying.upper(), expiry, span, day, strike)
+
+@router.get("/api/auction/options/{underlying}", dependencies=[Depends(authorize)])
+async def options_view(underlying: str, expiry: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                       day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                       at: int | None = Query(default=None, gt=0)):
+    """Options & flow desk, chain tools: NTM IV vs VIX, gamma exposure and walls, expected move, call/put volume
+    spectrum, writers' P&L on OI added today, the option table with Greeks and the IV range, from stored chains."""
+    return await asyncio.to_thread(options_desk.chain_view, engine.settings.research_database_path,
+                                   underlying.upper(), expiry, day, at)
+
+@router.get("/api/auction/futures-flow/{underlying}", dependencies=[Depends(authorize)])
+async def futures_flow_view(underlying: str, day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                            tf: int = Query(default=5, ge=1, le=30)):
+    """Options & flow desk, futures tools: MFLOW (volume by what OI did) and smart candles (IB, delta strength,
+    balance clusters) for the current-month futures."""
+    return await asyncio.to_thread(options_desk.futures_flow, engine.settings.tick_database_path,
+                                   engine.settings.research_database_path, underlying.upper(), day, tf)
 
 @router.get("/api/auction/positional", dependencies=[Depends(authorize)])
 async def auction_positional(day: str | None = None,
