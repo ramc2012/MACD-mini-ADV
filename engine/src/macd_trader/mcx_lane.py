@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 from collections import defaultdict, deque
@@ -73,7 +74,7 @@ from .config import RUNTIME_DIR, Settings
 from .contracts import liquidity_window, select_liquid_contract
 from .events import EventHub, json_value
 from .execution import ExecutionManager
-from .mcx_store import McxBarStore
+from .mcx_store import McxBarStore, valid_minute
 from .models import Candle, Signal, Tick, Trade
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
@@ -474,12 +475,11 @@ def pick_atm(series: list[McxListed], reference: float, option_type: str,
 class McxLaneEvents:
     """Publishes the lane's discrete events under ``mcx_`` names.
 
-    Portfolio, indicator and candle frames are dropped: ExecutionManager sends
-    a portfolio frame on every mark change, the gateway does not coalesce
-    unknown event types, and the MCX page reads the lane's REST snapshot.
+    Portfolio, indicator and candle frames are dropped. Quotes are published
+    separately as a coalesced batch, never on the NSE tick stream.
     """
 
-    FORWARDED = frozenset({"order", "trade", "signal", "position_closed", "decision"})
+    FORWARDED = frozenset({"order", "trade", "signal", "position_closed", "decision", "quotes"})
 
     def __init__(self, events: EventHub):
         self._events = events
@@ -551,7 +551,10 @@ SIGNAL_STALENESS_GRACE_SECONDS = 120
 WARMUP_ATTEMPTS = 4
 WARMUP_BACKOFF_SECONDS = (4.0, 12.0, 30.0)
 WARMUP_PACING_SECONDS = 0.35
-GAP_SECONDS = 180                 # session time without ticks that counts as a hole in the bar database
+QUOTE_BATCH_SECONDS = 0.1
+OI_REFRESH_SECONDS = 120
+OI_PACING_SECONDS = 0.8
+GAP_SECONDS = 120                 # session time without ticks that counts as a hole in the bar database
 HEARTBEAT_SECONDS = 60
 BACKFILL_RETRY_SECONDS = 1800
 STORE_STATS_SECONDS = 300
@@ -622,6 +625,12 @@ class McxLane:
         )
         self.execution.set_tradable_contracts({})
         self.latest: dict[str, Tick] = {}
+        self._display_quotes: dict[str, dict] = {}
+        self._dirty_quotes: dict[str, dict] = {}
+        self._quote_flush: asyncio.TimerHandle | None = None
+        self._oi_task: asyncio.Task | None = None
+        self._last_oi_poll_at = 0.0
+        self._oi_marks: dict[str, dict] = {}
         self.execution.quote_source = self.latest.get
         self.contracts: dict[str, McxContract] = {}      # symbol -> today's selected or held contract
         self.futures_by_root: dict[str, str] = {}
@@ -1098,6 +1107,11 @@ class McxLane:
                     await asyncio.sleep(WARMUP_BACKOFF_SECONDS[attempt] if limited else 0.5 * (attempt + 1))
         raise error or RuntimeError("history failed")
 
+    def _history_gaps(self, symbol_row: dict, window_ts: int) -> list[tuple[int, int]]:
+        first_seen = symbol_row["first_seen"] or 0
+        return [gap for gap in self.store.gaps_ending_after(symbol_row["checked_to"] or 0)
+                if gap[1] > window_ts and gap[1] > first_seen]
+
     async def _ensure_history(self, symbol: str) -> str:
         """Bring one contract's stored bars up to date; returns what was done.
 
@@ -1113,9 +1127,7 @@ class McxLane:
         if first:
             start = window
         else:
-            first_seen = row["first_seen"] or 0
-            gaps = [gap for gap in self.store.gaps_ending_after(row["checked_to"] or 0)
-                    if gap[1] > window_ts and gap[1] > first_seen]
+            gaps = self._history_gaps(row, window_ts)
             if not gaps:
                 return "stored"
             start = max(window, datetime.fromtimestamp(min(gap[0] for gap in gaps), UTC) - timedelta(minutes=1))
@@ -1131,8 +1143,11 @@ class McxLane:
         self.downloads["failed"].pop(symbol, None)
         # The minute still forming is incomplete in the download; the live recorder writes it when it closes.
         forming = now_ts - now_ts % 60
-        minutes = [bar for bar in minutes if bar.timestamp < forming and bar.timestamp >= window_ts - 86_400]
-        written = await asyncio.to_thread(self.store.write, minutes)
+        history_floor = (int(datetime.combine(window.astimezone(IST).date(), time.min, IST).timestamp())
+                         if first else int(start.timestamp()) // 60 * 60)
+        minutes = [bar for bar in minutes if bar.symbol == symbol and history_floor <= bar.timestamp < forming
+                   and valid_minute(bar) and self.calendar.in_session(datetime.fromtimestamp(bar.timestamp, UTC))]
+        written = await asyncio.to_thread(self.store.write, minutes, preserve_existing=True)
         self.store.mark_filled(symbol, now_ts, backfilled_from=window_ts if first else None)
         self.downloads["bars"] += written
         self.downloads["contracts"] += 1
@@ -1179,13 +1194,20 @@ class McxLane:
         return self.warm_report
 
     def _start_backfill(self) -> None:
-        """One download for each watched contract that has never had one (the strike ladder), in the background."""
+        """Fill first downloads and outstanding feed gaps for the entire watched ladder."""
         if not self.downloads_allowed():
             return
         task = self._backfill_task
         if task is not None and not task.done():
             return
-        pending = self.store.never_downloaded(self.subscription_symbols())
+        symbols = self.subscription_symbols()
+        pending = self.store.never_downloaded(symbols)
+        window_ts = int((datetime.now(UTC) - timedelta(days=self.settings.mcx_warmup_days)).timestamp())
+        if self.store.gaps_ending_after(window_ts):
+            new = set(pending)
+            for symbol in symbols:
+                if symbol not in new and self._history_gaps(self.store.symbol(symbol), window_ts):
+                    pending.append(symbol)
         if not pending:
             return
 
@@ -1234,6 +1256,76 @@ class McxLane:
         return (self.settings.mcx_enabled and bool(self.subscription_symbols()) and self.session_open(moment)
                 and self.ws_ticks_day == moment.astimezone(IST).date().isoformat() and self.ws_ticks_today > 0)
 
+    def _flush_display_quotes(self) -> None:
+        self._quote_flush = None
+        rows, self._dirty_quotes = self._dirty_quotes, {}
+        if rows:
+            self.events.publish("quotes", list(rows.values()))
+
+    def _publish_display_quote(self, row: dict) -> None:
+        symbol = row["symbol"]
+        self._display_quotes[symbol] = row
+        if self.events.client_count:
+            self._dirty_quotes[symbol] = row
+            if self._quote_flush is None:
+                self._quote_flush = asyncio.get_running_loop().call_later(QUOTE_BATCH_SECONDS, self._flush_display_quotes)
+
+    def _queue_display_quote(self, tick: Tick, previous: Tick | None, received_at: datetime,
+                             exchange_at: datetime, source: str) -> None:
+        if tick.symbol not in self.contracts and not self.is_future(tick.symbol):
+            return
+        old = self._display_quotes.get(tick.symbol)
+        move = ("up" if previous and tick.ltp > previous.ltp else
+                "down" if previous and tick.ltp < previous.ltp else old["move"] if old else None)
+        stamp = int(received_at.timestamp() * 1000)
+        day = exchange_at.astimezone(IST).date().isoformat()
+        close = tick.prev_close if tick.prev_close and math.isfinite(tick.prev_close) and tick.prev_close > 0 else None
+        if close is None and old and old["day"] == day:
+            close = old["prev_close"]
+        oi_mark = self._oi_marks.get(tick.symbol) or {}
+        same_day = oi_mark.get("day") == day
+        oi = tick.open_interest if tick.open_interest is not None and tick.open_interest >= 0 else (
+            oi_mark.get("oi") if same_day else None)
+        prev_oi = oi_mark.get("prev_oi") if same_day else None
+        self._publish_display_quote({
+            "symbol": tick.symbol, "ltp": tick.ltp, "move": move, "source": source, "day": day,
+            "seen_ms": stamp, "updated_ms": stamp, "price_ms": int(exchange_at.timestamp() * 1000),
+            "prev_close": close, "change": tick.ltp - close if close else None,
+            "change_pct": 100 * (tick.ltp - close) / close if close else None,
+            "volume": tick.volume, "oi": oi, "oi_change": oi - prev_oi if oi is not None and prev_oi is not None else None,
+            "oi_ms": stamp if tick.open_interest is not None else oi_mark.get("oi_ms") if same_day else None,
+        })
+
+    def _schedule_oi(self, now: datetime) -> None:
+        """Refresh broker OI in a separate paced task; it never drives prices or execution."""
+        reader = getattr(self.broker, "open_interest", None)
+        if (not self.settings.mcx_enabled or not callable(reader) or
+                now.timestamp() - self._last_oi_poll_at < OI_REFRESH_SECONDS or
+                (self._oi_task is not None and not self._oi_task.done())):
+            return
+        self._last_oi_poll_at = now.timestamp()
+        symbols = self.core_symbols()
+        day = now.astimezone(IST).date().isoformat()
+
+        async def refresh() -> None:
+            for symbol in symbols:
+                try:
+                    data = await reader(symbol)
+                except Exception:  # noqa: BLE001 — unavailable OI must not affect prices or paper orders
+                    data = None
+                if data and data.get("oi") is not None and data["oi"] >= 0:
+                    stamp = int(datetime.now(UTC).timestamp() * 1000)
+                    oi, prev_oi = data["oi"], data.get("prev_oi")
+                    prev_oi = prev_oi if prev_oi is not None and prev_oi >= 0 else None
+                    self._oi_marks[symbol] = {"day": day, "oi": oi, "prev_oi": prev_oi, "oi_ms": stamp}
+                    row = self._display_quotes.get(symbol)
+                    if row and row["day"] == day:
+                        self._publish_display_quote({**row, "oi": oi, "oi_ms": stamp, "updated_ms": stamp,
+                                                     "oi_change": oi - prev_oi if prev_oi is not None else None})
+                await asyncio.sleep(OI_PACING_SECONDS)
+
+        self._oi_task = asyncio.create_task(refresh())
+
     async def on_tick(self, tick: Tick, received_at: datetime | None = None, *, source: str = "ws") -> None:
         """Every MCX print the engine receives, and every REST fallback quote."""
         received_at = received_at or datetime.now(UTC)
@@ -1254,6 +1346,7 @@ class McxLane:
             self.ws_ticks_today += 1
         else:
             self.rest_ticks += 1
+        self._queue_display_quote(tick, previous, received_at, exchange_at, source)
         current = (exchange_at.astimezone(IST).date() == received_at.astimezone(IST).date()
                    and self.calendar.in_session(exchange_at) and self.calendar.in_session(received_at))
         # A REST quote is executable only if its own trade is recent: an
@@ -1312,7 +1405,8 @@ class McxLane:
         pending, self._minute_pending = self._minute_pending, []
         try:
             return self.store.write(pending)
-        except Exception as exc:  # noqa: BLE001 - the bars are lost, the lane goes on
+        except Exception as exc:  # noqa: BLE001 - keep a bounded retry queue on a transient store failure
+            self._minute_pending = pending[-15_000:]
             self._lane_error("bar store", exc)
             return 0
 
@@ -1489,6 +1583,7 @@ class McxLane:
             for symbol in self.expiring_positions(today):
                 await self.flatten(symbol, f"MCX_EXPIRY_FLATTEN_{cutoff[0]:02d}{cutoff[1]:02d}_IST")
         if self.calendar.in_session(now):
+            self._schedule_oi(now)
             await self.poll_stale_quotes(now)
         self.execution.sweep_closed_positions()
         if self.portfolio.positions or self.calendar.in_session(now):
@@ -1535,6 +1630,17 @@ class McxLane:
         return fed
 
     async def stop(self) -> None:
+        if self._oi_task is not None:
+            self._oi_task.cancel()
+            try:
+                await self._oi_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._oi_task = None
+        if self._quote_flush is not None:
+            self._quote_flush.cancel()
+            self._quote_flush = None
+        self._dirty_quotes.clear()
         if self._task is not None:
             self._task.cancel()
             try:
@@ -1554,8 +1660,10 @@ class McxLane:
         except Exception:  # noqa: BLE001
             pass
         try:
+            stop_ts = int(datetime.now(UTC).timestamp())
             for minute in self.minute_bars.flush():
-                self._queue_minute(minute)
+                if minute.timestamp + 60 <= stop_ts:
+                    self._queue_minute(minute)
             self._flush_minutes()
         except Exception:  # noqa: BLE001
             pass
@@ -1727,6 +1835,8 @@ class McxLane:
             "health": self.health(),
             "risk": self.risk_view(),
             "contracts": self.contract_rows(),
+            "quotes": {symbol: quote for symbol, quote in self._display_quotes.items()
+                       if symbol in self.contracts or self.is_future(symbol)},
             "portfolio": self.execution.portfolio_snapshot(),
             "closed_positions": self.execution.visible_closed_positions(),
             "decisions": list(self.decisions)[:60],

@@ -61,8 +61,13 @@ calls it.
 
 - **Ticks** come from the engine's websocket; the lane's options, their
   futures and every holding are added to the subscription. Every `MCX:` print
-  goes to the lane and nowhere else: not the NSE candle engine, the desk, the
-  tick bus or the browser stream.
+  stays out of the NSE candle engine, the desk and the tick bus. Displayed
+  contracts send coalesced `mcx_quotes` updates to the terminal every 100 ms
+  when quotes are arriving. Futures, Calls and Puts are separate watchlists.
+  The last price cell shows the last uptick or downtick with a green or red fill.
+  The watchlists show FYERS' previous close, price change, percent change and
+  session volume. OI and previous-session OI refresh from FYERS depth in a
+  paced background job; missing OI or a missing baseline displays a dash.
 - **REST fallback.** During the session, a lane contract the socket has been
   silent on for `mcx_rest_fallback_seconds` (default 60, counted from the later
   of the last tick, the subscription and the open) is quoted over REST, one
@@ -76,7 +81,9 @@ calls it.
     `mcx_ladder_strikes` strikes (default 5) either side of each ATM, calls and puts. The ladder is recorded so
     that tomorrow's ATM contract already has its bars.
   - **A second download** happens only to fill a stretch of session the lane received nothing for (the engine or
-    the socket was down for more than three minutes), and only for a contract being warmed.
+    the socket was down for more than two minutes). Outstanding gaps also
+    retry for the watched ladder. The repair preserves existing bars and skips
+    malformed or still-forming broker minutes.
   - **The switch** `mcx_history_downloads` decides whether those downloads may pass the app's history hold. Off:
     a new contract has only its live bars, and the warm-up report says it is waiting for the switch.
   - Bars older than `mcx_store_days` (default 60) are dropped at the close.
@@ -130,7 +137,7 @@ a verdict, kept in memory for the page and published as `mcx_decision`:
 | `POST /api/mcx/reselect` | re-run today's selection now; resubscribes only if the symbols changed |
 | `POST /api/mcx/orders` | manual paper ticket against the lane's book (MCX symbols only) |
 | `GET /api/system/health` | `mcx` block |
-| stream | `mcx_order`, `mcx_trade`, `mcx_signal`, `mcx_position_closed`, `mcx_decision` |
+| stream | `mcx_order`, `mcx_trade`, `mcx_signal`, `mcx_position_closed`, `mcx_decision`, `mcx_quotes` |
 
 Settings (environment prefix `MACD_`): `mcx_enabled`, `mcx_auto_trade`,
 `mcx_roots_csv`, `mcx_initial_capital`, `mcx_target_notional`,

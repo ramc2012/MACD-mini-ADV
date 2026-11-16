@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { changedSettings, fromForm, macdState, orderedRoots, sessionLabel, toForm, verdictMeta } from "../src/mcxMath.ts";
-import type { McxContractRow, McxSettings } from "../src/mcxMath.ts";
+import { changedSettings, fromForm, macdState, newestMcxQuote, orderedRoots, sessionLabel, toForm, verdictMeta } from "../src/mcxMath.ts";
+import type { McxContractRow, McxQuote, McxSettings } from "../src/mcxMath.ts";
 
 const SETTINGS: McxSettings = {
   enabled: true, auto_trade: false, roots_csv: "GOLD,SILVER,CRUDEOIL,COPPER,NATURALGAS", initial_capital: 1_000_000,
@@ -50,4 +50,14 @@ test("session and verdict labels", () => {
   assert.equal(sessionLabel({ ...session, open: false, phase: "holiday", holiday: "Christmas" }), "MCX holiday · Christmas");
   assert.equal(verdictMeta("TAKEN").label, "Taken");
   assert.equal(verdictMeta("SOMETHING_NEW").label, "SOMETHING_NEW");
+});
+
+test("a late polling snapshot cannot overwrite a newer MCX price move or OI", () => {
+  const price = { symbol: "MCX:CRUDEOIL", ltp: 6000, move: "up", updated_ms: 1200, seen_ms: 1200,
+    price_ms: 1100, day: "2026-11-16", source: "ws", prev_close: 5950, change: 50, change_pct: 0.84,
+    volume: 250, oi: 750, oi_change: 25, oi_ms: 1200 } satisfies McxQuote;
+  const older = { ...price, updated_ms: 1000, ltp: 5995, move: "down" as const, oi: null };
+  assert.equal(newestMcxQuote(older, price), price);
+  const oiUpdate = { ...price, oi: 800, oi_change: 75, oi_ms: 1500, updated_ms: 1500 };
+  assert.equal(newestMcxQuote(oiUpdate, price), oiUpdate);
 });

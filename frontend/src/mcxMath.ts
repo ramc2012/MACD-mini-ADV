@@ -71,9 +71,22 @@ export type McxRisk = {
   slippage_bps: number; target_position_notional: number; max_positions: number;
 };
 
+export const MCX_QUOTES_EVENT = "macd:mcx-quotes";
+export type McxQuote = {
+  symbol: string; ltp: number; source: "ws" | "rest"; move: "up" | "down" | null;
+  seen_ms: number; updated_ms: number; price_ms: number; day: string;
+  prev_close: number | null; change: number | null; change_pct: number | null; volume: number;
+  oi: number | null; oi_change: number | null; oi_ms: number | null;
+};
+
+export function newestMcxQuote(snapshot: McxQuote | undefined, live: McxQuote | undefined) {
+  return live && (!snapshot || live.updated_ms >= snapshot.updated_ms) ? live : snapshot;
+}
+
 export type McxSnapshot = {
   lane: "mcx"; settings: McxSettings; health: McxHealth; risk: McxRisk; contracts: McxContractRow[];
   portfolio: McxPortfolio; closed_positions: McxClosed[]; decisions: McxDecision[];
+  quotes?: Record<string, McxQuote>;
 };
 
 export type McxForm = {

@@ -744,3 +744,66 @@ class TestBarDatabase:
             assert asyncio.run(lane.warm())["downloaded"] == len(watched)
         finally:
             mcx_lane.WARMUP_ATTEMPTS = monkey
+
+
+def test_watchlist_prices_coalesce_movements_and_include_broker_oi(tmp_path, monkeypatch):
+    lane, contract = ready_lane(tmp_path)
+    symbol = contract.symbol
+    broker = lane.broker
+    async def oi(s):
+        return {"oi": 120, "prev_oi": 95} if s == symbol else None
+    broker.open_interest = oi
+    monkeypatch.setattr(mcx_lane, "OI_PACING_SECONDS", 0)
+
+    async def run():
+        rx = await lane.events._events.subscribe()
+        moment = at(11, 20).astimezone(UTC)
+        lane._schedule_oi(moment)
+        await lane._oi_task
+        for seconds, price in [(1, 100), (2, 102), (3, 102), (4, 101)]:
+            stamp = moment + timedelta(seconds=seconds)
+            await lane.on_tick(Tick(symbol, price, volume=425, timestamp=stamp, prev_close=90), stamp)
+        event = await asyncio.wait_for(rx.get(), timeout=2)
+        assert event["type"] == "mcx_quotes"
+        assert len(event["data"]) == 1
+        row = event["data"][0]
+        assert (row["ltp"], row["move"], row["volume"]) == (101, "down", 425)
+        assert (row["prev_close"], row["change"]) == (90, 11)
+        assert row["change_pct"] == pytest.approx(100 * 11 / 90)
+        assert (row["oi"], row["oi_change"]) == (120, 25)
+        assert lane.snapshot()["quotes"][symbol] == row
+        assert rx.empty()
+        await lane.stop()
+
+    asyncio.run(run())
+
+
+def test_history_fill_retains_valid_live_bars_and_skips_malformed_source(tmp_path):
+    lane, contract = ready_lane(tmp_path)
+    t = int(at(11, 0).timestamp())
+    make = lambda at_ts, o, h, l, c: Candle(contract.symbol, at_ts, o, h, l, c, 1, True)
+    assert lane.store.write([make(t, 10, 11, 9, 10)]) == 1
+    assert lane.store.write([make(t, 20, 21, 19, 20), make(t+60, 12, 11, 9, 10),
+                             make(t+120, 13, 14, 12, 13)], preserve_existing=True) == 1
+    bars = lane.store.minutes(contract.symbol, 0)
+    assert [(b.timestamp, b.close) for b in bars] == [(t, 10), (t+120, 13)]
+    asyncio.run(lane.stop())
+
+
+def test_pending_feed_gap_reaches_previously_downloaded_ladder(tmp_path):
+    broker = crude_broker()
+    lane = build(tmp_path, broker, mcx_ladder_strikes=2)
+    asyncio.run(lane.prepare())
+    start = int(at(11, 0).timestamp())
+    lane.store.seen(lane.subscription_symbols(), start - 60)
+    for symbol in lane.subscription_symbols():
+        lane.store.mark_filled(symbol, start, backfilled_from=start - 3600)
+    lane.store.add_gap(start, start + 240)
+    Clock.moment = at(11, 5)
+    async def run():
+        lane._start_backfill()
+        await lane._backfill_task
+        assert sorted(broker.history_requests) == sorted(lane.subscription_symbols())
+        assert set(lane.ladder) - set(lane.core_symbols())
+        await lane.stop()
+    asyncio.run(run())

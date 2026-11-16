@@ -16,6 +16,7 @@ SQLite in WAL mode. The lane writes from the event loop (a few hundred rows a mi
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 from pathlib import Path
@@ -36,6 +37,12 @@ CREATE TABLE IF NOT EXISTS gaps (from_ts INTEGER NOT NULL, to_ts INTEGER NOT NUL
 """
 
 
+def valid_minute(bar: Candle) -> bool:
+    stamp, o, h, l, c = bar.timestamp, bar.open, bar.high, bar.low, bar.close
+    return (stamp % 60 == 0 and all(math.isfinite(v) and v > 0 for v in (o, h, l, c))
+            and l <= min(o, c) <= max(o, c) <= h and (bar.volume or 0) >= 0)
+
+
 class McxBarStore:
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -50,23 +57,25 @@ class McxBarStore:
 
     # ------------------------------------------------------------------ bars
 
-    def write(self, bars: list[Candle]) -> int:
-        """Insert or replace one-minute bars; returns how many were written."""
+    def write(self, bars: list[Candle], *, preserve_existing: bool = False) -> int:
+        """Persist valid minutes; a history fill can preserve already captured bars."""
         rows = [(bar.symbol, int(bar.timestamp), float(bar.open), float(bar.high), float(bar.low), float(bar.close),
-                 int(bar.volume or 0)) for bar in bars]
+                 int(bar.volume or 0)) for bar in bars if valid_minute(bar)]
         if not rows:
             return 0
         with self._lock:
-            self._db.executemany("INSERT OR REPLACE INTO bars VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            verb = "IGNORE" if preserve_existing else "REPLACE"
+            result = self._db.executemany(f"INSERT OR {verb} INTO bars VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
             self._db.commit()
-        return len(rows)
+        return result.rowcount
 
     def minutes(self, symbol: str, since_ts: int) -> list[Candle]:
         with self._lock:
             rows = self._db.execute(
                 "SELECT ts, open, high, low, close, volume FROM bars WHERE symbol = ? AND ts >= ? ORDER BY ts",
                 (symbol, int(since_ts))).fetchall()
-        return [Candle(symbol, int(ts), o, h, l, c, int(v), True) for ts, o, h, l, c, v in rows]
+        bars = (Candle(symbol, int(ts), o, h, l, c, int(v), True) for ts, o, h, l, c, v in rows)
+        return [bar for bar in bars if valid_minute(bar)]
 
     def prune(self, before_ts: int) -> int:
         """Drop bars older than ``before_ts`` and the records of contracts that have none left."""

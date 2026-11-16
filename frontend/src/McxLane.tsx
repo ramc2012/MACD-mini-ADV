@@ -2,20 +2,19 @@ import { useCallback, useEffect, useState } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
 import {
-  MCX_ROOTS, ROOT_LABEL, ROOT_UNIT, changedSettings, fromForm, macdState, sessionLabel, toForm, verdictMeta,
-  type McxContractRow, type McxDecision, type McxForm, type McxSnapshot,
+  MCX_QUOTES_EVENT, MCX_ROOTS, ROOT_LABEL, ROOT_UNIT, changedSettings, fromForm, macdState, newestMcxQuote, sessionLabel, toForm, verdictMeta,
+  type McxDecision, type McxForm, type McxQuote, type McxSnapshot,
 } from "./mcxMath";
 
-/** The MCX lane: the MACD lane's rules on MCX commodity options, in its own paper book.
- *
- * The page reads the lane's REST snapshot every few seconds rather than the
- * stream: MCX prints are never fanned out to browsers, and a dozen contracts
- * do not need tick-by-tick frames to be read.
- */
-
-type Tab = "CONTRACTS" | "POSITIONS" | "SIGNALS" | "BOOK" | "SETTINGS";
+/** The lane snapshot owns settings, indicators, and the book. The
+ * existing terminal stream supplies frequent quotes while this page is open. */
+const WATCHLIST = { FUTURES: "FUT", CALLS: "CE", PUTS: "PE" } as const;
+type WatchTab = keyof typeof WATCHLIST;
+type Tab = WatchTab | "POSITIONS" | "SIGNALS" | "BOOK" | "SETTINGS";
 const TABS: { key: Tab; label: string }[] = [
-  { key: "CONTRACTS", label: "Contracts" },
+  { key: "FUTURES", label: "Futures" },
+  { key: "CALLS", label: "Calls" },
+  { key: "PUTS", label: "Puts" },
   { key: "POSITIONS", label: "Positions" },
   { key: "SIGNALS", label: "Signals" },
   { key: "BOOK", label: "Orders & trades" },
@@ -41,18 +40,20 @@ const errorText = (reason: unknown) => (reason instanceof Error ? reason.message
 type BookRow = Record<string, unknown>;
 type Book = { orders: BookRow[]; trades: BookRow[] };
 
-export function McxLanePage() {
+export function McxLanePage({ connected }: { connected: boolean }) {
   const [snapshot, setSnapshot] = useState<McxSnapshot>();
+  const [liveQuotes, setLiveQuotes] = useState<Record<string, McxQuote>>({});
+  const [clock, setClock] = useState(() => Date.now());
   const [error, setError] = useState("");
   const [tab, setTab] = useState<Tab>(() => {
     const stored = recall(TAB_STORE);
-    return TABS.some((row) => row.key === stored) ? stored as Tab : "CONTRACTS";
+    return TABS.some((row) => row.key === stored) ? stored as Tab : "FUTURES";
   });
   const pickTab = (next: Tab) => { setTab(next); remember(TAB_STORE, next); };
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      setSnapshot(await requestJson<McxSnapshot>(`${API_URL}/api/mcx/snapshot`, { headers: authHeaders(), signal }));
+      setSnapshot(await requestJson<McxSnapshot>(`${API_URL}/api/mcx/snapshot`, { headers: authHeaders(), signal, cache: "no-store" }));
       setError("");
     } catch (reason) {
       if (!signal?.aborted) setError(errorText(reason));
@@ -64,6 +65,20 @@ export function McxLanePage() {
     const timer = window.setInterval(() => void load(controller.signal), POLL_MS);
     return () => { controller.abort(); window.clearInterval(timer); };
   }, [load]);
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const rows = (event as CustomEvent<McxQuote[]>).detail;
+      if (!Array.isArray(rows)) return;
+      setLiveQuotes((old) => {
+        const next = { ...old };
+        for (const row of rows) next[row.symbol] = newestMcxQuote(next[row.symbol], row) ?? row;
+        return next;
+      });
+    };
+    window.addEventListener(MCX_QUOTES_EVENT, receive);
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => { window.removeEventListener(MCX_QUOTES_EVENT, receive); window.clearInterval(timer); };
+  }, []);
 
   if (!snapshot) {
     return <section className="ledger-page blast-page">
@@ -74,14 +89,24 @@ export function McxLanePage() {
 
   const { health, portfolio } = snapshot;
   const taken = health.decisions.TAKEN ?? 0;
+  const quoteFor = (symbol: string) => newestMcxQuote(snapshot.quotes?.[symbol], liveQuotes[symbol]);
+  const newestWs = Math.max(0, ...snapshot.contracts.map((row) => {
+    const q = liveQuotes[row.symbol];
+    return q?.source === "ws" ? q.seen_ms : 0;
+  }));
+  const live = connected && newestWs > 0 && clock - newestWs < 6_000;
+  const watch = tab === "FUTURES" || tab === "CALLS" || tab === "PUTS" ? WATCHLIST[tab] : undefined;
   const counts: Partial<Record<Tab, number>> = {
-    CONTRACTS: snapshot.contracts.length,
+    FUTURES: snapshot.contracts.filter((row) => row.option_type === "FUT").length,
+    CALLS: snapshot.contracts.filter((row) => row.option_type === "CE").length,
+    PUTS: snapshot.contracts.filter((row) => row.option_type === "PE").length,
     POSITIONS: portfolio.positions.length,
     SIGNALS: snapshot.decisions.length,
   };
   const problems = [
     health.error,
     ...Object.entries(health.selection.errors ?? {}).map(([root, text]) => `${root}: ${text}`),
+    ...Object.entries(health.warmup.failed ?? {}).map(([symbol, text]) => `${short(symbol)}: ${text}`),
     ...Object.entries(health.multiplier_warnings ?? {}).map(([root, text]) => `${root}: ${text}`),
     ...Object.entries(health.lane_errors ?? {}).map(([where, row]) => `${where} (${row.count}): ${row.last}`),
     health.rest_fallback.error ? `REST fallback: ${health.rest_fallback.error}` : null,
@@ -94,6 +119,7 @@ export function McxLanePage() {
         <p>Premium MACD zero-cross on ATM {health.roots.map((root) => ROOT_LABEL[root] ?? root).join(", ")} options · MACD lane rules · its own paper book</p></div>
       <div className="blast-badges">
         <span className={health.session.open ? "feed-badge" : "mode"}>{sessionLabel(health.session)}</span>
+        {health.session.open && <span className={live ? "feed-badge" : "mode"}>{live ? "Live quotes" : "Snapshot quotes"}</span>}
         {!health.enabled && <span className="mode alert" title="No new signals. Open positions keep their stops.">Disabled</span>}
         {health.enabled && (health.auto_trade
           ? <span className="feed-badge" title="Zero-crosses are bought in the lane's paper book.">Auto-trade · paper</span>
@@ -120,8 +146,8 @@ export function McxLanePage() {
 
     <div className="blast-body">
       {error && <div className="settings-error blast-inline-error" role="alert">Refresh failed: {error}. Showing the last snapshot.</div>}
-      {tab === "CONTRACTS" && <ContractsTab snapshot={snapshot} problems={problems} />}
-      {tab === "POSITIONS" && <PositionsTab snapshot={snapshot} />}
+      {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} problems={problems} />}
+      {tab === "POSITIONS" && <PositionsTab snapshot={snapshot} quoteFor={quoteFor} />}
       {tab === "SIGNALS" && <SignalsTab rows={snapshot.decisions} counts={health.decisions} />}
       {tab === "BOOK" && <BookTab />}
       {tab === "SETTINGS" && <SettingsTab snapshot={snapshot} onSaved={setSnapshot} />}
@@ -133,36 +159,53 @@ function Metric({ label, value, tone: value_tone }: { label: string; value: stri
   return <div><span>{label}</span><b className={tone(value_tone)}>{value}</b></div>;
 }
 
-function ContractsTab({ snapshot, problems }: { snapshot: McxSnapshot; problems: string[] }) {
+type QuoteFor = (symbol: string) => McxQuote | undefined;
+const movementClass = (quote?: McxQuote) => quote?.move === "up" || quote?.move === "down" ? `mcx-price-${quote.move}` : "";
+const withSign = (value?: number | null, digits = 2) => finite(value) ? `${value > 0 ? "+" : ""}${fixed(value, digits)}` : "—";
+const ageOf = (stamp: number, clock: number) => Math.max(0, Math.floor((clock - stamp) / 1000));
+
+function ContractsTab({ snapshot, side, quoteFor, clock, problems }: {
+  snapshot: McxSnapshot; side: "FUT" | "CE" | "PE"; quoteFor: QuoteFor; clock: number; problems: string[];
+}) {
   const { health, risk } = snapshot;
-  const byRoot = new Map<string, McxContractRow[]>();
-  snapshot.contracts.forEach((row) => byRoot.set(row.root, [...(byRoot.get(row.root) ?? []), row]));
+  const rows = snapshot.contracts.filter((row) => row.option_type === side);
   const selected = health.selection;
+  const headings = ["Commodity", "Contract", "Strike", "Expiry", "LTP", "Prev close", "Chg", "% chg", "OI chg", "OI", "Volume", "MACD", "Hist.", "Bars", "Lot units", "Held", "Last tick"];
   return <div className="mcx-grid">
     <section className="panel blast-panel-fill mcx-contracts">
-      <div className="panel-title"><span>Today's contracts</span>
+      <div className="panel-title"><span>{side === "FUT" ? "Futures" : side === "CE" ? "Calls" : "Puts"}</span>
         <span>{selected.selected_at ? `selected ${stamp(selected.selected_at)}${selected.source === "saved" ? " · restored" : ""}` : "not selected yet"}</span></div>
-      <div className="ledger-table-wrap"><table className="ledger-table">
-        <thead><tr>{["Commodity", "Futures", "Leg", "Strike", "Expiry", "Price", "MACD", "Histogram", "Bars", "Lot units", "Held", "Last tick"].map((label) => <th key={label}><button tabIndex={-1}>{label}</button></th>)}</tr></thead>
-        <tbody>{snapshot.contracts.length === 0
-          ? <tr><td className="empty" colSpan={12}>{health.enabled ? "No MCX contracts selected. The selection runs at connect and at the 08:45 rollover." : "The lane is switched off."}</td></tr>
-          : [...byRoot.entries()].flatMap(([root, rows]) => rows.map((row, index) => {
+      <div className="ledger-table-wrap"><table className="ledger-table mcx-watchlist">
+        <thead><tr>{headings.map((label) => <th key={label}>{label}</th>)}</tr></thead>
+        <tbody>{rows.length === 0
+          ? <tr><td className="empty" colSpan={headings.length}>{health.enabled ? "No contracts in this watchlist." : "The lane is switched off."}</td></tr>
+          : rows.map((row) => {
             const state = macdState(row);
+            const q = quoteFor(row.symbol);
+            const future = quoteFor(row.futures_symbol);
+            const freshOi = q?.oi_ms && (!health.session.open || clock - q.oi_ms < 5 * 60_000) ? q : undefined;
+            const age = q ? ageOf(q.price_ms, clock) : row.ws_age_seconds;
             return <tr key={row.symbol} title={row.symbol}>
-              <td>{index === 0 ? <b>{ROOT_LABEL[root] ?? root}</b> : ""}{index === 0 && <small className="mcx-unit">{ROOT_UNIT[root] ?? ""}</small>}</td>
-              <td>{index === 0 ? <>{fixed(row.futures_ltp)}<small className="mcx-unit">{short(row.futures_symbol)}</small></> : ""}</td>
-              <td>{row.option_type === "FUT" ? "Futures" : row.option_type}{row.retained ? " · carried" : ""}</td>
-              <td>{row.option_type === "FUT" ? "—" : number.format(row.strike)}</td>
+              <td><b>{ROOT_LABEL[row.root] ?? row.root}</b><small className="mcx-unit">{ROOT_UNIT[row.root] ?? ""}</small></td>
+              <td>{short(row.symbol)}{row.retained ? " · carried" : ""}
+                {side !== "FUT" && <small className="mcx-unit">Fut {fixed(future?.ltp ?? row.futures_ltp)} · {short(row.futures_symbol)}</small>}</td>
+              <td>{side === "FUT" ? "—" : number.format(row.strike)}</td>
               <td>{row.expiry}{finite(row.days_to_expiry) ? ` · ${row.days_to_expiry}d` : ""}</td>
-              <td>{fixed(row.ltp)}</td>
-              <td className={state.tone}>{finite(row.macd) ? fixed(row.macd, 3) : ""} <small>{state.label}</small></td>
+              <td className={movementClass(q)}>{fixed(q?.ltp ?? row.ltp)}</td>
+              <td>{fixed(q?.prev_close)}</td>
+              <td className={tone(q?.change)}>{withSign(q?.change)}</td>
+              <td className={tone(q?.change_pct)}>{signed(q?.change_pct, 2)}</td>
+              <td className={tone(freshOi?.oi_change)} title="Change from previous session open interest">{withSign(freshOi?.oi_change, 0)}</td>
+              <td title={freshOi?.oi_ms ? `OI updated ${ageOf(freshOi.oi_ms, clock)}s ago` : "No fresh OI from FYERS"}>{fixed(freshOi?.oi, 0)}</td>
+              <td>{fixed(q?.volume, 0)}</td>
+              <td className={state.tone}>{finite(row.macd) ? fixed(row.macd, 3) : "—"} <small>{state.label}</small></td>
               <td className={tone(row.histogram)}>{fixed(row.histogram, 3)}</td>
               <td>{row.bars}</td>
               <td>{number.format(row.lot_size)}</td>
-              <td>{row.held_lots ? `${row.held_lots} lot${row.held_lots === 1 ? "" : "s"}` : "—"}</td>
-              <td>{finite(row.ws_age_seconds) ? `${Math.round(row.ws_age_seconds)}s ago` : "—"}</td>
+              <td>{row.held_lots || "—"}</td>
+              <td>{finite(age) ? `${age < 60 ? Math.round(age) + "s" : Math.floor(age / 60) + "m"} ago${q?.source === "rest" ? " · REST" : ""}` : "—"}</td>
             </tr>;
-          }))}</tbody>
+          })}</tbody>
       </table></div>
     </section>
 
@@ -195,7 +238,7 @@ function ContractsTab({ snapshot, problems }: { snapshot: McxSnapshot; problems:
   </div>;
 }
 
-function PositionsTab({ snapshot }: { snapshot: McxSnapshot }) {
+function PositionsTab({ snapshot, quoteFor }: { snapshot: McxSnapshot; quoteFor: QuoteFor }) {
   const open = snapshot.portfolio.positions;
   const closed = snapshot.portfolio.closed_positions ?? snapshot.closed_positions ?? [];
   return <div className="blast-split mcx-split">
@@ -204,7 +247,7 @@ function PositionsTab({ snapshot }: { snapshot: McxSnapshot }) {
       <div className="ledger-table-wrap"><table className="ledger-table">
         <thead><tr>{["Contract", "Lots", "Avg", "Last", "P&L", "Return", "Best", "Hard stop", "Trail", "Opened"].map((label) => <th key={label}><button tabIndex={-1}>{label}</button></th>)}</tr></thead>
         <tbody>{open.length === 0 ? <tr><td className="empty" colSpan={10}>No open MCX positions</td></tr> : open.map((row) => <tr key={row.symbol}>
-          <td>{short(row.symbol)}</td><td>{row.lots} × {number.format(row.lot_size)}</td><td>{fixed(row.average_price)}</td><td>{fixed(row.last_price)}</td>
+          <td>{short(row.symbol)}</td><td>{row.lots} × {number.format(row.lot_size)}</td><td>{fixed(row.average_price)}</td><td className={movementClass(quoteFor(row.symbol))}>{fixed(quoteFor(row.symbol)?.ltp ?? row.last_price)}</td>
           <td className={tone(row.unrealized_pnl)}>{currency(row.unrealized_pnl)}</td><td className={tone(row.return_pct)}>{signed(row.return_pct)}</td>
           <td>{signed(row.max_return_pct)}</td><td>{fixed(row.hard_stop)}</td><td>{fixed(row.trailing_stop)}</td><td>{stamp(row.opened_at)}</td>
         </tr>)}</tbody>
