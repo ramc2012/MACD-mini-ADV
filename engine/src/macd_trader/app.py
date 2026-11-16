@@ -200,10 +200,20 @@ async def watchlist():
 
 
 CHART_SYMBOL = re.compile(r"(NSE|BSE):[A-Z0-9&_-]{2,40}")
+MCX_CHART_SYMBOL = re.compile(r"MCX:[A-Z0-9.]{2,40}")
 
 
 @app.get("/api/chart/{symbol:path}", dependencies=[Depends(authorize)])
 async def chart_history(symbol: str, timeframe_seconds: int = Query(default=1800, ge=60, le=86400)):
+    if symbol.startswith("MCX:"):
+        if not MCX_CHART_SYMBOL.fullmatch(symbol):
+            raise HTTPException(404, "Invalid MCX symbol")
+        if timeframe_seconds not in {60, 180, 300, 900, 1800, 3600, 86400}:
+            raise HTTPException(422, "Choose 1m, 3m, 5m, 15m, 30m, 1h or 1D for MCX charts")
+        chart = await engine.mcx.chart(symbol, timeframe_seconds)
+        if chart is None:
+            raise HTTPException(404, "No stored MCX bars for this symbol")
+        return fast_json(chart)
     # Outside the watchlist (a shadow or agentic lane's contract, an expired one) the stored minutes still chart.
     watched = symbol in engine.all_symbols
     if not watched and not CHART_SYMBOL.fullmatch(symbol):

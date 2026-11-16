@@ -3,10 +3,13 @@
 export const MCX_ROOTS = ["GOLD", "SILVER", "CRUDEOIL", "COPPER", "NATURALGAS"] as const;
 export const ROOT_LABEL: Record<string, string> = {
   GOLD: "Gold", SILVER: "Silver", CRUDEOIL: "Crude oil", COPPER: "Copper", NATURALGAS: "Natural gas",
+  GOLDM: "Gold mini", SILVERM: "Silver mini", CRUDEOILM: "Crude oil mini", NATGASMINI: "Natural gas mini",
 };
 export const ROOT_UNIT: Record<string, string> = {
   GOLD: "₹/10 g · 1 kg lot", SILVER: "₹/kg · 30 kg lot", CRUDEOIL: "₹/bbl · 100 bbl lot",
   COPPER: "₹/kg · 2,500 kg lot", NATURALGAS: "₹/mmBtu · 1,250 mmBtu lot",
+  GOLDM: "₹/10 g · 100 g lot", SILVERM: "₹/kg · 5 kg lot", CRUDEOILM: "₹/bbl · 10 bbl lot",
+  NATGASMINI: "₹/mmBtu · 250 mmBtu lot",
 };
 
 export type McxSettings = {
@@ -46,7 +49,7 @@ export type McxPortfolio = {
 };
 
 export type McxHealth = {
-  enabled: boolean; auto_trade: boolean; roots: string[]; timeframe_seconds: number;
+  enabled: boolean; auto_trade: boolean; roots: string[]; mini_roots?: string[]; timeframe_seconds: number;
   session: { open: boolean; phase: string; opens_at: string; closes_at: string; next_open: string;
     holiday: string | null; calendar_covers_year: boolean };
   selection: { date: string | null; selected_at: string | null; source?: string; errors: Record<string, string>;

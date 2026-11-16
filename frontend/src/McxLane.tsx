@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
+import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
 import {
   MCX_QUOTES_EVENT, MCX_ROOTS, ROOT_LABEL, ROOT_UNIT, changedSettings, fromForm, macdState, newestMcxQuote, sessionLabel, toForm, verdictMeta,
   type McxDecision, type McxForm, type McxQuote, type McxSnapshot,
@@ -43,6 +44,10 @@ type Book = { orders: BookRow[]; trades: BookRow[] };
 
 export function McxLanePage({ connected }: { connected: boolean }) {
   const [snapshot, setSnapshot] = useState<McxSnapshot>();
+  const [focus, setFocus] = useState<{ list: LaneChartFocus[]; index: number }>();
+  const closeChart = useCallback(() => setFocus(undefined), []);
+  const chartIndex = useCallback((index: number) => setFocus(old => old ? { ...old, index } : undefined), []);
+  const openChart = useCallback((list: LaneChartFocus[], index: number) => setFocus({ list, index }), []);
   const [liveQuotes, setLiveQuotes] = useState<Record<string, McxQuote>>({});
   const [clock, setClock] = useState(() => Date.now());
   const [error, setError] = useState("");
@@ -117,7 +122,7 @@ export function McxLanePage({ connected }: { connected: boolean }) {
   return <section className="ledger-page blast-page">
     <div className="page-heading blast-heading">
       <div><h1>MCX lane</h1>
-        <p>Premium MACD zero-cross on ATM {health.roots.map((root) => ROOT_LABEL[root] ?? root).join(", ")} options · MACD lane rules · its own paper book</p></div>
+        <p>Premium MACD zero-cross on ATM {[...health.roots, ...(health.mini_roots ?? [])].map((root) => ROOT_LABEL[root] ?? root).join(", ")} options · MACD lane rules · its own paper book</p></div>
       <div className="blast-badges">
         <span className={health.session.open ? "feed-badge" : "mode"}>{sessionLabel(health.session)}</span>
         {health.session.open && <span className={live ? "feed-badge" : "mode"}>{live ? "Live quotes" : "Snapshot quotes"}</span>}
@@ -147,13 +152,14 @@ export function McxLanePage({ connected }: { connected: boolean }) {
 
     <div className="blast-body">
       {error && <div className="settings-error blast-inline-error" role="alert">Refresh failed: {error}. Showing the last snapshot.</div>}
-      {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} />}
+      {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} onChart={openChart} />}
       {tab === "POSITIONS" && <PositionsTab snapshot={snapshot} quoteFor={quoteFor} />}
       {tab === "SIGNALS" && <SignalsTab rows={snapshot.decisions} counts={health.decisions} />}
       {tab === "BOOK" && <BookTab />}
       {tab === "RULES" && <RulesTab snapshot={snapshot} problems={problems} />}
       {tab === "SETTINGS" && <SettingsTab snapshot={snapshot} onSaved={setSnapshot} />}
     </div>
+    {focus && <LaneChartModal list={focus.list} index={focus.index} onIndex={chartIndex} onClose={closeChart} />}
   </section>;
 }
 
@@ -166,11 +172,15 @@ const movementClass = (quote?: McxQuote) => quote?.move === "up" || quote?.move 
 const withSign = (value?: number | null, digits = 2) => finite(value) ? `${value > 0 ? "+" : ""}${fixed(value, digits)}` : "—";
 const ageOf = (stamp: number, clock: number) => Math.max(0, Math.floor((clock - stamp) / 1000));
 
-function ContractsTab({ snapshot, side, quoteFor, clock }: {
+function ContractsTab({ snapshot, side, quoteFor, clock, onChart }: {
   snapshot: McxSnapshot; side: "FUT" | "CE" | "PE"; quoteFor: QuoteFor; clock: number;
+  onChart: (list: LaneChartFocus[], index: number) => void;
 }) {
   const { health } = snapshot;
   const rows = snapshot.contracts.filter((row) => row.option_type === side);
+  const chartList = rows.map(row => ({
+    symbol: row.symbol, title: short(row.symbol), subtitle: `MCX · ${row.display} · ${row.expiry}`,
+  }));
   const selected = health.selection;
   const headings = ["Commodity", "Contract", "Strike", "Expiry", "LTP", "Prev close", "Chg", "% chg", "OI chg", "OI", "Volume", "MACD", "Hist.", "Bars", "Lot units", "Held", "Last tick"];
   return <section className="panel blast-panel-fill mcx-contracts">
@@ -180,15 +190,16 @@ function ContractsTab({ snapshot, side, quoteFor, clock }: {
         <thead><tr>{headings.map((label) => <th scope="col" key={label}>{label}</th>)}</tr></thead>
         <tbody>{rows.length === 0
           ? <tr><td className="empty" colSpan={headings.length}>{health.enabled ? "No contracts in this watchlist." : "The lane is switched off."}</td></tr>
-          : rows.map((row) => {
+          : rows.map((row, index) => {
             const state = macdState(row);
             const q = quoteFor(row.symbol);
             const future = quoteFor(row.futures_symbol);
             const freshOi = q?.oi_ms && (!health.session.open || clock - q.oi_ms < 5 * 60_000) ? q : undefined;
             const age = q ? ageOf(q.price_ms, clock) : row.ws_age_seconds;
-            return <tr key={row.symbol} title={row.symbol}>
+            return <tr key={row.symbol} title={row.symbol} className="mcx-chart-row" onClick={() => onChart(chartList, index)}>
               <td><b>{ROOT_LABEL[row.root] ?? row.root}</b><small className="mcx-unit">{ROOT_UNIT[row.root] ?? ""}</small></td>
-              <td>{short(row.symbol)}{row.retained ? " · carried" : ""}
+              <td><button type="button" className="mcx-chart-link" aria-label={`Open chart for ${short(row.symbol)}`}
+                onClick={(event) => { event.stopPropagation(); onChart(chartList, index); }}>{short(row.symbol)}</button>{row.retained ? " · carried" : ""}
                 {side !== "FUT" && <small className="mcx-unit">Fut {fixed(future?.ltp ?? row.futures_ltp)} · {short(row.futures_symbol)}</small>}</td>
               <td>{side === "FUT" ? "—" : number.format(row.strike)}</td>
               <td>{row.expiry}{finite(row.days_to_expiry) ? ` · ${row.days_to_expiry}d` : ""}</td>

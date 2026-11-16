@@ -1496,3 +1496,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .mcx-rules-grid { grid-template-columns: 1fr; }
   .mcx-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
+
+.mcx-chart-row { cursor: pointer; }
+.mcx-chart-link { padding: 0; background: transparent; border: 0; color: var(--text-1); font: inherit; text-align: left; cursor: pointer; }
+.mcx-chart-link:hover, .mcx-chart-link:focus-visible { color: var(--accent); text-decoration: underline; }

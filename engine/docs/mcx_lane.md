@@ -36,6 +36,10 @@ contract specification, not the master's lot column:
 | CRUDEOIL | 100 barrels | 1 barrel | 100 |
 | COPPER | 2,500 kg | 1 kg | 2,500 |
 | NATURALGAS | 1,250 mmBtu | 1 mmBtu | 1,250 |
+| GOLDM | 100 g | 10 g | 10 |
+| SILVERM | 5 kg | 1 kg | 5 |
+| CRUDEOILM | 10 barrels | 1 barrel | 10 |
+| NATGASMINI | 250 mmBtu | 1 mmBtu | 250 |
 
 `mcx_lot_multipliers_csv` (`GOLD:100,SILVER:30`) overrides them. If the
 instrument master lists a lot that is neither 1 nor the units in use, health
@@ -46,7 +50,14 @@ The underlying column is matched exactly, so GOLDM, SILVERM and CRUDEOILM never
 stand in for the full-size contracts. The futures an option series exercises
 into comes from the master's underlying FyToken, or else is the nearest futures
 expiring on or after the option. A same-day restart reuses the morning's
-strikes (`runtime/mcx_contracts.json`), as the MACD lane does.
+strikes (`runtime/mcx_contracts.json`), as the MACD lane does. For enabled
+commodity roots with a listed mini, the same selection and paper execution rules
+apply to mini Calls and Puts. The nearest mini future and the selected options'
+underlying future appear in Futures for charting and monitoring.
+
+**Charts.** Each watchlist contract opens the MACD chart. Its OHLC and indicator
+history comes from the MCX minute store on the 09:00 IST grid. The shared feed
+updates the forming candle from the minutes in the quote stream.
 
 **Expiry.** MCX options devolve into futures. A holding in a contract
 expiring today is sold from `mcx_expiry_flatten_ist` (default 23:00). A

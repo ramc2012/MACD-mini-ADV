@@ -64,12 +64,13 @@ import math
 import os
 import re
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .brokers import OptionChainEntry
+from .chart_history import chart_indicators
 from .config import RUNTIME_DIR, Settings
 from .contracts import liquidity_window, select_liquid_contract
 from .events import EventHub, json_value
@@ -93,11 +94,17 @@ DEFAULT_LOT_MULTIPLIERS: dict[str, int] = {
     "CRUDEOIL": 100,     # 100 barrels, quoted per barrel
     "COPPER": 2500,      # 2,500 kg, quoted per kg
     "NATURALGAS": 1250,  # 1,250 mmBtu, quoted per mmBtu
+    "GOLDM": 10,        # 100 g, quoted per 10 g
+    "SILVERM": 5,       # 5 kg, quoted per kg
+    "CRUDEOILM": 10,    # 10 barrels, quoted per barrel
+    "NATGASMINI": 250,  # 250 mmBtu, quoted per mmBtu
 }
 DISPLAY_NAMES = {
     "GOLD": "Gold", "SILVER": "Silver", "CRUDEOIL": "Crude oil",
     "COPPER": "Copper", "NATURALGAS": "Natural gas",
+    "GOLDM": "Gold mini", "SILVERM": "Silver mini", "CRUDEOILM": "Crude oil mini", "NATGASMINI": "Natural gas mini",
 }
+MINI_ROOTS = {"GOLD": "GOLDM", "SILVER": "SILVERM", "CRUDEOIL": "CRUDEOILM", "NATURALGAS": "NATGASMINI"}
 
 # --------------------------------------------------------------------- calendar
 MCX_OPEN = time(9, 0)
@@ -610,6 +617,7 @@ class McxLane:
         self.store = McxBarStore(_store_file(settings, book))
         self.minute_bars = McxCandleAggregator(60, self.calendar)
         self._minute_pending: list[Candle] = []
+        self._last_chart_minute: dict[str, Candle] = {}
         self._day_volume: dict[str, tuple[str, int]] = {}
         self._last_ws_any: datetime | None = None
         self._last_heartbeat = 0.0
@@ -634,6 +642,8 @@ class McxLane:
         self.execution.quote_source = self.latest.get
         self.contracts: dict[str, McxContract] = {}      # symbol -> today's selected or held contract
         self.futures_by_root: dict[str, str] = {}
+        self.mini_front_futures: dict[str, dict[str, str]] = {}
+        self._mini_selection_complete = False
         self.selection: dict = {"date": None, "selected_at": None, "roots": {}, "errors": {}}
         self.decisions: deque[dict] = deque(maxlen=200)
         self.decision_counts: dict[str, int] = defaultdict(int)
@@ -669,6 +679,10 @@ class McxLane:
     def roots(self) -> list[str]:
         chosen = [item.strip().upper() for item in self.settings.mcx_roots_csv.split(",") if item.strip()]
         return list(dict.fromkeys(chosen))
+
+    @property
+    def mini_roots(self) -> list[str]:
+        return [MINI_ROOTS[root] for root in self.roots if root in MINI_ROOTS and MINI_ROOTS[root] not in self.roots]
 
     @property
     def timeframe_seconds(self) -> int:
@@ -808,6 +822,8 @@ class McxLane:
             "ladder": list(self.ladder.values()),
             "held": held,
         }
+        if self._mini_selection_complete:
+            payload["mini_front_futures"] = self.mini_front_futures
         try:
             self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
             self.snapshot_path.write_text(json.dumps(payload, indent=2))
@@ -835,10 +851,10 @@ class McxLane:
                                    *[s for s in self.portfolio.positions if s in self.contracts]]))
 
     def futures_symbols(self) -> list[str]:
-        return list(dict.fromkeys(self.futures_by_root.values()))
+        return list(dict.fromkeys([*self.futures_by_root.values(), *self.mini_front_futures]))
 
     def is_future(self, symbol: str) -> bool:
-        return symbol in self.futures_by_root.values()
+        return symbol in self.futures_by_root.values() or symbol in self.mini_front_futures
 
     def indicator_symbols(self) -> list[str]:
         """Everything that gets bars and MACD: the option contracts and the watched futures."""
@@ -849,7 +865,7 @@ class McxLane:
         if not self.settings.mcx_enabled:
             return list(dict.fromkeys(self.portfolio.positions))
         return list(dict.fromkeys([
-            *self.option_symbols(), *self.futures_by_root.values(), *self.portfolio.positions,
+            *self.option_symbols(), *self.futures_symbols(), *self.portfolio.positions,
         ]))
 
     def subscription_symbols(self) -> list[str]:
@@ -860,6 +876,7 @@ class McxLane:
 
     def known_expiries(self) -> dict[str, str]:
         expiries = {symbol: row["expiry"] for symbol, row in self.ladder.items()}
+        expiries.update({symbol: row["expiry"] for symbol, row in self.mini_front_futures.items()})
         expiries.update({symbol: row.expiry for symbol, row in self.contracts.items()})
         for row in self.contracts.values():
             if row.futures_symbol:
@@ -881,6 +898,8 @@ class McxLane:
             for contract in self.contracts.values():
                 contract.retained = True
             self.futures_by_root = {}
+            self.mini_front_futures = {}
+            self._mini_selection_complete = False
             self.ladder = {}
             self._apply_contracts()
             return self.subscription_symbols()
@@ -894,6 +913,8 @@ class McxLane:
                 for contract in self.contracts.values():
                     contract.retained = True
                 self.futures_by_root = {}
+                self.mini_front_futures = {}
+                self._mini_selection_complete = False
                 self.ladder = {}
         self._reset_strategy()
         self._apply_contracts()
@@ -913,7 +934,8 @@ class McxLane:
     async def _select(self, *, force: bool) -> None:
         today = datetime.now(IST).date()
         saved = self._load_snapshot()
-        held_symbols = set(self.portfolio.positions)
+        mini_roots = self.mini_roots
+        selection_roots = set(self.roots + mini_roots)
         if not force and saved.get("date") == today.isoformat():
             # A same-day restart keeps the morning's strikes, as the MACD lane does.
             rows = []
@@ -923,38 +945,86 @@ class McxLane:
                 except (TypeError, KeyError):
                     continue
                 remaining = days_to_expiry(contract.expiry, today)
-                if (contract.root in self.roots and remaining is not None
+                if (contract.root in selection_roots and remaining is not None
                         and remaining >= self.settings.mcx_min_days_to_expiry):
                     rows.append(contract)
             legs = {(row.root, row.option_type) for row in rows}
             if all((root, side) in legs for root in self.roots for side in ("CE", "PE")):
-                roots = {root: value for root, value in (saved.get("roots") or {}).items() if root in self.roots}
+                mini_ready = (isinstance(saved.get("mini_front_futures"), dict)
+                              and all((row.get("root"), row.get("option_type")) in legs
+                                      for row in (saved.get("contracts") or [])
+                                      if isinstance(row, dict) and row.get("root") in mini_roots))
+                saved_roots = {row.root for row in rows}
+                roots = {root: value for root, value in (saved.get("roots") or {}).items() if root in saved_roots}
+                errors = {root: value for root, value in (saved.get("errors") or {}).items()
+                          if root in selection_roots or root == "*"}
                 ladder = {row["symbol"]: row for row in saved.get("ladder") or []
                           if isinstance(row, dict) and row.get("symbol") and row.get("root") in self.roots}
                 if not ladder and self.settings.mcx_ladder_strikes > 0:
                     # A snapshot from before the ladder existed: build it around the saved prices. The
                     # morning's strikes stay as they are.
                     ladder = await self._ladder_from_master(roots)
-                self._install(rows, roots, saved.get("errors") or {}, saved.get("selected_at"), source="saved",
-                              ladder=ladder)
+                if mini_ready:
+                    self.mini_front_futures = {symbol: row for symbol, row in saved["mini_front_futures"].items()
+                                               if row["root"] in mini_roots and row["expiry"] >= today.isoformat()}
+                    self._mini_selection_complete = True
+                else:
+                    mini_rows, mini_summary, mini_errors = await self._select_minis(today, mini_roots)
+                    rows = [row for row in rows if row.root not in mini_roots] + mini_rows
+                    roots = {root: value for root, value in roots.items() if root not in mini_roots} | mini_summary
+                    errors = {root: value for root, value in errors.items() if root not in mini_roots} | mini_errors
+                self._install(rows, roots, errors, saved.get("selected_at"), source="saved", ladder=ladder)
                 return
         reader = getattr(self.broker, "instrument_rows", None)
         if reader is None:
             raise RuntimeError("the MCX lane needs the Fyers feed (no instrument master on this broker)")
-        rows = await reader(EXCHANGE)
-        listed = parse_mcx_master(rows, set(self.roots))
-        plans, errors = plan_selection(listed, self.roots, self.settings.mcx_min_days_to_expiry, today)
-        if not plans:
-            self.selection = {"date": today.isoformat(), "selected_at": datetime.now(IST).isoformat(timespec="seconds"),
-                              "roots": {}, "errors": errors, "source": "master"}
-            self.contracts = {s: c for s, c in self.contracts.items() if s in held_symbols}
+        master = await reader(EXCHANGE)
+        listed = parse_mcx_master(master, selection_roots)
+        picked, summary, errors, ladder = await self._select_options(
+            listed, self.roots, today, self.settings.mcx_ladder_strikes)
+        mini_rows, mini_summary, mini_errors = await self._select_minis(today, mini_roots, listed)
+        self._install([*picked, *mini_rows], {**summary, **mini_summary}, {**errors, **mini_errors},
+                      datetime.now(IST).isoformat(timespec="seconds"), source="master", ladder=ladder)
+        if not picked and not mini_rows:
             raise RuntimeError("no MCX root could be selected: " + "; ".join(f"{k}: {v}" for k, v in errors.items()))
+
+    async def _select_minis(self, today: date, roots: list[str], listed: list[McxListed] | None = None
+                            ) -> tuple[list[McxContract], dict, dict]:
+        """Find the nearest listed mini future and price mini options against their own underlying."""
+        self.mini_front_futures = {}
+        self._mini_selection_complete = True
+        if not roots:
+            return [], {}, {}
+        try:
+            if listed is None:
+                listed = parse_mcx_master(await self.broker.instrument_rows(EXCHANGE), set(roots))
+            today_iso = today.isoformat()
+            mini_rows = [row for row in listed if row.root in roots and row.expiry >= today_iso]
+            for root in roots:
+                futures = (row for row in mini_rows if row.root == root and row.kind == "FUT")
+                front = min(futures, key=lambda row: (row.expiry, row.symbol), default=None)
+                if front:
+                    self.mini_front_futures[front.symbol] = {"root": root, "expiry": front.expiry}
+            option_roots = [root for root in roots if any(row.root == root and row.kind != "FUT" for row in mini_rows)]
+            picked, summary, errors, _ = await self._select_options(mini_rows, option_roots, today, 0)
+        except Exception as exc:  # noqa: BLE001 - mini discovery is independent of the full-size selection
+            self._mini_selection_complete = False
+            self._lane_error("mini selection", exc)
+            return [], {}, {}
+        self._mini_selection_complete = all(root in summary for root in option_roots)
+        return picked, summary, errors
+
+    async def _select_options(self, listed: list[McxListed], roots: list[str], today: date, ladder_strikes: int
+                              ) -> tuple[list[McxContract], dict, dict, dict[str, dict]]:
+        plans, errors = plan_selection(listed, roots, self.settings.mcx_min_days_to_expiry, today)
+        if not plans:
+            return [], {}, errors, {}
         futures = sorted({plan["futures"].symbol for plan in plans.values()})
         marks = await self.broker.quotes(futures)
         references: dict[str, float] = {}
         for root, plan in list(plans.items()):
             tick = marks.get(plan["futures"].symbol)
-            if tick is None or not tick.ltp or tick.ltp <= 0:
+            if tick is None or not math.isfinite(tick.ltp) or tick.ltp <= 0:
                 errors[root] = f"no price for {plan['futures'].symbol}"
                 plans.pop(root)
                 continue
@@ -976,8 +1046,8 @@ class McxLane:
         picked: list[McxContract] = []
         summary: dict[str, dict] = {}
         ladder: dict[str, dict] = {}
-        self.multiplier_warnings = {}
         for root, plan in plans.items():
+            self.multiplier_warnings.pop(root, None)
             units = multipliers.get(root)
             if not units:
                 errors[root] = "no lot multiplier for this root; set mcx_lot_multipliers_csv"
@@ -1003,7 +1073,7 @@ class McxLane:
                 continue
             picked.extend(legs.values())
             errors.pop(root, None)
-            for row in ladder_rows(plan["series"], reference, self.settings.mcx_ladder_strikes):
+            for row in ladder_rows(plan["series"], reference, ladder_strikes):
                 ladder[row.symbol] = {"symbol": row.symbol, "root": root, "option_type": row.kind,
                                       "strike": row.strike, "expiry": row.expiry}
             summary[root] = {
@@ -1011,8 +1081,7 @@ class McxLane:
                 "reference": reference, "rolled": plan["rolled"], "lot_multiplier": units,
                 "strikes": {side: legs[side].strike for side in legs},
             }
-        self._install(picked, summary, errors, datetime.now(IST).isoformat(timespec="seconds"), source="master",
-                      ladder=ladder)
+        return picked, summary, errors, ladder
 
     async def _ladder_from_master(self, roots: dict) -> dict[str, dict]:
         """The strike ladder of an already-made selection; empty if the master cannot be read."""
@@ -1260,7 +1329,9 @@ class McxLane:
         self._quote_flush = None
         rows, self._dirty_quotes = self._dirty_quotes, {}
         if rows:
-            self.events.publish("quotes", list(rows.values()))
+            self.events.publish("quotes", [
+                {**row, "minutes": self._chart_minute_tail(symbol)} for symbol, row in rows.items()
+            ])
 
     def _publish_display_quote(self, row: dict) -> None:
         symbol = row["symbol"]
@@ -1397,7 +1468,10 @@ class McxLane:
         total = int(bar.volume or 0)
         self._day_volume[bar.symbol] = (day, max(total, base or 0))
         volume = max(0, total - base) if base is not None else 0
-        self._minute_pending.append(Candle(bar.symbol, bar.timestamp, bar.open, bar.high, bar.low, bar.close, volume, True))
+        closed = Candle(bar.symbol, bar.timestamp, bar.open, bar.high, bar.low, bar.close, volume, True)
+        self._minute_pending.append(closed)
+        if bar.symbol in self.contracts or self.is_future(bar.symbol):
+            self._last_chart_minute[bar.symbol] = closed
 
     def _flush_minutes(self) -> int:
         if not self._minute_pending:
@@ -1623,7 +1697,7 @@ class McxLane:
         fed = 0
         for symbol in stale:
             tick = quotes.get(symbol)
-            if tick is None or not tick.ltp or tick.ltp <= 0:
+            if tick is None or not math.isfinite(tick.ltp) or tick.ltp <= 0:
                 continue
             await self.on_tick(tick, now, source="rest")
             fed += 1
@@ -1688,6 +1762,56 @@ class McxLane:
             "at": datetime.now(UTC).isoformat(),
         }
 
+    def _chart_minute_tail(self, symbol: str) -> list[Candle]:
+        """Copy the last closed and current minute; convert the feed's day volume first."""
+        tail = []
+        last = self._last_chart_minute.get(symbol)
+        if last is not None:
+            tail.append(last)
+        current = self.minute_bars.current.get(symbol)
+        if current is not None:
+            day = datetime.fromtimestamp(current.timestamp, UTC).astimezone(IST).date().isoformat()
+            previous = self._day_volume.get(symbol)
+            delta = max(0, current.volume - previous[1]) if previous is not None and previous[0] == day else 0
+            tail.append(Candle(symbol, current.timestamp, current.open, current.high, current.low,
+                               current.close, delta, False))
+        return tail
+
+    async def chart(self, symbol: str, timeframe: int, now: datetime | None = None) -> dict | None:
+        """Chart the durable MCX minutes plus the forming minute; never calls the broker."""
+        now = now or datetime.now(UTC)
+        now_ts = int(now.timestamp())
+        observed = int(now.timestamp() * 1000)
+        calendar, settings = self.calendar, self.settings
+        pending = [bar for bar in self._minute_pending if bar.symbol == symbol]
+        tail = [replace(row, closed=True) if not row.closed and row.timestamp + 60 <= now_ts else row
+                for row in self._chart_minute_tail(symbol)]
+        cutoff = int((now - timedelta(days=settings.mcx_store_days)).timestamp())
+        forming = mcx_bucket(now_ts, timeframe, calendar)
+        active = symbol in self.contracts or self.is_future(symbol)
+
+        def load() -> dict | None:
+            by_time = {row.timestamp: row for row in self.store.minutes(symbol, cutoff)}
+            for row in (*pending, *tail):
+                if valid_minute(row):
+                    by_time[row.timestamp] = row
+            if not by_time and not active:
+                return None
+            bars = tuple(row for row in by_time.values() if row.timestamp <= now_ts // 60 * 60)
+            open_minutes = sorted((row for row in bars if forming is not None and
+                                   mcx_bucket(row.timestamp, timeframe, calendar) == forming),
+                                  key=lambda row: row.timestamp)
+            candles = aggregate_minutes([row for row in bars if row.closed and
+                                        (forming is None or row.timestamp < forming)], timeframe, calendar)
+            indicators = chart_indicators(symbol, candles, settings.fast_period, settings.slow_period, settings.signal_period,
+                                          settings.bb_period, settings.bb_deviations, settings.kama_period, settings.kama_fast,
+                                          settings.kama_slow, settings.kama_rsi_period, settings.kama_roc_period)
+            return {"symbol": symbol, "timeframe_seconds": timeframe, "candles": candles[-5_000:],
+                    "indicators": indicators[-5_000:], "forming_minutes": open_minutes, "observed_ms": observed,
+                    "macd_periods": {"fast": settings.fast_period, "slow": settings.slow_period, "signal": settings.signal_period}}
+
+        return await asyncio.to_thread(load)
+
     def settings_view(self) -> dict:
         current = self.settings
         return {
@@ -1742,7 +1866,7 @@ class McxLane:
     def contract_rows(self) -> list[dict]:
         rows = []
         now = datetime.now(UTC)
-        order = {root: index for index, root in enumerate(self.roots)}
+        order = {root: index for index, root in enumerate(self.roots + self.mini_roots)}
         for symbol, contract in sorted(self.contracts.items(), key=lambda item: (
                 order.get(item[1].root, len(order)), item[1].root, item[1].retained, item[1].option_type)):
             tick = self.latest.get(symbol)
@@ -1768,11 +1892,14 @@ class McxLane:
             })
         # The futures each series is priced from: watched with their own bars and MACD, never traded.
         futures_rows = []
-        for root, symbol in self.futures_by_root.items():
+        futures = {(root, symbol): next((row.futures_expiry for row in self.contracts.values()
+                                         if row.futures_symbol == symbol), "")
+                   for root, symbol in self.futures_by_root.items()}
+        futures.update({(row["root"], symbol): row["expiry"] for symbol, row in self.mini_front_futures.items()})
+        for (root, symbol), expiry in futures.items():
             tick = self.latest.get(symbol)
             point = self.futures_strategy.points.get(symbol)
             seen = self._last_ws_at.get(symbol)
-            expiry = next((row.futures_expiry for row in self.contracts.values() if row.futures_symbol == symbol), "")
             futures_rows.append({
                 "root": root, "symbol": symbol, "option_type": "FUT", "strike": 0.0, "expiry": expiry,
                 "futures_symbol": symbol, "futures_expiry": expiry,
@@ -1799,6 +1926,7 @@ class McxLane:
             "auto_trade": self.settings.mcx_auto_trade,
             "execution": "paper only",
             "roots": self.roots,
+            "mini_roots": [root for root in self.mini_roots if root in (self.selection.get("roots") or {})],
             "timeframe_seconds": self.timeframe_seconds,
             "session": self.session_view(),
             "selection": self.selection,

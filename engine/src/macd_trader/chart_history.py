@@ -73,25 +73,37 @@ def load_chart_history(
             for candle in extra_candles:
                 by_time[candle.timestamp] = candle
             candles = [by_time[key] for key in sorted(by_time)]
-        macd = IncrementalMACD(fast_period, slow_period, signal_period)
-        bollinger = IncrementalBollingerBands(bb_period, bb_deviations)
-        kama = IncrementalKAMA(kama_period, kama_fast, kama_slow)
-        kama_rsi = IncrementalRSI(kama_rsi_period)
-        kama_roc = IncrementalROC(kama_roc_period)
-        indicators: list[IndicatorPoint] = []
-        for candle in candles:
-            macd_value = macd.update(candle.close)
-            bb = bollinger.update(candle.close)
-            kama_value = kama.update(candle.close)
-            rsi_value = kama_rsi.update(kama_value) if kama_value is not None else None
-            roc_value = kama_roc.update(kama_value) if kama_value is not None else None
-            indicators.append(IndicatorPoint(
-                symbol, candle.timestamp, macd_value.macd, macd_value.signal, macd_value.histogram,
-                bb.middle, bb.upper, bb.lower, bb.width, kama_value, rsi_value, roc_value,
-            ))
+        indicators = chart_indicators(symbol, candles, fast_period, slow_period, signal_period, bb_period,
+                                      bb_deviations, kama_period, kama_fast, kama_slow, kama_rsi_period, kama_roc_period)
         return {"symbol": symbol, "timeframe_seconds": timeframe_seconds, "candles": candles, "indicators": indicators}
     finally:
         connection.close()
+
+
+
+def chart_indicators(
+    symbol: str, candles: list[Candle], fast_period: int, slow_period: int, signal_period: int,
+    bb_period: int = 20, bb_deviations: float = 2.0, kama_period: int = 10, kama_fast: int = 2,
+    kama_slow: int = 30, kama_rsi_period: int = 14, kama_roc_period: int = 5,
+) -> list[IndicatorPoint]:
+    """Read-only studies shared by both exchange chart readers."""
+    macd = IncrementalMACD(fast_period, slow_period, signal_period)
+    bollinger = IncrementalBollingerBands(bb_period, bb_deviations)
+    kama = IncrementalKAMA(kama_period, kama_fast, kama_slow)
+    kama_rsi = IncrementalRSI(kama_rsi_period)
+    kama_roc = IncrementalROC(kama_roc_period)
+    indicators: list[IndicatorPoint] = []
+    for candle in candles:
+        macd_value = macd.update(candle.close)
+        bb = bollinger.update(candle.close)
+        kama_value = kama.update(candle.close)
+        rsi_value = kama_rsi.update(kama_value) if kama_value is not None else None
+        roc_value = kama_roc.update(kama_value) if kama_value is not None else None
+        indicators.append(IndicatorPoint(
+            symbol, candle.timestamp, macd_value.macd, macd_value.signal, macd_value.histogram,
+            bb.middle, bb.upper, bb.lower, bb.width, kama_value, rsi_value, roc_value,
+        ))
+    return indicators
 
 
 def aggregate_session_candles(rows: list[Candle], timeframe_seconds: int) -> list[Candle]:

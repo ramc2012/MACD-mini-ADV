@@ -771,6 +771,10 @@ def test_watchlist_prices_coalesce_movements_and_include_broker_oi(tmp_path, mon
         assert (row["prev_close"], row["change"]) == (90, 11)
         assert row["change_pct"] == pytest.approx(100 * 11 / 90)
         assert (row["oi"], row["oi_change"]) == (120, 25)
+        minutes = row.pop("minutes")
+        assert len(minutes) == 1
+        bar = minutes[0]
+        assert (bar["open"], bar["high"], bar["low"], bar["close"], bar["closed"]) == (100, 102, 100, 101, False)
         assert lane.snapshot()["quotes"][symbol] == row
         assert rx.empty()
         await lane.stop()
@@ -807,3 +811,85 @@ def test_pending_feed_gap_reaches_previously_downloaded_ladder(tmp_path):
         assert set(lane.ladder) - set(lane.core_symbols())
         await lane.stop()
     asyncio.run(run())
+
+
+def test_mini_upgrade_preserves_full_size_contracts_and_trades_only_options(tmp_path):
+    broker = crude_broker()
+    lane = build(tmp_path, broker)
+    asyncio.run(lane.prepare())
+    original = set(lane.option_symbols())
+    saved = json.loads(lane.snapshot_path.read_text())
+    del saved["mini_front_futures"]  # snapshot from before minis were supported
+    lane.snapshot_path.write_text(json.dumps(saved))
+    asyncio.run(lane.stop())
+
+    front = "MCX:CRUDEOILM26NOVFUT"
+    underlying = "MCX:CRUDEOILM26DECFUT"
+    broker.rows += [
+        master_row("M-NOV", front, NOV_FUT, "CRUDEOILM"),
+        master_row("M-DEC", underlying, DEC_FUT, "CRUDEOILM"),
+        master_row("M-CE", "MCX:CRUDEOILM26DEC5850CE", DEC_OPT, "CRUDEOILM",
+                   strike=5850, side="CE", underlying_token="M-DEC"),
+        master_row("M-PE", "MCX:CRUDEOILM26DEC5800PE", DEC_OPT, "CRUDEOILM",
+                   strike=5800, side="PE", underlying_token="M-DEC"),
+    ]
+    broker.quote_map[underlying] = quote(underlying, 5823)
+    lane = build(tmp_path, broker, execution_mode="live", allow_live_orders=True)
+    asyncio.run(lane.prepare())
+    minis = {row.option_type: row for row in lane.contracts.values() if row.root == "CRUDEOILM"}
+    assert set(lane.option_symbols()) == original | {row.symbol for row in minis.values()}
+    assert set(minis) == {"CE", "PE"} and all(row.lot_size == 10 for row in minis.values())
+    assert {front, underlying} <= set(lane.futures_symbols())
+    assert front not in lane.execution.tradable_symbols and underlying not in lane.execution.tradable_symbols
+    assert lane.known_expiries()[front] == NOV_FUT.isoformat()
+    assert all(row.futures_symbol == underlying for row in minis.values())
+    asyncio.run(lane.warm())
+    assert {front, underlying, *(row.symbol for row in minis.values())} <= set(broker.history_requests)
+
+    start = at(11, 0)
+    path = [100, 96, 92, 88, 85, 83, 82, 82.5, 84, 88, 94, 101]
+    for minute, price in enumerate(path):
+        feed(lane, minis["CE"].symbol, price, start + timedelta(minutes=minute, seconds=5))
+        feed(lane, minis["CE"].symbol, price, start + timedelta(minutes=minute, seconds=50))
+    paper_call = lane.portfolio.positions[minis["CE"].symbol]
+    assert paper_call.quantity == paper_call.lots * 10
+    assert lane.execution.settings.execution_mode == "paper"
+    assert any(decision["verdict"] == TAKEN for decision in lane.decisions)
+    feed(lane, minis["PE"].symbol, 40, at(11, 12))
+    order = asyncio.run(lane.manual_order(minis["PE"].symbol, "BUY", 1))
+    assert order.status == "FILLED" and lane.portfolio.positions[minis["PE"].symbol].quantity == 10
+    with pytest.raises(ValueError):
+        asyncio.run(lane.manual_order(front, "BUY", 1))
+    asyncio.run(lane.stop())
+
+    cached_reads = broker.master_reads
+    again = build(tmp_path, broker)
+    asyncio.run(again.prepare())
+    assert broker.master_reads == cached_reads
+    assert set(again.option_symbols()) == original | {row.symbol for row in minis.values()}
+    assert {front, underlying} <= set(again.subscription_symbols())
+    asyncio.run(again.stop())
+
+
+def test_chart_uses_mcx_buckets_and_forming_minutes_without_broker_requests(tmp_path):
+    lane, contract = ready_lane(tmp_path)
+    symbol = contract.symbol
+    lane.store.write(minutes_for(symbol, at(9), 33))
+    feed(lane, symbol, 121, at(9, 33, 3))
+    feed(lane, symbol, 124, at(9, 33, 14))
+    feed(lane, symbol, 122, at(9, 33, 22))
+    requests = list(lane.broker.history_requests)
+
+    chart = asyncio.run(lane.chart(symbol, 1800))
+    assert [bar.timestamp for bar in chart["candles"]] == [int(at(9).timestamp())]
+    assert [row.timestamp for row in chart["indicators"]] == [bar.timestamp for bar in chart["candles"]]
+    assert len(chart["forming_minutes"]) == 4
+    current = chart["forming_minutes"][-1]
+    assert (current.open, current.high, current.low, current.close, current.closed) == (121, 124, 121, 122, False)
+    later = asyncio.run(lane.chart(symbol, 60, now=at(9, 34, 10)))
+    assert later["candles"][-1].close == 122 and later["candles"][-1].closed
+    daily = asyncio.run(lane.chart(symbol, 86400, now=at(23, 56)))
+    assert [(bar.timestamp, bar.close) for bar in daily["candles"]] == [(int(at(9).timestamp()), 122)]
+    assert asyncio.run(lane.chart("MCX:UNKNOWN", 60)) is None
+    assert lane.broker.history_requests == requests and not lane.decisions
+    asyncio.run(lane.stop())
