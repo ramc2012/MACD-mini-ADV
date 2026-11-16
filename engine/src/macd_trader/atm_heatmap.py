@@ -8,22 +8,27 @@ Each column is period-to-date, from the period's first trade to now:
   1W  this week, from its first session's open
   1M  this month, from its first session's open
 Outside the session "now" is the last close, so on a weekend the periods are Friday's last hour, Friday, this week
-and this month. The reference price is the contract's first stored minute OPEN at or after the period start. When
+and this month. The one-day view also compares to the previous regular session close for the same
+instrument. Prefer the same-session quote's previous close where available, otherwise use the prior
+session's last stored close. The period reference price is the contract's first stored minute OPEN at or after the period start. When
 that first trade came well after the start (an illiquid contract, or one that entered the band mid-period) the
 change is still measured from it and the leg's ``partial`` map records when it began. The current price is the
 latest tick, else the last stored close. The underlying's own move is reported alongside.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from . import market_calendar
+from .sectors import sector_of
 
 IST = ZoneInfo("Asia/Kolkata")
 OPEN, CLOSE = time(9, 15), time(15, 30)
 PERIODS = ("1H", "4H", "1D", "1W", "1M")
+PREVIOUS_CLOSE = "PREV_CLOSE"
 BLOCK_MINUTES = {"1H": 60, "4H": 240}
 # A first trade later than this after the period start marks the change as partial.
 PARTIAL_AFTER_SECONDS = {"1H": 15 * 60, "4H": 30 * 60, "1D": 60 * 60, "1W": 60 * 60, "1M": 60 * 60}
@@ -86,10 +91,15 @@ def _first_open(db: sqlite3.Connection, symbol: str, start: int, end: int) -> tu
     return (float(row[0]), int(row[1])) if row and row[0] else None
 
 
-def _last_close(db: sqlite3.Connection, symbol: str, at: int) -> float | None:
+def _price(value: float | None) -> float | None:
+    return float(value) if value is not None and math.isfinite(value) and value > 0 else None
+
+
+def _last_close(db: sqlite3.Connection, symbol: str, at: int, start: int = 0) -> float | None:
     row = db.execute("""SELECT close FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60
-                        AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1""", (symbol, at)).fetchone()
-    return float(row[0]) if row and row[0] else None
+                        AND timestamp BETWEEN ? AND ? AND close > 0 ORDER BY timestamp DESC LIMIT 1""",
+                     (symbol, start, at)).fetchone()
+    return _price(row[0]) if row else None
 
 
 def _symbols(db: sqlite3.Connection) -> list[str]:
@@ -147,17 +157,24 @@ def historical_contracts(database_path: str, day: date) -> list[dict]:
 
 
 def build(database_path: str, contracts: list[dict], live_prices: dict[str, float], now: datetime | None = None,
-          context_spots: list[str] | None = None) -> dict:
+          context_spots: list[str] | None = None, *, previous_closes: dict[str, float] | None = None) -> dict:
     """``contracts``: dicts with underlying, spot_symbol, option_type, symbol, strike, expiry (ATM, tradable).
     ``context_spots``: index symbols shown in the Spot view only (sectors, broad indices, VIX); kind "sector"."""
     anchor = session_anchor(now or datetime.now(IST))
     starts = {name: period_start(anchor, name) for name in PERIODS}
     anchor_ts = int(anchor.timestamp()) + 59
+    session_start_ts = int(starts["1D"].timestamp())
+    prior_day = market_calendar.previous_trading_day(anchor.date())
+    prior_open = int(datetime.combine(prior_day, OPEN, IST).timestamp())
+    prior_close = datetime.combine(prior_day, CLOSE, IST)
+    prior_close_ts = int(prior_close.timestamp())
+    previous_closes = previous_closes or {}
     by_underlying: dict[str, dict] = {}
     for contract in contracts:
         row = by_underlying.setdefault(contract["underlying"], {
             "kind": "index" if contract["underlying"] in INDEX_ORDER else "stock",
             "underlying": contract["underlying"], "spot_symbol": contract["spot_symbol"],
+            "sector": sector_of(contract["spot_symbol"]),
             "strike": contract["strike"], "expiry": str(contract["expiry"])[:10]})
         row[contract["option_type"].lower()] = {"symbol": contract["symbol"], "strike": contract["strike"]}
     for symbol in context_spots or []:
@@ -167,22 +184,32 @@ def build(database_path: str, contracts: list[dict], live_prices: dict[str, floa
         for row in by_underlying.values():
             legs = [("spot", row["spot_symbol"])] + [(leg, row[leg]["symbol"]) for leg in ("ce", "pe") if leg in row]
             for leg, symbol in legs:
-                current = live_prices.get(symbol) or _last_close(db, symbol, anchor_ts)
-                changes, partial = {}, {}
+                current = _price(live_prices.get(symbol)) or _last_close(db, symbol, anchor_ts, session_start_ts)
+                previous = _price(previous_closes.get(symbol)) or _last_close(db, symbol, prior_close_ts, prior_open)
+                changes = {PREVIOUS_CLOSE: round((current / previous - 1) * 100, 2)
+                           if current is not None and previous is not None else None}
+                comparison = {PREVIOUS_CLOSE: previous, "1D": None}
+                partial = {}
                 for name, start in starts.items():
                     first = _first_open(db, symbol, int(start.timestamp()), anchor_ts)
-                    if first is None or not current:
+                    base = _price(first[0]) if first else None
+                    if name == "1D":
+                        comparison[name] = base
+                    if base is None or current is None:
                         changes[name] = None
                         continue
-                    changes[name] = round((current / first[0] - 1) * 100, 2)
-                    if first[1] - int(start.timestamp()) > PARTIAL_AFTER_SECONDS[name]:
+                    changes[name] = round((current / base - 1) * 100, 2)
+                    max_delay = 0 if name == "1D" else PARTIAL_AFTER_SECONDS[name]
+                    if first[1] - int(start.timestamp()) > max_delay:
                         partial[name] = datetime.fromtimestamp(first[1], IST).isoformat(timespec="minutes")
                 if leg == "spot":
                     row["spot"], row["spot_change"], row["spot_partial"] = current, changes, partial
+                    row["spot_comparison"] = comparison
                 else:
-                    row[leg].update({"price": current, "change": changes, "partial": partial})
+                    row[leg].update({"price": current, "change": changes, "partial": partial, "comparison": comparison})
     by_underlying = {key: row for key, row in by_underlying.items() if row["kind"] != "sector" or row.get("spot")}
     rows = sorted(by_underlying.values(), key=lambda r: (
         INDEX_ORDER.index(r["underlying"]) if r["underlying"] in INDEX_ORDER else len(INDEX_ORDER), r["underlying"]))
     return {"as_of": anchor.isoformat(), "periods": list(PERIODS), "basis": "period to date",
-            "references": {name: start.isoformat() for name, start in starts.items()}, "rows": rows}
+            "references": {**{name: start.isoformat() for name, start in starts.items()},
+                           PREVIOUS_CLOSE: prior_close.isoformat()}, "rows": rows}

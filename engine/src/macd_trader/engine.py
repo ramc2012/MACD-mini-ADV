@@ -2501,8 +2501,14 @@ class TradingEngine(DeskMixin):
                              if str(row.get("moneyness") or "ATM").upper() == "ATM" and not row.get("analysis_only")]
             except (OSError, ValueError):
                 contracts = []
-        live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
-        result = await asyncio.to_thread(atm_heatmap.build, self.settings.research_database_path, contracts, live, None, context)
+        now = datetime.now(IST)
+        anchor = atm_heatmap.session_anchor(now)
+        opened = datetime.combine(anchor.date(), atm_heatmap.OPEN, IST)
+        session_ticks = {symbol: tick for symbol, tick in self.latest_ticks.items() if opened <= tick.timestamp <= anchor}
+        live = {symbol: tick.ltp for symbol, tick in session_ticks.items()}
+        previous = {symbol: tick.prev_close for symbol, tick in session_ticks.items() if tick.prev_close is not None}
+        result = await asyncio.to_thread(atm_heatmap.build, self.settings.research_database_path, contracts, live,
+                                         now, context, previous_closes=previous)
         if result["rows"]:                       # never cache the empty answer of a still-selecting engine
             self._atm_heatmap_cache = (time.monotonic(), result)
         return result

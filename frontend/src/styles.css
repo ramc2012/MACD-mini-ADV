@@ -1332,6 +1332,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .ws-row { color: var(--text-3); font-size: var(--fs-sm); display: flex; gap: 6px; align-items: center; }
 .ws-row select { background: var(--bg-raised); color: var(--text-1); border: 1px solid var(--line-strong); border-radius: 5px; padding: 3px 4px; }
 .ws-main { display: grid; grid-template-columns: minmax(0, 1fr) 330px; min-height: 0; }
+.ws-chart-stack { min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+.ws-bar { padding: 7px 10px; color: var(--text-3); border-bottom: 1px solid var(--line-subtle); font-size: var(--fs-xs); }
+.ws-bar header, .ws-bar-values { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.ws-bar header { margin-bottom: 4px; }
+.ws-bar time, .ws-bar-values { font-variant-numeric: tabular-nums; }
+.ws-bar-values + .ws-bar-values { margin-top: 4px; }
+.ws-bar b { color: var(--text-1); font-weight: 600; }
 .ws-chart { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
 .ws-chart canvas { display: block; cursor: crosshair; touch-action: none; }
 .ws-jump { position: absolute; right: 84px; bottom: 40px; background: #2563eb; color: var(--text-on-accent); border: 0; border-radius: 16px; padding: 7px 14px; font-size: var(--fs-sm); cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
@@ -1343,7 +1350,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .ws-levels > div { display: grid; grid-template-columns: 10px 1fr auto; align-items: center; gap: 6px; font-size: var(--fs-xs); padding: 2px 0; color: var(--text-3); }
 .ws-levels i { width: 3px; height: 11px; border-radius: 1px; }
 .ws-levels b { font: 500 11px ui-monospace, Menlo, monospace; }
-.ws-status { display: flex; gap: 16px; align-items: center; padding: 5px 10px; border-top: 1px solid var(--line-subtle); font: 11px ui-monospace, Menlo, monospace; color: var(--text-4); overflow: hidden; white-space: nowrap; }
+.ws-status { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center; padding: 5px 10px; border-top: 1px solid var(--line-subtle); font: 11px ui-monospace, Menlo, monospace; color: var(--text-4); overflow: hidden; white-space: nowrap; }
 .ws-status .ok { color: var(--up); } .ws-status .bad { color: var(--down); }
 .ws-status .ws-spacer { flex: 1; }
 @media (max-width: 900px) { .ws-main { grid-template-columns: 1fr; } .ws-side { display: none; } }

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DomLadder, TimeAndSales } from "./DomLadder";
-import { initiativeState, type FootprintBar, type FootprintData, type FootprintProfile, type InitiativePeriod } from "./FootprintChart";
+import { initiativeState, type FootprintBar, type FootprintData, type FootprintProfile } from "./FootprintChart";
 import { API_TOKEN, API_URL } from "./runtime";
 
-/* Auction workstation: TPO profile, footprint and cumulative delta on one shared, scrollable time axis, across
+/* Auction workstation: switch between TPO and footprint on one scrollable time axis, with optional cumulative delta across
    the stored sessions (completed days from /api/mp/session-footprint, today's from /api/mp/footprint), with the
    book, the tape and the key levels beside it.
 
@@ -32,6 +32,7 @@ const IST = "Asia/Kolkata";
 const nf = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2, minimumFractionDigits: 2 });
 const qf = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 });
 const hm = new Intl.DateTimeFormat("en-IN", { timeZone: IST, hour: "2-digit", minute: "2-digit", hour12: false });
+const sessionClock = new Intl.DateTimeFormat("sv-SE", { timeZone: IST, dateStyle: "short", timeStyle: "medium" });
 const dayLabel = new Intl.DateTimeFormat("en-IN", { timeZone: IST, weekday: "short", day: "2-digit", month: "short" });
 const istDay = (t = Date.now() / 1000) => new Date((t + 19_800) * 1000).toISOString().slice(0, 10);
 const compact = (v: number) => {
@@ -50,8 +51,8 @@ const C = {
 const LETTER_COLORS = ["#7c5cff", "#9a6bff", "#3d7bd9", "#2f9bb3", "#2fa67a", "#7aa83a", "#c9a227", "#d97a2b",
   "#d1495b", "#b8487f", "#8a5bc4", "#4d6fd1", "#2e93a8"];
 
-type Context = { prior_day?: { poc?: number; vah?: number; val?: number; high?: number; low?: number; close?: number } | null };
-type Payload = FootprintData & { context?: Context | null; day?: string };
+type Payload = FootprintData & { day?: string };
+type PricePane = "fp" | "tpo";
 type Session = { day: string; live: boolean; data: Payload };
 type Flat = { bar: FootprintBar; s: number; vwap: number | null; cvdOpen: number };
 type PaneId = "tpo" | "fp" | "cvd";
@@ -82,13 +83,15 @@ function letterRows(profile: FootprintProfile | null | undefined, row: number): 
   return new Map([...out].map(([k, set]) => [k, [...set].sort((a, b) => order(a) - order(b)).join("")]));
 }
 
-export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
-  const saved = useMemo(() => recall({ symbol: "", tf: 1800, row: 0, tpo: true, fp: true, vp: true, cvd: true, vwap: true }), []);
+export function AuctionWorkstation({ symbols, marketOpen }: { symbols: string[]; marketOpen?: boolean }) {
+  const saved = useMemo(() => recall({ symbol: "", tf: 1800, row: 0, pricePane: null as PricePane | null,
+    tpo: true, fp: true, vp: true, cvd: true, vwap: true }), []);
   const [symbol, setSymbol] = useState(saved.symbol);
   const [tf, setTf] = useState<number>(saved.tf);
   const [row, setRow] = useState<number>(saved.row);
-  const [show, setShow] = useState({ tpo: saved.tpo, fp: saved.fp, vp: saved.vp, cvd: saved.cvd, vwap: saved.vwap });
-  useEffect(() => remember({ symbol, tf, row, ...show }), [symbol, tf, row, show]);
+  const [pricePane, setPricePane] = useState<PricePane>(saved.pricePane ?? (saved.tpo && !saved.fp ? "tpo" : "fp"));
+  const [show, setShow] = useState({ vp: saved.vp, cvd: saved.cvd, vwap: saved.vwap });
+  useEffect(() => remember({ symbol, tf, row, pricePane, ...show }), [symbol, tf, row, pricePane, show]);
   // Futures first (front month leading), expired series dropped, then everything else alphabetically.
   const instruments = useMemo(() => {
     const now = new Date(Date.now() + 19_800_000);
@@ -107,7 +110,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
   }, [instruments, symbol]);
 
   // ------------------------------------------------------------------------------------------------- data
-  const [live, setLive] = useState<{ key: string; data: Payload; at: number; ms: number }>();
+  const [live, setLive] = useState<{ key: string; data: Payload }>();
   const [liveError, setLiveError] = useState("");
   const history = useRef(new Map<string, Payload>());
   const [historyDays, setHistoryDays] = useState<string[]>([]);
@@ -116,22 +119,25 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
 
   useEffect(() => {
     if (!symbol) return;
-    let stop = false;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    setLiveError("");
     const load = async () => {
-      const started = performance.now();
       try {
-        const response = await fetch(`${API_URL}/api/mp/footprint/${encodeURIComponent(symbol)}?bars=180&timeframe_seconds=${tf}&profile_full=true`, { headers });
+        const response = await fetch(`${API_URL}/api/mp/footprint/${encodeURIComponent(symbol)}?bars=180&timeframe_seconds=${tf}&profile_full=true`,
+          { headers, signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json() as Payload;
-        if (!stop) { setLive({ key: liveKey, data, at: Date.now(), ms: Math.round(performance.now() - started) }); setLiveError(""); }
+        if (!controller.signal.aborted) { setLive({ key: liveKey, data }); setLiveError(""); }
       } catch (error) {
-        if (!stop) setLiveError(error instanceof Error ? error.message : "live feed failed");
+        if (!controller.signal.aborted) setLiveError(error instanceof Error ? error.message : "Chart request failed");
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(load, marketOpen === false ? 60_000 : POLL_MS);
       }
     };
     void load();
-    const timer = window.setInterval(load, POLL_MS);
-    return () => { stop = true; window.clearInterval(timer); };
-  }, [symbol, tf, liveKey]);
+    return () => { controller.abort(); if (timer !== undefined) window.clearTimeout(timer); };
+  }, [symbol, tf, liveKey, marketOpen]);
 
   useEffect(() => {
     if (!symbol) return;
@@ -157,13 +163,17 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
   }, [symbol, tf]);
 
   const sessions = useMemo<Session[]>(() => {
-    const out: Session[] = [];
+    const byDay = new Map<string, Session>();
     for (const day of historyDays) {
       const data = history.current.get(`${symbol}|${tf}|${day}`);
-      if (data?.bars?.length) out.push({ day, live: false, data });
+      if (data?.bars?.length) byDay.set(day, { day, live: false, data });
     }
-    if (live?.key === liveKey && live.data.bars?.length) out.push({ day: istDay(), live: true, data: live.data });
-    return out;
+    const latest = live?.key === liveKey ? live.data.bars.at(-1) : undefined;
+    if (live && latest) {
+      const day = istDay(latest.t);
+      byDay.set(day, { day, live: true, data: live.data });
+    }
+    return [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
     // historyVersion: the Map is mutated in place
   }, [historyDays, symbol, tf, live, liveKey, historyVersion]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -193,17 +203,13 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
   const mouse = useRef<{ x: number; y: number } | null>(null);
   const layoutRef = useRef<{ rects: Rect[]; plotW: number; plotH: number; rowSize: number }>({ rects: [], plotW: 0, plotH: 0, rowSize: 1 });
   const [awayFromLive, setAwayFromLive] = useState(false);
-  const [renderMs, setRenderMs] = useState(0);
-  const [hover, setHover] = useState<Flat | null>(null);
+  const [hoverTime, setHoverTime] = useState<number>();
   const frame = useRef(0);
-  const hoverRef = useRef<Flat | null>(null);
-  const lastStat = useRef(0);
 
   const draw = useCallback(() => {
     const el = canvas.current;
     const box = wrap.current;
     if (!el || !box) return;
-    const started = performance.now();
     const dpr = window.devicePixelRatio || 1;
     const W = box.clientWidth, H = box.clientHeight;
     if (el.width !== Math.round(W * dpr) || el.height !== Math.round(H * dpr)) {
@@ -216,8 +222,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
     g.fillStyle = C.bg; g.fillRect(0, 0, W, H);
     const v = view.current;
     const plotW = W - AXIS_W, plotH = H - TIME_H;
-    const panes: [PaneId, number][] = ([["tpo", 0.36], ["fp", 0.46], ["cvd", 0.18]] as [PaneId, number][])
-      .filter(([id]) => (id === "tpo" ? show.tpo : id === "fp" ? show.fp : show.cvd));
+    const panes: [PaneId, number][] = show.cvd ? [[pricePane, 0.78], ["cvd", 0.22]] : [[pricePane, 1]];
     const total = panes.reduce((a, [, w]) => a + w, 0) || 1;
     let y0 = 0;
     const rects: Rect[] = panes.map(([id, w]) => { const r = { id, top: y0, h: Math.round(plotH * w / total) }; y0 += r.h; return r; });
@@ -234,11 +239,11 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
     const visible = N ? flat.slice(iFirst, iLast + 1) : [];
 
     // row size: chosen, or the nicest step that gives the footprint ~14 px rows over the visible range
-    const fpRect = rects.find((r) => r.id === "fp");
+    const priceRect = rects[0];
     let lo = Infinity, hi = -Infinity;
     for (const f of visible) { lo = Math.min(lo, f.bar.l); hi = Math.max(hi, f.bar.h); }
     const span = hi > lo ? hi - lo : tick * 20;
-    const rowSize = row > 0 ? row : Math.max(tick, niceStep(span / Math.max(8, ((fpRect?.h || 300) - HEAD_H) / 14)));
+    const rowSize = row > 0 ? row : Math.max(tick, niceStep(span / Math.max(8, (priceRect.h - HEAD_H) / 14)));
     layoutRef.current = { rects, plotW, plotH, rowSize };
 
     const fit = (pane: PaneView, min: number, max: number, h: number) => {
@@ -303,7 +308,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
       g.font = "10px ui-monospace, Menlo, monospace"; g.fillStyle = C.dim;
       const note = rect.id === "tpo" ? `30m letters · row ${rowSize} · VA 70% · IB 2 periods`
         : rect.id === "cvd" ? `session CVD ${signed((sessions.at(-1)?.data.session_cumulative_delta ?? visible.at(-1)?.bar.cvd ?? 0) / unit)}${unit > 1 ? " lots" : ""}`
-        : hoverNote();
+        : "Sell × buy · outlined row is volume POC";
       g.fillText(note, 16 + tw, rect.top + HEAD_H / 2);
     }
 
@@ -357,27 +362,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
     }
     const away = v.offset > 0.5;
     setAwayFromLive((old) => (old === away ? old : away));
-    // a readout, not a meter: refreshed twice a second so mouse moves do not re-render the side panels each frame
-    if (performance.now() - lastStat.current > 500) {
-      lastStat.current = performance.now();
-      setRenderMs(Math.round((performance.now() - started) * 10) / 10);
-    }
-
     // -------------------------------------------------------------------------------------- pane painters
-    function hoverNote(): string {
-      const f = hoverRef.current;
-      if (!f) return "";
-      const b = f.bar;
-      const periods = (sessions[f.s]?.data.initiative_30m || []).filter((p) => b.t < p.end && b.t + tf > p.t).map(periodNote);
-      return `${dayLabel.format(new Date(b.t * 1000))} ${hm.format(new Date(b.t * 1000))}   O ${nf.format(b.o)}  H ${nf.format(b.h)}  L ${nf.format(b.l)}  C ${nf.format(b.c)}   V ${q(b.v)}   Δ ${signed(b.delta / unit)}${unit > 1 ? " lots" : ""}${periods.length ? `   ${periods.join(" | ")}` : ""}`;
-    }
-
-    function periodNote(p: InitiativePeriod): string {
-      const share = finite(p.share) ? `${p.share >= 0 ? "+" : "−"}${Math.round(Math.abs(p.share) * 100)}%` : "—";
-      const who = initiativeState(p);
-      return `${hm.format(new Date(p.t * 1000))} ${p.label ?? "no initiative"} ${share}${finite(p.oi_change) ? ` OI ${signed(p.oi_change / unit)}` : ""}${who ? ` ${who}` : ""}`;
-    }
-
     function drawTpo(gc: CanvasRenderingContext2D, rect: Rect, pane: PaneView, yOf: (p: number) => number, pw: number) {
       const rowH = Math.max(1, rowSize * pane.ppp);
       const sessionsOnScreen = [...new Set(visible.map((f) => f.s))];
@@ -437,15 +422,15 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
         gc.beginPath(); gc.moveTo(xL + 2.5, yOf(b.h)); gc.lineTo(xL + 2.5, yOf(b.l)); gc.stroke();
         gc.fillRect(xL + 1, Math.min(yOf(b.o), yOf(b.c)), 3, Math.max(1, Math.abs(yOf(b.o) - yOf(b.c))));
         // cells
-        const cells = new Map<number, { bid: number; ask: number }>();
+        const cells = new Map<number, { bid: number; ask: number; unknown: number }>();
         for (const level of b.levels || []) {
           const key = Math.floor(level.p / rowSize + 1e-9) * rowSize;
-          const cell = cells.get(key) || { bid: 0, ask: 0 };
-          cell.bid += level.bid || 0; cell.ask += level.ask || 0;
+          const cell = cells.get(key) || { bid: 0, ask: 0, unknown: 0 };
+          cell.bid += level.bid || 0; cell.ask += level.ask || 0; cell.unknown += level.u || 0;
           cells.set(key, cell);
         }
         let pocKey = NaN, pocVol = -1, maxVol = 1;
-        for (const [k, c] of cells) { const t = c.bid + c.ask; if (t > pocVol) { pocVol = t; pocKey = k; } maxVol = Math.max(maxVol, t); }
+        for (const [k, c] of cells) { const t = c.bid + c.ask + c.unknown; if (t > pocVol) { pocVol = t; pocKey = k; } maxVol = Math.max(maxVol, t); }
         const cx0 = xL + 7, cw = Math.max(1, xR - cx0);
         gc.font = "10px ui-monospace, Menlo, monospace";
         for (const [k, c] of cells) {
@@ -455,7 +440,8 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
           const sellImb = c.bid > 0 && c.bid >= ratio * Math.max(c.ask, 1);
           const net = c.ask - c.bid;
           gc.fillStyle = buyImb ? "rgba(34,197,139,0.42)" : sellImb ? "rgba(240,86,106,0.42)"
-            : net >= 0 ? `rgba(34,197,139,${0.08 + 0.3 * (c.bid + c.ask) / maxVol})` : `rgba(240,86,106,${0.08 + 0.3 * (c.bid + c.ask) / maxVol})`;
+            : net === 0 ? `rgba(154,168,188,${0.08 + 0.3 * (c.bid + c.ask + c.unknown) / maxVol})`
+            : net > 0 ? `rgba(34,197,139,${0.08 + 0.3 * (c.bid + c.ask) / maxVol})` : `rgba(240,86,106,${0.08 + 0.3 * (c.bid + c.ask) / maxVol})`;
           gc.fillRect(cx0, yT, cw, hh);
           if (k === pocKey) { gc.strokeStyle = C.poc; gc.strokeRect(cx0 + 0.5, yT + 0.5, cw - 1, hh - 1); }
           if (showText) {
@@ -517,7 +503,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
         const vp = new Map<number, number>();
         for (const f of visible) for (const level of f.bar.levels || []) {
           const key = Math.floor(level.p / rowSize + 1e-9) * rowSize;
-          vp.set(key, (vp.get(key) || 0) + (level.bid || 0) + (level.ask || 0));
+          vp.set(key, (vp.get(key) || 0) + (level.bid || 0) + (level.ask || 0) + (level.u || 0));
         }
         let max = 1, pocK = NaN;
         for (const [k, val] of vp) if (val > max) { max = val; pocK = k; }
@@ -545,7 +531,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
         gc.fillRect(x - Math.max(1, barW * 0.38), Math.min(y1, y2), Math.max(2, barW * 0.76), Math.max(2, Math.abs(y2 - y1)));
       }
     }
-  }, [flat, sessions, show, row, tick, tf, symbol]);
+  }, [flat, sessions, pricePane, show, row, tick, tf, symbol]);
 
   const schedule = useCallback(() => {
     if (frame.current) return;
@@ -590,8 +576,7 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
     const { plotW } = layoutRef.current;
     const N = flat.length;
     const i = Math.round(N - 1 - v.offset - (plotW - v.barW / 2 - x) / v.barW);
-    const f = flat[i] || null;
-    if (f !== hoverRef.current) { hoverRef.current = f; setHover(f); }
+    setHoverTime(x >= 0 && x < plotW ? flat[i]?.bar.t : undefined);
     schedule();
   };
   const onPointerUp = () => { drag.current = null; };
@@ -628,22 +613,49 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
   const current = sessions.at(-1);
   const data = current?.data;
   const lastBar = data?.bars.at(-1);
-  const prior = data?.context?.prior_day || sessions.at(-2)?.data.profile && {
-    poc: sessions.at(-2)!.data.profile!.poc, vah: sessions.at(-2)!.data.profile!.vah, val: sessions.at(-2)!.data.profile!.val,
-    high: sessions.at(-2)!.data.profile!.high, low: sessions.at(-2)!.data.profile!.low, close: sessions.at(-2)!.data.bars.at(-1)?.c,
-  } || null;
-  const sessionFlat = flat.filter((f) => f.s === sessions.length - 1);
-  const vwapNow = sessionFlat.at(-1)?.vwap ?? null;
-  const change = lastBar && finite(prior?.close) ? lastBar.c - prior!.close! : null;
+  const priorSession = sessions.at(-2);
+  const reference = data?.session?.prior_day;
+  const stored = data?.context?.prior_day;
+  const priorValue = (key: "poc" | "vah" | "val" | "high" | "low" | "close") => {
+    const value = reference?.[key] ?? stored?.[key];
+    if (finite(value)) return value;
+    if (data?.session?.prior_day_date && data.session.prior_day_date !== priorSession?.day) return undefined;
+    return key === "close" ? priorSession?.data.bars.at(-1)?.c : priorSession?.data.profile?.[key];
+  };
+  const vwapNow = flat.at(-1)?.vwap ?? null;
+  const priorClose = priorValue("close");
+  const change = lastBar && finite(priorClose) && priorClose > 0 ? lastBar.c - priorClose : null;
+  const session = data?.session;
   const levels: [string, number | null | undefined, string][] = [
-    ["POC", data?.profile?.poc, C.poc], ["VAH", data?.profile?.vah, C.vaLine], ["VAL", data?.profile?.val, C.vaLine],
-    ["IB High", data?.profile?.ib_high, C.ib], ["IB Low", data?.profile?.ib_low, C.ib], ["VWAP", vwapNow, C.vwap],
-    ["Session High", data?.profile?.high, C.text], ["Session Low", data?.profile?.low, C.text],
-    ["PD High", prior?.high, C.dim], ["PD Low", prior?.low, C.dim], ["PD Close", prior?.close, C.dim],
-    ["PD POC", prior?.poc, C.poc], ["PD VAH", prior?.vah, C.vaLine], ["PD VAL", prior?.val, C.vaLine],
+    ["TPO POC", data?.profile?.poc, C.poc], ["Volume POC", data?.profile?.vpoc, C.poc],
+    ["Value area high", data?.profile?.vah, C.vaLine], ["Value area low", data?.profile?.val, C.vaLine],
+    ["IB high", data?.profile?.ib_high, C.ib], ["IB low", data?.profile?.ib_low, C.ib],
+    ["VWAP", vwapNow, C.vwap], ["Session open", session?.open_observed ? data?.bars[0]?.o : null, C.text],
+    ["Session high", data?.profile?.high, C.text], ["Session low", data?.profile?.low, C.text],
+    ["Prior high", priorValue("high"), C.dim], ["Prior low", priorValue("low"), C.dim], ["Prior close", priorClose, C.dim],
+    ["Prior POC", priorValue("poc"), C.poc], ["Prior VAH", priorValue("vah"), C.vaLine], ["Prior VAL", priorValue("val"), C.vaLine],
   ];
-  const connected = !!live && Date.now() - live.at < 15_000 && !liveError;
-  const sessionVol = (current?.live ? current.data.bars : ([] as FootprintBar[])).reduce((a: number, b: FootprintBar) => a + (b.v || 0), 0);
+  const hasBook = !!marketOpen && !!current?.live && current.day === istDay();
+  const status = liveError ? `Chart request failed · ${liveError}` : marketOpen === false
+    ? "Session closed" : hasBook ? "Session open" : "Waiting for session data";
+  const sessionVol = data?.bars.reduce((total, bar) => total + bar.v, 0);
+  const sessionCvd = data?.session_cumulative_delta ?? lastBar?.cvd;
+  const unit = data?.lot_size || 1;
+  const selected = flat.find(f => f.bar.t === hoverTime) ?? flat.at(-1);
+  const selectedData = selected && sessions[selected.s]?.data;
+  const selectedUnit = selectedData?.lot_size || 1;
+  const bar = selected?.bar;
+  const priceText = (value: number | null | undefined) => finite(value) ? nf.format(value) : "—";
+  const qtyText = (value: number | null | undefined) => finite(value) ? compact(value / selectedUnit) : "—";
+  const barMetrics = bar ? [
+    ["Open", priceText(bar.o)], ["High", priceText(bar.h)], ["Low", priceText(bar.l)], ["Close", priceText(bar.c)],
+    ["Volume", qtyText(bar.v)], ["Δ", signed(bar.delta / selectedUnit)], ["CVD", signed(bar.cvd / selectedUnit)],
+    ["POC", priceText(bar.poc)], ["VAH", priceText(bar.vah)], ["VAL", priceText(bar.val)],
+    ["VWAP", priceText(selected?.vwap)], ["Trades", finite(bar.trades) ? qf.format(bar.trades) : "—"],
+    ["Unclassified", qtyText(bar.u)],
+    ["Confidence", finite(bar.confidence) ? `${Math.round(bar.confidence * 100)}%` : "—"],
+  ] : [];
+  const initiatives = bar ? (selectedData?.initiative_30m || []).filter(p => bar.t < p.end && bar.t + tf > p.t && p.label) : [];
 
   return <div className="ws-root">
     <div className="ws-toolbar">
@@ -651,14 +663,20 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
         {instruments.map((s) => <option key={s} value={s}>{s}</option>)}
       </select>
       <span className="ws-last">{lastBar ? nf.format(lastBar.c) : "—"}
-        {change != null && <em className={change >= 0 ? "positive" : "negative"}>{change >= 0 ? "+" : ""}{nf.format(change)} ({((change / (prior?.close || 1)) * 100).toFixed(2)}%)</em>}</span>
+        {change != null && <em title="Change versus the prior reference close" className={change >= 0 ? "positive" : "negative"}>{change >= 0 ? "+" : ""}{nf.format(change)} ({((change / (priorClose || 1)) * 100).toFixed(2)}%)</em>}</span>
       <div className="ws-group">{TIMEFRAMES.map(([value, label]) =>
-        <button key={value} className={tf === value ? "active" : ""} onClick={() => setTf(value)}>{label}</button>)}</div>
-      <div className="ws-group">
-        {([["tpo", "TPO"], ["fp", "Footprint"], ["vp", "Volume Profile"], ["cvd", "CVD"]] as [keyof typeof show, string][]).map(([key, label]) =>
-          <button key={key} className={show[key] ? "active" : ""} onClick={() => setShow((old) => ({ ...old, [key]: !old[key] }))}>{label}</button>)}
+        <button key={value} aria-pressed={tf === value} className={tf === value ? "active" : ""} onClick={() => setTf(value)}>{label}</button>)}</div>
+      <div className="ws-group" role="group" aria-label="Auction price view">
+        {([["fp", "Footprint"], ["tpo", "TPO"]] as const).map(([key, label]) =>
+          <button key={key} aria-pressed={pricePane === key} className={pricePane === key ? "active" : ""} onClick={() => setPricePane(key)}>{label}</button>)}
       </div>
-      <button className={`ws-toggle ${show.vwap ? "active" : ""}`} onClick={() => setShow((old) => ({ ...old, vwap: !old.vwap }))}>VWAP</button>
+      <div className="ws-group" role="group" aria-label="Chart overlays">
+        <button aria-pressed={show.cvd} className={show.cvd ? "active" : ""} onClick={() => setShow(old => ({ ...old, cvd: !old.cvd }))}>CVD</button>
+        {pricePane === "fp" && <>
+          <button aria-pressed={show.vp} className={show.vp ? "active" : ""} onClick={() => setShow(old => ({ ...old, vp: !old.vp }))}>Volume Profile</button>
+          <button aria-pressed={show.vwap} className={show.vwap ? "active" : ""} onClick={() => setShow(old => ({ ...old, vwap: !old.vwap }))}>VWAP</button>
+        </>}
+      </div>
       <label className="ws-row">Row <select value={row} onChange={(e) => setRow(Number(e.target.value))}>
         {ROWS.map((r) => <option key={r} value={r}>{r === 0 ? "auto" : r}</option>)}</select> pts</label>
       <button className="ws-toggle" onClick={autoFit} title="Auto-fit every pane (or double-click the chart)">Fit</button>
@@ -666,22 +684,39 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
     </div>
 
     <div className="ws-main">
-      <div className="ws-chart" ref={wrap}>
-        <canvas ref={canvas} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
-                onPointerLeave={() => { mouse.current = null; schedule(); }} onWheel={onWheel} onDoubleClick={autoFit}
-                aria-label="TPO, footprint and cumulative delta chart" />
-        {awayFromLive && <button className="ws-jump" onClick={jumpLive}>⇥ Jump to live</button>}
+      <div className="ws-chart-stack">
+        <div className="ws-bar" aria-label="Selected bar details">
+          {bar ? <>
+            <header><b>{hoverTime === undefined ? "Latest bar" : "Selected bar"}</b>
+              <time dateTime={new Date(bar.t * 1000).toISOString()}>{sessionClock.format(bar.t * 1000)} IST</time>
+              <span>{selectedUnit > 1 ? "Volume in lots" : "Volume in units"}</span></header>
+            <div className="ws-bar-values">{barMetrics.map(([label, value]) => <span key={label}>{label} <b>{value}</b></span>)}</div>
+            {initiatives.length > 0 && <div className="ws-bar-values">{initiatives.map(p => <span key={p.t}>
+              {hm.format(p.t * 1000)} <b>{p.label}</b>
+              {finite(p.share) && ` ${Math.round(p.share * 100)}%`}
+              {finite(p.oi_change) && ` · OI ${signed(p.oi_change / selectedUnit)}`}
+              {initiativeState(p) && ` · ${initiativeState(p)}`}
+            </span>)}</div>}
+          </> : <span>Bar details appear when footprint data is available.</span>}
+        </div>
+        <div className="ws-chart" ref={wrap}>
+          <canvas ref={canvas} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
+                  onPointerLeave={() => { mouse.current = null; setHoverTime(undefined); schedule(); }}
+                  onPointerCancel={onPointerUp} onWheel={onWheel} onDoubleClick={autoFit}
+                  aria-label={`${pricePane === "tpo" ? "TPO" : "Footprint"} chart${show.cvd ? " with cumulative delta" : ""}`} />
+          {awayFromLive && <button className="ws-jump" onClick={jumpLive}>Jump to latest</button>}
+        </div>
       </div>
       <aside className="ws-side">
         {/* Fyers streams the touch only: sizes at the best bid/ask, traded volume at every price */}
         <section className="ws-panel ws-bare">
-          <DomLadder dom={current?.live ? data?.dom || null : null} profile={data?.profile || null} tickSize={tick} lastPrice={lastBar?.c ?? null} lot={data?.lot_size} />
+          <DomLadder dom={hasBook ? data?.dom || null : null} profile={data?.profile || null} tickSize={tick} lastPrice={lastBar?.c ?? null} lot={data?.lot_size} />
         </section>
         <section className="ws-panel ws-bare">
           <TimeAndSales tape={(current?.live ? data?.tape : []) || []} tickSize={tick} height={180} lot={data?.lot_size} />
         </section>
         <section className="ws-panel ws-levels">
-          <header>Key Levels <small>row {layoutRef.current.rowSize || "auto"} pts</small></header>
+          <header>Key levels <small>{current?.day}</small></header>
           {levels.map(([name, value, color]) => <div key={name}><i style={{ background: color }} /><span>{name}</span>
             <b style={{ color }}>{finite(value) ? nf.format(value) : "—"}</b></div>)}
         </section>
@@ -689,16 +724,15 @@ export function AuctionWorkstation({ symbols }: { symbols: string[] }) {
     </div>
 
     <footer className="ws-status">
-      <span className={connected ? "ok" : "bad"}>● {connected ? "Connected" : liveError || "Waiting"}</span>
-      <span>Latency {live ? `${live.ms} ms` : "—"}</span>
-      <span>Session 09:15–15:30 IST</span>
-      <span>Vol {compact(sessionVol / (data?.lot_size || 1))}{(data?.lot_size || 1) > 1 ? " lots" : ""}</span>
-      <span className={(data?.session_cumulative_delta ?? 0) >= 0 ? "positive" : "negative"}>Δ session {signed((current?.live ? data?.session_cumulative_delta ?? 0 : 0) / (data?.lot_size || 1))}</span>
-      <span>History {sessions.filter((s) => !s.live).length} sessions</span>
+      <span className={liveError ? "bad" : hasBook ? "ok" : ""}>{status}</span>
+      {current && <span>Session {current.day}</span>}
+      <span>Captured vol {finite(sessionVol) ? compact(sessionVol / unit) : "—"}{unit > 1 ? " lots" : ""}</span>
+      <span className={finite(sessionCvd) ? sessionCvd >= 0 ? "positive" : "negative" : ""}>
+        Session Δ {finite(sessionCvd) ? signed(sessionCvd / unit) : "—"}</span>
+      {session?.quality?.grade && <span>Capture quality {session.quality.grade}</span>}
+      {session?.partial_capture && <span>Partial session</span>}
       <span className="ws-spacer" />
-      {hover && <span>{hm.format(new Date(hover.bar.t * 1000))} · V {qf.format(hover.bar.v / (data?.lot_size || 1))} · Δ {signed(hover.bar.delta / (data?.lot_size || 1))}{(data?.lot_size || 1) > 1 ? " lots" : ""}</span>}
-      <span>{renderMs} ms render · {flat.length} bars</span>
-      <span>Tick {tick} · Row {layoutRef.current.rowSize} · {TIMEFRAMES.find((t) => t[0] === tf)?.[1]}</span>
+      <span>{sessions.length} sessions · {flat.length} bars</span>
     </footer>
   </div>;
 }

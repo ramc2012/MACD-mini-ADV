@@ -115,3 +115,40 @@ def test_historical_contracts_pick_the_day_s_traded_atm_pair_of_the_nearest_live
     picks = hm.historical_contracts(str(path), day.date())
     assert sorted(c["symbol"] for c in picks) == ["NSE:SBIN26OCT900CE", "NSE:SBIN26OCT900PE"]
     assert {c["underlying"] for c in picks} == {"SBIN"} and picks[0]["spot_symbol"] == "NSE:SBIN-EQ"
+
+
+def test_daily_comparisons_are_instrument_specific_and_use_the_prior_session(tmp_path):
+    path = tmp_path / "h.sqlite3"
+    spot, call, put = "NSE:SBIN-EQ", "NSE:SBIN26OCT900CE", "NSE:SBIN26OCT900PE"
+    bars = [
+        (spot, at(15, 15, 29), 870, 880), (spot, at(16, 9, 15), 900, 905),
+        (spot, at(16, 15, 29), 919, 920),
+        (call, at(15, 15, 29), 25, 28), (call, at(16, 9, 20), 30, 34),
+        (call, at(16, 15, 29), 39, 40),
+        (put, at(14, 15, 29), 55, 50), (put, at(16, 9, 15), 25, 22),
+        (put, at(16, 15, 29), 12, 10),
+    ]
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE historical_candles (symbol TEXT, timeframe_seconds INTEGER, timestamp INTEGER, open REAL, close REAL)")
+        db.executemany("INSERT INTO historical_candles VALUES (?,60,?,?,?)",
+                       [(symbol, int(t.timestamp()), opened, closed) for symbol, t, opened, closed in bars])
+    contracts = [{"underlying": "SBIN", "spot_symbol": spot, "option_type": side, "symbol": symbol,
+                  "strike": 900.0, "expiry": "2026-10-27"} for side, symbol in (("CE", call), ("PE", put))]
+    close_view = hm.build(str(path), contracts, {}, now=at(17, 12, 0))
+    assert close_view["references"][hm.PREVIOUS_CLOSE] == at(15, 15, 30).isoformat()
+    row = close_view["rows"][0]
+    assert row["sector"] == "Banks"
+    assert row["spot_comparison"] == {"1D": 900, hm.PREVIOUS_CLOSE: 880}
+    assert row["ce"]["comparison"] == {"1D": 30, hm.PREVIOUS_CLOSE: 28}
+    assert row["ce"]["change"]["1D"] == approx(33.33)
+    assert row["ce"]["change"][hm.PREVIOUS_CLOSE] == approx(42.86)
+    assert row["ce"]["partial"]["1D"] == at(16, 9, 20).isoformat(timespec="minutes")
+    assert row["pe"]["change"][hm.PREVIOUS_CLOSE] is None
+    assert row["pe"]["change"]["1D"] == -60
+
+    live = hm.build(str(path), contracts, {call: 42}, now=at(16, 15, 30), previous_closes={call: 30})
+    assert live["rows"][0]["ce"]["change"][hm.PREVIOUS_CLOSE] == 40
+
+    new_session = hm.build(str(path), contracts, {}, now=at(19, 9, 30))
+    assert new_session["rows"][0]["ce"]["change"][hm.PREVIOUS_CLOSE] is None
+    assert new_session["rows"][0]["ce"]["price"] is None

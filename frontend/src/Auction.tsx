@@ -92,14 +92,14 @@ function ProfileNotes({ symbol }: { symbol: string }) {
 
 const VIEW_STORE = "macd.auctionView";
 
-export function AuctionPage() {
+export function AuctionPage({ marketOpen }: { marketOpen?: boolean }) {
   const [view, setView] = useState(() => (recall(VIEW_STORE) === "context" ? "context" : "flow"));
   const pickView = (value: "flow" | "context") => { setView(value); remember(VIEW_STORE, value); };
   const { data: auctionSymbols } = useEndpoint<string[]>("/api/auction/symbols", []);
   if (view === "flow") {
     return <section className="ledger-page auction-page auction-flow-page">
       <AuctionTabs view={view} onView={pickView} />
-      <AuctionWorkstation symbols={auctionSymbols || []} />
+      <AuctionWorkstation symbols={auctionSymbols || []} marketOpen={marketOpen} />
     </section>;
   }
   return <AuctionContextPage tabs={<AuctionTabs view={view} onView={pickView} />} symbols={auctionSymbols} />;
@@ -243,8 +243,7 @@ function LevelsPanel({ reference }: { reference: AuctionContext }) {
       })}
       {!rows.length && <p className="muted">No stored references for this symbol yet.</p>}
     </div>
-    <p className="auction-note">An untested point of control stays a magnet until price trades
-      back through it. These are the ones no later session has reached.</p>
+    <p className="auction-note">Naked POC levels are prior points of control that no later session has reached.</p>
   </section>;
 }
 
