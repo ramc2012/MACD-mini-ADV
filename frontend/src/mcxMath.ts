@@ -16,7 +16,7 @@ export type McxSettings = {
 };
 
 export type McxContractRow = {
-  root: string; display: string; symbol: string; option_type: "CE" | "PE"; strike: number; expiry: string;
+  root: string; display: string; symbol: string; option_type: "CE" | "PE" | "FUT"; strike: number; expiry: string;
   futures_symbol: string; futures_expiry: string; selection_price: number; lot_size: number; exchange_lot: number;
   volume: number; oi: number; retained: boolean; ltp: number | null; futures_ltp: number | null;
   macd: number | null; signal_line: number | null; histogram: number | null; bar: number | null; bars: number;
@@ -52,7 +52,13 @@ export type McxHealth = {
   selection: { date: string | null; selected_at: string | null; source?: string; errors: Record<string, string>;
     roots: Record<string, { expiry: string; futures: string; reference: number; rolled: boolean; lot_multiplier: number }> };
   contracts: number; held: number; subscribed: number;
-  warmup: { state?: string; symbols?: number; loaded?: number; failed?: Record<string, string>; finished_at?: string };
+  warmup: { state?: string; symbols?: number; loaded?: number; failed?: Record<string, string>; finished_at?: string;
+    from_store?: number; downloaded?: number; held?: number };
+  futures?: number; ladder?: number;
+  store?: { contracts?: number; downloaded_once?: number; bars?: number; first_bar?: number | null; last_bar?: number | null;
+    feed_gaps?: number; megabytes?: number };
+  history?: { downloads_allowed: boolean; requests: number; bars: number; contracts: number; last_at: string | null;
+    failed_count: number; backfill_running: boolean };
   ws_ticks_today: number; rest_fallback: { seconds: number; polls: number; ticks: number; error: string | null };
   signals_emitted: number; decisions: Record<string, number>; multiplier_warnings: Record<string, string>;
   lane_errors: Record<string, { count: number; last: string; at: string }>; error: string | null;

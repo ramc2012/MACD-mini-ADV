@@ -43,6 +43,8 @@ def mcx_clock(monkeypatch):
     Clock.moment = datetime(2026, 11, 18, 11, 0, tzinfo=IST)
     for module in (mcx_lane, execution, models, rollover):
         monkeypatch.setattr(module, "datetime", Clock)
+    monkeypatch.setattr(mcx_lane, "WARMUP_PACING_SECONDS", 0)
+    monkeypatch.delenv("MACD_HISTORY_DOWNLOADS_ENABLED", raising=False)
     monkeypatch.setattr(sys.modules[__name__], "datetime", Clock)
     return Clock
 
@@ -111,6 +113,8 @@ class FakeBroker:
         self.quote_map: dict[str, Tick] = dict(quotes or {})
         self.history = history or {}
         self.quote_requests: list[list[str]] = []
+        self.history_requests: list[str] = []
+        self.history_error: str | None = None
         self.master_reads = 0
 
     async def instrument_rows(self, exchange):
@@ -124,6 +128,9 @@ class FakeBroker:
 
     async def history_range(self, symbol, timeframe_seconds, start, end):
         assert timeframe_seconds == 60
+        self.history_requests.append(symbol)
+        if self.history_error:
+            raise RuntimeError(self.history_error)
         return self.history.get(symbol, [])
 
     async def place_order(self, _order):
@@ -144,6 +151,7 @@ def build(tmp_path: Path, broker=None, **overrides) -> McxLane:
         "mcx_timeframe_seconds": 60,
         "mcx_target_notional": 100_000,
         "mcx_database_path": str(tmp_path / "mcx.sqlite3"),
+        "mcx_ladder_strikes": 0,
         "mcx_contract_snapshot_path": str(tmp_path / "mcx_contracts.json"),
         "fast_period": 3, "slow_period": 6, "signal_period": 3,
         **overrides,
@@ -590,3 +598,149 @@ def test_switching_history_downloads_on_tells_the_broker_and_restarts_the_warmup
     assert lane.settings_view()["history_downloads"] is True
     needs = lane.apply_settings(lane.settings.model_copy(update={"mcx_history_downloads": False}))
     assert lane.broker.mcx_history_allowed is False and not needs["rewarm"]
+
+
+# ------------------------------------------------- the lane's own bar database
+
+def minutes_for(symbol: str, start: datetime, count: int, base: float = 90.0) -> list[Candle]:
+    return [Candle(symbol, int((start + timedelta(minutes=m)).timestamp()), base + m, base + m + 1, base + m - 1, base + m, 3, True)
+            for m in range(count)]
+
+
+class TestBarDatabase:
+    def test_session_seconds_skip_the_night_and_the_weekend(self):
+        calendar = McxCalendar()
+        assert calendar.session_seconds(int(at(10, 0).timestamp()), int(at(10, 5).timestamp())) == 300
+        overnight = calendar.session_seconds(int(at(23, 50).timestamp()), int(at(9, 10, day=date(2026, 11, 19)).timestamp()))
+        assert overnight == 5 * 60 + 10 * 60                      # 23:50 to the 23:55 close, then 09:00 to 09:10
+        friday_close = int(at(23, 55, day=date(2026, 11, 20)).timestamp())
+        assert calendar.session_seconds(friday_close, int(at(8, 59, day=date(2026, 11, 23)).timestamp())) == 0
+
+    def test_a_contract_is_downloaded_once_and_later_warmups_read_the_database(self, tmp_path):
+        broker = crude_broker()
+        lane = build(tmp_path, broker)
+        asyncio.run(lane.prepare())
+        call = next(row for row in lane.contracts.values() if row.option_type == "CE")
+        Clock.moment = at(11, 30, 20)
+        broker.history[call.symbol] = minutes_for(call.symbol, at(10, 0), 91)
+        first = asyncio.run(lane.warm())
+        watched = set(lane.indicator_symbols())
+        assert set(broker.history_requests) == watched and len(broker.history_requests) == len(watched)
+        assert first["downloaded"] == len(watched) and first["from_store"] == 0
+        # A second warm-up, and a fresh lane on the same files (a restart), ask the broker for nothing.
+        lane._reset_strategy()
+        second = asyncio.run(lane.warm())
+        assert second["from_store"] == len(watched) and second["downloaded"] == 0
+        assert lane.history[call.symbol][-1].timestamp == int(at(11, 29).timestamp())
+        asyncio.run(lane.stop())
+        again = build(tmp_path, broker)
+        asyncio.run(again.prepare())
+        asyncio.run(again.warm())
+        assert len(broker.history_requests) == len(watched)
+        assert again.history[call.symbol][-1].timestamp == int(at(11, 29).timestamp())
+
+    def test_live_minutes_are_recorded_and_feed_the_next_warmup(self, tmp_path):
+        lane, call = ready_lane(tmp_path)
+        requests = len(lane.broker.history_requests)
+        for minute, price in enumerate([100.0, 101.0, 102.0, 103.0]):
+            Clock.moment = at(11, minute, 10)
+            asyncio.run(lane.on_tick(Tick(call.symbol, price, 1000 + 40 * minute, Clock.moment.astimezone(UTC)),
+                                     Clock.moment.astimezone(UTC)))
+        asyncio.run(lane.maintain(Clock.moment.astimezone(UTC)))            # writes the closed minutes
+        stored = lane.store.minutes(call.symbol, 0)
+        assert [bar.timestamp for bar in stored] == [int(at(11, m).timestamp()) for m in range(3)]
+        assert [bar.close for bar in stored] == [100.0, 101.0, 102.0]
+        assert [bar.volume for bar in stored] == [0, 40, 40]             # the day's running volume, minute by minute
+        Clock.moment = at(11, 4, 5)
+        lane._reset_strategy()
+        asyncio.run(lane.warm())
+        assert len(lane.broker.history_requests) == requests            # nothing downloaded again
+        assert [bar.timestamp for bar in lane.history[call.symbol]][:3] == [int(at(11, m).timestamp()) for m in range(3)]
+
+    def test_the_futures_are_watched_with_bars_and_macd_and_never_traded(self, tmp_path):
+        broker = crude_broker()
+        lane = build(tmp_path, broker)
+        asyncio.run(lane.prepare())
+        future = lane.futures_symbols()[0]
+        Clock.moment = at(11, 30, 20)
+        broker.history[future] = minutes_for(future, at(10, 0), 90, base=5800.0)
+        asyncio.run(lane.warm())
+        assert len(lane.history[future]) == 90 and future not in lane._warming
+        for minute, price in enumerate([5700.0, 5650.0, 5600.0, 5900.0, 6100.0, 6300.0]):
+            feed(lane, future, price, at(11, 31 + minute, 5))
+        row = next(row for row in lane.contract_rows() if row["option_type"] == "FUT")
+        assert row["symbol"] == future and row["ltp"] == 6300.0 and row["macd"] is not None and row["bars"] >= 90
+        assert lane.contract_rows()[0]["option_type"] == "FUT"          # the future leads its commodity's rows
+        assert not lane.decisions and not lane.portfolio.positions and not lane.repository.rows("signals", 5)
+
+    def test_the_strike_ladder_is_streamed_and_downloaded_once_in_the_background(self, tmp_path):
+        broker = crude_broker()
+        lane = build(tmp_path, broker, mcx_ladder_strikes=2)
+        asyncio.run(lane.prepare())
+        strikes = sorted({row["strike"] for row in lane.ladder.values()})
+        assert len(strikes) == 5 and len(lane.ladder) == 10             # two strikes either side, calls and puts
+        assert set(lane.ladder) <= set(lane.subscription_symbols())
+        assert set(lane.ladder) - set(lane.core_symbols())               # wider than what is traded
+
+        async def run():
+            await lane.warm()
+            await lane._backfill_task
+        asyncio.run(run())
+        assert sorted(broker.history_requests) == sorted(lane.subscription_symbols())
+        assert lane.store.never_downloaded(lane.subscription_symbols()) == []
+        # A same-day restart restores the ladder from the snapshot and downloads nothing.
+        asyncio.run(lane.stop())
+        again = build(tmp_path, broker, mcx_ladder_strikes=2)
+        asyncio.run(again.prepare())
+        assert set(again.ladder) == set(lane.ladder) and broker.master_reads == 1
+        asyncio.run(again.warm())
+        assert len(broker.history_requests) == len(lane.subscription_symbols())
+
+    def test_a_feed_gap_is_filled_once_and_only_for_the_stretch_missed(self, tmp_path):
+        lane, call = ready_lane(tmp_path)
+        broker = lane.broker
+        feed(lane, call.symbol, 100.0, at(11, 0, 5))
+        asyncio.run(lane.maintain(at(11, 0, 30).astimezone(UTC)))        # the feed is alive at 11:00
+        asyncio.run(lane.stop())
+        Clock.moment = at(11, 20, 0)                                     # back after 20 minutes of session
+        again = build(tmp_path, broker)
+        asyncio.run(again.prepare())
+        before = len(broker.history_requests)
+        broker.history[call.symbol] = minutes_for(call.symbol, at(11, 1), 18)
+        report = asyncio.run(again.warm())
+        watched = set(again.indicator_symbols())
+        assert set(broker.history_requests[before:]) == watched and report["downloaded"] == len(watched)
+        assert [bar.timestamp for bar in again.store.minutes(call.symbol, 0)][-1] == int(at(11, 18).timestamp())
+        again._reset_strategy()
+        assert asyncio.run(again.warm())["downloaded"] == 0              # the gap is filled; not asked again
+
+    def test_under_the_hold_nothing_is_requested_until_the_switch_is_on(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MACD_HISTORY_DOWNLOADS_ENABLED", "false")
+        broker = crude_broker()
+        lane = build(tmp_path, broker)
+        asyncio.run(lane.prepare())
+        report = asyncio.run(lane.warm())
+        watched = set(lane.indicator_symbols())
+        assert broker.history_requests == [] and report["held"] == len(watched)
+        assert all(reason == mcx_lane.HOLD_MESSAGE for reason in report["failed"].values())
+        needs = lane.apply_settings(lane.settings.model_copy(update={"mcx_history_downloads": True}))
+        assert needs["rewarm"]
+        report = asyncio.run(lane.warm())
+        assert set(broker.history_requests) == watched and report["downloaded"] == len(watched) and not report["failed"]
+
+    def test_a_failed_download_is_reported_and_tried_again_next_time(self, tmp_path):
+        broker = crude_broker()
+        broker.history_error = "boom"
+        lane = build(tmp_path, broker)
+        asyncio.run(lane.prepare())
+        monkey = mcx_lane.WARMUP_ATTEMPTS
+        mcx_lane.WARMUP_ATTEMPTS = 1
+        try:
+            report = asyncio.run(lane.warm())
+            watched = set(lane.indicator_symbols())
+            assert set(report["failed"]) == watched and lane.store.never_downloaded(sorted(watched)) == sorted(watched)
+            broker.history_error = None
+            lane._reset_strategy()
+            assert asyncio.run(lane.warm())["downloaded"] == len(watched)
+        finally:
+            mcx_lane.WARMUP_ATTEMPTS = monkey

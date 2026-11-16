@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass
@@ -72,6 +73,7 @@ from .config import RUNTIME_DIR, Settings
 from .contracts import liquidity_window, select_liquid_contract
 from .events import EventHub, json_value
 from .execution import ExecutionManager
+from .mcx_store import McxBarStore
 from .models import Candle, Signal, Tick, Trade
 from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
@@ -199,6 +201,21 @@ class McxCalendar:
 
     def covers_year(self, year: int) -> bool:
         return any(day.year == year for day in self.closed)
+
+    def session_seconds(self, start_ts: int, end_ts: int) -> int:
+        """Seconds of MCX session between two instants (zero overnight, at weekends and on holidays)."""
+        if end_ts <= start_ts:
+            return 0
+        day = datetime.fromtimestamp(start_ts, UTC).astimezone(IST).date()
+        last = datetime.fromtimestamp(end_ts, UTC).astimezone(IST).date()
+        total = 0
+        while day <= last:
+            if self.is_trading_day(day):
+                opens = int(datetime.combine(day, self.opens_at(day), IST).timestamp())
+                closes = int(datetime.combine(day, self.closes_at(day), IST).timestamp())
+                total += max(0, min(end_ts, closes) - max(start_ts, opens))
+            day += timedelta(days=1)
+        return total
 
 
 def mcx_bucket(epoch: int, timeframe_seconds: int, calendar: McxCalendar) -> int | None:
@@ -533,7 +550,31 @@ MAINTENANCE_INTERVAL_SECONDS = 15.0
 SIGNAL_STALENESS_GRACE_SECONDS = 120
 WARMUP_ATTEMPTS = 4
 WARMUP_BACKOFF_SECONDS = (4.0, 12.0, 30.0)
-WARMUP_PACING_SECONDS = 0.3
+WARMUP_PACING_SECONDS = 0.35
+GAP_SECONDS = 180                 # session time without ticks that counts as a hole in the bar database
+HEARTBEAT_SECONDS = 60
+BACKFILL_RETRY_SECONDS = 1800
+STORE_STATS_SECONDS = 300
+HOLD_MESSAGE = "history downloads are held and the lane's switch is off"
+
+
+class _NoEvents:
+    """Event sink of the futures' indicators: they are shown on the page and never published."""
+
+    client_count = 0
+
+    def publish(self, _event_type: str, _data) -> None:
+        return None
+
+
+def ladder_rows(series: list[McxListed], reference: float, each_side: int) -> list[McxListed]:
+    """Calls and puts of the strikes within ``each_side`` steps of the strike nearest ``reference``."""
+    strikes = sorted({row.strike for row in series})
+    if not strikes or each_side <= 0:
+        return []
+    middle = min(range(len(strikes)), key=lambda index: abs(strikes[index] - reference))
+    keep = set(strikes[max(0, middle - each_side): middle + each_side + 1])
+    return [row for row in series if row.strike in keep]
 
 
 def _lane_file(settings: Settings, configured: str, name: str) -> str:
@@ -541,6 +582,14 @@ def _lane_file(settings: Settings, configured: str, name: str) -> str:
     if configured != str(RUNTIME_DIR / name):
         return configured
     return str(Path(settings.database_path).parent / name)
+
+
+def _store_file(settings: Settings, book: str) -> str:
+    """The bar database: where it is configured, else beside the lane's book."""
+    configured = settings.mcx_bar_store_path
+    if configured != str(RUNTIME_DIR / "mcx_bars.sqlite3"):
+        return configured
+    return str(Path(book).parent / "mcx_bars.sqlite3")
 
 
 class McxLane:
@@ -552,7 +601,21 @@ class McxLane:
         self.broker = broker
         self.calendar = McxCalendar(settings.mcx_holidays_csv, settings.mcx_evening_only_csv)
         self.snapshot_path = Path(_lane_file(settings, settings.mcx_contract_snapshot_path, "mcx_contracts.json"))
-        self.repository = TradeRepository(_lane_file(settings, settings.mcx_database_path, "mcx_trader.sqlite3"))
+        book = _lane_file(settings, settings.mcx_database_path, "mcx_trader.sqlite3")
+        self.repository = TradeRepository(book)
+        # One-minute bars of every watched contract: downloaded once, then kept up from live ticks.
+        self.store = McxBarStore(_store_file(settings, book))
+        self.minute_bars = McxCandleAggregator(60, self.calendar)
+        self._minute_pending: list[Candle] = []
+        self._day_volume: dict[str, tuple[str, int]] = {}
+        self._last_ws_any: datetime | None = None
+        self._last_heartbeat = 0.0
+        self.ladder: dict[str, dict] = {}                 # symbol -> root, option_type, strike, expiry
+        self.downloads: dict = {"requests": 0, "bars": 0, "contracts": 0, "last_at": None, "failed": {}}
+        self._backfill_task: asyncio.Task | None = None
+        self._backfill_retry_at = 0.0
+        self._store_stats: dict = {}
+        self._store_stats_at = 0.0
         self.portfolio = Portfolio(settings.mcx_initial_capital, lane=LANE)
         self.execution = ExecutionManager(
             mcx_execution_settings(settings), McxPaperBroker(), self.portfolio, self.repository, self.events,
@@ -608,6 +671,8 @@ class McxLane:
 
     def _build_strategy(self) -> None:
         self.strategy = MACDStrategyManager(self.settings, self.events, [])
+        # The futures are watched, not traded: same MACD, its signals and indicator frames go nowhere.
+        self.futures_strategy = MACDStrategyManager(self.settings, _NoEvents(), [])
         self.aggregator = McxCandleAggregator(self.timeframe_seconds, self.calendar)
 
     def apply_settings(self, settings: Settings) -> dict:
@@ -637,11 +702,14 @@ class McxLane:
             self._reset_strategy()
         else:
             self.strategy.settings = settings
+            self.futures_strategy.settings = settings
             self.aggregator.calendar = self.calendar
+        self.minute_bars.calendar = self.calendar
         return {
             "reselect": (previous.mcx_enabled != settings.mcx_enabled
                          or previous.mcx_roots_csv != settings.mcx_roots_csv
                          or previous.mcx_min_days_to_expiry != settings.mcx_min_days_to_expiry
+                         or previous.mcx_ladder_strikes != settings.mcx_ladder_strikes
                          or previous.mcx_lot_multipliers_csv != settings.mcx_lot_multipliers_csv),
             "rewarm": timeframe_changed or strategy_changed or history_allowed,
         }
@@ -728,6 +796,7 @@ class McxLane:
             "roots": self.selection.get("roots") or {},
             "errors": self.selection.get("errors") or {},
             "contracts": [asdict(row) for row in self.contracts.values() if not row.retained],
+            "ladder": list(self.ladder.values()),
             "held": held,
         }
         try:
@@ -756,16 +825,33 @@ class McxLane:
         return list(dict.fromkeys([*self.option_symbols(),
                                    *[s for s in self.portfolio.positions if s in self.contracts]]))
 
-    def subscription_symbols(self) -> list[str]:
-        """Everything the lane needs streamed: today's options, their futures, every holding."""
+    def futures_symbols(self) -> list[str]:
+        return list(dict.fromkeys(self.futures_by_root.values()))
+
+    def is_future(self, symbol: str) -> bool:
+        return symbol in self.futures_by_root.values()
+
+    def indicator_symbols(self) -> list[str]:
+        """Everything that gets bars and MACD: the option contracts and the watched futures."""
+        return list(dict.fromkeys([*self.strategy_symbols(), *self.futures_symbols()]))
+
+    def core_symbols(self) -> list[str]:
+        """Today's options, their futures and every holding: what the lane trades and prices from."""
         if not self.settings.mcx_enabled:
             return list(dict.fromkeys(self.portfolio.positions))
         return list(dict.fromkeys([
             *self.option_symbols(), *self.futures_by_root.values(), *self.portfolio.positions,
         ]))
 
+    def subscription_symbols(self) -> list[str]:
+        """Everything streamed and recorded: the core symbols and the strike ladder around each ATM."""
+        if not self.settings.mcx_enabled:
+            return self.core_symbols()
+        return list(dict.fromkeys([*self.core_symbols(), *self.ladder]))
+
     def known_expiries(self) -> dict[str, str]:
-        expiries = {symbol: row.expiry for symbol, row in self.contracts.items()}
+        expiries = {symbol: row["expiry"] for symbol, row in self.ladder.items()}
+        expiries.update({symbol: row.expiry for symbol, row in self.contracts.items()})
         for row in self.contracts.values():
             if row.futures_symbol:
                 expiries.setdefault(row.futures_symbol, row.futures_expiry)
@@ -786,6 +872,7 @@ class McxLane:
             for contract in self.contracts.values():
                 contract.retained = True
             self.futures_by_root = {}
+            self.ladder = {}
             self._apply_contracts()
             return self.subscription_symbols()
         try:
@@ -798,6 +885,7 @@ class McxLane:
                 for contract in self.contracts.values():
                     contract.retained = True
                 self.futures_by_root = {}
+                self.ladder = {}
         self._reset_strategy()
         self._apply_contracts()
         self._save_snapshot()
@@ -810,7 +898,7 @@ class McxLane:
         self._build_strategy()
         self.history.clear()
         self._warm_buffer.clear()
-        self._warming = set(self.strategy_symbols())
+        self._warming = set(self.indicator_symbols())
         self.warm_report = {"state": "pending", "symbols": len(self._warming)}
 
     async def _select(self, *, force: bool) -> None:
@@ -832,7 +920,14 @@ class McxLane:
             legs = {(row.root, row.option_type) for row in rows}
             if all((root, side) in legs for root in self.roots for side in ("CE", "PE")):
                 roots = {root: value for root, value in (saved.get("roots") or {}).items() if root in self.roots}
-                self._install(rows, roots, saved.get("errors") or {}, saved.get("selected_at"), source="saved")
+                ladder = {row["symbol"]: row for row in saved.get("ladder") or []
+                          if isinstance(row, dict) and row.get("symbol") and row.get("root") in self.roots}
+                if not ladder and self.settings.mcx_ladder_strikes > 0:
+                    # A snapshot from before the ladder existed: build it around the saved prices. The
+                    # morning's strikes stay as they are.
+                    ladder = await self._ladder_from_master(roots)
+                self._install(rows, roots, saved.get("errors") or {}, saved.get("selected_at"), source="saved",
+                              ladder=ladder)
                 return
         reader = getattr(self.broker, "instrument_rows", None)
         if reader is None:
@@ -871,6 +966,7 @@ class McxLane:
         multipliers = self.multipliers
         picked: list[McxContract] = []
         summary: dict[str, dict] = {}
+        ladder: dict[str, dict] = {}
         self.multiplier_warnings = {}
         for root, plan in plans.items():
             units = multipliers.get(root)
@@ -898,14 +994,41 @@ class McxLane:
                 continue
             picked.extend(legs.values())
             errors.pop(root, None)
+            for row in ladder_rows(plan["series"], reference, self.settings.mcx_ladder_strikes):
+                ladder[row.symbol] = {"symbol": row.symbol, "root": root, "option_type": row.kind,
+                                      "strike": row.strike, "expiry": row.expiry}
             summary[root] = {
                 "expiry": plan["expiry"], "futures": plan["futures"].symbol, "futures_expiry": plan["futures"].expiry,
                 "reference": reference, "rolled": plan["rolled"], "lot_multiplier": units,
                 "strikes": {side: legs[side].strike for side in legs},
             }
-        self._install(picked, summary, errors, datetime.now(IST).isoformat(timespec="seconds"), source="master")
+        self._install(picked, summary, errors, datetime.now(IST).isoformat(timespec="seconds"), source="master",
+                      ladder=ladder)
 
-    def _install(self, rows: list[McxContract], roots: dict, errors: dict, selected_at, *, source: str) -> None:
+    async def _ladder_from_master(self, roots: dict) -> dict[str, dict]:
+        """The strike ladder of an already-made selection; empty if the master cannot be read."""
+        reader = getattr(self.broker, "instrument_rows", None)
+        if reader is None:
+            return {}
+        try:
+            listed = parse_mcx_master(await reader(EXCHANGE), set(roots))
+        except Exception as exc:  # noqa: BLE001 - the selection stands without a ladder
+            self._lane_error("ladder", exc)
+            return {}
+        ladder: dict[str, dict] = {}
+        for root, chosen in roots.items():
+            reference = chosen.get("reference")
+            series = [row for row in listed if row.root == root and row.kind in {"CE", "PE"}
+                      and row.expiry == chosen.get("expiry")]
+            if not reference or not series:
+                continue
+            for row in ladder_rows(series, float(reference), self.settings.mcx_ladder_strikes):
+                ladder[row.symbol] = {"symbol": row.symbol, "root": root, "option_type": row.kind,
+                                      "strike": row.strike, "expiry": row.expiry}
+        return ladder
+
+    def _install(self, rows: list[McxContract], roots: dict, errors: dict, selected_at, *, source: str,
+                 ladder: dict[str, dict] | None = None) -> None:
         today = datetime.now(IST).date().isoformat()
         held = {symbol: contract for symbol, contract in self.contracts.items() if symbol in self.portfolio.positions}
         self.contracts = {row.symbol: row for row in rows}
@@ -914,6 +1037,7 @@ class McxLane:
                 contract.retained = True
                 self.contracts[symbol] = contract
         self.futures_by_root = {row.root: row.futures_symbol for row in rows}
+        self.ladder = dict(ladder or {})
         self.selection = {"date": today, "selected_at": selected_at, "roots": roots, "errors": errors, "source": source}
         self.error = None if rows else self.error
 
@@ -945,41 +1069,139 @@ class McxLane:
 
     # ----------------------------------------------------------------- warm-up
 
+    def downloads_allowed(self) -> bool:
+        """May the lane ask the broker for history: the engine-wide hold is off, or the lane's switch is on."""
+        held = os.environ.get("MACD_HISTORY_DOWNLOADS_ENABLED", "true").lower() in ("false", "0", "off")
+        return bool(self.settings.mcx_history_downloads) or not held
+
+    def _note_feed_gap(self, now: datetime) -> None:
+        """Record a stretch of session the lane received nothing for (engine or socket down)."""
+        now_ts = int(now.timestamp())
+        alive = self.store.alive_to()
+        if alive is not None and self.calendar.session_seconds(alive, now_ts) > GAP_SECONDS:
+            self.store.add_gap(alive, now_ts)
+            self.store.heartbeat(now_ts)
+
+    async def _download(self, symbol: str, start: datetime, end: datetime) -> list[Candle]:
+        history = getattr(self.broker, "history_range", None)
+        if history is None:
+            raise RuntimeError("this broker has no history")
+        error: Exception | None = None
+        for attempt in range(WARMUP_ATTEMPTS):
+            try:
+                self.downloads["requests"] += 1
+                return await history(symbol, 60, start, end)
+            except Exception as exc:  # noqa: BLE001
+                error = exc
+                if attempt < WARMUP_ATTEMPTS - 1:
+                    limited = "429" in str(exc) or "Too Many Requests" in str(exc)
+                    await asyncio.sleep(WARMUP_BACKOFF_SECONDS[attempt] if limited else 0.5 * (attempt + 1))
+        raise error or RuntimeError("history failed")
+
+    async def _ensure_history(self, symbol: str) -> str:
+        """Bring one contract's stored bars up to date; returns what was done.
+
+        ``stored``: nothing to fetch. ``downloaded``: its one full download, or a feed gap filled.
+        ``held``: a download is due and downloads are not allowed. ``failed``: the request failed.
+        """
+        now = datetime.now(UTC)
+        now_ts = int(now.timestamp())
+        window = now - timedelta(days=self.settings.mcx_warmup_days)
+        window_ts = int(window.timestamp())
+        row = self.store.symbol(symbol)
+        first = row is None or row["backfilled_from"] is None
+        if first:
+            start = window
+        else:
+            first_seen = row["first_seen"] or 0
+            gaps = [gap for gap in self.store.gaps_ending_after(row["checked_to"] or 0)
+                    if gap[1] > window_ts and gap[1] > first_seen]
+            if not gaps:
+                return "stored"
+            start = max(window, datetime.fromtimestamp(min(gap[0] for gap in gaps), UTC) - timedelta(minutes=1))
+        if not self.downloads_allowed():
+            return "held"
+        try:
+            minutes = await self._download(symbol, start, now)
+        except Exception as exc:  # noqa: BLE001
+            self.downloads["failed"][symbol] = f"{type(exc).__name__}: {exc}"[:200]
+            return "failed"
+        finally:
+            await asyncio.sleep(WARMUP_PACING_SECONDS)
+        self.downloads["failed"].pop(symbol, None)
+        # The minute still forming is incomplete in the download; the live recorder writes it when it closes.
+        forming = now_ts - now_ts % 60
+        minutes = [bar for bar in minutes if bar.timestamp < forming and bar.timestamp >= window_ts - 86_400]
+        written = await asyncio.to_thread(self.store.write, minutes)
+        self.store.mark_filled(symbol, now_ts, backfilled_from=window_ts if first else None)
+        self.downloads["bars"] += written
+        self.downloads["contracts"] += 1
+        self.downloads["last_at"] = datetime.now(IST).isoformat(timespec="seconds")
+        return "downloaded"
+
     async def warm(self) -> dict:
-        """One-minute history for today's contracts, folded onto the lane's bars."""
+        """Build every watched contract's bars from the lane's own database.
+
+        A contract is downloaded only the first time it is seen, or to fill a stretch the feed was down; the
+        rest of its bars are the minutes recorded from live ticks.
+        """
         symbols = sorted(self._warming)
         started = datetime.now(UTC)
+        self._flush_minutes()
+        self._note_feed_gap(started)
+        self.store.seen(self.subscription_symbols(), int(started.timestamp()))
+        counts = {"stored": 0, "downloaded": 0, "held": 0, "failed": 0}
         loaded, failed = 0, {}
-        history = getattr(self.broker, "history_range", None)
         for symbol in symbols:
+            outcome = await self._ensure_history(symbol)
+            counts[outcome] += 1
+            if outcome == "failed":
+                failed[symbol] = self.downloads["failed"].get(symbol, "download failed")
+            elif outcome == "held":
+                failed[symbol] = HOLD_MESSAGE
             end = datetime.now(UTC)
-            start = end - timedelta(days=self.settings.mcx_warmup_days)
-            # The bar forming at download time is incomplete in the history;
-            # the live aggregator owns it from here.
+            since = int((end - timedelta(days=self.settings.mcx_warmup_days)).timestamp())
+            minutes = await asyncio.to_thread(self.store.minutes, symbol, since)
+            # The bar forming now belongs to the live aggregator.
             forming = mcx_bucket(int(end.timestamp()), self.timeframe_seconds, self.calendar)
-            minutes: list[Candle] = []
-            if history is not None:
-                for attempt in range(WARMUP_ATTEMPTS):
-                    try:
-                        minutes = await history(symbol, 60, start, end)
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        failed[symbol] = f"{type(exc).__name__}: {exc}"[:200]
-                        if attempt < WARMUP_ATTEMPTS - 1:
-                            limited = "429" in str(exc) or "Too Many Requests" in str(exc)
-                            await asyncio.sleep(WARMUP_BACKOFF_SECONDS[attempt] if limited else 0.5 * (attempt + 1))
-                await asyncio.sleep(WARMUP_PACING_SECONDS)
             if minutes:
-                failed.pop(symbol, None)
                 loaded += 1
             bars = aggregate_minutes(minutes, self.timeframe_seconds, self.calendar)
             self._finish_warmup(symbol, [bar for bar in bars if forming is None or bar.timestamp < forming])
         self.warm_report = {
             "state": "done", "symbols": len(symbols), "loaded": loaded, "failed": failed,
+            "from_store": counts["stored"], "downloaded": counts["downloaded"], "held": counts["held"],
             "finished_at": datetime.now(IST).isoformat(timespec="seconds"),
             "seconds": round((datetime.now(UTC) - started).total_seconds(), 1),
         }
+        self._store_stats_at = 0.0          # the page's database figures are refreshed at the next maintenance pass
+        self._start_backfill()
         return self.warm_report
+
+    def _start_backfill(self) -> None:
+        """One download for each watched contract that has never had one (the strike ladder), in the background."""
+        if not self.downloads_allowed():
+            return
+        task = self._backfill_task
+        if task is not None and not task.done():
+            return
+        pending = self.store.never_downloaded(self.subscription_symbols())
+        if not pending:
+            return
+
+        async def run() -> None:
+            try:
+                for symbol in pending:
+                    if not self.downloads_allowed():
+                        return
+                    await self._ensure_history(symbol)
+            finally:
+                self._store_stats_at = 0.0
+
+        try:
+            self._backfill_task = asyncio.get_running_loop().create_task(run())
+        except RuntimeError:
+            self._backfill_task = None
 
     def _finish_warmup(self, symbol: str, bars: list[Candle]) -> None:
         """Replay history, then the live bars that closed meanwhile, without trading on either."""
@@ -991,9 +1213,10 @@ class McxLane:
         last = replay[-1].timestamp if replay else -1
         # Buffered live bars only extend the history: never an earlier or the same bar twice.
         replay += [bar for bar in self._warm_buffer.pop(symbol, []) if bar.timestamp > last]
+        strategy = self.futures_strategy if self.is_future(symbol) else self.strategy
         for bar in replay:
             self.history[symbol].append(bar)
-            self.strategy.on_closed_candle(bar, warmup=True)
+            strategy.on_closed_candle(bar, warmup=True)
         self._warming.discard(symbol)
 
     # -------------------------------------------------------------------- ticks
@@ -1024,6 +1247,7 @@ class McxLane:
         if source == "ws":
             self.ws_ticks += 1
             self._last_ws_at[tick.symbol] = received_at
+            self._last_ws_any = received_at
             day = received_at.astimezone(IST).date().isoformat()
             if self.ws_ticks_day != day:
                 self.ws_ticks_day, self.ws_ticks_today = day, 0
@@ -1047,24 +1271,59 @@ class McxLane:
                     self.portfolio.mark(tick.symbol, tick.ltp)
             except Exception as exc:  # noqa: BLE001 - one bad print must not stop the feed
                 self._lane_error("execution", exc, tick.symbol)
+        if current:
+            # Every watched contract's minute goes to the lane's database, traded or not.
+            self._record_minute(tick)
         contract = self.contracts.get(tick.symbol)
-        if not current or contract is None or not self.settings.mcx_enabled:
+        future = self.is_future(tick.symbol)
+        if not current or not self.settings.mcx_enabled or (contract is None and not future):
             return
-        if contract.retained and tick.symbol not in self.portfolio.positions:
+        if contract is not None and contract.retained and tick.symbol not in self.portfolio.positions:
             return
         candle, closed = self.aggregator.on_tick(tick)
         if closed is not None:
             await self._on_closed_bar(closed)
         if candle is not None and tick.symbol not in self._warming:
+            if future:
+                self.futures_strategy.on_live_candle(candle)      # watched only: its signal is not used
+                return
             signal = self.strategy.on_live_candle(candle)
             if signal is not None:
                 await self._on_signal(signal)
+
+    def _record_minute(self, tick: Tick) -> None:
+        _, closed = self.minute_bars.on_tick(tick)
+        if closed is not None:
+            self._queue_minute(closed)
+
+    def _queue_minute(self, bar: Candle) -> None:
+        """A closed live minute, with the day's running volume turned into that minute's volume."""
+        day = datetime.fromtimestamp(bar.timestamp, UTC).astimezone(IST).date().isoformat()
+        previous = self._day_volume.get(bar.symbol)
+        base = previous[1] if previous is not None and previous[0] == day else None
+        total = int(bar.volume or 0)
+        self._day_volume[bar.symbol] = (day, max(total, base or 0))
+        volume = max(0, total - base) if base is not None else 0
+        self._minute_pending.append(Candle(bar.symbol, bar.timestamp, bar.open, bar.high, bar.low, bar.close, volume, True))
+
+    def _flush_minutes(self) -> int:
+        if not self._minute_pending:
+            return 0
+        pending, self._minute_pending = self._minute_pending, []
+        try:
+            return self.store.write(pending)
+        except Exception as exc:  # noqa: BLE001 - the bars are lost, the lane goes on
+            self._lane_error("bar store", exc)
+            return 0
 
     async def _on_closed_bar(self, candle: Candle) -> None:
         if candle.symbol in self._warming:
             self._warm_buffer[candle.symbol].append(candle)
             return
         self.history[candle.symbol].append(candle)
+        if self.is_future(candle.symbol):
+            self.futures_strategy.on_closed_candle(candle, warmup=True)   # indicators only, never a signal
+            return
         signal = self.strategy.on_closed_candle(candle)
         point = self.strategy.points.get(candle.symbol)
         if point is not None:
@@ -1204,6 +1463,26 @@ class McxLane:
             self._flushed_day = today.isoformat()
             for candle in self.aggregator.flush():
                 await self._on_closed_bar(candle)
+            for minute in self.minute_bars.flush():
+                self._queue_minute(minute)
+            self._flush_minutes()
+            keep_from = int((now - timedelta(days=self.settings.mcx_store_days)).timestamp())
+            await asyncio.to_thread(self.store.prune, keep_from)
+        self._flush_minutes()
+        clock_now = now.timestamp()
+        if (self.calendar.in_session(now) and self._last_ws_any is not None
+                and (now - self._last_ws_any).total_seconds() <= HEARTBEAT_SECONDS
+                and clock_now - self._last_heartbeat >= HEARTBEAT_SECONDS):
+            # The feed is alive: note any hole before this moment, then move the mark.
+            self._note_feed_gap(now)
+            self.store.heartbeat(int(clock_now))
+            self._last_heartbeat = clock_now
+        if clock_now - self._backfill_retry_at >= BACKFILL_RETRY_SECONDS and not self._warming:
+            self._backfill_retry_at = clock_now
+            self._start_backfill()
+        if clock_now - self._store_stats_at >= STORE_STATS_SECONDS:
+            self._store_stats_at = clock_now
+            self._store_stats = await asyncio.to_thread(self.store.stats)
         cutoff = self.flatten_time()
         if (cutoff is not None and self.calendar.is_trading_day(today) and (local.hour, local.minute) >= cutoff
                 and self.calendar.in_session(now)):
@@ -1234,7 +1513,7 @@ class McxLane:
         local = now.astimezone(IST)
         opened = datetime.combine(local.date(), self.calendar.opens_at(local.date()), IST)
         floor = max(opened, self._prepared_at or opened)
-        stale = [symbol for symbol in self.subscription_symbols()
+        stale = [symbol for symbol in self.core_symbols()
                  if (now - max(self._last_ws_at.get(symbol, floor), floor)).total_seconds() > limit]
         if not stale:
             return 0
@@ -1263,10 +1542,24 @@ class McxLane:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._task = None
+        if self._backfill_task is not None:
+            self._backfill_task.cancel()
+            try:
+                await self._backfill_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._backfill_task = None
         try:
             self.repository.save_position_excursions(self.portfolio.positions.values())
         except Exception:  # noqa: BLE001
             pass
+        try:
+            for minute in self.minute_bars.flush():
+                self._queue_minute(minute)
+            self._flush_minutes()
+        except Exception:  # noqa: BLE001
+            pass
+        self.store.close()
         self.repository.close()
 
     # ---------------------------------------------------------- manual orders
@@ -1365,7 +1658,32 @@ class McxLane:
                 "held_lots": position.lots if position else 0,
                 "days_to_expiry": days_to_expiry(contract.expiry),
             })
-        return rows
+        # The futures each series is priced from: watched with their own bars and MACD, never traded.
+        futures_rows = []
+        for root, symbol in self.futures_by_root.items():
+            tick = self.latest.get(symbol)
+            point = self.futures_strategy.points.get(symbol)
+            seen = self._last_ws_at.get(symbol)
+            expiry = next((row.futures_expiry for row in self.contracts.values() if row.futures_symbol == symbol), "")
+            futures_rows.append({
+                "root": root, "symbol": symbol, "option_type": "FUT", "strike": 0.0, "expiry": expiry,
+                "futures_symbol": symbol, "futures_expiry": expiry,
+                "selection_price": (self.selection.get("roots") or {}).get(root, {}).get("reference"),
+                "lot_size": self.multipliers.get(root, 0), "exchange_lot": 1, "volume": tick.volume if tick else 0,
+                "oi": 0, "retained": False,
+                "display": DISPLAY_NAMES.get(root, root),
+                "ltp": tick.ltp if tick else None, "futures_ltp": tick.ltp if tick else None,
+                "macd": point.macd if point else None, "signal_line": point.signal if point else None,
+                "histogram": point.histogram if point else None, "bar": point.timestamp if point else None,
+                "bars": len(self.history.get(symbol, ())), "warming": symbol in self._warming,
+                "ws_age_seconds": round((now - seen).total_seconds(), 1) if seen else None,
+                "evaluation": None, "held_lots": 0, "days_to_expiry": days_to_expiry(expiry) if expiry else None,
+            })
+        merged = []
+        for root in dict.fromkeys([*order, *(row["root"] for row in rows), *(row["root"] for row in futures_rows)]):
+            merged += [row for row in futures_rows if row["root"] == root]
+            merged += [row for row in rows if row["root"] == root]
+        return merged
 
     def health(self) -> dict:
         return {
@@ -1379,6 +1697,13 @@ class McxLane:
             "contracts": len(self.option_symbols()),
             "held": len(self.portfolio.positions),
             "subscribed": len(self.subscription_symbols()),
+            "futures": len(self.futures_symbols()),
+            "ladder": len(self.ladder),
+            "store": self._store_stats,
+            "history": {"downloads_allowed": self.downloads_allowed(), **self.downloads,
+                        "failed": dict(list(self.downloads["failed"].items())[:10]),
+                        "failed_count": len(self.downloads["failed"]),
+                        "backfill_running": self._backfill_task is not None and not self._backfill_task.done()},
             "warmup": self.warm_report,
             "warming": len(self._warming),
             "ws_ticks": self.ws_ticks,

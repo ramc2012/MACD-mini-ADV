@@ -69,10 +69,22 @@ calls it.
   batched request at most every 15 s. A REST quote can trigger a stop or an
   entry only if its own trade time is within the order-quote age limit;
   otherwise it only marks the position.
-- **Warm-up** downloads `mcx_warmup_days` (default 10) of one-minute history
-  per contract and folds it onto the lane's 09:00 grid. The bar forming at
-  download time is left to the live aggregator; live bars that close during
-  warm-up are buffered and replayed after the history, never traded on.
+- **Bar database** (`mcx_store.py`, `mcx_bars.sqlite3` beside the lane's book). One-minute bars of every contract
+  the lane watches. A contract is downloaded once, the first time the lane sees it (`mcx_warmup_days`, default 10),
+  and from then on its bars are the minutes recorded from live ticks. Nothing is downloaded every day.
+  - **Watched:** today's ATM options, the futures each series is priced from, every holding, and a ladder of
+    `mcx_ladder_strikes` strikes (default 5) either side of each ATM, calls and puts. The ladder is recorded so
+    that tomorrow's ATM contract already has its bars.
+  - **A second download** happens only to fill a stretch of session the lane received nothing for (the engine or
+    the socket was down for more than three minutes), and only for a contract being warmed.
+  - **The switch** `mcx_history_downloads` decides whether those downloads may pass the app's history hold. Off:
+    a new contract has only its live bars, and the warm-up report says it is waiting for the switch.
+  - Bars older than `mcx_store_days` (default 60) are dropped at the close.
+- **Warm-up** reads the database, folds the minutes onto the lane's 09:00 grid and replays them. The bar forming
+  now is left to the live aggregator; live bars that close during warm-up are buffered and replayed after the
+  history, never traded on.
+- **Futures** are watched, not traded: they get the same bars and MACD and lead their commodity's rows in the
+  contracts table. Their signals are not recorded.
 - **Feed watchdog.** Once the lane has had a websocket tick today, the
   engine's watchdog treats silence during the MCX session as a dead socket, so
   an evening disconnect is recovered. An account with no MCX data never trips

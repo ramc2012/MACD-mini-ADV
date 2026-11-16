@@ -143,7 +143,7 @@ function ContractsTab({ snapshot, problems }: { snapshot: McxSnapshot; problems:
       <div className="panel-title"><span>Today's contracts</span>
         <span>{selected.selected_at ? `selected ${stamp(selected.selected_at)}${selected.source === "saved" ? " · restored" : ""}` : "not selected yet"}</span></div>
       <div className="ledger-table-wrap"><table className="ledger-table">
-        <thead><tr>{["Commodity", "Futures", "Leg", "Strike", "Expiry", "Premium", "MACD", "Histogram", "Bars", "Lot units", "Held", "Last tick"].map((label) => <th key={label}><button tabIndex={-1}>{label}</button></th>)}</tr></thead>
+        <thead><tr>{["Commodity", "Futures", "Leg", "Strike", "Expiry", "Price", "MACD", "Histogram", "Bars", "Lot units", "Held", "Last tick"].map((label) => <th key={label}><button tabIndex={-1}>{label}</button></th>)}</tr></thead>
         <tbody>{snapshot.contracts.length === 0
           ? <tr><td className="empty" colSpan={12}>{health.enabled ? "No MCX contracts selected. The selection runs at connect and at the 08:45 rollover." : "The lane is switched off."}</td></tr>
           : [...byRoot.entries()].flatMap(([root, rows]) => rows.map((row, index) => {
@@ -151,8 +151,8 @@ function ContractsTab({ snapshot, problems }: { snapshot: McxSnapshot; problems:
             return <tr key={row.symbol} title={row.symbol}>
               <td>{index === 0 ? <b>{ROOT_LABEL[root] ?? root}</b> : ""}{index === 0 && <small className="mcx-unit">{ROOT_UNIT[root] ?? ""}</small>}</td>
               <td>{index === 0 ? <>{fixed(row.futures_ltp)}<small className="mcx-unit">{short(row.futures_symbol)}</small></> : ""}</td>
-              <td>{row.option_type}{row.retained ? " · carried" : ""}</td>
-              <td>{number.format(row.strike)}</td>
+              <td>{row.option_type === "FUT" ? "Futures" : row.option_type}{row.retained ? " · carried" : ""}</td>
+              <td>{row.option_type === "FUT" ? "—" : number.format(row.strike)}</td>
               <td>{row.expiry}{finite(row.days_to_expiry) ? ` · ${row.days_to_expiry}d` : ""}</td>
               <td>{fixed(row.ltp)}</td>
               <td className={state.tone}>{finite(row.macd) ? fixed(row.macd, 3) : ""} <small>{state.label}</small></td>
@@ -183,8 +183,11 @@ function ContractsTab({ snapshot, problems }: { snapshot: McxSnapshot; problems:
       <p className="blast-note">Stops, trail and MACD periods are the MACD lane's own settings; change them there. Lot units turn a premium into rupees: a GOLD premium is per 10 g on a 1 kg lot, so one lot is 100 units.</p>
       <div className="panel-title"><span>Warm-up and data</span><span>{health.warmup.state ?? "—"}</span></div>
       <div className="blast-kv">
-        <span>Contracts warmed</span><b>{health.warmup.loaded ?? 0} of {health.warmup.symbols ?? 0}</b>
-        <span>Subscribed</span><b>{health.subscribed} symbols</b>
+        <span>Contracts warmed</span><b>{health.warmup.loaded ?? 0} of {health.warmup.symbols ?? 0}{health.warmup.state === "done" ? ` · ${health.warmup.from_store ?? 0} from the database, ${health.warmup.downloaded ?? 0} downloaded${health.warmup.held ? `, ${health.warmup.held} waiting for the download switch` : ""}` : ""}</b>
+        <span>Subscribed</span><b>{health.subscribed} symbols{health.ladder ? ` · ${health.ladder} ladder strikes, ${health.futures ?? 0} futures` : ""}</b>
+        <span>Bar database</span><b>{health.store?.bars ? `${number.format(health.store.bars)} one-minute bars · ${health.store.contracts ?? 0} contracts · ${health.store.megabytes ?? 0} MB` : "building"}</b>
+        <span>Downloaded once</span><b>{health.store?.downloaded_once ?? 0} contracts{health.history?.backfill_running ? " · in progress" : ""}{health.history?.failed_count ? ` · ${health.history.failed_count} failed` : ""}</b>
+        <span>New downloads</span><b>{health.history?.downloads_allowed ? "allowed for contracts not yet in the database" : "off · live bars only"}</b>
         <span>REST fallback</span><b>{health.rest_fallback.seconds ? `after ${health.rest_fallback.seconds}s silence · ${health.rest_fallback.polls} polls` : "off"}</b>
       </div>
       {problems.length > 0 && <div className="settings-error mcx-problems" role="status">{problems.map((text) => <div key={text}>{text}</div>)}</div>}
@@ -326,8 +329,8 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: McxSnapshot; onSaved: (n
       <p className="field-help">Off unsubscribes today's contracts. Open positions keep their stops, trail and expiry exit.</p>
       <label className="toggle"><input type="checkbox" checked={form.auto_trade} onChange={(event) => setField("auto_trade", event.target.checked)} />Buy premium zero-crosses (paper)</label>
       <p className="field-help">Off records every signal with its verdict and buys nothing. This lane never places a live order.</p>
-      <label className="toggle"><input type="checkbox" checked={form.history_downloads} onChange={(event) => setField("history_downloads", event.target.checked)} />Download MCX history for the warm-up</label>
-      <p className="field-help">While the app's history-download hold is on, this lets the lane fetch 1-minute bars for its own contracts at each warm-up (every morning and after a restart). Off: the lane starts with no bars and needs about a session of live bars before it can signal.</p>
+      <label className="toggle"><input type="checkbox" checked={form.history_downloads} onChange={(event) => setField("history_downloads", event.target.checked)} />Download history for contracts not yet in the database</label>
+      <p className="field-help">The lane keeps its own one-minute bar database. A contract is downloaded once, the first time the lane watches it, and kept up from live ticks after that; a stretch the feed was down is filled the same way. Off: nothing is downloaded while the app's history hold is on, and a new contract has only its live bars.</p>
     </div>
 
     <div className="settings-section">

@@ -356,10 +356,18 @@ class Settings(BaseSettings):
     # for this many seconds during the MCX session. 0 disables.
     mcx_rest_fallback_seconds: float = Field(default=60.0, ge=0, le=3600)
     mcx_warmup_days: int = Field(default=10, ge=2, le=60)
-    # The lane keeps no bar store of its own, so its warm-up is a broker download. While
-    # MACD_HISTORY_DOWNLOADS_ENABLED=false holds every history request, this lets MCX symbols alone through
-    # (straight to Fyers, a few requests per warm-up). Off: the lane starts cold and builds its MACD from live bars.
+    # The lane keeps its own one-minute bar database (mcx_store.py): a contract is downloaded once, the first
+    # time the lane watches it, and kept up from live ticks after that; the warm-up reads the database. While
+    # MACD_HISTORY_DOWNLOADS_ENABLED=false holds every history request, this switch lets MCX symbols alone
+    # through (straight to Fyers) for that one download and for filling a stretch the feed was down. Off: a
+    # contract has only the bars recorded live.
     mcx_history_downloads: bool = False
+    # Strikes either side of the ATM strike that are streamed and recorded for each commodity, calls and puts,
+    # so that tomorrow's ATM contract already has its bars. 0 records only the selected contracts.
+    mcx_ladder_strikes: int = Field(default=5, ge=0, le=30)
+    # One-minute bars older than this many days are dropped from the lane's database.
+    mcx_store_days: int = Field(default=60, ge=10, le=400)
+    mcx_bar_store_path: str = str(RUNTIME_DIR / "mcx_bars.sqlite3")
     # "ROOT:UNITS" overrides of the units one lot carries (GOLD:100 ...).
     mcx_lot_multipliers_csv: str = ""
     # MCX holidays beyond the built-in 2026 list: full closures, and days on
@@ -494,6 +502,6 @@ ENVIRONMENT_ONLY = frozenset({
     "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
     "research_report_path", "contract_snapshot_path", "mp_database_path",
     "blast_database_path", "tick_database_path", "api_token", "allowed_origins_csv",
-    "mcx_database_path", "mcx_contract_snapshot_path",
+    "mcx_database_path", "mcx_contract_snapshot_path", "mcx_bar_store_path",
     "engine_role", "nats_url", "strategy_url", "desk_url", "market_hub_url",
 })
