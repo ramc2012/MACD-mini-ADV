@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { asOf, bandPath, compact, extent, linePath, linear, nearestIndex, sessionDomain, sessionTicks, ticks } from "../src/optionsDeskMath.ts";
+import { asOf, bandPath, compact, extent, linePath, linear, nearestIndex, observedAt, sessionDomain, sessionTicks, strikeWindow, ticks } from "../src/optionsDeskMath.ts";
 
 test("scales, extents and round ticks", () => {
   const x = linear([0, 10], [100, 200]);
@@ -39,4 +39,19 @@ test("compact numbers and paths", () => {
   assert.equal(compact(null), "—");
   assert.equal(linePath([[0, 1], [1, null], [2, 3], [3, 4]]), "M0.0,1.0M2.0,3.0L3.0,4.0");
   assert.equal(bandPath([[0, 1, 5], [2, 2, 6]]), "M0.0,1.0L2.0,2.0L2.0,6.0L0.0,5.0Z");
+});
+
+test("a pinned value does not read future snapshots", () => {
+  const points = [{ ts: 10, value: 7 }, { ts: 22, value: 8 }];
+  assert.equal(observedAt(points, 9), undefined);
+  assert.equal(observedAt(points, 21)?.value, 7);
+  assert.equal(observedAt(points, 22)?.value, 8);
+  assert.equal(observedAt([], 22), undefined);
+});
+
+test("the ATM window counts actual captured strikes even when spacing is uneven", () => {
+  const rows = [100, 115, 120, 150, 160].map(strike => ({ strike }));
+  assert.deepEqual(strikeWindow(rows, 120, 1).map(row => row.strike), [115, 120, 150]);
+  assert.deepEqual(strikeWindow(rows, 100, 2).map(row => row.strike), [100, 115, 120]);
+  assert.equal(strikeWindow(rows, 120, 0), rows);
 });

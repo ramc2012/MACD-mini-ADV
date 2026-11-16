@@ -90,3 +90,16 @@ export function bandPath(points: [number, number, number][]): string {
   const bottom = [...points].reverse().map(([x, , l]) => `${x.toFixed(1)},${l.toFixed(1)}`);
   return `M${top.join("L")}L${bottom.join("L")}Z`;
 }
+
+/** Select by listed strikes around ATM, including chains with gaps or irregular spacing. */
+export function strikeWindow<T extends { strike: number }>(rows: T[], atm: number | undefined, radius: number): T[] {
+  if (!radius || atm === undefined || !rows.length) return rows;
+  const center = rows.reduce((best, row, index) =>
+    Math.abs(row.strike - atm) < Math.abs(rows[best].strike - atm) ? index : best, 0);
+  return rows.slice(Math.max(0, center - radius), center + radius + 1);
+}
+
+/** An observation at or before the cursor, without reading a future observation before capture began. */
+export function observedAt<T extends { ts: number }>(rows: T[], at: number): T | undefined {
+  return rows.length && at >= rows[0].ts ? asOf(rows, at) : undefined;
+}

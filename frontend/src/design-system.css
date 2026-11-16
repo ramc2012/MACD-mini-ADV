@@ -198,3 +198,19 @@ main .nomad-port {
   .od-zones { grid-template-columns: 1fr; }
   .od-panel { padding: 8px; }
 }
+
+/* Options & flow */
+.od-tabs { flex-wrap: wrap; margin-bottom: 0; }
+.od-brief { grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); }
+.od-panel-controls, .od-flow-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.od-panel-controls .radar-filter, .od-flow-controls .radar-filter { margin: 0; }
+.od-flow-controls, .od-strike-detail { grid-column: 1 / -1; min-width: 0; }
+.od-flow-note { color: var(--text-3); font-size: var(--fs-xs); }
+.od-inline { display: inline-flex; align-items: center; gap: 7px; color: var(--text-3); font-size: var(--fs-xs); }
+.od-strike-quotes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 6px; }
+.od-strike-quotes > div { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 6px 8px; background: var(--bg-raised); border-radius: var(--radius-sm); color: var(--text-3); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.od-strike-quotes b { color: var(--text-1); font-weight: 600; }
+.od-strike-link { background: none; border: 0; color: inherit; font: inherit; cursor: pointer; padding: 4px 8px; }
+.od-table tbody th.od-strike { position: static; padding: 0; }
+.od-table tr[data-selected="true"] :is(th, td) { background: var(--bg-accent-soft); }
+.od-strike-link:is(:hover, :focus-visible) { color: var(--accent-text); text-decoration: underline; }

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { requestJson } from "./requestJson";
 import { API_TOKEN, API_URL } from "./runtime";
-import { asOf, bandPath, compact, extent, linePath, linear, nearestIndex, sessionDomain, sessionTicks, ticks, type Domain } from "./optionsDeskMath";
+import { bandPath, compact, extent, linePath, linear, nearestIndex, observedAt, sessionDomain, sessionTicks, strikeWindow, ticks, type Domain } from "./optionsDeskMath";
 
 // Auction desk -> Options & flow. Eight tools from data the app already stores (no downloads, no second socket):
 // NTM IV vs VIX, spot with the expected-move band and volume zones, gamma exposure by strike and through the day,
@@ -12,6 +12,13 @@ type VolxPoint = { ts: number; spot: number; vix: number | null; ntm_iv: number 
 type Leg = { ltp: number | null; bid: number | null; ask: number | null; volume: number | null; oi: number | null; oi_change: number | null;
   oi_change_today: number | null; iv: number | null; delta: number | null; gamma: number | null; theta: number | null; vega: number | null };
 type TableRow = { strike: number; CE?: Leg; PE?: Leg };
+type StrikePoint = { t: number; ce: number; pe: number; straddle: number; ce_oi: number | null; pe_oi: number | null; vwap_day: number | null };
+type StrikeSeries = { points: StrikePoint[]; day?: string; expiry?: string; note?: string };
+type Side = "CE" | "PE";
+const VIEWS = [["position", "Positioning"], ["chain", "Options chain"], ["iv", "Volatility"], ["flow", "Futures flow"], ["models", "Models"]] as const;
+type View = typeof VIEWS[number][0];
+const METRICS = [["oi", "Open interest"], ["oi_change_today", "OI change since open"], ["volume", "Volume"]] as const;
+type Metric = typeof METRICS[number][0];
 type WriterLeg = { net_added: number; avg_premium: number | null; premium: number; pnl: number };
 type Chain = {
   underlying: string; expiries: string[]; expiry?: string; day?: string; days?: string[]; note?: string;
@@ -93,8 +100,7 @@ type ChartProps = {
 
 const valueAt = (points: [number, number | null][], x: number) => {
   if (!points.length) return null;
-  const i = nearestIndex(points.map(([ts]) => ({ ts })), x);
-  return points[i]?.[1] ?? null;
+  return observedAt(points.map(([ts, value]) => ({ ts, value })), x)?.value ?? null;
 };
 
 function XYChart({ label, height = 190, xDomain, xTicks, xFmt, yFmt, lines = [], band, hlines = [], yDomain, zeroLine, hover, onHover, onPick, pinned, children }: ChartProps) {
@@ -154,6 +160,10 @@ function Empty({ text }: { text: string }) {
 export function OptionsDeskPage() {
   const saved = useMemo(recall, []);
   const [instruments, setInstruments] = useState<Instrument[]>([]);
+  const [view, setView] = useState<View>(VIEWS.find(([key]) => key === saved.view)?.[0] ?? "position");
+  const [metric, setMetric] = useState<Metric>("oi");
+  const [radius, setRadius] = useState(5);
+  const [selectedStrike, setSelectedStrike] = useState<number | null>(null);
   const [underlying, setUnderlying] = useState(saved.underlying || "NIFTY");
   const [expiry, setExpiry] = useState("");
   const [day, setDay] = useState("");
@@ -165,6 +175,7 @@ export function OptionsDeskPage() {
   const [error, setError] = useState("");
   const [flowError, setFlowError] = useState("");
   const [hover, setHover] = useState<number | null>(null);
+  const [futuresHover, setFuturesHover] = useState<number | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -172,7 +183,7 @@ export function OptionsDeskPage() {
       .then((r) => setInstruments(r.instruments)).catch(() => undefined);
     return () => controller.abort();
   }, []);
-  useEffect(() => remember({ underlying, tf: String(tf) }), [underlying, tf]);
+  useEffect(() => remember({ underlying, tf: String(tf), view }), [underlying, tf, view]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -183,7 +194,7 @@ export function OptionsDeskPage() {
     const load = (quiet = false) => {
       if (!quiet) { setLoading(true); setError(""); }
       requestJson<Chain>(`${API_URL}/api/auction/options/${encodeURIComponent(underlying)}?${query}`, { headers, signal: controller.signal })
-        .then((r) => { setChain(r); setError(""); })
+        .then((r) => { if (!controller.signal.aborted) { setChain(r); setError(""); } })
         .catch((reason) => { if (reason.name !== "AbortError") setError(reason instanceof Error ? reason.message : "Options request failed"); })
         .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     };
@@ -193,82 +204,261 @@ export function OptionsDeskPage() {
     return () => { controller.abort(); if (timer) clearInterval(timer); };
   }, [underlying, expiry, day, at]);
 
-  const flowDay = day || chain?.day || "";
+  const flowDay = chain?.day || "";
   useEffect(() => {
-    if (!flowDay) return;
+    setFlow(undefined); setFlowError("");
+    if (!flowDay || view !== "flow") return;
     const controller = new AbortController();
     const load = () => requestJson<Flow>(`${API_URL}/api/auction/futures-flow/${encodeURIComponent(underlying)}?day=${flowDay}&tf=${tf}`, { headers, signal: controller.signal })
-      .then((r) => { setFlow(r); setFlowError(""); })
-      .catch((reason) => { if (reason.name !== "AbortError") setFlowError(reason instanceof Error ? reason.message : "Futures flow request failed"); });
-    load();
+      .then((r) => { if (!controller.signal.aborted) { setFlow(r); setFlowError(""); } })
+      .catch((reason) => { if (!controller.signal.aborted) setFlowError(reason instanceof Error ? reason.message : "Futures flow request failed"); });
+    void load();
     const timer = day ? undefined : window.setInterval(load, 60_000);
     return () => { controller.abort(); if (timer) clearInterval(timer); };
-  }, [underlying, flowDay, tf, day]);
+  }, [underlying, flowDay, tf, day, view]);
 
-  const pickUnderlying = (value: string) => { setUnderlying(value); setExpiry(""); setDay(""); setAt(null); setChain(undefined); setFlow(undefined); };
-  const domain = useMemo(() => sessionDomain(chain?.day || flowDay || new Date().toISOString().slice(0, 10)), [chain?.day, flowDay]);
+  const resetMoment = () => { setAt(null); setHover(null); setSelectedStrike(null); setChain(undefined); setFlow(undefined); };
+  const pickUnderlying = (value: string) => { setUnderlying(value); setExpiry(""); setDay(""); resetMoment(); };
+  const domain = useMemo<Domain>(() => {
+    const [start, end] = sessionDomain(chain?.day ?? new Date().toISOString().slice(0, 10));
+    return [start, Math.max(end, chain?.last_ts ?? end)];
+  }, [chain?.day, chain?.last_ts]);
   const xTicks = useMemo(() => sessionTicks(domain), [domain]);
-  const shared = { xDomain: domain, xTicks, xFmt: hhmm, hover, onHover: setHover, onPick: (x: number) => setAt(x), pinned: at };
+  const moments = chain?.volx ?? [];
+  const pinMoment = (x: number) => {
+    const point = observedAt(moments, Math.floor(x)) ?? moments[0];
+    if (point) setAt(point.ts);
+  };
+  const shownPin = chain?.as_of != null && (chain.as_of === at || chain.as_of !== chain.last_ts) ? chain.as_of : null;
+  const shared: Shared = { xDomain: domain, xTicks, xFmt: hhmm, hover, onHover: setHover,
+    onPick: moments.length ? pinMoment : undefined, pinned: shownPin };
+  const fallbackFlow = !!flow?.day && flow.day !== flowDay;
+  const futuresDomain = fallbackFlow && flow ? sessionDomain(flow.day) : domain;
+  const futuresShared: Shared = fallbackFlow ? { xDomain: futuresDomain, xTicks: sessionTicks(futuresDomain),
+    xFmt: hhmm, hover: futuresHover, onHover: setFuturesHover, pinned: null } : shared;
   const indices = instruments.filter((r) => r.kind === "index"), stocks = instruments.filter((r) => r.kind === "stock");
-  const iv = chain?.volx?.length ? asOf(chain.volx, chain.as_of ?? Infinity) : undefined;
-  const ivr = chain?.iv_range;
-  const g = chain?.gamma;
-  const flowNow = chain?.spectrum?.points.length ? asOf(chain.spectrum.points, chain.as_of ?? Infinity) : undefined;
-  const writersNow = chain?.writers?.timeline.length ? asOf(chain.writers.timeline, chain.as_of ?? Infinity) : undefined;
+  const rows = chain?.table ?? [];
+  const visible = strikeWindow(rows, chain?.atm, radius);
+  const focused = rows.find(row => row.strike === selectedStrike) ?? rows.find(row => row.strike === chain?.atm);
+  const atm = rows.find(row => row.strike === chain?.atm);
+  const topOi = (side: Side) => rows.reduce<TableRow | undefined>((best, row) =>
+    (row[side]?.oi ?? 0) > (best?.[side]?.oi ?? 0) ? row : best, undefined);
+  const topCall = topOi("CE"), topPut = topOi("PE");
+  const sumOI = (side: Side) => {
+    const values = rows.flatMap(row => row[side]?.oi == null ? [] : [row[side].oi]);
+    return values.length ? values.reduce((total, value) => total + value, 0) : null;
+  };
+  const callOI = sumOI("CE"), putOI = sumOI("PE");
+  const atmPair = atm?.CE?.ltp != null && atm.PE?.ltp != null ? atm.CE.ltp + atm.PE.ltp : null;
+  const pickStrike = (strike: number) => setSelectedStrike(strike);
+  const strikeChoices = <label className="od-inline">Strike
+    <select className="rrg-select" aria-label="Selected strike" value={focused?.strike ?? ""} onChange={event => pickStrike(Number(event.target.value))}>
+      {!rows.length && <option value="">—</option>}
+      {rows.map(row => <option value={row.strike} key={row.strike}>{num(row.strike, 0)}{row.strike === chain?.atm ? " · ATM" : ""}</option>)}
+    </select>
+  </label>;
+  const widthChoices = <div className="radar-filter" role="group" aria-label="Strike range">
+    {[5, 10, 0].map(n => <button key={n} aria-pressed={radius === n} className={radius === n ? "active" : ""}
+      onClick={() => setRadius(n)}>{n ? `ATM ±${n}` : "All strikes"}</button>)}
+  </div>;
 
   return <section className="ledger-page options-desk">
     <div className="page-heading">
-      <div><h1>Options &amp; flow</h1><p>NTM IV vs VIX · gamma · expected move · call/put volume · writers' P&amp;L · IV range · MFLOW · smart candles · option table — from stored chains and futures flow, no downloads</p></div>
+      <div><h1>Options &amp; flow</h1></div>
       <div className="straddle-controls">
         <select className="rrg-select" value={underlying} onChange={(e) => pickUnderlying(e.target.value)} aria-label="Instrument">
           {!instruments.length && <option value={underlying}>{underlying}</option>}
           {!!indices.length && <optgroup label="Indices">{indices.map((r) => <option key={r.underlying} value={r.underlying}>{r.underlying}</option>)}</optgroup>}
           {!!stocks.length && <optgroup label="F&O stocks">{stocks.map((r) => <option key={r.underlying} value={r.underlying}>{r.underlying}</option>)}</optgroup>}
         </select>
-        <select className="rrg-select" value={expiry} onChange={(e) => { setExpiry(e.target.value); setDay(""); setAt(null); }} aria-label="Expiry">
+        <select className="rrg-select" value={expiry} onChange={(e) => { setExpiry(e.target.value); setDay(""); resetMoment(); }} aria-label="Expiry">
           <option value="">Front expiry{chain?.expiry && !expiry ? ` · ${chain.expiry}` : ""}</option>
           {(chain?.expiries ?? []).map((x) => <option key={x} value={x}>{x}</option>)}
         </select>
-        <select className="rrg-select" value={day} onChange={(e) => { setDay(e.target.value); setAt(null); }} aria-label="Session">
+        <select className="rrg-select" value={day} onChange={(e) => { setDay(e.target.value); resetMoment(); }} aria-label="Session">
           <option value="">Latest session{chain?.day && !day ? ` · ${chain.day}` : ""}</option>
           {[...(chain?.days ?? [])].reverse().map((d) => <option key={d} value={d}>{d}</option>)}
         </select>
-        <span className="radar-filter" role="group" aria-label="Candle and MFLOW bucket">{TFS.map(([value, text]) => <button key={value} aria-pressed={tf === value} className={tf === value ? "active" : ""} onClick={() => setTf(value)}>{text}</button>)}</span>
+
       </div>
     </div>
 
-    <div className="od-moment" role="status">
-      {chain?.as_of ? <>Moment <b>{full(chain.as_of)}</b>{at ? <> · pinned <button className="od-link" onClick={() => setAt(null)}>back to latest</button></> : <> · latest snapshot · click any session chart to pin a moment</>}</> : null}
-      {loading && <span className="state-loading">Reading stored option chains…</span>}
+    <div className="od-moment">
+      <label className="od-inline">Snapshot
+        <select className="rrg-select" aria-label="Chain snapshot" value={at === null ? "" : String(observedAt(moments, at)?.ts ?? "")}
+          onChange={event => { setAt(event.target.value ? Number(event.target.value) : null); setHover(null); }}>
+          <option value="">Latest{chain?.last_ts ? ` · ${hhmm(chain.last_ts)} IST` : ""}</option>
+          {moments.map(point => <option key={point.ts} value={point.ts}>{hhmm(point.ts)} IST</option>)}
+        </select>
+      </label>
+      {chain?.as_of && <span>Showing <b>{full(chain.as_of)}</b>{shownPin !== null ? " · pinned" : ""}</span>}
+      {loading && <span role="status" className="state-loading">{at === null ? "Reading latest chain…" : `Reading ${hhmm(at)} IST snapshot…`}</span>}
       {error && <span className="negative" role="alert">{error}</span>}
+      {day && chain?.day && day !== chain.day && <span className="muted">Showing stored session {chain.day}</span>}
       {chain?.note && <span className="muted">{chain.note}</span>}
     </div>
 
-    <div className="straddle-tiles">
-      <div><span>Spot · futures</span><b>{num(chain?.spot)}</b><small>{chain?.futures ? `fut ${num(chain.futures)} · basis ${signed(chain.futures - (chain.spot ?? 0))}` : "—"}</small></div>
-      <div><span>NTM IV vs VIX</span><b>{pct(iv?.ntm_iv)}</b><small>VIX {num(iv?.vix)} · spread {iv?.ntm_iv != null && iv?.vix != null ? signed(iv.ntm_iv - iv.vix) : "—"} pts</small></div>
-      <div><span>IV percentile</span><b>{ivr?.percentile != null ? ordinal(ivr.percentile) : "—"}</b><small>{ivr?.sessions ? `${ivr.sessions} sessions · range ${pct(ivr.low, 1)}–${pct(ivr.high, 1)}` : "—"}</small></div>
-      <div><span>Expected move · 1 day</span><b>{chain?.expected_move?.moves["1 day"] ? `±${num(chain.expected_move.moves["1 day"].points, 0)}` : "—"}</b><small>{chain?.expected_move?.moves["to expiry"] ? `to expiry ±${num(chain.expected_move.moves["to expiry"].points, 0)} (${num(chain.days_to_expiry, 1)} d)` : "—"}</small></div>
-      <div><span>Net GEX · 1% move</span><b className={g ? (g.net >= 0 ? "positive" : "negative") : ""}>{g ? rupees(g.net) : "—"}</b><small>{g?.zero_gamma ? `zero gamma ${num(g.zero_gamma, 0)} · walls ${g.put_wall ?? "—"} / ${g.call_wall ?? "—"}` : "zero gamma —"}</small></div>
-      <div><span>PCR · volume</span><b>{flowNow?.ce ? (flowNow.pe / flowNow.ce).toFixed(2) : "—"}</b><small>CE {compact(flowNow?.ce)} · PE {compact(flowNow?.pe)}</small></div>
-      <div><span>Writers' P&amp;L (added OI)</span><b>{writersNow ? rupees(writersNow.ce + writersNow.pe) : "—"}</b><small>CE {rupees(writersNow?.ce)} · PE {rupees(writersNow?.pe)}</small></div>
+    <div className="straddle-tiles od-brief">
+      <div><span>Spot · futures</span><b>{num(chain?.spot)}</b><small>{chain?.futures != null && chain.spot != null ? `Futures ${num(chain.futures)} · basis ${signed(chain.futures - chain.spot)}` : "—"}</small></div>
+      <div><span>ATM straddle</span><b>{num(atmPair)}</b><small>{atm ? `${num(atm.strike, 0)} · CE ${num(atm.CE?.ltp)} · PE ${num(atm.PE?.ltp)}` : "—"}</small></div>
+      <div><span>Put/call OI ratio</span><b>{callOI && putOI != null ? num(putOI / callOI) : "—"}</b><small>CE {compact(callOI)} · PE {compact(putOI)} · captured strikes</small></div>
+      <div><span>Highest open interest</span><b>CE {num(topCall?.strike, 0)} · PE {num(topPut?.strike, 0)}</b><small>{compact(topCall?.CE?.oi)} / {compact(topPut?.PE?.oi)} shares</small></div>
     </div>
 
-    <div className="od-grid">
-      <VolxPanel chain={chain} shared={shared} />
-      <MovePanel chain={chain} shared={shared} />
-      <GammaPanel chain={chain} shared={shared} />
-      <SpectrumPanel chain={chain} shared={shared} />
-      <WritersPanel chain={chain} shared={shared} />
-      <IvRangePanel chain={chain} />
-      <MflowPanel flow={flow} error={flowError} shared={shared} />
-      <CandlePanel flow={flow} error={flowError} shared={shared} />
-      <OptionTable chain={chain} />
+    <div className="auction-tabs od-tabs" role="tablist" aria-label="Options and flow views">
+      {VIEWS.map(([key, label]) => <button role="tab" key={key} aria-selected={view === key} className={view === key ? "active" : ""}
+        onClick={() => { setView(key); setHover(null); setFuturesHover(null); }}>{label}</button>)}
+    </div>
+    <div className="od-grid" role="tabpanel" aria-label={VIEWS.find(([key]) => key === view)?.[1]}>
+      {view === "position" && <>
+        <PositioningPanel rows={visible} atm={chain?.atm} spot={chain?.spot} metric={metric} onMetric={setMetric}
+          onStrike={pickStrike} strike={focused?.strike} controls={widthChoices} />
+        <MovePanel chain={chain} shared={shared} />
+      </>}
+      {view === "chain" && <OptionTable chain={chain} rows={visible} selected={focused?.strike} onSelect={pickStrike} controls={widthChoices} />}
+      {(view === "position" || view === "chain") && <StrikeDetail chain={chain} row={focused} shared={shared}
+        controls={strikeChoices} refresh={!day && at === null} />}
+      {view === "iv" && <><VolxPanel chain={chain} shared={shared} /><IvRangePanel chain={chain} /></>}
+      {view === "flow" && <>
+        <div className="od-flow-controls">
+          <div className="radar-filter" role="group" aria-label="Futures bar size">{TFS.map(([value, text]) => <button key={value} aria-pressed={tf === value} className={tf === value ? "active" : ""} onClick={() => setTf(value)}>{text}</button>)}</div>
+          {fallbackFlow && flow && <span className="od-flow-note">Futures charts use {flow.day}. Options session {flowDay} has no stored futures flow.</span>}
+        </div>
+        <CandlePanel flow={flow} error={flowError} shared={futuresShared} />
+        <MflowPanel flow={flow} error={flowError} shared={futuresShared} />
+        <SpectrumPanel chain={chain} shared={shared} />
+      </>}
+      {view === "models" && <><GammaPanel chain={chain} shared={shared} /><WritersPanel chain={chain} shared={shared} /></>}
     </div>
   </section>;
 }
 
-type Shared = { xDomain: Domain; xTicks: number[]; xFmt: (x: number) => string; hover: number | null; onHover: (x: number | null) => void; onPick: (x: number) => void; pinned: number | null };
+type Shared = { xDomain: Domain; xTicks: number[]; xFmt: (x: number) => string; hover: number | null; onHover: (x: number | null) => void; onPick?: (x: number) => void; pinned: number | null };
+
+function PositioningPanel({ rows, atm, spot, metric, onMetric, strike, onStrike, controls }: {
+  rows: TableRow[]; atm?: number; spot?: number; strike?: number; metric: Metric; onMetric: (value: Metric) => void;
+  onStrike: (strike: number) => void; controls: ReactNode;
+}) {
+  const [hover, setHover] = useState<number | null>(null);
+  const hovered = hover == null ? undefined : rows[nearestIndex(rows.map(row => ({ ts: row.strike })), hover)];
+  const active = hovered ?? rows.find(row => row.strike === strike);
+  const label = METRICS.find(([key]) => key === metric)?.[1] ?? "Open interest";
+  const values = rows.flatMap(row => [row.CE?.[metric], row.PE?.[metric]]);
+  const hasValues = values.some(value => value != null);
+  const step = Math.min(...rows.slice(1).map((row, i) => row.strike - rows[i].strike).filter(gap => gap > 0));
+  const gap = Number.isFinite(step) ? step : Math.max(1, (rows[0]?.strike ?? 0) * 0.01);
+  const domain: Domain = [(rows[0]?.strike ?? 0) - gap, (rows.at(-1)?.strike ?? 0) + gap];
+  const every = Math.max(1, Math.ceil(rows.length / 10));
+  return <Panel title="Activity by strike" sub={atm === undefined ? undefined : `ATM ${num(atm, 0)} · shares`}
+    foot={metric === "oi_change_today" ? "Change from the first stored snapshot of this session." : undefined}>
+    <div className="od-panel-controls">{controls}
+      <div className="radar-filter" role="group" aria-label="Strike activity metric">
+        {METRICS.map(([key, text]) => <button key={key} aria-pressed={metric === key} className={metric === key ? "active" : ""}
+          onClick={() => onMetric(key)}>{text}</button>)}
+      </div>
+    </div>
+    <div className="od-legend">
+      {active && <span>Strike <b>{num(active.strike, 0)}</b>{active.strike === atm ? " · ATM" : ""}</span>}
+      <span><i style={{ borderColor: C.ce }} />Calls <b>{compact(active?.CE?.[metric], metric === "oi_change_today")}</b></span>
+      <span><i style={{ borderColor: C.pe }} />Puts <b>{compact(active?.PE?.[metric], metric === "oi_change_today")}</b></span>
+    </div>
+    {hasValues ? <XYChart label={`${label} by strike`} height={240} xDomain={domain}
+      xTicks={rows.filter((_, i) => i % every === 0).map(row => row.strike)}
+      xFmt={x => num(x, 0)} yFmt={value => compact(value)} yDomain={extent(values, 0.08, 0)} zeroLine
+      hover={hovered?.strike} onHover={setHover} pinned={strike}
+      onPick={x => {
+        const near = rows[nearestIndex(rows.map(row => ({ ts: row.strike })), x)];
+        if (near) onStrike(near.strike);
+      }}>
+      {({ sx, sy, top, bottom }) => {
+        const span = sx(gap) - sx(0);
+        const width = Math.max(1, span * 0.32);
+        return <>
+          {spot != null && <line x1={sx(spot)} x2={sx(spot)} y1={top} y2={bottom}
+            style={{ stroke: C.spot, strokeDasharray: "4 3", opacity: 0.6 }}><title>Spot {num(spot)}</title></line>}
+          {rows.map(row => <g key={row.strike}>
+            {(["CE", "PE"] as const).map((side, i) => {
+              const value = row[side]?.[metric];
+              if (value == null) return null;
+              return <rect key={side} x={sx(row.strike) + (i === 0 ? -width - 1 : 1)}
+                y={Math.min(sy(0), sy(value))} width={width} height={Math.max(1, Math.abs(sy(0) - sy(value)))}
+                style={{ fill: side === "CE" ? C.ce : C.pe, opacity: active?.strike === row.strike ? 1 : 0.75 }}>
+                <title>{row.strike} {side} · {label} {compact(value, metric === "oi_change_today")}</title>
+              </rect>;
+            })}
+          </g>)}
+        </>;
+      }}
+    </XYChart> : <Empty text="No recorded values for this metric." />}
+  </Panel>;
+}
+
+function StrikeDetail({ chain, row, shared, controls, refresh }: {
+  chain?: Chain; row?: TableRow; shared: Shared; controls: ReactNode; refresh: boolean;
+}) {
+  const [series, setSeries] = useState<{ key: string; data: StrikeSeries }>();
+  const [error, setError] = useState("");
+  const [view, setView] = useState<"premium" | "oi">("premium");
+  const { underlying, expiry, day } = chain ?? {};
+  const strike = row?.strike;
+  const key = JSON.stringify([underlying, expiry, day, strike]);
+  useEffect(() => {
+    if (underlying == null || expiry == null || day == null || strike == null) return;
+    const controller = new AbortController();
+    const query = new URLSearchParams({ expiry, day, strike: String(strike), span: "day" });
+    setError("");
+    const load = () => requestJson<StrikeSeries>(`${API_URL}/api/auction/straddle/series/${encodeURIComponent(underlying)}?${query}`,
+      { headers, signal: controller.signal }).then(data => {
+      if (!controller.signal.aborted) { setSeries({ key, data }); setError(""); }
+    }).catch(reason => {
+      if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "Strike history unavailable");
+    });
+    void load();
+    const timer = refresh ? window.setInterval(load, 60_000) : undefined;
+    return () => { controller.abort(); if (timer) window.clearInterval(timer); };
+  }, [underlying, expiry, day, strike, key, refresh]);
+
+  const result = series?.key === key ? series.data : undefined;
+  const data = result?.day === day && result?.expiry === expiry ? result : undefined;
+  const points = (data?.points || []).filter(point => point.t >= shared.xDomain[0] && point.t <= shared.xDomain[1]);
+  const lines: Line[] = view === "premium" ? [
+    { key: "ce", label: "Call premium", color: C.ce, points: points.map(p => [p.t, p.ce]) },
+    { key: "pe", label: "Put premium", color: C.pe, points: points.map(p => [p.t, p.pe]) },
+    { key: "pair", label: "Straddle", color: C.iv, points: points.map(p => [p.t, p.straddle]) },
+    { key: "vwap", label: "Straddle VWAP", color: C.vix, dash: "5 3", points: points.map(p => [p.t, p.vwap_day]) },
+  ] : [
+    { key: "ce", label: "Call OI", color: C.ce, points: points.map(p => [p.t, p.ce_oi]), fmt: value => compact(value) },
+    { key: "pe", label: "Put OI", color: C.pe, points: points.map(p => [p.t, p.pe_oi]), fmt: value => compact(value) },
+  ];
+  const cursor = shared.hover ?? shared.pinned ?? chain?.as_of;
+  const populated = lines.some(line => line.points.some(([, value]) => value != null));
+  return <div className="od-strike-detail" id="od-strike-detail">
+    <Panel title={strike === undefined ? "Strike detail" : `${num(strike, 0)} strike`}
+      sub={expiry && day ? `${underlying} · expiry ${expiry} · ${day}` : undefined}
+      foot={view === "premium" ? "Straddle VWAP uses paired chain snapshots weighted by captured volume changes." : undefined}>
+      <div className="od-panel-controls">{controls}
+        <div className="radar-filter" role="group" aria-label="Strike history metric">
+          <button aria-pressed={view === "premium"} className={view === "premium" ? "active" : ""} onClick={() => setView("premium")}>Premium and VWAP</button>
+          <button aria-pressed={view === "oi"} className={view === "oi" ? "active" : ""} onClick={() => setView("oi")}>Open interest</button>
+        </div>
+      </div>
+      {row && <div className="od-strike-quotes">
+        {(["CE", "PE"] as const).map(side => <div key={side}>
+          <b style={{ color: side === "CE" ? C.ce : C.pe }}>{side}</b>
+          <span>LTP <b>{num(row[side]?.ltp)}</b></span>
+          <span>Bid / ask <b>{num(row[side]?.bid)} / {num(row[side]?.ask)}</b></span>
+          <span>OI <b>{compact(row[side]?.oi)}</b></span>
+          <span>Δ OI since open <b>{compact(row[side]?.oi_change_today, true)}</b></span>
+          <span>IV <b>{pct(row[side]?.iv, 1)}</b></span>
+        </div>)}
+      </div>}
+      <Legend lines={lines} at={cursor} />
+      {populated ? <XYChart label={view === "premium" ? "Fixed-strike premiums and straddle VWAP" : "Fixed-strike call and put OI"}
+        lines={lines} yFmt={view === "premium" ? x => num(x, 0) : x => compact(x)} height={250} {...shared} />
+        : <Empty text={error || (!row ? "Select a strike." : result ? "No paired observations for this strike and session." : "Reading strike history…")} />}
+    </Panel>
+  </div>;
+}
 
 // ------------------------------------------------------------------------------------------------ 3 NTM VolX
 
@@ -280,8 +470,8 @@ function VolxPanel({ chain, shared }: { chain?: Chain; shared: Shared }) {
     { key: "pe", label: "PE IV", color: C.pe, width: 1.25, points: v.map((p) => [p.ts, p.pe_iv]), fmt: (x) => pct(x) },
     { key: "vix", label: "India VIX", color: C.vix, dash: "6 4", points: v.map((p) => [p.ts, p.vix]), fmt: (x) => num(x) },
   ];
-  return <Panel title="NTM VolX" sub="implied volatility of the 5 strikes nearest spot vs India VIX"
-    foot="IV solved from each contract's mid (or last) price, Black-Scholes on spot, 6.5%, calendar days. VIX is the 30-day NIFTY index; the front weekly's NTM IV usually sits below it early in the week and swings near expiry.">
+  return <Panel title="Near-ATM implied volatility" sub="implied volatility of the 5 strikes nearest spot vs India VIX"
+    foot="IV solved from each contract's mid (or last) price, Black-Scholes on spot, 6.5%, calendar days. India VIX measures 30-day NIFTY volatility.">
     <Legend lines={lines} at={shared.hover ?? shared.pinned} />
     {v.length ? <XYChart label="NTM IV vs VIX" lines={lines} yFmt={(x) => x.toFixed(1)} {...shared} /> : <Empty text="No chain snapshots for this session." />}
   </Panel>;
@@ -352,7 +542,7 @@ function GammaPanel({ chain, shared }: { chain?: Chain; shared: Shared }) {
   const g = chain?.gamma;
   const rows = (g?.strikes ?? []).map((s) => ({ strike: s.strike, up: s.call, down: s.put, tip: `${s.strike}: calls ${rupees(s.call)} · puts ${rupees(s.put)} · net ${rupees(s.net)} per 1% move` }));
   const net: Line[] = [{ key: "net", label: "Net GEX", color: C.violet, points: (g?.timeline ?? []).map((p) => [p.ts, p.net]), fmt: (x) => rupees(x) }];
-  return <Panel title="Gamma exposure" sub={g ? `net ${rupees(g.net)} per 1% · ${g.net >= 0 ? "positive: dealer hedging damps moves (model)" : "negative: dealer hedging adds to moves (model)"}` : undefined}
+  return <Panel title="Gamma exposure" sub={g ? `Modelled net ${rupees(g.net)} per 1% move` : undefined}
     foot="GEX = gamma × OI (shares) × spot² × 1%, calls +, puts − (dealers assumed long calls, short puts). The zero-gamma level re-prices every contract at other spots with its IV held. A positioning model, not observed dealer books.">
     <StrikeBars label="Gamma exposure by strike" rows={rows} spot={g?.spot} fmt={(v) => compact(v)}
       marks={g?.zero_gamma ? [{ x: g.zero_gamma, label: "zero γ", color: C.violet }] : []} />
@@ -372,7 +562,7 @@ function SpectrumPanel({ chain, shared }: { chain?: Chain; shared: Shared }) {
   ];
   const zones = sp?.zones ?? [];
   const top = Math.max(1, ...zones.map((z) => z.volume));
-  return <Panel title="Spectrum · call vs put volume" sub={sp?.pcr != null ? `put/call volume ${sp.pcr.toFixed(2)}` : undefined}
+  return <Panel title="Call and put volume" sub={sp?.pcr != null ? `put/call volume ${sp.pcr.toFixed(2)}` : undefined}
     foot="Cumulative volume (shares) of the chain read (±8% of spot for indices): each contract adds what it traded since its previous snapshot.">
     <Legend lines={lines} at={shared.hover ?? shared.pinned} />
     {pts.length ? <XYChart label="Cumulative call and put volume" lines={lines} yFmt={(v) => compact(v)} zeroLine {...shared} /> : <Empty text="No volume yet." />}
@@ -397,7 +587,7 @@ function WritersPanel({ chain, shared }: { chain?: Chain; shared: Shared }) {
     return { strike: s.strike, up: Math.max(0, ce) + Math.max(0, pe), down: Math.min(0, ce) + Math.min(0, pe),
       tip: `${s.strike}: CE ${rupees(ce)} (${compact(s.CE?.net_added)} added @ ${num(s.CE?.avg_premium)} → ${num(s.CE?.premium)}) · PE ${rupees(pe)} (${compact(s.PE?.net_added)} @ ${num(s.PE?.avg_premium)} → ${num(s.PE?.premium)})` };
   });
-  return <Panel title="Gamma derivatives · writers' P&L" sub="OI added today × (average premium while added − premium now)"
+  return <Panel title="Estimated writer P&L" sub="OI added today × (average premium while added − premium now)"
     foot="Positive = whoever sold the added contracts is ahead. It assumes added OI was written (sold to open); OI cannot say which side opened it. Bars: per strike, green ahead, red behind.">
     <Legend lines={lines} at={shared.hover ?? shared.pinned} />
     {lines[0].points.length ? <XYChart label="Writers P&L through the day" lines={lines} yFmt={(v) => compact(v)} zeroLine height={160} {...shared} /> : <Empty text="No OI added yet." />}
@@ -444,7 +634,7 @@ function MflowPanel({ flow, error, shared }: { flow?: Flow; error: string; share
   const running: Record<Cls, number> = { long_buildup: 0, short_buildup: 0, short_covering: 0, long_unwinding: 0 };
   const cum = series.map((b) => { for (const [k] of CLASSES) running[k] += b[k]; return { ts: b.ts, ...running }; });
   const lines: Line[] = CLASSES.map(([k, label, color, dash]) => ({ key: k, label, color, dash, points: cum.map((p) => [p.ts, p[k]]), fmt: (x) => compact(x) }));
-  return <Panel title="MFLOW · futures volume by OI" sub={flow?.symbol ? `${flow.symbol} · OI ${compact(m?.oi)} (${compact(m?.oi_change, true)} today)` : undefined}
+  return <Panel title="Futures volume by OI change" sub={flow?.symbol ? `${flow.symbol} · OI ${compact(m?.oi)} (${compact(m?.oi_change, true)} today)` : undefined}
     foot={`OI rising = new business, falling = old business leaving; the volume traded since the last OI change goes to the next one. New ${compact(m?.new)} · leaving ${compact(m?.exit)}${m?.unassigned ? ` · ${compact(m.unassigned)} since the last OI change` : ""}. OI captured for NIFTY, BANKNIFTY and SENSEX futures.`}>
     {error ? <Empty text={error} /> : flow?.note ? <Empty text={flow.note} /> : m && !m.available ? <Empty text={m.note || "OI not captured for this contract."} /> : <>
       <Legend lines={lines} at={shared.hover ?? shared.pinned} extra={m?.shares ? <span className="muted">{CLASSES.map(([k]) => `${Math.round((m.shares?.[k] ?? 0) * 100)}%`).join(" / ")}</span> : null} />
@@ -460,8 +650,9 @@ function CandlePanel({ flow, error, shared }: { flow?: Flow; error: string; shar
   const bars = c?.bars ?? [];
   const tf = (flow?.tf || 5) * 60;
   const ys = extent(bars.flatMap((b) => [b.high, b.low]), 0.06);
-  const hb = shared.hover != null ? bars[nearestIndex(bars, shared.hover - tf / 2)] : undefined;
-  return <Panel title="Smart candles" sub={flow?.symbol ? `${flow.symbol} · ${flow.tf}-minute · colour = delta / volume` : undefined}
+  const cursor = shared.hover ?? shared.pinned;
+  const hb = cursor == null ? undefined : observedAt(bars, cursor);
+  return <Panel title="Futures candles and delta" sub={flow?.symbol ? `${flow.symbol} · ${flow.tf}-minute · colour = delta / volume` : undefined}
     foot="Shaded box: initial balance (first hour). Outlined boxes: balance clusters (3+ overlapping bars inside 2.5× a typical bar's range). Stronger colour = more one-sided aggressor volume (quote-classified, not exchange tick data).">
     {error ? <Empty text={error} /> : flow?.note ? <Empty text={flow.note} /> : <>
       <div className="od-legend">{hb ? <span>{hhmm(hb.ts)} · O {num(hb.open)} H {num(hb.high)} L {num(hb.low)} C {num(hb.close)} · vol {compact(hb.volume)} · delta {compact(hb.delta, true)} · strength <b>{(hb.strength * 100).toFixed(0)}%</b></span>
@@ -493,35 +684,54 @@ function CandlePanel({ flow, error, shared }: { flow?: Flow; error: string; shar
 
 // ------------------------------------------------------------------------------------------------ 8 option table
 
-function OptionTable({ chain }: { chain?: Chain }) {
-  const rows = chain?.table ?? [];
+function OptionTable({ chain, rows, selected, onSelect, controls }: {
+  chain?: Chain; rows: TableRow[]; selected?: number; onSelect: (strike: number) => void; controls: ReactNode;
+}) {
+  const [greeks, setGreeks] = useState(false);
   const spot = chain?.spot ?? 0;
   const maxOi = Math.max(1, ...rows.flatMap((r) => [r.CE?.oi ?? 0, r.PE?.oi ?? 0]));
   const leg = (l: Leg | undefined, side: "CE" | "PE", itm: boolean) => {
     const k = (name = "") => `${name}${itm ? " itm" : ""}`.trim() || undefined;
     const cells = [
       <td key="oi" className={k("od-oi")}><i style={{ width: `${(100 * (l?.oi ?? 0)) / maxOi}%`, background: side === "CE" ? C.ce : C.pe }} /><span>{compact(l?.oi)}</span></td>,
-      <td key="chg" className={k((l?.oi_change ?? 0) >= 0 ? "positive" : "negative")}>{compact(l?.oi_change, true)}</td>,
+      <td key="chg" className={k(l?.oi_change_today == null || l.oi_change_today === 0 ? "" : l.oi_change_today > 0 ? "positive" : "negative")}>{compact(l?.oi_change_today, true)}</td>,
+      <td key="prior" className={k()}>{compact(l?.oi_change, true)}</td>,
       <td key="vol" className={k()}>{compact(l?.volume)}</td>,
-      <td key="iv" className={k()}>{l?.iv != null ? l.iv.toFixed(1) : "—"}</td>,
-      <td key="d" className={k()}>{l?.delta != null ? l.delta.toFixed(2) : "—"}</td>,
-      <td key="g" className={k()}>{l?.gamma != null ? (l.gamma * 1e4).toFixed(2) : "—"}</td>,
-      <td key="t" className={k()}>{num(l?.theta)}</td>,
-      <td key="v" className={k()}>{num(l?.vega)}</td>,
+      <td key="iv" className={k()}>{num(l?.iv, 1)}</td>,
+      ...(greeks ? [
+        <td key="d" className={k()}>{num(l?.delta)}</td>,
+        <td key="g" className={k()}>{num(l?.gamma == null ? null : l.gamma * 1e4)}</td>,
+        <td key="t" className={k()}>{num(l?.theta)}</td>,
+        <td key="v" className={k()}>{num(l?.vega)}</td>,
+      ] : [
+        <td key="bid" className={k()}>{num(l?.bid)}</td>,
+        <td key="ask" className={k()}>{num(l?.ask)}</td>,
+      ]),
       <td key="ltp" className={k("od-ltp")}>{num(l?.ltp)}</td>,
     ];
     return side === "CE" ? cells : [...cells].reverse();
   };
-  const heads = ["OI", "OI chg", "Volume", "IV %", "Delta", "Gamma ×10⁴", "Theta/day", "Vega/pt", "LTP"];
-  return <Panel title="Options table" wide sub={chain?.as_of ? `${chain.underlying} ${chain.expiry} · ${full(chain.as_of)} · OI and volume in shares · OI change vs the previous session` : undefined}
-    foot="Greeks from the solved IV (Black-Scholes on spot). Shaded cells are in the money. Hover a strike for bid/ask and today's OI change.">
+  const heads = ["OI", "Δ OI · open", "Δ OI · prev", "Volume", "IV %",
+    ...(greeks ? ["Delta", "Gamma ×10⁴", "Theta/day", "Vega/pt"] : ["Bid", "Ask"]), "LTP"];
+  return <Panel title="Options chain" wide sub="OI and volume in shares"
+    foot="Open Δ uses the first stored snapshot. Prev Δ uses the broker's previous-session OI.">
+    <div className="od-panel-controls">{controls}
+      <div className="radar-filter" role="group" aria-label="Chain columns">
+        <button aria-pressed={!greeks} className={!greeks ? "active" : ""} onClick={() => setGreeks(false)}>Quotes</button>
+        <button aria-pressed={greeks} className={greeks ? "active" : ""} onClick={() => setGreeks(true)}>Greeks</button>
+      </div>
+    </div>
     {rows.length ? <div className="overflow-auto od-table-wrap"><table className="od-table">
-      <thead><tr><th colSpan={9} className="od-side ce">Calls</th><th className="od-strike">Strike</th><th colSpan={9} className="od-side pe">Puts</th></tr>
+      <thead><tr><th colSpan={heads.length} className="od-side ce">Calls</th><th className="od-strike">Strike</th><th colSpan={heads.length} className="od-side pe">Puts</th></tr>
         <tr>{heads.map((h) => <th key={`c${h}`}>{h}</th>)}<th className="od-strike" />{[...heads].reverse().map((h) => <th key={`p${h}`}>{h}</th>)}</tr></thead>
-      <tbody>{rows.map((r) => <tr key={r.strike} className={r.strike === chain?.atm ? "atm" : ""}
-        title={`${r.strike} · CE bid/ask ${num(r.CE?.bid)} / ${num(r.CE?.ask)}, OI today ${compact(r.CE?.oi_change_today, true)} · PE bid/ask ${num(r.PE?.bid)} / ${num(r.PE?.ask)}, OI today ${compact(r.PE?.oi_change_today, true)}`}>
+      <tbody>{rows.map((r) => <tr key={r.strike} className={r.strike === chain?.atm ? "atm" : ""} data-selected={r.strike === selected}>
         {leg(r.CE, "CE", r.strike < spot)}
-        <td className="od-strike">{r.strike}</td>
+        <th scope="row" className="od-strike"><button className="od-strike-link" type="button"
+          aria-label={`Show strike ${r.strike}`} aria-pressed={r.strike === selected} onClick={() => {
+            onSelect(r.strike);
+            document.getElementById("od-strike-detail")?.scrollIntoView({ block: "nearest" });
+          }}>
+          {num(r.strike, 0)}{r.strike === chain?.atm ? " · ATM" : ""}</button></th>
         {leg(r.PE, "PE", r.strike > spot)}
       </tr>)}</tbody></table></div> : <Empty text="No chain at this moment." />}
   </Panel>;
