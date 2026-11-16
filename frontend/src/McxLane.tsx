@@ -10,7 +10,7 @@ import {
  * existing terminal stream supplies frequent quotes while this page is open. */
 const WATCHLIST = { FUTURES: "FUT", CALLS: "CE", PUTS: "PE" } as const;
 type WatchTab = keyof typeof WATCHLIST;
-type Tab = WatchTab | "POSITIONS" | "SIGNALS" | "BOOK" | "SETTINGS";
+type Tab = WatchTab | "POSITIONS" | "SIGNALS" | "BOOK" | "RULES" | "SETTINGS";
 const TABS: { key: Tab; label: string }[] = [
   { key: "FUTURES", label: "Futures" },
   { key: "CALLS", label: "Calls" },
@@ -18,6 +18,7 @@ const TABS: { key: Tab; label: string }[] = [
   { key: "POSITIONS", label: "Positions" },
   { key: "SIGNALS", label: "Signals" },
   { key: "BOOK", label: "Orders & trades" },
+  { key: "RULES", label: "Rules & data" },
   { key: "SETTINGS", label: "Settings" },
 ];
 const TAB_STORE = "macd.mcxTab";
@@ -146,10 +147,11 @@ export function McxLanePage({ connected }: { connected: boolean }) {
 
     <div className="blast-body">
       {error && <div className="settings-error blast-inline-error" role="alert">Refresh failed: {error}. Showing the last snapshot.</div>}
-      {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} problems={problems} />}
+      {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} />}
       {tab === "POSITIONS" && <PositionsTab snapshot={snapshot} quoteFor={quoteFor} />}
       {tab === "SIGNALS" && <SignalsTab rows={snapshot.decisions} counts={health.decisions} />}
       {tab === "BOOK" && <BookTab />}
+      {tab === "RULES" && <RulesTab snapshot={snapshot} problems={problems} />}
       {tab === "SETTINGS" && <SettingsTab snapshot={snapshot} onSaved={setSnapshot} />}
     </div>
   </section>;
@@ -164,19 +166,18 @@ const movementClass = (quote?: McxQuote) => quote?.move === "up" || quote?.move 
 const withSign = (value?: number | null, digits = 2) => finite(value) ? `${value > 0 ? "+" : ""}${fixed(value, digits)}` : "—";
 const ageOf = (stamp: number, clock: number) => Math.max(0, Math.floor((clock - stamp) / 1000));
 
-function ContractsTab({ snapshot, side, quoteFor, clock, problems }: {
-  snapshot: McxSnapshot; side: "FUT" | "CE" | "PE"; quoteFor: QuoteFor; clock: number; problems: string[];
+function ContractsTab({ snapshot, side, quoteFor, clock }: {
+  snapshot: McxSnapshot; side: "FUT" | "CE" | "PE"; quoteFor: QuoteFor; clock: number;
 }) {
-  const { health, risk } = snapshot;
+  const { health } = snapshot;
   const rows = snapshot.contracts.filter((row) => row.option_type === side);
   const selected = health.selection;
   const headings = ["Commodity", "Contract", "Strike", "Expiry", "LTP", "Prev close", "Chg", "% chg", "OI chg", "OI", "Volume", "MACD", "Hist.", "Bars", "Lot units", "Held", "Last tick"];
-  return <div className="mcx-grid">
-    <section className="panel blast-panel-fill mcx-contracts">
+  return <section className="panel blast-panel-fill mcx-contracts">
       <div className="panel-title"><span>{side === "FUT" ? "Futures" : side === "CE" ? "Calls" : "Puts"}</span>
         <span>{selected.selected_at ? `selected ${stamp(selected.selected_at)}${selected.source === "saved" ? " · restored" : ""}` : "not selected yet"}</span></div>
       <div className="ledger-table-wrap"><table className="ledger-table mcx-watchlist">
-        <thead><tr>{headings.map((label) => <th key={label}>{label}</th>)}</tr></thead>
+        <thead><tr>{headings.map((label) => <th scope="col" key={label}>{label}</th>)}</tr></thead>
         <tbody>{rows.length === 0
           ? <tr><td className="empty" colSpan={headings.length}>{health.enabled ? "No contracts in this watchlist." : "The lane is switched off."}</td></tr>
           : rows.map((row) => {
@@ -207,9 +208,13 @@ function ContractsTab({ snapshot, side, quoteFor, clock, problems }: {
             </tr>;
           })}</tbody>
       </table></div>
-    </section>
+    </section>;
+}
 
-    <section className="panel mcx-side">
+function RulesTab({ snapshot, problems }: { snapshot: McxSnapshot; problems: string[] }) {
+  const { health, risk } = snapshot;
+  return <div className="mcx-rules-grid">
+    <section className="panel mcx-rules-panel">
       <div className="panel-title"><span>Rules</span><span>{risk.inherited_from}</span></div>
       <div className="blast-kv">
         <span>Entry</span><b>{risk.entry_filter}</b>
@@ -224,6 +229,8 @@ function ContractsTab({ snapshot, side, quoteFor, clock, problems }: {
         <span>Expiry exit</span><b>{snapshot.settings.expiry_flatten_ist || "off"}</b>
       </div>
       <p className="blast-note">Stops, trail and MACD periods are the MACD lane's own settings; change them there. Lot units turn a premium into rupees: a GOLD premium is per 10 g on a 1 kg lot, so one lot is 100 units.</p>
+    </section>
+    <section className="panel mcx-rules-panel">
       <div className="panel-title"><span>Warm-up and data</span><span>{health.warmup.state ?? "—"}</span></div>
       <div className="blast-kv">
         <span>Contracts warmed</span><b>{health.warmup.loaded ?? 0} of {health.warmup.symbols ?? 0}{health.warmup.state === "done" ? ` · ${health.warmup.from_store ?? 0} from the database, ${health.warmup.downloaded ?? 0} downloaded${health.warmup.held ? `, ${health.warmup.held} waiting for the download switch` : ""}` : ""}</b>

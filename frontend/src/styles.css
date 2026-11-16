@@ -1472,13 +1472,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .coil-table { font-size: var(--fs-xs); } .coil-table th, .coil-table td { padding: 4px 6px; white-space: nowrap; text-align: right; } .coil-table td:first-child, .coil-table th:first-child { text-align: left; }
 
 /* MCX lane (McxLane.tsx): reuses the blast lane's page frame. */
-.mcx-tabs { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-.mcx-grid { height: 100%; display: grid; grid-template-columns: minmax(0, 2.3fr) minmax(280px, 1fr); gap: 8px; overflow: auto; }
-.mcx-contracts { min-height: 0; }
-.mcx-watchlist :is(td, th) { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.mcx-tabs { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+.mcx-contracts { min-height: 0; min-width: 0; height: 100%; }
+.mcx-watchlist { font-size: var(--fs-sm); }
+.mcx-watchlist :is(td, th) { white-space: nowrap; font-variant-numeric: tabular-nums; padding: 10px 9px; }
+.mcx-watchlist th { color: var(--text-3); }
+.mcx-watchlist :is(td, th):nth-child(n+3) { text-align: right; }
+.mcx-watchlist :is(td, th):first-child { position: sticky; left: 0; background: var(--bg-panel); box-shadow: 1px 0 var(--line-subtle); z-index: 1; }
+.mcx-watchlist th:first-child { z-index: 2; }
+.mcx-watchlist .mcx-unit { color: var(--text-3); font-size: var(--fs-micro); }
 .ledger-table td.mcx-price-up { background-color: #1a573e; color: #e1ffed; font-weight: 700; }
 .ledger-table td.mcx-price-down { background-color: #71313a; color: #fff0f1; font-weight: 700; }
-.mcx-side { min-height: 0; overflow: auto; }
+.mcx-rules-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-content: start; gap: 8px; height: 100%; overflow: auto; }
+.mcx-rules-panel { min-width: 0; }
 .mcx-unit { display: block; margin-top: 2px; color: #59677a; font-size: 9px; }
 .mcx-roots .toggle .mcx-unit { display: inline; margin: 0 0 0 6px; }
 .mcx-problems { margin: 8px 12px 12px; }
@@ -1487,6 +1493,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .mcx-split > .panel { min-height: 0; display: flex; flex-direction: column; }
 .mcx-split .ledger-table-wrap { flex: 1; min-height: 0; height: auto; }
 @media (max-width: 900px) {
-  .mcx-grid { grid-template-columns: 1fr; }
+  .mcx-rules-grid { grid-template-columns: 1fr; }
   .mcx-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
