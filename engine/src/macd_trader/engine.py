@@ -35,6 +35,7 @@ from .models import Candle, Signal, Tick, Trade
 from .reentry import REENTRY_KIND, ReentryTracker
 from . import market_calendar
 from .blast_engine import BlastEngine
+from .mcx_lane import McxLane
 from .smart_lane import SmartLanes
 from .agentic_lane import INDEX_SPOTS as AGENTIC_INDICES, AgenticLane
 from .spot_lane import SpotLane
@@ -156,7 +157,9 @@ def _drop_expired(symbols: list[str], known_expiries: dict[str, str], today) -> 
     kept = []
     for symbol in symbols:
         expiry = known_expiries.get(symbol)
-        if expiry is None and symbol.endswith(("CE", "PE")):
+        # MCX series do not follow the NSE expiry convention parse_option
+        # infers; without a recorded expiry, Fyers' own rejection is the check.
+        if expiry is None and symbol.endswith(("CE", "PE")) and not symbol.startswith("MCX:"):
             parsed = parse_option(symbol)
             expiry = parsed["expiry"] if parsed else None
         if expiry is not None and str(expiry)[:10] < today.isoformat():
@@ -444,6 +447,12 @@ class TradingEngine(DeskMixin):
         self.spot_lane = (SpotLane(settings, self.broker, self.events,
                                    str(Path(settings.database_path).parent / "spot_macd.sqlite3"))
                           if settings.spot_lane_enabled else None)
+        # Eighth book: the MCX lane (mcx_lane.py) -- the MACD lane's rules on
+        # MCX commodity options, on the MCX clock, in its own paper book. Its
+        # contracts ride this engine's websocket; every MCX print goes to it
+        # and to nothing else.
+        self.mcx = McxLane(settings, self.broker, self.events)
+        self._mcx_warm_task: asyncio.Task | None = None
         self.extreme_booker = ExtremeBooker(settings.research_database_path)
         # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
         # priced them, and the blast journal reads the spread and IV inputs at each candidate.
@@ -501,6 +510,7 @@ class TradingEngine(DeskMixin):
         self._expiry_flatten_task = asyncio.create_task(self._expiry_flatten_loop())
         self._dispersion_task = asyncio.create_task(self._dispersion_loop())
         self._blast_task = asyncio.create_task(self._blast_maintenance_loop())
+        self.mcx.start()
         self.smart_lanes.start()
         if self.agentic is not None:
             self.agentic.start()
@@ -988,6 +998,9 @@ class TradingEngine(DeskMixin):
             if getattr(self, "spot_lane", None) is not None:
                 await self.spot_lane.resolve_futures(self.broker)
             self.context_indices = await self._validated_context_indices()
+            # The MCX lane selects its own contracts; prepare() never raises,
+            # so an MCX problem cannot block the NSE feed.
+            mcx_symbols = await self.mcx.prepare()
             # The desk's own instruments must be subscribed too: it watches
             # index futures, which are in neither the spot universe nor the
             # option list.
@@ -1005,8 +1018,10 @@ class TradingEngine(DeskMixin):
                  # websocket the engine already holds open.
                  *self.blast.portfolio.positions, *[s for smart in _smart_lanes(self) for s in smart.held_symbols()],
                  # Every stock's chosen future: a spot-lane entry fills on a fresh futures quote.
-                 *(self.spot_lane.feed_symbols() if getattr(self, "spot_lane", None) is not None else [])])),
-                {row.symbol: row.expiry for row in contracts}, datetime.now(IST).date())
+                 *(self.spot_lane.feed_symbols() if getattr(self, "spot_lane", None) is not None else []),
+                 *mcx_symbols])),
+                {**self.mcx.known_expiries(), **{row.symbol: row.expiry for row in contracts}},
+                datetime.now(IST).date())
             self.strategy = MACDStrategyManager(self.settings, self.events, self.option_symbols)
             self._wire_contract_universe(contracts)
             # Before trading the new selection: every held contract's lot size against the exchange's
@@ -1053,6 +1068,7 @@ class TradingEngine(DeskMixin):
             self.error = None
             self._stream_task = asyncio.create_task(self._run_broker_stream())
             step("stream")
+            self._start_mcx_warmup()
             warm_started = time.monotonic()
             await asyncio.gather(*(self._warm_symbol(symbol, run) for symbol in warm_symbols))
             self.warmup_report = {
@@ -1562,7 +1578,8 @@ class TradingEngine(DeskMixin):
             return
         if refreshed:
             return
-        if not (regular_session_open() or preopen_window()):
+        mcx = getattr(self, "mcx", None)
+        if not (regular_session_open() or preopen_window() or (mcx is not None and mcx.feed_expected())):
             return
         age = self.seconds_since_last_tick()
         if age is not None and age <= FEED_STALE_SECONDS:
@@ -1735,6 +1752,9 @@ class TradingEngine(DeskMixin):
             self.execution.broker = self.broker
             self.blast.rebind_broker(self.broker)
             self.blast.apply_settings(new_settings)
+            if getattr(self, "mcx", None) is not None:
+                self.mcx.rebind_broker(self.broker)
+                self.mcx.apply_settings(new_settings)
             for smart in _smart_lanes(self):
                 smart.broker.rebind(self.broker)
                 smart.apply_settings(new_settings)
@@ -1781,6 +1801,8 @@ class TradingEngine(DeskMixin):
             self.blast.apply_settings(new_settings)
             for smart in _smart_lanes(self):
                 smart.apply_settings(new_settings)
+            if getattr(self, "mcx", None) is not None:  # tests drive this on bare stand-ins
+                await self.apply_mcx_settings(new_settings)
 
             if timeframe_changed:
                 self.history.clear()
@@ -1862,6 +1884,8 @@ class TradingEngine(DeskMixin):
         await step("feed", self.disconnect_feed, FEED_STEP_TIMEOUT * 3)
         await step("desk", self.mp.stop)
         await step("blast", self.blast.stop)
+        await end("_mcx_warm_task")
+        await step("mcx", self.mcx.stop)
         if getattr(self, "smart_lanes", None) is not None:
             await step("smart lanes", self.smart_lanes.stop)
         if getattr(self, "agentic", None) is not None:
@@ -1963,6 +1987,16 @@ class TradingEngine(DeskMixin):
             self._last_future_tick = (now, skew)
             if first_report:
                 self.events.publish("broker", self.broker_status())
+            return
+        if tick.symbol.startswith("MCX:"):
+            # MCX prints belong to the MCX lane alone: the NSE candle engine,
+            # the desk and the browser tick stream never see them.
+            try:
+                await self.mcx.on_tick(tick, self.last_tick_at)
+            except Exception as exc:  # noqa: BLE001 -- one lane must not stop the feed
+                self.lane_errors["mcx"] = {"count": self.lane_errors.get("mcx", {}).get("count", 0) + 1,
+                                           "last": f"{tick.symbol}: {type(exc).__name__}: {exc}"[:300],
+                                           "at": datetime.now(UTC).isoformat()}
             return
         self.entry_gate.days.observe(tick.symbol, tick.ltp, exchange_at)
         if previous is not None:
@@ -2670,6 +2704,56 @@ class TradingEngine(DeskMixin):
         price = tick.ltp if tick else None
         return price if price and price > 0 else None
 
+    def _start_mcx_warmup(self) -> None:
+        """Warm the MCX lane in the background; its live bars buffer meanwhile."""
+        task = self._mcx_warm_task
+        if task is not None and not task.done():
+            task.cancel()
+
+        async def run() -> None:
+            try:
+                await self.mcx.warm()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- warm-up must never reach the feed
+                self.mcx.error = f"warm-up failed: {type(exc).__name__}: {exc}"[:300]
+
+        self._mcx_warm_task = asyncio.create_task(run())
+
+    async def reselect_mcx(self) -> list[str]:
+        """Re-run the MCX lane's selection and resubscribe only if its symbols changed."""
+        async with self._reconfigure_lock:
+            before = set(self.mcx.subscription_symbols())
+            symbols = await self.mcx.prepare(force=True)
+            if self.status == "connected" and set(symbols) != before:
+                kept = [symbol for symbol in self.all_symbols if not symbol.startswith("MCX:")]
+                self.all_symbols = _drop_expired(list(dict.fromkeys([*kept, *symbols])),
+                                                 self.mcx.known_expiries(), datetime.now(IST).date())
+                await self.restart_stream()
+            if self.status == "connected":
+                self._start_mcx_warmup()
+            return symbols
+
+    async def apply_mcx_settings(self, new_settings: Settings) -> dict:
+        """Hand the MCX lane new settings; reselect or re-warm when they require it.
+
+        Called with the reconfigure lock held (reconfigure_strategy) or not
+        (the lane's own settings endpoint), so it never takes the lock itself;
+        a reselection is scheduled as its own task.
+        """
+        needs = self.mcx.apply_settings(new_settings)
+        if needs["reselect"]:
+            asyncio.create_task(self._reselect_mcx_quietly())
+        elif needs["rewarm"] and self.status == "connected":
+            self._start_mcx_warmup()
+        return needs
+
+    async def _reselect_mcx_quietly(self) -> None:
+        try:
+            await self.reselect_mcx()
+        except Exception as exc:  # noqa: BLE001
+            self.mcx.error = f"reselection failed: {type(exc).__name__}: {exc}"[:300]
+
     async def _blast_maintenance_loop(self) -> None:
         """Persist the blast journal's forward excursions and age out the desk.
 
@@ -3305,6 +3389,7 @@ class TradingEngine(DeskMixin):
                            key: self.desk_status.get(key) for key in ("reachable", "checked_at", "error", "bus")},
                        "bus": self.bus.status() if self.bus else None},
             "blast": self.blast.health(),
+            "mcx": self.mcx.health(),
             "smart_lanes": {smart.name: smart.health() for smart in _smart_lanes(self)},
             "exit_failures": self.exit_failures(),
             "entry_rule": {name: status for name, execution in self._books()

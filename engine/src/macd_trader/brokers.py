@@ -431,6 +431,8 @@ class FyersBroker(Broker):
     instrument_master_urls = {
         "NSE": "https://public.fyers.in/sym_details/NSE_FO.csv",
         "BSE": "https://public.fyers.in/sym_details/BSE_FO.csv",
+        # Commodity derivatives, read by the MCX lane. Same column layout.
+        "MCX": "https://public.fyers.in/sym_details/MCX_COM.csv",
     }
 
     def __init__(self, settings: Settings):
@@ -655,8 +657,14 @@ class FyersBroker(Broker):
             from .sessions import market_close, session_close
             market_time = parsed.astimezone(ZoneInfo("Asia/Kolkata"))
             symbol = payload.get("symbol")
-            close = (session_close(symbol, market_time.date()) if isinstance(symbol, str) and ":" in symbol
-                     else market_close(market_time.date()))
+            if isinstance(symbol, str) and symbol.startswith("MCX:"):
+                # MCX trades to 23:30/23:55; the NSE F&O close would stamp
+                # every evening print 15:40.
+                from .mcx_lane import McxCalendar
+                close = McxCalendar.closes_at(market_time.date())
+            else:
+                close = (session_close(symbol, market_time.date()) if isinstance(symbol, str) and ":" in symbol
+                         else market_close(market_time.date()))
             if market_time.time().replace(tzinfo=None) > close:
                 parsed = market_time.replace(hour=close.hour, minute=close.minute,
                                              second=0, microsecond=0).astimezone(UTC)
@@ -996,6 +1004,10 @@ class FyersBroker(Broker):
                     strike=strike, expiry=expiry, lot_size=lot_size,
                 ))
         return rows
+
+    async def instrument_rows(self, exchange: str) -> list[list[str]]:
+        """One exchange's instrument master as CSV rows (cached for the day like the rest)."""
+        return list(csv.reader(io.StringIO(await self._master(exchange))))
 
     async def option_master(self, exchanges: list[str]) -> list[OptionContractMetadata]:
         rows: list[OptionContractMetadata] = []

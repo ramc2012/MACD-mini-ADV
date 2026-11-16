@@ -10,7 +10,7 @@ It was copied from the standalone MACD Trader repository
 here from now on. That repository is left as it was and is no longer
 deployed; changes made in one are not carried to the other.
 
-Operating notes for the strategy, desks and blast lane are in [docs/](docs/).
+Operating notes for the strategy, desks, blast lane and [MCX lane](docs/mcx_lane.md) are in [docs/](docs/).
 
 ## Process roles
 

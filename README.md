@@ -29,7 +29,7 @@ To change the watchlist or supply Fyers credentials through Docker, copy `.env.e
 | --- | --- |
 | `frontend` | Full React/TypeScript terminal, served by Nginx on port 3200. |
 | `gateway` | Go API gateway on port 8201. Holds the one engine stream and fans it out to browsers, publishes every tick to the bus, and serves `/parallel/*`. |
-| `engine` | The strategy process, built from [engine/](engine/README.md) with `MACD_ENGINE_ROLE=strategy`: the only Fyers client, the MACD and blast lanes and their books. Publishes every accepted tick to the bus. |
+| `engine` | The strategy process, built from [engine/](engine/README.md) with `MACD_ENGINE_ROLE=strategy`: the only Fyers client, the MACD, blast and [MCX](engine/docs/mcx_lane.md) lanes and their books. Publishes every accepted NSE tick to the bus. |
 | `desk` | Same image, `MACD_ENGINE_ROLE=desk`: the Market Profile / order-flow lane -- the auction desk and its book, tick capture, whale tracker, option-chain collector and nightly memory. Serves `/api/mp/*` and `/api/auction/*`. |
 | `nats` | Tick bus (core NATS, no persistence). The engine publishes `md.tick.<symbol>`; the desk and Rust analytics subscribe. |
 | `analytics` | Rust service. Live: worker shards consume the bus and build per-symbol 1-minute bars, MACD and volatility in parallel. On demand: `/analyze` of a chart's candles. |
