@@ -1,4 +1,5 @@
 import { CandlestickSeries, ColorType, createChart, HistogramSeries, LineSeries, type IChartApi, type Time } from "lightweight-charts";
+import { niftyFirst } from "./defaults";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
@@ -55,7 +56,7 @@ function useJson<T>(url: string | null, deps: unknown[], every = 0) {
 export function QuantAnalyticsPage({ symbols, selected, timeframe, onSelect }: {
   symbols: string[]; selected: string; timeframe?: number; onSelect: (symbol: string) => void;
 }) {
-  const symbol = selected || symbols[0] || "";
+  const symbol = selected || niftyFirst(symbols);
   const [frame, setFrame] = useState(timeframe && TIMEFRAMES.includes(timeframe) ? timeframe : 1800);
   const chart = useJson<ChartPayload>(symbol ? `${API_URL}/api/chart/${encodeURIComponent(symbol)}?timeframe_seconds=${frame}` : null, [symbol, frame], 60_000);
   const bench = useJson<ChartPayload>(`${API_URL}/api/chart/${encodeURIComponent("NSE:NIFTY50-INDEX")}?timeframe_seconds=${frame}`, [frame], 120_000);

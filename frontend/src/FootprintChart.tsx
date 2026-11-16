@@ -2086,7 +2086,9 @@ export function FootprintChart({ data, height = 520, requestedBars }: {
   }, [schedule]);
 
   useEffect(() => () => {
-    if (frameRef.current) window.cancelAnimationFrame(frameRef.current);
+    // Reset the handle too: a cancelled frame never runs its callback, and a stale handle made schedule() return
+    // early for good after a remount (React's development double-mount left the chart blank).
+    if (frameRef.current) { window.cancelAnimationFrame(frameRef.current); frameRef.current = 0; }
   }, []);
 
   const moveTo = (start: number, count = viewRef.current.count) => {

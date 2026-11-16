@@ -37,6 +37,16 @@ Code: `engine/src/macd_trader/options_desk.py` (tests in `engine/tests/test_opti
 `frontend/src/OptionsDesk.tsx`, `frontend/src/optionsDeskMath.ts`, and the MI `console/app.py` and
 `console/static/index.html` (`optionsView`).
 
+## Load time (16 Nov 2026)
+
+- Implied volatility is solved with a few Newton steps inside the bisection bracket (`options_desk._iv`); it gives the
+  same answer as `option_greeks.implied_vol` and made a full index day about 7 times cheaper (0.59 s to 0.08 s).
+- Solved points are kept per snapshot (`_MEMO`), so the live session's refresh solves only the new minutes (0.05 s).
+- The expiry list reads earlier sessions once every 6 hours and only today's rows each minute
+  (`straddle_views.expiries`); it used to scan the underlying's whole history every 60 seconds.
+- The desk builds the six index views in a background thread at start (`options_desk.warm`), so the first load after
+  a restart is not a cold one (it was about 2 s per index).
+
 ## Definitions
 
 - **Premium for IV:** the bid/ask mid when the quote is sane (spread ≤ 20% of mid), else the last price. IV is

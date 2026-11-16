@@ -217,3 +217,65 @@ def test_futures_flow_reads_the_tick_store_and_oi_minutes(tmp_path):
     assert out["mflow"]["classes"]["short_covering"] == 30
     assert out["candles"]["bars"][0]["volume"] == 30 and out["candles"]["bars"][0]["delta"] == 10
     assert "note" in od.futures_flow(ticks, research, "FINNIFTY", day=d)
+
+
+def test_fast_iv_matches_the_bisection_solver():
+    import random
+    rng = random.Random(4)
+    for _ in range(3000):
+        k, t = rng.uniform(22500, 27500), rng.choice([2e-5, 2e-4, 0.002, 0.01, 0.05, 0.3])
+        call = rng.random() < 0.5
+        premium = og.price(25000, k, t, rng.uniform(0.03, 1.5), call) * rng.uniform(0.8, 1.2)
+        slow, fast = og.implied_vol(premium, 25000, k, t, call), od._iv(premium, 25000, k, t, call)
+        assert (slow is None) == (fast is None)
+        if slow is not None:
+            assert fast == pytest.approx(slow, abs=1e-4)
+            assert og.price(25000, k, t, fast, call) == pytest.approx(premium, abs=1e-6 * max(1.0, premium))
+
+
+def test_a_refresh_solves_only_the_new_snapshots(tmp_path, monkeypatch):
+    d = "2026-11-13"
+    path = _chain_db(tmp_path, [(_ts(d, f"09:{m}"), 25000 + i, 15.0, _legs(STRIKES)) for i, m in enumerate((20, 25, 30))])
+    od._MEMO.clear()
+    calls = []
+    solver = od._iv
+    monkeypatch.setattr(od, "_iv", lambda *a: calls.append(1) or solver(*a))
+    first = od.chain_view(path, "NIFTY", day=d)
+    cold = len(calls)
+    straddle_views._cache.clear()               # the 30-second cache has expired; no new snapshot yet
+    calls.clear()
+    again = od.chain_view(path, "NIFTY", day=d)
+    assert again["volx"] == first["volx"] and again["gamma"] == first["gamma"]
+    assert 0 < len(calls) < cold / 2            # only the moment's own gamma is solved again
+    c = sqlite3.connect(path)
+    with c:
+        for (k, side), (iv, volume, oi, prev_oi) in _legs(STRIKES).items():
+            ltp = _price(25010, k, _ts(d, "09:35"), iv, side == "CE")
+            c.execute("INSERT INTO chain_snapshots (ts, underlying, expiry, strike, option_type, symbol, ltp, volume, oi, spot,"
+                      " bid, ask, prev_oi, fp, vix) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      (_ts(d, "09:35"), "NIFTY", EXPIRY, k, side, f"N{k:.0f}{side}{EXPIRY}", ltp, volume, oi, 25010, ltp, ltp,
+                       prev_oi, 25040, 15.0))
+    c.close()
+    straddle_views._cache.clear()
+    grown = od.chain_view(path, "NIFTY", day=d)
+    assert len(grown["volx"]) == 4 and grown["volx"][:3] == first["volx"]
+    assert grown["volx"][3]["ntm_iv"] == pytest.approx(15.0, abs=0.1)
+
+
+def test_expiries_merge_earlier_sessions_with_todays_rows(tmp_path, monkeypatch):
+    path = _chain_db(tmp_path, [(_ts("2026-11-12", "15:00"), 25000, 15.0, _legs(STRIKES)),
+                                (_ts("2026-11-13", "09:20"), 25010, 15.0, _legs(STRIKES)),
+                                (_ts("2026-11-13", "09:25"), 25020, 15.0, _legs(STRIKES))])
+    monkeypatch.setattr(straddle_views.time, "time", lambda: _ts("2026-11-13", "09:30"))   # "today" is 13 Nov
+    listed = straddle_views.expiries(path, "NIFTY")
+    assert listed == [{"expiry": EXPIRY, "first_ts": _ts("2026-11-12", "15:00"), "last_ts": _ts("2026-11-13", "09:25"),
+                       "snapshots": 3}]
+    assert ("expiries-past", path, "NIFTY", _ts("2026-11-13", "00:00")) in straddle_views._cache
+
+
+def test_warm_builds_views_and_survives_a_missing_store(tmp_path):
+    d = "2026-11-13"
+    path = _chain_db(tmp_path, [(_ts(d, "09:20"), 25000, 15.0, _legs(STRIKES))])
+    od.warm(path, ("NIFTY", "NOSUCH"))
+    assert any(k[0] == "chain_view" and k[2] == "NIFTY" for k in straddle_views._cache)
+    od.warm(str(tmp_path / "missing.sqlite3"))            # no exception

@@ -1,6 +1,7 @@
 import { AreaSeries, ColorType, createChart, LineSeries, type IChartApi, type ISeriesApi, type Time } from "lightweight-charts";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { OrderFlowWorkspace, SessionBadges } from "./OrderFlowWorkspace";
+import { frontNiftyFuture } from "./defaults";
 import { ProfileSeriesChart } from "./ProfileSeries";
 import { MarketProfileLadder, type LadderProfile } from "./MarketProfileLadder";
 import type { SessionInfo } from "./types";
@@ -86,6 +87,7 @@ const FOCUS_STORE = "macd.mpFocus";
 // Safari's private mode throws on both halves of localStorage, and a rejected
 // preference must not take the desk down with it.
 const recall = (key: string) => { try { return window.localStorage.getItem(key) || ""; } catch { return ""; } };
+const AUTO_FOCUS = "AUTO";
 const remember = (key: string, value: string) => { try { window.localStorage.setItem(key, value); } catch { return; } };
 
 export function MarketProfilePage() {
@@ -95,11 +97,14 @@ export function MarketProfilePage() {
   const [stats, setStats] = useState<Stats>();
   const [fullProfile, setFullProfile] = useState<{ profile: ProfileData; receivedAt: number }>();
   const [fullProfileErrorKey, setFullProfileErrorKey] = useState("");
-  const [focus, setFocus] = useState(() => recall(FOCUS_STORE));
+  // "" in the store = nothing chosen yet (the page opens on the front NIFTY future); "AUTO" = the owner picked
+  // "Auto (most active)". The state keeps "" for auto either way, which is what /api/mp/snapshot expects.
+  const [focus, setFocus] = useState(() => { const stored = recall(FOCUS_STORE); return stored === AUTO_FOCUS ? "" : stored; });
+  const autoChosen = useRef(recall(FOCUS_STORE) === AUTO_FOCUS);
   const [tab, setTab] = useState<Tab>(() => TABS.find(k => k === recall(TAB_STORE)) ?? "FLOW");
   const [error, setError] = useState("");
   const inflight = useRef(false);
-  const pickFocus = (symbol: string) => { setFocus(symbol); remember(FOCUS_STORE, symbol); };
+  const pickFocus = (symbol: string) => { setFocus(symbol); autoChosen.current = !symbol; remember(FOCUS_STORE, symbol || AUTO_FOCUS); };
   const pickTab = (next: Tab) => { setTab(next); remember(TAB_STORE, next); };
 
   // A remembered contract survives only while the desk still carries it: an
@@ -108,7 +113,15 @@ export function MarketProfilePage() {
   useEffect(() => {
     if (!focus || !snap) return;
     const known = [...(snap.subscribed_symbols || []), ...snap.tracked_symbols];
-    if (known.length && !known.includes(focus)) pickFocus("");
+    if (known.length && !known.includes(focus)) { setFocus(""); autoChosen.current = false; remember(FOCUS_STORE, ""); }
+  }, [focus, snap]);
+  // Nothing chosen: open on NIFTY (owner, 16 Nov 2026) -- the front NIFTY future, which carries the volume the
+  // profile and footprint need; the index itself when no future is subscribed. Not stored, so it stays a default.
+  useEffect(() => {
+    if (focus || autoChosen.current || !snap) return;
+    const known = [...new Set([...(snap.subscribed_symbols || []), ...snap.tracked_symbols])];
+    const pick = frontNiftyFuture(known) || known.find((s) => s === "NSE:NIFTY50-INDEX");
+    if (pick) setFocus(pick);
   }, [focus, snap]);
 
   useEffect(() => {
@@ -238,7 +251,7 @@ export function MarketProfilePage() {
         symbols={snap?.subscribed_symbols?.length ? snap.subscribed_symbols : (snap?.tracked_symbols || [])}
         traded={snap?.tracked_symbols || []}
         focus={focus || snap?.focus || ""}
-        onFocus={pickFocus} onOpenAuction={() => pickTab("AUCTION")} />}
+        onFocus={pickFocus} onOpenAuction={() => pickTab("AUCTION")} sessionOpen={snap?.health?.session_open} />}
       {tab === "AUCTION" && <AuctionView snap={snap}
         fullProfile={currentFullProfile}
         fullProfileUnavailable={fullProfileErrorKey === `${snap?.profile?.symbol}|${snap?.profile?.day}`} />}

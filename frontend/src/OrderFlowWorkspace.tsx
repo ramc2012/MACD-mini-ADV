@@ -37,8 +37,12 @@ const overlayKind = (name: string): ProfileOverlay["kind"] =>
   name.startsWith("pd_") ? "pd" : name.startsWith("week_") ? "week"
     : name.startsWith("month_") ? "month" : "composite";
 
-export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpenAuction }: {
+// "The end of the session" for a replay request: the desk clamps ``at`` to the day's last tick.
+const SESSION_END = 4102444800;
+
+export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpenAuction, sessionOpen }: {
   symbols: string[]; traded?: string[]; focus: string; onFocus: (s: string) => void; onOpenAuction: () => void;
+  sessionOpen?: boolean;
 }) {
   // Any subscribed contract can be opened; a marker shows which have actually
   // printed today, since a chart on an untraded contract is legitimately empty.
@@ -60,6 +64,12 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
   const [expanded, setExpanded] = useState(false);
   const [composite, setComposite] = useState(0);
   const [replay, setReplay] = useState(false);
+  // With the market closed the live surface is empty, so the page opens the contract's last recorded session at its
+  // close instead (owner, 16 Nov 2026). Once per contract, so pressing Replay off stays off.
+  const lastSessionShown = useRef("");
+  const autoLast = useRef(false);
+  const [lastSession, setLastSessionState] = useState(false);
+  const setLastSession = (on: boolean) => { autoLast.current = on; setLastSessionState(on); };
   const [days, setDays] = useState<string[]>([]);
   const [day, setDay] = useState("");
   const [at, setAt] = useState(0);
@@ -100,7 +110,7 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
         if (stopped) return;
         setDays(list);
         setDay((current) => (current && list.includes(current) ? current : (list[0] || "")));
-        setAt(0);
+        setAt(autoLast.current ? SESSION_END : 0);
       })
       .catch(() => { if (!stopped) { setDays([]); setDay(""); } });
     return () => { stopped = true; };
@@ -153,6 +163,22 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
     const timer = window.setInterval(load, 3000);
     return () => { stopped = true; clearInterval(timer); inFlight?.abort(); };
   }, [focus, paused, replay, day, requestUrl]);
+
+  useEffect(() => {
+    if (sessionOpen !== false || replay || !focus || !data || lastSessionShown.current === focus) return;
+    if ((data.bars || []).length || data.profile) return;          // the live surface still has something to show
+    lastSessionShown.current = focus;
+    setLastSession(true);
+    setReplay(true);
+  }, [sessionOpen, replay, focus, data]);
+  // The request asked for "the end"; put the scrubber on the moment the desk answered with.
+  useEffect(() => {
+    if (replay && at === SESSION_END && data?.replay?.at) setAt(data.replay.at);
+  }, [replay, at, data]);
+  // Back to live when the session opens, if the page (not the owner) had switched to the last session.
+  useEffect(() => {
+    if (sessionOpen && lastSession) { setLastSession(false); setReplay(false); setPlaying(false); lastSessionShown.current = ""; }
+  }, [sessionOpen, lastSession]);
 
   const flow = data?.flow;
   const speedRead = data?.tape_speed ?? flow?.tape_speed ?? null;
@@ -214,7 +240,7 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
       {!replay && <button className={paused ? "of-toggle active" : "of-toggle"} onClick={() => setPaused((v) => !v)}>{paused ? "Paused" : "Live"}</button>}
       <span className={`of-source${responseAged ? " aged" : ""}`} role="status" title="Response age is time since the last API update; print time is the latest captured trade, which may be older.">{responseLabel}</span>
       <button className={replay ? "of-toggle active" : "of-toggle"}
-        onClick={() => { setReplay((v) => !v); setPlaying(false); }}>Replay</button>
+        onClick={() => { setReplay((v) => !v); setPlaying(false); setLastSession(false); }}>Replay</button>
       {/* The composite is a trailing window merged per request, so it is asked
           for explicitly: 20 days of ladders is thousands of rows on a poll
           that already runs every three seconds. That is also why it is the one
@@ -295,7 +321,7 @@ export function OrderFlowWorkspace({ symbols, traded = [], focus, onFocus, onOpe
       <span className="of-clock">{at ? clock.format(new Date(at * 1000)) : "--:--"}</span>
       {/* Raw ticks live for tick_retention_days; older sessions were condensed
           to a ladder and carry no prints to rebuild clusters from. */}
-      <span className="of-scrub-note">{!days.length ? "no session on this contract still has its raw ticks"
+      <span className="of-scrub-note">{lastSession && days.length ? "market closed · last recorded session · " : ""}{!days.length ? "no session on this contract still has its raw ticks"
         : data?.replay ? `${data.replay.position} / ${data.replay.ticks} ticks` : "loading session…"}</span>
     </div>}
 

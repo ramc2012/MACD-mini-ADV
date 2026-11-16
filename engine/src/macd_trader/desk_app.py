@@ -369,8 +369,17 @@ desk_routes.bind(engine, persist_mp_settings_remotely)
 async def lifespan(_: FastAPI):
     await engine.start()
     _start_loop_watchdog()
+    _warm_options_views()
     yield
     await engine.stop()
+
+
+def _warm_options_views() -> None:
+    """Read the index option views once in the background so the first Options & flow load is not a cold one."""
+    import threading
+    from . import options_desk
+    threading.Thread(target=options_desk.warm, args=(engine.settings.research_database_path,), daemon=True,
+                     name="options-warm").start()
 
 
 def _start_loop_watchdog() -> None:

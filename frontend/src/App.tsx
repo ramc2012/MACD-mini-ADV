@@ -1,4 +1,5 @@
 import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { niftyFirst } from "./defaults";
 import { DEFAULT_LAYERS, DEFAULT_PANES, TradingChart, type PriceStyle } from "./Chart";
 import { chartSourceStatus } from "./chartSource";
 import { useChartReferences } from "./useChartReferences";
@@ -93,7 +94,8 @@ const HEADER_INDICES: { label: string; short: string; symbol: string }[] = [
 // still subscribes it, so an expired contract cannot strand the chart.
 function restoreSelected(symbols: string[]) {
   const stored = readKey(SELECTED_SYMBOL_STORE);
-  return (stored && symbols.includes(stored) ? stored : symbols[0]) || "";
+  // Nothing remembered: open on NIFTY (owner, 16 Nov 2026), not on whichever symbol the broker lists first.
+  return (stored && symbols.includes(stored) ? stored : niftyFirst(symbols));
 }
 type PositionAudit = { signalTime?: string; signalPrice?: number; macd?: number; fillLatencyMs?: number; message?: string; intrabar?: boolean };
 type PositionFocus = { position: { symbol: string; entryTime: string; entryPrice: number; audit?: PositionAudit }; list: { symbol: string; entryTime: string; entryPrice: number }[]; index: number };

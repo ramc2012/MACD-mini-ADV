@@ -51,6 +51,24 @@ WALL_SPAN = 0.05            # zero-gamma search: spot +-5%
 EXCHANGE = {"SENSEX": "BSE", "BANKEX": "BSE", "FOCIT": "BSE"}
 
 
+# Solved points per series: a snapshot never changes once written, so the live session's refresh (every 30 s) solves
+# only the minutes that arrived since the last one instead of the whole day again.
+_MEMO: dict[tuple, dict] = {}
+_MEMO_SERIES = 48           # (kind, underlying, expiry, day) series kept; a full index day is ~375 small dicts
+
+
+def _memo(key: tuple | None) -> dict:
+    if key is None:
+        return {}
+    store = _MEMO.pop(key, None)
+    if store is None:
+        store = {}
+        while len(_MEMO) >= _MEMO_SERIES:
+            _MEMO.pop(next(iter(_MEMO)))
+    _MEMO[key] = store          # re-inserted last: the dict's order is least-recently-used first
+    return store
+
+
 # ------------------------------------------------------------------------------------------------ helpers
 
 def _premium(ltp, bid, ask) -> float | None:
@@ -67,9 +85,43 @@ def _years(expiry: str, ts: int) -> float:
 
 
 def _iv(prem, spot, strike, years, call) -> float | None:
-    if not prem or years <= 0:
+    """Implied volatility, the same answer as option_greeks.implied_vol (80 bisection steps) in a handful of
+    Newton steps kept inside the bisection bracket. A day's view solves tens of thousands of contracts, and the
+    plain bisection made every refresh of the live session cost about a second of the desk's CPU."""
+    if not prem or years <= 0 or not (prem > 0 and spot > 0 and strike > 0):
         return None
-    return og.implied_vol(prem, spot, strike, years, call)
+    disc = strike * math.exp(-og.RATE * years)
+    intrinsic = max(0.0, spot - disc) if call else max(0.0, disc - spot)
+    if prem <= intrinsic + 1e-9:
+        return None
+    low, high = 0.001, 5.0
+    if og.price(spot, strike, years, high, call) < prem:
+        return None
+    root = math.sqrt(years)
+    moneyness = math.log(spot / strike) + og.RATE * years
+    vol = min(2.0, max(0.05, math.sqrt(2 * math.pi / years) * (prem - intrinsic / 2) / spot))
+    for _ in range(60):
+        d1 = (moneyness + vol * vol / 2 * years) / (vol * root)
+        d2 = d1 - vol * root
+        value = spot * og._cdf(d1) - disc * og._cdf(d2)
+        if not call:
+            value += disc - spot
+        diff = value - prem
+        if diff < 0:
+            low = vol
+        else:
+            high = vol
+        if high - low < 1e-10:
+            break
+        vega = spot * og._pdf(d1) * root
+        step = vol - diff / vega if vega > 1e-12 else None
+        if step is None or not low < step < high:
+            step = (low + high) / 2
+        if abs(step - vol) < 1e-11:
+            vol = step
+            break
+        vol = step
+    return vol
 
 
 def _gamma(spot: float, strike: float, years: float, vol: float) -> float:
@@ -187,11 +239,12 @@ def _chain_build(path: str, underlying: str, expiry: str, view_day: date, at: in
         snapshots=len(snaps), first_ts=snaps[0][0], last_ts=snaps[-1][0],
         days_to_expiry=round(max(0.0, _years(expiry, moment_ts)) * 365, 2),
     )
-    volx = _volx(minutes, expiry)
+    memo_key = (path, underlying, expiry, view_day.isoformat())
+    volx = _volx(minutes, expiry, memo_key)
     out["volx"] = volx
     out["expected_move"] = _expected_move(volx, expiry, moment_ts, spot)
     out["table"] = _table(moment_rows, expiry, moment_ts, snaps)
-    out["gamma"] = _gamma_view(moment_rows, expiry, moment_ts, minutes, step)
+    out["gamma"] = _gamma_view(moment_rows, expiry, moment_ts, minutes, step, memo_key)
     out["spectrum"] = _spectrum(snaps)
     out["writers"] = _writers(snaps, moment_ts)
     now_iv = next((p["ntm_iv"] for p in reversed(volx) if p["ts"] <= moment_ts and p["ntm_iv"]), None)
@@ -200,11 +253,15 @@ def _chain_build(path: str, underlying: str, expiry: str, view_day: date, at: in
     return out
 
 
-def _volx(minutes, expiry) -> list[dict]:
+def _volx(minutes, expiry, memo_key: tuple | None = None) -> list[dict]:
+    solved = _memo(memo_key and ("volx", *memo_key))
     points = []
     for ts, rows in minutes:
-        spot = rows[0][7]
-        points.append({"ts": ts, "spot": spot, "vix": rows[0][11], **_ntm_iv(rows, spot, expiry, ts)})
+        point = solved.get((ts, len(rows)))
+        if point is None:
+            spot = rows[0][7]
+            point = solved[(ts, len(rows))] = {"ts": ts, "spot": spot, "vix": rows[0][11], **_ntm_iv(rows, spot, expiry, ts)}
+        points.append(point)
     return points
 
 
@@ -278,7 +335,7 @@ def _net_gex(solved, years, at_spot) -> float:
     return total
 
 
-def _gamma_view(rows, expiry, ts, minutes, step) -> dict:
+def _gamma_view(rows, expiry, ts, minutes, step, memo_key: tuple | None = None) -> dict:
     """GEX in rupees of dealer gamma per 1% move, OI in shares (the chain stores quantities, not lots). Convention:
     dealers long calls / short puts (SqueezeMetrics), so call gamma counts +, put gamma -. A model output."""
     solved, years, spot = _gex_rows(rows, expiry, ts)
@@ -309,12 +366,16 @@ def _gamma_view(rows, expiry, ts, minutes, step) -> dict:
     put_wall = min(strikes, key=lambda c: c["put"])["strike"] if strikes else None
     timeline = []
     last_point = None
+    done = _memo(memo_key and ("gex", *memo_key))
     for p_ts, p_rows in minutes:
         if last_point is not None and p_ts - last_point < GEX_EVERY_SECONDS and p_ts != minutes[-1][0]:
             continue
         last_point = p_ts
-        s_solved, s_years, s_spot = _gex_rows(p_rows, expiry, p_ts)
-        timeline.append({"ts": p_ts, "spot": s_spot, "net": round(_net_gex(s_solved, s_years, s_spot))})
+        point = done.get((p_ts, len(p_rows)))
+        if point is None:
+            s_solved, s_years, s_spot = _gex_rows(p_rows, expiry, p_ts)
+            point = done[(p_ts, len(p_rows))] = {"ts": p_ts, "spot": s_spot, "net": round(_net_gex(s_solved, s_years, s_spot))}
+        timeline.append(point)
     return {"spot": spot, "net": round(net), "zero_gamma": zero, "call_wall": call_wall, "put_wall": put_wall,
             "strikes": [{k: (round(v) if k != "strike" else v) for k, v in c.items()} for c in strikes],
             "timeline": timeline, "unit": "rupees per 1% move (OI in shares)"}
@@ -394,6 +455,16 @@ def _writers(snaps, moment_ts) -> dict:
     return {"strikes": [per[k] for k in sorted(per)], "timeline": timeline,
             "ce_total": timeline[-1]["ce"] if timeline else 0, "pe_total": timeline[-1]["pe"] if timeline else 0,
             "basis": "OI added today x (average premium while it was added - premium now); assumes the added OI was written"}
+
+
+def warm(path: str, underlyings=INDICES) -> None:
+    """Build the index views once at desk start, so the first page load after a restart does not wait for the cold
+    reads (about 2 s per index on 16 Nov 2026). Runs in its own thread; any failure is left for the real request."""
+    for underlying in underlyings:
+        try:
+            chain_view(path, underlying)
+        except Exception:  # noqa: BLE001 - a warm-up must never take the desk down
+            continue
 
 
 # ------------------------------------------------------------------------------------------------ IV range

@@ -73,17 +73,31 @@ def instruments(path: str) -> dict:
 
 
 def expiries(path: str, underlying: str) -> list[dict]:
-    def build():
+    """Each stored expiry with its first and last snapshot time. Sessions before today no longer change, so their scan
+    (every row the underlying ever stored: 0.4 s warm, 2 s cold) is kept for hours; only today's rows are read each
+    minute. It used to be the whole scan every 60 seconds, on every refresh of the straddle and options views."""
+    today_start = _start(_day(int(time.time())))
+
+    def scan(lo: int, hi: int) -> list[tuple]:
         connection = _read(path)
         try:
-            rows = connection.execute(
+            return connection.execute(
                 """SELECT expiry, MIN(ts), MAX(ts), COUNT(DISTINCT ts) FROM chain_snapshots
-                   WHERE underlying = ? GROUP BY expiry ORDER BY expiry""", (underlying,)).fetchall()
+                   WHERE underlying = ? AND ts >= ? AND ts < ? GROUP BY expiry""", (underlying, lo, hi)).fetchall()
         except sqlite3.OperationalError:
-            rows = []
+            return []
         finally:
             connection.close()
-        return [dict(expiry=e, first_ts=a, last_ts=b, snapshots=n) for e, a, b, n in rows]
+
+    def build():
+        past = _cached(("expiries-past", path, underlying, today_start), 6 * 3600, lambda: scan(0, today_start))
+        merged: dict[str, list] = {e: [a, b, n] for e, a, b, n in past}
+        for e, a, b, n in scan(today_start, today_start + 7 * 86400):
+            if e in merged:
+                merged[e] = [min(merged[e][0], a), max(merged[e][1], b), merged[e][2] + n]
+            else:
+                merged[e] = [a, b, n]
+        return [dict(expiry=e, first_ts=a, last_ts=b, snapshots=n) for e, (a, b, n) in sorted(merged.items())]
     return _cached(("expiries", path, underlying), 60, build)
 
 
