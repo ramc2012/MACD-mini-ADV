@@ -657,6 +657,47 @@ class TestBarDatabase:
         assert len(lane.broker.history_requests) == requests            # nothing downloaded again
         assert [bar.timestamp for bar in lane.history[call.symbol]][:3] == [int(at(11, m).timestamp()) for m in range(3)]
 
+    def test_a_minute_without_a_print_is_a_flat_bar_at_the_last_price(self, tmp_path):
+        lane, call = ready_lane(tmp_path)
+        tick = lambda price, volume, moment: asyncio.run(lane.on_tick(
+            Tick(call.symbol, price, volume, moment.astimezone(UTC)), moment.astimezone(UTC)))
+        Clock.moment = at(11, 0, 10)
+        tick(100.0, 1000, Clock.moment)
+        Clock.moment = at(11, 0, 40)
+        tick(101.0, 1040, Clock.moment)
+        # Other contracts keep the feed alive; this one is quiet from 11:01 to 11:03.
+        other = next(row for row in lane.contracts.values() if row.option_type == "PE")
+        for minute in (1, 2, 3):
+            Clock.moment = at(11, minute, 30)
+            asyncio.run(lane.on_tick(Tick(other.symbol, 50.0, 10 * minute, Clock.moment.astimezone(UTC)),
+                                     Clock.moment.astimezone(UTC)))
+        asyncio.run(lane.maintain(at(11, 3, 30).astimezone(UTC)))
+        stored = lane.store.minutes(call.symbol, int(at(11, 0).timestamp()))
+        assert [(bar.timestamp, bar.close, bar.volume) for bar in stored] == [
+            (int(at(11, 0).timestamp()), 101.0, 0),                         # its own minute, closed by the clock
+            (int(at(11, 1).timestamp()), 101.0, 0),                         # flat: no print
+            (int(at(11, 2).timestamp()), 101.0, 0),
+        ]
+        assert all(bar.open == bar.high == bar.low == 101.0 for bar in stored[1:])
+        # A late print stamped in a written minute is not merged into it; the next minute's print is recorded.
+        tick(150.0, 1100, at(11, 2, 59))
+        tick(102.0, 1100, at(11, 3, 40))
+        asyncio.run(lane.maintain(at(11, 4, 10).astimezone(UTC)))
+        stored = lane.store.minutes(call.symbol, int(at(11, 2).timestamp()))
+        assert [(bar.timestamp, bar.close) for bar in stored] == [(int(at(11, 2).timestamp()), 101.0),
+                                                                  (int(at(11, 3).timestamp()), 102.0)]
+        assert stored[1].volume == 60 and lane.quiet_minutes["late_ticks"] == 1
+        # The forming 30-minute bar still comes from prints alone.
+        assert lane.aggregator.current[call.symbol].close == 102.0
+
+    def test_no_flat_bars_while_the_feed_is_silent(self, tmp_path):
+        lane, call = ready_lane(tmp_path)
+        Clock.moment = at(11, 0, 10)
+        asyncio.run(lane.on_tick(Tick(call.symbol, 100.0, 1000, Clock.moment.astimezone(UTC)), Clock.moment.astimezone(UTC)))
+        asyncio.run(lane.maintain(at(11, 5, 0).astimezone(UTC)))         # nothing at all for five minutes
+        stored = lane.store.minutes(call.symbol, int(at(11, 0).timestamp()))
+        assert stored == [] and lane.quiet_minutes["flat"] == 0          # a gap for history, not invented bars
+
     def test_the_futures_are_watched_with_bars_and_macd_and_never_traded(self, tmp_path):
         broker = crude_broker()
         lane = build(tmp_path, broker)

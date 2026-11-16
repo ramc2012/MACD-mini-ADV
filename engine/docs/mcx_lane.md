@@ -91,6 +91,11 @@ calls it.
   - **Watched:** today's ATM options, the futures each series is priced from, every holding, and a ladder of
     `mcx_ladder_strikes` strikes (default 5) either side of each ATM, calls and puts. The ladder is recorded so
     that tomorrow's ATM contract already has its bars.
+  - **Minutes without a trade.** A contract's minute is written when the clock passes it (5 s grace), not on its
+    next tick, and a minute with no print gets a flat bar at the last price with volume 0 -- what Fyers' own minute
+    history holds for such a minute, so recorded and downloaded stretches read alike. Only while the feed is alive
+    and within the day; a print arriving after its minute was written is counted (`quiet_minutes.late_ticks` in
+    health), not merged. The 30-minute bars the lane trades on still come from prints alone.
   - **A second download** happens only to fill a stretch of session the lane received nothing for (the engine or
     the socket was down for more than two minutes). Outstanding gaps also
     retry for the watched ladder. The repair preserves existing bars and skips

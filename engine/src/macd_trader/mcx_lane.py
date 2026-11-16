@@ -563,6 +563,7 @@ OI_REFRESH_SECONDS = 120
 OI_PACING_SECONDS = 0.8
 GAP_SECONDS = 120                 # session time without ticks that counts as a hole in the bar database
 HEARTBEAT_SECONDS = 60
+QUIET_MINUTE_GRACE_SECONDS = 5      # a print stamped in the last seconds of a minute can arrive just after it
 BACKFILL_RETRY_SECONDS = 1800
 STORE_STATS_SECONDS = 300
 HOLD_MESSAGE = "history downloads are held and the lane's switch is off"
@@ -618,6 +619,9 @@ class McxLane:
         self.minute_bars = McxCandleAggregator(60, self.calendar)
         self._minute_pending: list[Candle] = []
         self._last_chart_minute: dict[str, Candle] = {}
+        self._last_minute: dict[str, tuple[int, float]] = {}   # symbol -> (last written minute, its close)
+        self._quiet_closed_to = 0
+        self.quiet_minutes = {"flat": 0, "late_ticks": 0}
         self._day_volume: dict[str, tuple[str, int]] = {}
         self._last_ws_any: datetime | None = None
         self._last_heartbeat = 0.0
@@ -1456,9 +1460,58 @@ class McxLane:
                 await self._on_signal(signal)
 
     def _record_minute(self, tick: Tick) -> None:
+        written = self._last_minute.get(tick.symbol)
+        if written is not None and self.minute_bars.current.get(tick.symbol) is None:
+            bucket = mcx_bucket(int(tick.timestamp.timestamp()), 60, self.calendar)
+            if bucket is not None and bucket <= written[0]:
+                # Its minute is already written (closed by the clock, or a flat bar): a late print is not merged.
+                self.quiet_minutes["late_ticks"] += 1
+                return
         _, closed = self.minute_bars.on_tick(tick)
         if closed is not None:
             self._queue_minute(closed)
+
+    def _close_quiet_minutes(self, now: datetime) -> int:
+        """Write every watched contract's minutes up to the one just past, ticks or not.
+
+        A contract's minute closes on the clock (a few seconds' grace for late prints), not on its next tick, and a
+        minute with no print gets a flat bar at the last price with volume 0 -- what Fyers' minute history holds for
+        such a minute, so live-recorded and downloaded stretches read alike. Only while the feed is alive and within
+        the day: a stretch the socket was down is a feed gap, filled from history instead.
+        """
+        if self._last_ws_any is None or (now - self._last_ws_any).total_seconds() > HEARTBEAT_SECONDS:
+            return 0
+        edge = mcx_bucket(int(now.timestamp()) - QUIET_MINUTE_GRACE_SECONDS, 60, self.calendar)
+        if edge is None or edge <= self._quiet_closed_to:
+            return 0
+        self._quiet_closed_to = edge
+        flats = 0
+        for symbol in self.subscription_symbols():
+            candle = self.minute_bars.current.get(symbol)
+            if candle is not None and candle.timestamp < edge:
+                del self.minute_bars.current[symbol]
+                candle.closed = True
+                self._queue_minute(candle)
+            last = self._last_minute.get(symbol)
+            if last is None:
+                continue                      # no print yet since the engine started: nothing to carry
+            ts, close = last
+            day = datetime.fromtimestamp(ts, UTC).astimezone(IST).date()
+            minute = ts + 60
+            while minute < edge:
+                moment = datetime.fromtimestamp(minute, UTC)
+                if moment.astimezone(IST).date() != day:
+                    break
+                if self.calendar.in_session(moment):
+                    flat = Candle(symbol, minute, close, close, close, close, 0, True)
+                    self._minute_pending.append(flat)
+                    self._last_minute[symbol] = (minute, close)
+                    if symbol in self.contracts or self.is_future(symbol):
+                        self._last_chart_minute[symbol] = flat
+                    flats += 1
+                minute += 60
+        self.quiet_minutes["flat"] += flats
+        return flats
 
     def _queue_minute(self, bar: Candle) -> None:
         """A closed live minute, with the day's running volume turned into that minute's volume."""
@@ -1470,6 +1523,8 @@ class McxLane:
         volume = max(0, total - base) if base is not None else 0
         closed = Candle(bar.symbol, bar.timestamp, bar.open, bar.high, bar.low, bar.close, volume, True)
         self._minute_pending.append(closed)
+        if bar.timestamp >= self._last_minute.get(bar.symbol, (0, 0.0))[0]:
+            self._last_minute[bar.symbol] = (bar.timestamp, bar.close)
         if bar.symbol in self.contracts or self.is_future(bar.symbol):
             self._last_chart_minute[bar.symbol] = closed
 
@@ -1636,6 +1691,8 @@ class McxLane:
             self._flush_minutes()
             keep_from = int((now - timedelta(days=self.settings.mcx_store_days)).timestamp())
             await asyncio.to_thread(self.store.prune, keep_from)
+        if self.calendar.in_session(now):
+            self._close_quiet_minutes(now)
         self._flush_minutes()
         clock_now = now.timestamp()
         if (self.calendar.in_session(now) and self._last_ws_any is not None
@@ -1936,6 +1993,7 @@ class McxLane:
             "futures": len(self.futures_symbols()),
             "ladder": len(self.ladder),
             "store": self._store_stats,
+            "quiet_minutes": dict(self.quiet_minutes),
             "history": {"downloads_allowed": self.downloads_allowed(), **self.downloads,
                         "failed": dict(list(self.downloads["failed"].items())[:10]),
                         "failed_count": len(self.downloads["failed"]),
