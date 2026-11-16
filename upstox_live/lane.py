@@ -400,6 +400,10 @@ def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: st
         journal("ORDER_SENT", symbol=symbol, side=side, quantity=qty, price=price, order_ids=ids, reason=reason)
     except Exception as e:
         journal("ORDER_ERROR", symbol=symbol, side=side, quantity=qty, price=price, error=str(e)[:400])
+        blocked = ip_block(str(e))
+        if blocked:   # stop sending entries until the periodic probe passes again (it re-checks every 15 minutes)
+            cache["order_api"] = {**(cache.get("order_api") or {}), "ok": False, "detail": blocked,
+                                  "checked": time.time(), "checked_at": iso()}
 
 
 def cancel(o: dict, why: str) -> bool:
@@ -414,6 +418,20 @@ def cancel(o: dict, why: str) -> bool:
     except Exception as e:
         journal("CANCEL_ERROR", symbol=o["symbol"], order_id=o["order_id"], error=str(e)[:300])
         return False
+
+
+def ip_block(text: str) -> str | None:
+    """Upstox refuses order calls from an IP other than the app's registered static IP: UDAPI1221 (none registered /
+    not this one) or UDAPI1154 (registered IP differs from the caller's). Returns the reason, with both IPs when
+    Upstox names them, else None. A home connection's public IP can change (it did on 16 Nov 2026, mid-session)."""
+    if "UDAPI1154" not in text and "UDAPI1221" not in text:
+        return None
+    m = re.search(r"static IP \(([0-9a-fA-F.:]+)\) does not match the request origin IP \(([0-9a-fA-F.:]+)\)", text)
+    if m:
+        return (f"orders are blocked: this network's public IP is now {m.group(2)}, but the static IP registered on "
+                f"the Upstox app is {m.group(1)} (UDAPI1154). Update the app's static IP at Upstox")
+    code = "UDAPI1154" if "UDAPI1154" in text else "UDAPI1221"
+    return f"orders are blocked: this IP is not the static IP registered on the Upstox app ({code})"
 
 
 def probe_order_api() -> None:
@@ -435,8 +453,8 @@ def probe_order_api() -> None:
             result.update(ok=False, detail=text)
         elif "UDAPI100067" in text:
             result.update(ok=False, detail="the Upstox token is READ-ONLY: orders are refused (log in for a trading token)")
-        elif "UDAPI1221" in text:
-            result.update(ok=False, detail="this IP is not registered as the app's static IP (UDAPI1221)")
+        elif ip_block(text):
+            result.update(ok=False, detail=ip_block(text))
         elif " 401" in text or "-> 401" in text:
             result.update(ok=False, detail="token not accepted by the order API: " + text[-200:])
         else:   # e.g. order not found: the request got through to the order system

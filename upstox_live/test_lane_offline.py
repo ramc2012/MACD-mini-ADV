@@ -32,6 +32,19 @@ trade_token_path.with_suffix(".new").write_text("mock-trading-token-rotated")
 trade_token_path.with_suffix(".new").replace(trade_token_path)
 lane.upstox("POST", lane.ORDER_HOST, "/v3/order/place")
 assert auth_calls[-1][0] == "POST" and auth_calls[-1][2] == "Bearer mock-trading-token-rotated"
+# A changed public IP: Upstox answers UDAPI1154 with both addresses. The probe must report "blocked" (it used to
+# count any answered request as reachable), and the reason must name the IP to register.
+MISMATCH = ('POST /v3/order/place -> 403: {"status":"error","errors":[{"errorCode":"UDAPI1154","message":"Access to this API '
+            'is blocked due to static IP restrictions. Reason: The configured static IP (198.51.100.7) does not match the '
+            'request origin IP (203.0.113.9)."}]}')
+def refuse_http(method, url, headers, body=None):
+    raise RuntimeError(MISMATCH)
+lane.http = refuse_http
+lane.cache.pop("order_api", None)
+lane.probe_order_api()
+assert lane.cache["order_api"]["ok"] is False, lane.cache["order_api"]
+assert "203.0.113.9" in lane.cache["order_api"]["detail"] and "198.51.100.7" in lane.cache["order_api"]["detail"]
+assert lane.ip_block("-> 401: UDAPI1221 not registered").endswith("(UDAPI1221)") and lane.ip_block("order not found") is None
 lane.http = original_http
 lane.cache.clear()
 lane.cache.update(original_cache)
