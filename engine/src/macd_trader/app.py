@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
 from .alerts import AlertManager
-from .brokers import create_broker
+from .brokers import FyersConnectionError, create_broker
 from .config import ENVIRONMENT_ONLY, Settings, settings
 from .chart_history import load_chart_history
 from .candle_store import store_historical_candles
@@ -1243,6 +1243,8 @@ async def install_fyers_token(access_token: str, described: dict | None = None, 
     try:
         await probe.connect()
         accepted_expiry = probe.token_expiry()
+    except FyersConnectionError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except Exception as exc:
         client = new_settings.fyers_client_id or "this app"
         raise HTTPException(400, "Fyers did not accept this access token -- it is invalid, revoked, or was issued "

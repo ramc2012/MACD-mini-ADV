@@ -7,6 +7,7 @@ import json
 import math
 import os
 import random
+import socket
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, deque
@@ -408,6 +409,21 @@ HUB_OWN_FAILURES = frozenset({400, 404, 500, 502, 503, 504})
 HUB_RETRY_SECONDS = 60.0
 
 
+class FyersConnectionError(RuntimeError):
+    """The FYERS profile could not answer the session check."""
+
+
+def _fyers_transport_error(exc: httpx.RequestError) -> FyersConnectionError:
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, socket.gaierror) or (isinstance(exc, httpx.ConnectError) and any(
+            hint in str(cause).lower() for hint in ("name or service not known", "name resolution", "nodename nor servname")
+        )):
+            return FyersConnectionError("FYERS API hostname could not be resolved (DNS). Retrying will reuse the saved token.")
+        cause = cause.__cause__ or (None if cause.__suppress_context__ else cause.__context__)
+    return FyersConnectionError(f"Could not reach the FYERS API ({type(exc).__name__}).")
+
+
 class FyersBroker(Broker):
     name = "fyers"
     data_url = "https://api-t1.fyers.in/data"
@@ -647,37 +663,43 @@ class FyersBroker(Broker):
         return parsed
 
     async def connect(self) -> None:
+        self.connected = False
         if not self.settings.fyers_client_id:
             raise RuntimeError("Fyers client ID is required")
-        if self.settings.fyers_access_token and await self._token_is_valid():
-            self.connected = True
-            return
-        raise RuntimeError("Fyers daily access token is missing or expired; paste today’s token in Fyers settings")
+        if not self.settings.fyers_access_token or self.token_expired():
+            raise RuntimeError("Fyers daily access token is missing or expired; paste today’s token in Fyers settings")
+        if not await self.validate_session():
+            raise RuntimeError("FYERS rejected the saved access token; reconnect FYERS in Settings")
+        self.connected = True
 
-    async def _token_is_valid(self) -> bool:
+    async def validate_session(self) -> bool:
+        """Return false for auth rejection; transport and malformed replies are inconclusive."""
         if not self.settings.fyers_access_token:
             return False
         try:
-            return await self.validate_session()
-        except (httpx.HTTPError, ValueError):
-            return False
-
-    async def validate_session(self) -> bool:
-        """Use Fyers' profile endpoint as the source of truth for auth state."""
-        if not self.settings.fyers_access_token:
-            return False
-        async with httpx.AsyncClient(timeout=6) as client:
-            response = await client.get(
-                f"{self.api_url}/profile",
-                headers={"Authorization": self.authorization},
-            )
+            async with httpx.AsyncClient(timeout=6) as client:
+                response = await client.get(
+                    f"{self.api_url}/profile",
+                    headers={"Authorization": self.authorization},
+                )
+        except httpx.RequestError as exc:
+            raise _fyers_transport_error(exc) from exc
         if response.status_code in {401, 403}:
             return False
-        response.raise_for_status()
-        payload = response.json()
-        # Be fail-closed: an HTTP 200 without Fyers' explicit success marker
-        # must not turn the terminal green.
-        return isinstance(payload, dict) and payload.get("s") == "ok"
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise FyersConnectionError(f"FYERS profile returned HTTP {response.status_code}; session status unknown.") from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise FyersConnectionError("FYERS profile returned an unreadable response; session status unknown.") from exc
+        if isinstance(payload, dict):
+            if payload.get("s") == "ok":
+                return True
+            if payload.get("code") == -8:
+                return False
+        raise FyersConnectionError("FYERS profile did not confirm the session; retry the profile check.")
 
     async def history(self, symbol: str, timeframe_seconds: int, count: int) -> list[Candle]:
         resolution = str(max(1, timeframe_seconds // 60))

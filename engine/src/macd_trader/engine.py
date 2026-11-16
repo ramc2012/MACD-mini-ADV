@@ -1577,7 +1577,8 @@ class TradingEngine(DeskMixin):
                 async with self._reconfigure_lock:
                     await self.restart_stream()
         except Exception as exc:  # noqa: BLE001 — retry on the next sweep
-            self.error = f"feed recovery failed: {exc}"
+            self.status = "error"
+            self.error = f"feed recovery failed: {str(exc) or type(exc).__name__}"
         finally:
             self.events.publish("broker", self.broker_status())
 
@@ -2988,6 +2989,16 @@ class TradingEngine(DeskMixin):
         seen_at, skew = last
         return skew if time.monotonic() - seen_at <= CLOCK_SKEW_REPORT_SECONDS else None
 
+    def observed_feed_status(self) -> str:
+        """Use the same observed market-feed state in REST health and broker events."""
+        if self.token_expired() and self.status != "connecting":
+            return "token_expired"
+        if self.socket_auth_rejected():
+            return "socket_auth_failed"
+        if self.status == "connected" and not self.feed_alive():
+            return "stale"
+        return self.status
+
     def broker_status(self, include_symbols: bool = True) -> dict:
         skew = self.clock_skew_seconds()
         skew_error = (f"Host clock is {skew:.0f}s behind exchange time; "
@@ -2996,10 +3007,7 @@ class TradingEngine(DeskMixin):
         return {
             "name": self.broker.name,
             # Report what the feed is DOING, not what connect() once returned.
-            "status": ("token_expired" if self.token_expired() and self.status == "connected"
-                       else "socket_auth_failed" if self.socket_auth_rejected()
-                       else self.status if self.feed_alive()
-                       else "stale" if self.status == "connected" else self.status),
+            "status": self.observed_feed_status(),
             "token_expires_at": (lambda e: e.isoformat() if e else None)(
                 getattr(self.broker, "token_expiry", lambda: None)()),
             "token_expired": self.token_expired(),
@@ -3234,7 +3242,7 @@ class TradingEngine(DeskMixin):
         if self.last_tick_at is not None:
             last_age = round(max(0.0, (datetime.now(UTC) - self.last_tick_at).total_seconds()), 1)
         return {
-            "status": self.status,
+            "status": self.observed_feed_status(),
             "error": self.error,
             "uptime_seconds": round((datetime.now(UTC) - self.started_at).total_seconds()),
             "feed_connects": self.feed_connects,

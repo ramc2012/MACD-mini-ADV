@@ -1,7 +1,9 @@
 import asyncio
+import httpx
+import pytest
 from types import SimpleNamespace
 
-from macd_trader.brokers import FyersBroker, _ThreadsafeTickBuffer
+from macd_trader.brokers import FyersBroker, FyersConnectionError, _ThreadsafeTickBuffer
 from macd_trader.config import Settings
 from macd_trader.engine import TradingEngine
 from macd_trader.events import EventHub
@@ -91,6 +93,76 @@ def test_fyers_auth_accepts_explicit_ok(monkeypatch):
     monkeypatch.setattr("macd_trader.brokers.httpx.AsyncClient", FakeClient)
     FakeClient.response = FakeResponse(200, {"s": "ok", "data": {}})
     assert asyncio.run(broker().validate_session()) is True
+
+
+def test_connect_reports_dns_failure_without_blaming_the_saved_token(monkeypatch):
+    class UnreachableProfile(FakeClient):
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectError("[Errno -2] Name or service not known")
+
+    monkeypatch.setattr("macd_trader.brokers.httpx.AsyncClient", UnreachableProfile)
+    client = broker()
+    client.connected = True
+    with pytest.raises(FyersConnectionError, match="could not be resolved"):
+        asyncio.run(client.connect())
+    assert client.connected is False
+    assert client.token_expired() is False
+
+
+def test_profile_outage_is_not_an_auth_rejection(monkeypatch):
+    class UnavailableProfile(FakeClient):
+        async def get(self, *args, **kwargs):
+            return httpx.Response(503, request=httpx.Request("GET", "https://broker.example/profile"))
+
+    monkeypatch.setattr("macd_trader.brokers.httpx.AsyncClient", UnavailableProfile)
+    with pytest.raises(FyersConnectionError, match="HTTP 503"):
+        asyncio.run(broker().validate_session())
+
+
+def test_watchdog_reports_failed_recovery_then_retries(monkeypatch):
+    from macd_trader import engine as module
+
+    async def run():
+        engine = object.__new__(TradingEngine)
+        engine.broker = broker()
+        engine.status = "connected"
+        engine.error = None
+        engine._reconfigure_lock = asyncio.Lock()
+        engine._last_feed_recovery = float("-inf")
+        engine.feed_recoveries = 0
+        engine.all_symbols = []
+        engine.option_symbols = []
+        engine.settings = SimpleNamespace(symbols=[])
+        engine.events = EventHub()
+        engine.seconds_since_last_tick = lambda: 600.0
+        monkeypatch.setattr(module, "regular_session_open", lambda: True)
+        monkeypatch.setattr(module, "FEED_RECOVERY_COOLDOWN", 0)
+        assert engine.observed_feed_status() == "stale"
+
+        async def preopen():
+            return False
+
+        async def failed():
+            raise FyersConnectionError("FYERS DNS unavailable")
+
+        engine._preopen_refresh = preopen
+        engine.restart_stream = failed
+        await engine._watchdog_sweep()
+        assert engine.broker_status()["status"] == "error"
+        assert "DNS" in engine.broker_status()["error"]
+        assert not engine.broker_status()["token_expired"]
+
+        async def recovered():
+            engine.status = "connected"
+            engine.error = None
+            engine.seconds_since_last_tick = lambda: 0.0
+
+        engine.restart_stream = recovered
+        await engine._watchdog_sweep()
+        assert engine.broker_status()["status"] == "connected"
+        assert engine.feed_recoveries == 2
+
+    asyncio.run(run())
 
 
 def test_engine_clears_connected_state_when_session_expires():
