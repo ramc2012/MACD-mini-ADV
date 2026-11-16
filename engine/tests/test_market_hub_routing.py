@@ -102,3 +102,24 @@ def test_the_hubs_own_error_falls_back_but_a_fyers_answer_through_the_hub_does_n
 def test_the_hub_url_comes_from_the_environment_never_settings_json():
     from macd_trader.config import ENVIRONMENT_ONLY
     assert "market_hub_url" in ENVIRONMENT_ONLY
+
+
+def test_the_mcx_lane_switch_lets_only_mcx_history_through_the_hold(monkeypatch):
+    """mcx_history_downloads: MCX symbols go straight to Fyers; every other symbol stays held, hub or no hub."""
+    monkeypatch.setenv("MACD_HISTORY_DOWNLOADS_ENABLED", "false")
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.host)
+        return httpx.Response(200, json={"s": "ok", "candles": []})
+
+    for hub in ("", "http://hub:8400"):
+        broker = _broker(hub)
+        with pytest.raises(RuntimeError, match="disabled"):       # the switch is off by default
+            _run(broker, handler, lambda c: broker._data_get(c, "history", {"symbol": "MCX:GOLD26DECFUT"}, priority="bulk"))
+        broker.mcx_history_allowed = True
+        response = _run(broker, handler, lambda c: broker._data_get(c, "history", {"symbol": "MCX:GOLD26DECFUT"}, priority="bulk"))
+        assert response.json()["s"] == "ok"
+        with pytest.raises(RuntimeError, match="disabled"):
+            _run(broker, handler, lambda c: broker._data_get(c, "history", {"symbol": "NSE:SBIN-EQ"}, priority="bulk"))
+    assert seen == ["api-t1.fyers.in", "api-t1.fyers.in"]         # never the hub, never a non-MCX symbol

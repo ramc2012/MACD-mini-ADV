@@ -586,6 +586,7 @@ class McxLane:
         self._flushed_day: str | None = None
         self._held_saved: frozenset[str] = frozenset()
         self._task: asyncio.Task | None = None
+        self._allow_history()
         self._build_strategy()
         self._restore()
         self._restore_contracts()
@@ -622,6 +623,9 @@ class McxLane:
         self.execution.settings = risk
         for position in self.portfolio.positions.values():
             position.hard_stop = round(position.average_price * (1 - risk.hard_stop_pct), 4)
+        self._allow_history()
+        # Switched on: the warm-up that was refused can now run, so start it again from empty.
+        history_allowed = settings.mcx_history_downloads and not previous.mcx_history_downloads
         timeframe_changed = (int(previous.mcx_timeframe_seconds or previous.timeframe_seconds)
                              != self.timeframe_seconds)
         # Anything that changes how an indicator is built needs fresh state and
@@ -629,7 +633,7 @@ class McxLane:
         strategy_changed = any(getattr(previous, key) != getattr(settings, key) for key in (
             "fast_period", "slow_period", "signal_period", "bb_period", "bb_deviations", "kama_period",
             "kama_fast", "kama_slow", "kama_rsi_period", "kama_roc_period"))
-        if timeframe_changed or strategy_changed:
+        if timeframe_changed or strategy_changed or history_allowed:
             self._reset_strategy()
         else:
             self.strategy.settings = settings
@@ -639,11 +643,19 @@ class McxLane:
                          or previous.mcx_roots_csv != settings.mcx_roots_csv
                          or previous.mcx_min_days_to_expiry != settings.mcx_min_days_to_expiry
                          or previous.mcx_lot_multipliers_csv != settings.mcx_lot_multipliers_csv),
-            "rewarm": timeframe_changed or strategy_changed,
+            "rewarm": timeframe_changed or strategy_changed or history_allowed,
         }
 
     def rebind_broker(self, broker) -> None:
         self.broker = broker
+        self._allow_history()
+
+    def _allow_history(self) -> None:
+        """Tell the broker whether MCX history may pass the engine-wide download hold."""
+        try:
+            self.broker.mcx_history_allowed = bool(self.settings.mcx_history_downloads)
+        except AttributeError:      # a stand-in broker without attributes
+            pass
 
     # ----------------------------------------------------------------- restore
 
@@ -1290,6 +1302,7 @@ class McxLane:
             "expiry_flatten_ist": current.mcx_expiry_flatten_ist,
             "rest_fallback_seconds": current.mcx_rest_fallback_seconds,
             "lot_multipliers_csv": current.mcx_lot_multipliers_csv,
+            "history_downloads": current.mcx_history_downloads,
         }
 
     def risk_view(self) -> dict:

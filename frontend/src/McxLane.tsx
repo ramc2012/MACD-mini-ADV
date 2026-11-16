@@ -326,6 +326,8 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: McxSnapshot; onSaved: (n
       <p className="field-help">Off unsubscribes today's contracts. Open positions keep their stops, trail and expiry exit.</p>
       <label className="toggle"><input type="checkbox" checked={form.auto_trade} onChange={(event) => setField("auto_trade", event.target.checked)} />Buy premium zero-crosses (paper)</label>
       <p className="field-help">Off records every signal with its verdict and buys nothing. This lane never places a live order.</p>
+      <label className="toggle"><input type="checkbox" checked={form.history_downloads} onChange={(event) => setField("history_downloads", event.target.checked)} />Download MCX history for the warm-up</label>
+      <p className="field-help">While the app's history-download hold is on, this lets the lane fetch 1-minute bars for its own contracts at each warm-up (every morning and after a restart). Off: the lane starts with no bars and needs about a session of live bars before it can signal.</p>
     </div>
 
     <div className="settings-section">

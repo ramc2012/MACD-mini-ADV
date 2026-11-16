@@ -12,7 +12,7 @@ export const ROOT_UNIT: Record<string, string> = {
 export type McxSettings = {
   enabled: boolean; auto_trade: boolean; roots_csv: string; initial_capital: number; target_notional: number;
   max_entry_lots: number; max_positions: number; timeframe_seconds: number; min_days_to_expiry: number;
-  expiry_flatten_ist: string; rest_fallback_seconds: number; lot_multipliers_csv: string;
+  expiry_flatten_ist: string; rest_fallback_seconds: number; lot_multipliers_csv: string; history_downloads?: boolean;
 };
 
 export type McxContractRow = {
@@ -73,7 +73,7 @@ export type McxSnapshot = {
 export type McxForm = {
   enabled: boolean; auto_trade: boolean; roots: string[]; initial_capital: string; target_notional: string;
   max_entry_lots: string; max_positions: string; timeframe_minutes: string; min_days_to_expiry: string;
-  expiry_flatten_ist: string; rest_fallback_seconds: string;
+  expiry_flatten_ist: string; rest_fallback_seconds: string; history_downloads: boolean;
 };
 
 export const VERDICT_LABEL: Record<string, { label: string; help: string }> = {
@@ -113,6 +113,7 @@ export function toForm(settings: McxSettings): McxForm {
     min_days_to_expiry: String(settings.min_days_to_expiry),
     expiry_flatten_ist: settings.expiry_flatten_ist,
     rest_fallback_seconds: String(settings.rest_fallback_seconds),
+    history_downloads: Boolean(settings.history_downloads),
   };
 }
 
@@ -143,6 +144,7 @@ export function fromForm(form: McxForm): { payload?: Payload; error?: string } {
       roots_csv: orderedRoots(form.roots).join(","),
       initial_capital: capital, target_notional: notional, max_entry_lots: lots, max_positions: positions,
       timeframe_seconds: minutes * 60, min_days_to_expiry: days, expiry_flatten_ist: flatten, rest_fallback_seconds: fallback,
+      history_downloads: form.history_downloads,
     },
   };
 }
@@ -152,7 +154,7 @@ export function changedSettings(current: McxSettings, next: Payload): Partial<Pa
   const changes: Partial<Payload> = {};
   (Object.keys(next) as (keyof Payload)[]).forEach((key) => {
     const before = key === "roots_csv" ? orderedRoots(rootsFrom(current.roots_csv)).join(",") : current[key];
-    if (before !== next[key]) (changes as Record<string, unknown>)[key] = next[key];
+    if (key === "history_downloads" ? Boolean(before) !== Boolean(next[key]) : before !== next[key]) (changes as Record<string, unknown>)[key] = next[key];
   });
   return changes;
 }

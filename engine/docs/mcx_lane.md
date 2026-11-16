@@ -142,6 +142,10 @@ The lane was written on the 19 Oct tree and ported onto the current one on 16 No
 - **Warm-up under the recovery hold:** with `MACD_HISTORY_DOWNLOADS_ENABLED=false` the broker refuses every history
   request, so the lane starts with no bars and its MACD needs about 35 live bars (a little over one MCX session at
   30 minutes) before it can signal. The warm-up report lists each contract as failed with that reason.
+  - `mcx_history_downloads` (MCX lane → Settings → "Download MCX history for the warm-up", or
+    `PUT /api/mcx/settings {"history_downloads": true}`) lets MCX symbols alone through the hold, straight to Fyers:
+    one request of `mcx_warmup_days` per option contract at each warm-up. Switching it on re-runs the warm-up at once.
+  - The lane re-warms at every 08:45 selection and after every restart, so with the switch off each morning starts cold.
 - **REST quotes carry no trade time for MCX** (the stamp is the start of the day), so a REST fallback quote only
   marks a holding; it never triggers an entry or a stop.
 

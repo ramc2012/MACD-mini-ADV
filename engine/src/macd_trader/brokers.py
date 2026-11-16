@@ -583,6 +583,11 @@ class FyersBroker(Broker):
         straight to Fyers, as before.
         """
         if endpoint == "history" and os.environ.get("MACD_HISTORY_DOWNLOADS_ENABLED", "true").lower() in ("false", "0", "off"):
+            # The one exception: the MCX lane's warm-up, when its own switch allows it (mcx_history_downloads).
+            # MCX bars go to that lane's memory and to no store, and the request goes straight to Fyers: the
+            # hub holds history too.
+            if getattr(self, "mcx_history_allowed", False) and str(params.get("symbol") or "").startswith("MCX:"):
+                return await self._direct_get(client, endpoint, params)
             raise RuntimeError("Historical broker downloads disabled during local-archive recovery")
         hub = (getattr(self.settings, "market_hub_url", "") or "").rstrip("/")
         if not hub or time.monotonic() < self._hub_skip_until:

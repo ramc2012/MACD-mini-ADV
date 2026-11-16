@@ -576,3 +576,17 @@ def test_evening_feed_time_is_not_clamped_to_the_nse_close():
     assert late == at(23, 55).astimezone(UTC)
     nse = FyersBroker.exchange_timestamp({"symbol": "NSE:SBIN26NOV800CE", "exch_feed_time": evening})
     assert nse.astimezone(IST).time() < time(16, 0)
+
+
+def test_switching_history_downloads_on_tells_the_broker_and_restarts_the_warmup(tmp_path):
+    """Under the engine-wide hold the warm-up is refused; turning the lane's switch on must run it again from empty."""
+    lane, call = ready_lane(tmp_path)
+    assert lane.broker.mcx_history_allowed is False
+    assert not lane._warming                                    # the first warm-up has finished
+    needs = lane.apply_settings(lane.settings.model_copy(update={"mcx_history_downloads": True}))
+    assert lane.broker.mcx_history_allowed is True
+    assert needs["rewarm"] and not needs["reselect"]
+    assert call.symbol in lane._warming
+    assert lane.settings_view()["history_downloads"] is True
+    needs = lane.apply_settings(lane.settings.model_copy(update={"mcx_history_downloads": False}))
+    assert lane.broker.mcx_history_allowed is False and not needs["rewarm"]

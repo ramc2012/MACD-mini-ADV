@@ -631,6 +631,7 @@ class McxSettingsInput(BaseModel):
     expiry_flatten_ist: str | None = Field(default=None, pattern=r"^(|([01]\d|2[0-3]):[0-5]\d)$")
     rest_fallback_seconds: float | None = Field(default=None, ge=0, le=3600)
     lot_multipliers_csv: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:, ]*$", max_length=300)
+    history_downloads: bool | None = None
 
 
 def _smart_lane(name: str):

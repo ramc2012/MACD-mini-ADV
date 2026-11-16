@@ -356,6 +356,10 @@ class Settings(BaseSettings):
     # for this many seconds during the MCX session. 0 disables.
     mcx_rest_fallback_seconds: float = Field(default=60.0, ge=0, le=3600)
     mcx_warmup_days: int = Field(default=10, ge=2, le=60)
+    # The lane keeps no bar store of its own, so its warm-up is a broker download. While
+    # MACD_HISTORY_DOWNLOADS_ENABLED=false holds every history request, this lets MCX symbols alone through
+    # (straight to Fyers, a few requests per warm-up). Off: the lane starts cold and builds its MACD from live bars.
+    mcx_history_downloads: bool = False
     # "ROOT:UNITS" overrides of the units one lot carries (GOLD:100 ...).
     mcx_lot_multipliers_csv: str = ""
     # MCX holidays beyond the built-in 2026 list: full closures, and days on
