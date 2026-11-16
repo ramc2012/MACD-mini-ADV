@@ -1,9 +1,41 @@
 import os, sys, json, importlib
 from datetime import datetime, timezone, timedelta
 import tempfile; S = tempfile.mkdtemp()
-os.environ.update(STATE_DIR=S + "/state", UPSTOX_TOKEN_FILE="/nonexistent", ORDER_WINDOW="")  # window gate: section 9
+from pathlib import Path
+trade_token_path = Path(S) / "trading-token"
+analytics_token_path = Path(S) / "analytics-token"
+os.environ.update(STATE_DIR=S + "/state", UPSTOX_ORDER_TOKEN_FILE=str(trade_token_path),
+                  UPSTOX_TOKEN_FILE=str(analytics_token_path), ORDER_WINDOW="")  # window gate: section 9
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lane
+
+# Account reads and order calls use the same daily token, including after rotation.
+# If it is missing, there is no network request and no fallback to the analytics token.
+analytics_token_path.write_text("mock-analytics-token")
+original_http = lane.http
+original_cache = lane.cache.copy()
+auth_calls = []
+def intercept_http(method, url, headers, body=None):
+    auth_calls.append((method, url, headers["Authorization"]))
+    return {"data": {"equity": {"available_margin": 1000}}} if "funds" in url else {"data": []}
+
+lane.http = intercept_http
+lane.read_upstox()
+lane.probe_order_api()
+assert lane.cache["read_error"].startswith("Upstox trading token is unavailable")
+assert lane.cache["order_api"]["ok"] is False and not auth_calls
+trade_token_path.write_text("mock-trading-token")
+lane.read_upstox()
+assert lane.cache["read_error"] is None
+assert len(auth_calls) == 4 and all(row[0] == "GET" and row[2] == "Bearer mock-trading-token" for row in auth_calls)
+trade_token_path.with_suffix(".new").write_text("mock-trading-token-rotated")
+trade_token_path.with_suffix(".new").replace(trade_token_path)
+lane.upstox("POST", lane.ORDER_HOST, "/v3/order/place")
+assert auth_calls[-1][0] == "POST" and auth_calls[-1][2] == "Bearer mock-trading-token-rotated"
+lane.http = original_http
+lane.cache.clear()
+lane.cache.update(original_cache)
+
 sent = []
 now = datetime.now(timezone.utc)
 sig = lambda i, sym, price, ago=5: {"signal_id": f"s{i}", "symbol": sym, "side": "BUY", "kind": "PREMIUM_MACD_ZERO_CROSS_UP", "price": price,

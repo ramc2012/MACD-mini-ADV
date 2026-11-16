@@ -32,4 +32,6 @@ docker compose stop upstox-live          # stop the lane entirely
 
 Upstox's order and account APIs answer `UDAPI1221` unless the request comes from the static IP registered on the
 Upstox API app; register this Mac's public IP there first. Test offline (no network): `python3 -I upstox_live/test_lane_offline.py`.
-The Upstox token is read from the platform's `secrets/upstox.token` and is never logged or served.
+This lane uses the platform's daily OAuth token (`secrets/upstox-trade.token`) for its account reads and order calls.
+When the token is missing, the lane does not fall back to the analytics token. The platform continues to use its
+own analytics token for market data. Neither token is logged or served.

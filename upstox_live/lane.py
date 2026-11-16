@@ -39,7 +39,6 @@ IST = timezone(timedelta(hours=5, minutes=30))
 ENGINE_URL = os.environ.get("ENGINE_URL", "http://gateway:8100").rstrip("/")
 ENGINE_TOKEN = os.environ.get("MACD_API_TOKEN", "")
 HUB_URL = os.environ.get("HUB_URL", "http://host.docker.internal:8400").rstrip("/")
-TOKEN_FILE = os.environ.get("UPSTOX_TOKEN_FILE", "/secrets/upstox.token")
 STATE_DIR = os.environ.get("STATE_DIR", "/app/runtime/upstox_live")
 CAPITAL = float(os.environ.get("LANE_CAPITAL") or 0)          # optional cap; 0 = use the whole available margin
 START_FUND = float(os.environ.get("LANE_START_FUND") or 25000)  # reference for return %, not a limit
@@ -62,7 +61,7 @@ MACD_ADOPT_SECONDS = 600
 MAX_ORDERS_PER_DAY = int(os.environ.get("MAX_ORDERS_PER_DAY", "30"))
 TAG = "MACDLIVE"
 ORDER_HOST = os.environ.get("UPSTOX_ORDER_HOST", "https://api-hft.upstox.com")
-ORDER_TOKEN_FILE = os.environ.get("UPSTOX_ORDER_TOKEN_FILE", "/secrets/upstox-trade.token")
+TRADE_TOKEN_FILE = os.environ.get("UPSTOX_ORDER_TOKEN_FILE", "/secrets/upstox-trade.token")
 READ_HOST = os.environ.get("UPSTOX_READ_HOST", "https://api.upstox.com")
 ARM_FILE = os.path.join(STATE_DIR, "ARMED")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
@@ -228,16 +227,21 @@ def engine(path: str) -> object:
     return http("GET", ENGINE_URL + path, {"X-Macd-Token": ENGINE_TOKEN})
 
 
-def upstox_token(order: bool = False) -> str:
-    """Reads use the platform's token; ORDER calls need the daily OAuth access token (the analytics token is read-only)."""
-    path = ORDER_TOKEN_FILE if order and os.path.exists(ORDER_TOKEN_FILE) else TOKEN_FILE
-    with open(path) as f:
-        return f.read().strip()
+def upstox_token() -> str:
+    """Read the daily OAuth token for all requests made by this lane."""
+    try:
+        with open(TRADE_TOKEN_FILE) as f:
+            token = f.read().strip()
+    except OSError:
+        token = ""
+    if not token:
+        raise RuntimeError("Upstox trading token is unavailable; complete Browser login in Platform → Brokers")
+    return token
 
 
 def upstox(method: str, host: str, path: str, body: dict | None = None, query: dict | None = None) -> dict:
     url = host + path + (("?" + urllib.parse.urlencode(query)) if query else "")
-    return http(method, url, {"Authorization": "Bearer " + upstox_token(order=host == ORDER_HOST)}, body)
+    return http(method, url, {"Authorization": "Bearer " + upstox_token()}, body)
 
 
 def resolve(symbol: str) -> dict | None:
@@ -415,7 +419,7 @@ def cancel(o: dict, why: str) -> bool:
 def probe_order_api() -> None:
     """Can this token reach the ORDER API? Cancels an order id that cannot exist (nothing is placed or changed)."""
     try:
-        mtime = os.path.getmtime(ORDER_TOKEN_FILE if os.path.exists(ORDER_TOKEN_FILE) else TOKEN_FILE)
+        mtime = os.path.getmtime(TRADE_TOKEN_FILE)
     except OSError:
         mtime = 0
     last = cache.get("order_api") or {}
@@ -427,7 +431,9 @@ def probe_order_api() -> None:
         result.update(ok=True, detail="order API reachable")
     except Exception as e:
         text = str(e)
-        if "UDAPI100067" in text:
+        if text.startswith("Upstox trading token is unavailable"):
+            result.update(ok=False, detail=text)
+        elif "UDAPI100067" in text:
             result.update(ok=False, detail="the Upstox token is READ-ONLY: orders are refused (log in for a trading token)")
         elif "UDAPI1221" in text:
             result.update(ok=False, detail="this IP is not registered as the app's static IP (UDAPI1221)")
