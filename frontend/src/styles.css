@@ -1199,3 +1199,20 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .position-tabs .book-side-count.buy { color:#41d5a1; background:#14352d; }
 .position-tabs .book-side-count.sell { color:#f39bab; background:#38212a; }
 .position-tabs button { flex-wrap:wrap; }
+
+/* MCX lane (McxLane.tsx): reuses the blast lane's page frame. */
+.mcx-tabs { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.mcx-grid { height: 100%; display: grid; grid-template-columns: minmax(0, 2.3fr) minmax(280px, 1fr); gap: 8px; overflow: auto; }
+.mcx-contracts { min-height: 0; }
+.mcx-side { min-height: 0; overflow: auto; }
+.mcx-unit { display: block; margin-top: 2px; color: #59677a; font-size: 9px; }
+.mcx-roots .toggle .mcx-unit { display: inline; margin: 0 0 0 6px; }
+.mcx-problems { margin: 8px 12px 12px; }
+.mcx-problems div + div { margin-top: 4px; }
+.mcx-split { height: 100%; display: grid; grid-template-rows: minmax(160px, 45%) minmax(200px, 55%); gap: 8px; }
+.mcx-split > .panel { min-height: 0; display: flex; flex-direction: column; }
+.mcx-split .ledger-table-wrap { flex: 1; min-height: 0; height: auto; }
+@media (max-width: 900px) {
+  .mcx-grid { grid-template-columns: 1fr; }
+  .mcx-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}

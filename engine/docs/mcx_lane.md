@@ -1,0 +1,149 @@
+# MCX lane
+
+A paper book that runs the MACD lane's rules on MCX commodity options:
+GOLD, SILVER, CRUDEOIL, COPPER and NATURALGAS to start with. It shares the
+engine's Fyers websocket and nothing else: its own contracts, clock, bars,
+book and settings.
+
+## What it shares with the MACD lane
+
+| | MACD lane | MCX lane |
+|---|---|---|
+| Contract | Side-rounded ATM CE and PE, 1.5× liquidity tie-break over the two strikes either side, nearest series ≥ `min_days_to_expiry` out | The same rule (`contracts.select_liquid_contract`), on each root's nearest option series ≥ `mcx_min_days_to_expiry` out, priced off that series' underlying futures |
+| Entry | `MACDStrategyManager`: premium MACD crosses up through zero, intrabar or on the close, one signal per bar, optional KAMA/RSI/ROC confirmations | The same object, with the MACD lane's periods and confirmation switches |
+| Stale signals | Dropped when the bar is older than one period plus 120 s | The same |
+| Exits | `ExecutionManager`: hard stop, trail armed at +activation and floored at breakeven, scale-in +7.5/15/22.5%, scale-out +30/50/75%, optional MACD invalidation | The same object and the MACD lane's risk settings |
+| Sizing | Whole lots nearest `target_position_notional` | Whole lots nearest `mcx_target_notional`, capped by `mcx_max_entry_lots` |
+| Entry gate | NSE entry scorer ranks and skips the weakest 30% | None: the scorer's features describe NSE options, not commodities |
+
+## What is MCX-specific
+
+**Session.** 09:00 to 23:30 IST, or 23:55 while New York is on daylight
+time. Bars are anchored at 09:00 (`mcx_bucket`), so 30-minute bars are
+09:00, 09:30 … 17:00 … 23:00. The 2026 holiday list is built in: full
+closures, and days on which only the evening session (17:00 onward) trades.
+Add later years with `mcx_holidays_csv` and `mcx_evening_only_csv`; health
+reports `calendar_covers_year: false` when the year has no entries.
+
+**Lot units.** The book values a position as premium × units, and MCX's
+instrument files count quantity in lots. The units per lot are therefore the
+contract specification, not the master's lot column:
+
+| Root | Lot | Premium quoted per | Units per lot |
+|---|---|---|---|
+| GOLD | 1 kg | 10 g | 100 |
+| SILVER | 30 kg | 1 kg | 30 |
+| CRUDEOIL | 100 barrels | 1 barrel | 100 |
+| COPPER | 2,500 kg | 1 kg | 2,500 |
+| NATURALGAS | 1,250 mmBtu | 1 mmBtu | 1,250 |
+
+`mcx_lot_multipliers_csv` (`GOLD:100,SILVER:30`) overrides them. If the
+instrument master lists a lot that is neither 1 nor the units in use, health
+shows a `multiplier_warnings` entry for that root.
+
+**Contracts.** Read from Fyers' `MCX_COM.csv` (same layout as the NSE file).
+The underlying column is matched exactly, so GOLDM, SILVERM and CRUDEOILM never
+stand in for the full-size contracts. The futures an option series exercises
+into comes from the master's underlying FyToken, or else is the nearest futures
+expiring on or after the option. A same-day restart reuses the morning's
+strikes (`runtime/mcx_contracts.json`), as the MACD lane does.
+
+**Expiry.** MCX options devolve into futures. A holding in a contract
+expiring today is sold from `mcx_expiry_flatten_ist` (default 23:00). A
+holding whose contract expired while the engine was down is closed at its last
+mark with reason `EXPIRED_WHILE_OFFLINE_LAST_MARK`.
+
+**Paper only.** The lane's execution settings force `execution_mode=paper`
+whatever the engine is set to, and its order surface raises if anything ever
+calls it.
+
+## Data
+
+- **Ticks** come from the engine's websocket; the lane's options, their
+  futures and every holding are added to the subscription. Every `MCX:` print
+  goes to the lane and nowhere else: not the NSE candle engine, the desk, the
+  tick bus or the browser stream.
+- **REST fallback.** During the session, a lane contract the socket has been
+  silent on for `mcx_rest_fallback_seconds` (default 60, counted from the later
+  of the last tick, the subscription and the open) is quoted over REST, one
+  batched request at most every 15 s. A REST quote can trigger a stop or an
+  entry only if its own trade time is within the order-quote age limit;
+  otherwise it only marks the position.
+- **Warm-up** downloads `mcx_warmup_days` (default 10) of one-minute history
+  per contract and folds it onto the lane's 09:00 grid. The bar forming at
+  download time is left to the live aggregator; live bars that close during
+  warm-up are buffered and replayed after the history, never traded on.
+- **Feed watchdog.** Once the lane has had a websocket tick today, the
+  engine's watchdog treats silence during the MCX session as a dead socket, so
+  an evening disconnect is recovered. An account with no MCX data never trips
+  it.
+- **Feed-time clamp.** Fyers republishes a feed time without a trade time;
+  the broker clamps it to the instrument's close. For `MCX:` symbols that close
+  is now the MCX close, not NSE F&O's 15:40.
+
+## Signal verdicts
+
+Every zero-cross the strategy fires is saved (one per bar, durable) and given
+a verdict, kept in memory for the page and published as `mcx_decision`:
+
+| Verdict | Meaning |
+|---|---|
+| `TAKEN` | bought in the lane's paper book |
+| `AUTO_TRADE_OFF` | valid, and `mcx_auto_trade` is off |
+| `ALREADY_HELD` | the lane holds the contract; it never re-enters on a new signal |
+| `NOT_SELECTED` | a holding carried from an earlier selection; entries use today's ATM legs only |
+| `SESSION_CLOSED` | fired on the closing-bar flush after MCX shut |
+| `NO_CASH` | one lot costs more than the free cash |
+| `ENTRY_REJECTED` | the paper order was refused (stale quote, position cap, cash) |
+| `STALE_BAR` | the bar is from an earlier period than now |
+| `DISABLED` | the lane is switched off |
+
+## Operating it
+
+1. Deploy and open **MCX lane** in the terminal. Check the contracts table:
+   every root should show a futures price, an ATM CE and PE and lot units.
+2. `mcx_auto_trade` starts **off**, like the MACD lane: signals are recorded
+   with their verdicts and nothing is bought. Turn it on from **MCX lane →
+   Settings** when you are ready to paper-trade it.
+3. Stops, trail, scale-in/out and MACD periods are the MACD lane's settings.
+   Changing them there changes them here.
+
+## Interfaces
+
+| | |
+|---|---|
+| `GET /api/mcx/snapshot` | settings, health, session, contracts with live premium and MACD, rules, book, recent verdicts |
+| `GET /api/mcx/book` | orders, trades, signals, equity, portfolio, closed positions |
+| `PUT /api/mcx/settings` | partial update (`enabled`, `auto_trade`, `roots_csv`, `initial_capital`, `target_notional`, `max_entry_lots`, `max_positions`, `timeframe_seconds`, `min_days_to_expiry`, `expiry_flatten_ist`, `rest_fallback_seconds`, `lot_multipliers_csv`); a change of roots, expiry rule or units re-selects, a new bar length re-warms |
+| `POST /api/mcx/reselect` | re-run today's selection now; resubscribes only if the symbols changed |
+| `POST /api/mcx/orders` | manual paper ticket against the lane's book (MCX symbols only) |
+| `GET /api/system/health` | `mcx` block |
+| stream | `mcx_order`, `mcx_trade`, `mcx_signal`, `mcx_position_closed`, `mcx_decision` |
+
+Settings (environment prefix `MACD_`): `mcx_enabled`, `mcx_auto_trade`,
+`mcx_roots_csv`, `mcx_initial_capital`, `mcx_target_notional`,
+`mcx_max_entry_lots`, `mcx_max_positions`, `mcx_timeframe_seconds` (0 follows
+`timeframe_seconds`), `mcx_min_days_to_expiry`, `mcx_expiry_flatten_ist`,
+`mcx_rest_fallback_seconds`, `mcx_warmup_days`, `mcx_lot_multipliers_csv`,
+`mcx_holidays_csv`, `mcx_evening_only_csv`; paths `mcx_database_path` and
+`mcx_contract_snapshot_path` are environment-only.
+
+## Not verified yet
+
+Written without access to a live MCX session or the current `MCX_COM.csv`.
+Before relying on it, check on the first evening:
+
+- the contracts table shows all five roots (the master's underlying column and
+  ticker format are as assumed);
+- `ws_ticks_today` rises in health (the account receives MCX market data on
+  the websocket); if it stays at 0, the REST fallback is carrying the lane;
+- the units per lot match what Fyers shows for one lot of each option.
+
+## Code
+
+- `src/macd_trader/mcx_lane.py` — calendar, bars, master parsing, selection, lane
+- `src/macd_trader/engine.py` — wiring: subscription, tick routing, warm-up, watchdog, health
+- `src/macd_trader/app.py` — `/api/mcx/*`
+- `src/macd_trader/brokers.py` — `MCX_COM.csv`, `instrument_rows`, MCX-aware feed-time clamp
+- `frontend/src/McxLane.tsx`, `frontend/src/mcxMath.ts` — the terminal page
+- `tests/test_mcx_lane.py`, `frontend/tests/mcxMath.test.ts`

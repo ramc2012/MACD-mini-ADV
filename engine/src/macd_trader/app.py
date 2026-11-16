@@ -409,6 +409,22 @@ class BlastSettingsInput(BaseModel):
     trail_pct: float | None = Field(default=None, gt=0, lt=1)
 
 
+class McxSettingsInput(BaseModel):
+    """The MCX lane's own settings. Its entry and exit rules are the MACD lane's."""
+    enabled: bool | None = None
+    auto_trade: bool | None = None
+    roots_csv: str | None = Field(default=None, pattern=r"^[A-Za-z, ]*$", max_length=200)
+    initial_capital: float | None = Field(default=None, ge=1)
+    target_notional: float | None = Field(default=None, ge=0, le=10_000_000)
+    max_entry_lots: int | None = Field(default=None, ge=1, le=500)
+    max_positions: int | None = Field(default=None, ge=1, le=100)
+    timeframe_seconds: int | None = Field(default=None, ge=0, le=3600)
+    min_days_to_expiry: int | None = Field(default=None, ge=0, le=30)
+    expiry_flatten_ist: str | None = Field(default=None, pattern=r"^(|([01]\d|2[0-3]):[0-5]\d)$")
+    rest_fallback_seconds: float | None = Field(default=None, ge=0, le=3600)
+    lot_multipliers_csv: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:, ]*$", max_length=300)
+
+
 def _smart_lane(name: str):
     lane = engine.smart_lanes.get(name)
     if lane is None:
@@ -524,6 +540,61 @@ async def blast_settings(payload: BlastSettingsInput):
     engine.blast.apply_settings(new_settings)
     persist_settings(new_settings)
     return engine.blast.snapshot()
+
+
+@app.get("/api/mcx/snapshot", dependencies=[Depends(authorize)])
+async def mcx_snapshot():
+    """The MCX lane's settings, session, contracts, book and recent signal verdicts."""
+    return fast_json(engine.mcx.snapshot())
+
+
+@app.get("/api/mcx/book", dependencies=[Depends(authorize)])
+async def mcx_book():
+    return fast_json(engine.mcx.book())
+
+
+@app.put("/api/mcx/settings", dependencies=[Depends(authorize)])
+async def mcx_settings(payload: McxSettingsInput):
+    updates = payload.model_dump(exclude_none=True)
+    if "roots_csv" in updates:
+        updates["roots_csv"] = ",".join(dict.fromkeys(
+            item.strip().upper() for item in updates["roots_csv"].split(",") if item.strip()))
+        if not updates["roots_csv"]:
+            raise HTTPException(400, "Choose at least one MCX underlying")
+    if engine.mcx.portfolio.positions and "initial_capital" in updates:
+        raise HTTPException(409, "Close MCX positions before changing the lane's capital")
+    merged = {**engine.settings.model_dump(), **{f"mcx_{key}": value for key, value in updates.items()}}
+    try:
+        new_settings = Settings(**merged)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    engine.settings = new_settings
+    await engine.apply_mcx_settings(new_settings)
+    persist_settings(new_settings)
+    return fast_json(engine.mcx.snapshot())
+
+
+@app.post("/api/mcx/reselect", dependencies=[Depends(authorize)])
+async def mcx_reselect():
+    """Re-run today's MCX contract selection now (held contracts are kept)."""
+    try:
+        await engine.reselect_mcx()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"MCX reselection failed: {exc}") from exc
+    return fast_json(engine.mcx.snapshot())
+
+
+@app.post("/api/mcx/orders", dependencies=[Depends(authorize)])
+async def mcx_manual_order(payload: OrderInput):
+    """Manual paper ticket against the MCX lane's own book."""
+    try:
+        order = await engine.mcx.manual_order(
+            payload.symbol, payload.side, payload.lots,
+            order_type=payload.order_type, limit_price=payload.limit_price,
+        )
+    except (ValueError, RuntimeError, PermissionError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _as_json(order)
 
 
 @app.post("/api/blast/orders", dependencies=[Depends(authorize)])

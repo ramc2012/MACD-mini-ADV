@@ -265,6 +265,43 @@ class Settings(BaseSettings):
     smart_min_dispersion_size: float = Field(default=0.25, gt=0, le=1)
     smart_blast_source: bool = True
 
+    # --- MCX lane (mcx_lane.py) -------------------------------------------
+    # The MACD lane's entry and exit rules on MCX commodity options, in its own
+    # paper book and on the MCX clock (09:00-23:30 IST, 23:55 while the US is
+    # on daylight time). MACD periods, KAMA confirmations, hard stop, trail,
+    # scale-in/out and the invalidation exit are the MACD lane's own settings;
+    # only capital, sizing, caps and the contract universe are set here.
+    mcx_enabled: bool = True
+    # Off by default, like the MACD lane: every signal is recorded with its
+    # verdict, and nothing is bought until the owner turns this on.
+    mcx_auto_trade: bool = False
+    mcx_roots_csv: str = "GOLD,SILVER,CRUDEOIL,COPPER,NATURALGAS"
+    mcx_initial_capital: float = Field(default=1_000_000.0, ge=1)
+    # Whole lots nearest this rupee value per entry (premium x lot units). One
+    # ATM GOLD lot alone can be worth ~2 lakh; an entry is never below one lot.
+    mcx_target_notional: float = Field(default=100_000.0, ge=0, le=10_000_000)
+    mcx_max_entry_lots: int = Field(default=10, ge=1, le=500)
+    mcx_max_positions: int = Field(default=10, ge=1, le=100)
+    # Bar length for the lane's premium MACD. 0 follows the MACD lane's
+    # timeframe_seconds.
+    mcx_timeframe_seconds: int = Field(default=0, ge=0, le=3600)
+    mcx_min_days_to_expiry: int = Field(default=1, ge=0, le=30)
+    # MCX options devolve into futures at expiry; anything still held in a
+    # contract expiring today is sold from this IST time. Blank disables.
+    mcx_expiry_flatten_ist: str = "23:00"
+    # Poll REST quotes for a lane contract the websocket has been silent on
+    # for this many seconds during the MCX session. 0 disables.
+    mcx_rest_fallback_seconds: float = Field(default=60.0, ge=0, le=3600)
+    mcx_warmup_days: int = Field(default=10, ge=2, le=60)
+    # "ROOT:UNITS" overrides of the units one lot carries (GOLD:100 ...).
+    mcx_lot_multipliers_csv: str = ""
+    # MCX holidays beyond the built-in 2026 list: full closures, and days on
+    # which only the evening session (17:00 onward) trades.
+    mcx_holidays_csv: str = ""
+    mcx_evening_only_csv: str = ""
+    mcx_database_path: str = str(RUNTIME_DIR / "mcx_trader.sqlite3")
+    mcx_contract_snapshot_path: str = str(RUNTIME_DIR / "mcx_contracts.json")
+
     # Raw tick capture. Ticks cannot be backfilled -- Fyers' finest history is
     # 5-second OHLCV -- so the socket's output is the only copy that will ever
     # exist. Raw rows are kept this many days, then condensed to the flow and
@@ -361,5 +398,6 @@ ENVIRONMENT_ONLY = frozenset({
     "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
     "research_report_path", "contract_snapshot_path", "mp_database_path",
     "blast_database_path", "tick_database_path", "api_token", "allowed_origins_csv",
+    "mcx_database_path", "mcx_contract_snapshot_path",
     "engine_role", "nats_url", "strategy_url", "desk_url",
 })
