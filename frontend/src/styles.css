@@ -1499,6 +1499,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .mcx-split { height: 100%; display: grid; grid-template-rows: minmax(160px, 45%) minmax(200px, 55%); gap: 8px; }
 .mcx-split > .panel { min-height: 0; display: flex; flex-direction: column; }
 .mcx-split .ledger-table-wrap { flex: 1; min-height: 0; height: auto; }
+/* Selling tab: sections stack at their natural height and the body scrolls. */
+.mcx-sell { display: flex; flex-direction: column; gap: 8px; }
+.mcx-sell .ledger-table-wrap { max-height: 360px; overflow: auto; }
 @media (max-width: 900px) {
   .mcx-rules-grid { grid-template-columns: 1fr; }
   .mcx-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }

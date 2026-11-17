@@ -25,7 +25,7 @@ const Head = ({ labels }: { labels: string[] }) =>
 export function SellingTab({ snapshot, onSaved }: { snapshot: McxSnapshot; onSaved: (next: McxSnapshot) => void }) {
   const book = snapshot.shorts;
   if (!book) return <section className="panel"><p className="blast-note">The selling book is not running on this engine yet.</p></section>;
-  return <>
+  return <div className="mcx-sell">
     <section className="blast-metrics" aria-label="MCX selling book">
       <div><span>Selling equity</span><b>{currency(book.account.equity)}</b></div>
       <div><span>Margin used</span><b>{currency(book.account.margin_used)}</b></div>
@@ -38,7 +38,7 @@ export function SellingTab({ snapshot, onSaved }: { snapshot: McxSnapshot; onSav
     <ShortDecisions book={book} />
     <MarginTable book={book} />
     <ShortSettings book={book} onSaved={onSaved} />
-  </>;
+  </div>;
 }
 
 function ShortPositions({ book, onSaved }: { book: McxShorts; onSaved: (next: McxSnapshot) => void }) {
@@ -53,7 +53,7 @@ function ShortPositions({ book, onSaved }: { book: McxShorts; onSaved: (next: Mc
     if (response.ok) onSaved(body as McxSnapshot);
     else setMessage(((body as { detail?: string } | undefined)?.detail) || `Request failed (HTTP ${response.status})`);
   }
-  return <div className="blast-split mcx-split">
+  return <>
     <section className="panel">
       <div className="panel-title"><span>Open shorts</span><span>{book.open.length}</span></div>
       {message && <div className="settings-message" role="status">{message}</div>}
@@ -77,7 +77,7 @@ function ShortPositions({ book, onSaved }: { book: McxShorts; onSaved: (next: Mc
         </tr>)}</tbody>
       </table></div>
     </section>
-  </div>;
+  </>;
 }
 
 function ShortDecisions({ book }: { book: McxShorts }) {
