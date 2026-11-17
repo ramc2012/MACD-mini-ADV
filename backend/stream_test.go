@@ -347,6 +347,31 @@ func TestSnapshotRequiredRefreshesTheCutInsteadOfLooping(t *testing.T) {
 	}
 }
 
+func TestStaleCutWithLongReplayIsRefreshedNotLooped(t *testing.T) {
+	// 17 Nov 2026: hours of deliver-always mcx_quotes after a cut, ring not yet wrapped. The replay alone
+	// tripped the browser's resync limit, so every browser looped without a frame sent.
+	old := replayMaxMandatory
+	replayMaxMandatory = 20
+	t.Cleanup(func() { replayMaxMandatory = old })
+	engine := newFakeEngine(t)
+	hub, server := startFanout(t, engine, "", nil)
+	for i := 1; i <= 30; i++ {
+		engine.emit("mcx_quotes", fmt.Sprintf(`[{"symbol":"MCX:X","ltp":%d}]`, i), 0)
+	}
+	waitFor(t, func() bool { hub.mu.Lock(); defer hub.mu.Unlock(); return hub.lastSeq == 30 })
+	browser := dialBrowser(t, server, "/ws/stream", nil)
+	var last int64
+	frames := readUntil(t, browser, &last, "snapshot")
+	if string(frames[len(frames)-1].Data) != `{"cut":30}` {
+		t.Fatalf("expected a fresh cut instead of a 30-event replay, got %s", frames[len(frames)-1].Data)
+	}
+	engine.emit("mcx_quotes", `[{"symbol":"MCX:X","ltp":31}]`, 0)
+	frames = readUntil(t, browser, &last, "mcx_quotes")
+	if !strings.Contains(string(frames[len(frames)-1].Data), `"ltp":31`) {
+		t.Fatalf("live events did not follow the fresh cut")
+	}
+}
+
 func TestBrowserResyncCommandAndPingAreAnswered(t *testing.T) {
 	engine := newFakeEngine(t)
 	_, server := startFanout(t, engine, "", nil)

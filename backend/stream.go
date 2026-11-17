@@ -58,6 +58,26 @@ const (
 	upstreamReadLimit = 256 << 20
 )
 
+// A replay with more deliver-always events than this takes a fresh snapshot instead. Above
+// clientMaxMandatory the browser's own queue would reset it to a resync at once, so a stale cut
+// made every browser loop attach -> resync -> attach without one frame sent. 17 Nov 2026: after
+// the NSE close only the MCX lane's mcx_quotes (deliver-always, ~3/s) arrived, the ring stopped
+// wrapping, and from ~1.6 h after the last cut until the ring wrapped the UI showed no data.
+var replayMaxMandatory = clientMaxMandatory / 2
+
+func replayable(events []streamEvent) bool {
+	mandatory := 0
+	for _, ev := range events {
+		if ev.key == "" {
+			mandatory++
+			if mandatory > replayMaxMandatory {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 type upstreamFrame struct {
 	Seq  int64           `json:"seq"`
 	Type string          `json:"type"`
@@ -316,7 +336,7 @@ func (h *streamHub) attach(ctx context.Context, client *streamClient) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		h.mu.Lock()
 		if h.snap != nil {
-			if events, ok := h.ringSince(h.snap.seq); ok {
+			if events, ok := h.ringSince(h.snap.seq); ok && replayable(events) {
 				client.reset(h.snap, events)
 				h.clients[client] = struct{}{}
 				h.mu.Unlock()
@@ -329,7 +349,9 @@ func (h *streamHub) attach(ctx context.Context, client *streamClient) error {
 		h.mu.Lock()
 		fresh := h.snap != nil
 		if fresh {
-			_, fresh = h.ringSince(h.snap.seq)
+			var events []streamEvent
+			events, fresh = h.ringSince(h.snap.seq)
+			fresh = fresh && replayable(events)
 		}
 		h.mu.Unlock()
 		if !fresh { // nobody refreshed it while we waited
