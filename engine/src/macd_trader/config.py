@@ -362,6 +362,11 @@ class Settings(BaseSettings):
     # through (straight to Fyers) for that one download and for filling a stretch the feed was down. Off: a
     # contract has only the bars recorded live.
     mcx_history_downloads: bool = False
+    # Feed-gap repair (self_heal.repair_session_gaps, owner 17 Nov 2026): when the feed goes quiet mid-session
+    # (16 Nov: 09:36-11:04 IST, the Mac's network) and comes back, the missing minute bars are downloaded and
+    # only the minutes the store lacks are written. It also lets the boot-time outage repair through the
+    # local-archive hold. Off: gaps stay until filled by hand.
+    session_gap_repair: bool = True
     # Strikes either side of the ATM strike that are streamed and recorded for each commodity, calls and puts,
     # so that tomorrow's ATM contract already has its bars. 0 records only the selected contracts.
     mcx_ladder_strikes: int = Field(default=5, ge=0, le=30)

@@ -232,3 +232,71 @@ def test_doctor_blocks_corruption_without_replacing_any_original(tmp_path):
     with sqlite3.connect(healthy) as db:
         assert db.execute('SELECT value FROM protected').fetchone()[0] == 'keep me'
     assert not list(tmp_path.glob('*.recovering'))
+
+
+# --------------------------------------------------------------------------- mid-session feed gaps (owner, 17 Nov 2026)
+
+def _minutes(symbol, day, start, end, close=100.0):
+    t, rows = datetime.combine(day, start, IST), []
+    while t < datetime.combine(day, end, IST):
+        rows.append((symbol, t, close)); t += timedelta(minutes=1)
+    return rows
+
+
+def test_a_mid_session_feed_gap_is_found_once_the_feed_is_back(tmp_path):
+    from datetime import time as clock
+    day, path = date(2026, 11, 16), tmp_path / "h.sqlite3"
+    # 16 Nov 2026: bars to 09:35, nothing 09:36-11:03, bars again from 11:04; a 3-minute blip at 12:00 is ignored
+    _history(path, [*_minutes(self_heal.NIFTY, day, clock(9, 15), clock(9, 36)),
+                    *_minutes(self_heal.NIFTY, day, clock(11, 4), clock(12, 0)),
+                    *_minutes(self_heal.NIFTY, day, clock(12, 3), clock(13, 0))])
+    at = lambda h, m: datetime(2026, 11, 16, h, m, tzinfo=IST)
+    assert self_heal.session_gaps(str(path), day, at(10, 30)) == []           # feed still down: not yet
+    assert self_heal.session_gaps(str(path), day, at(11, 5)) == []            # back, but not settled
+    assert self_heal.session_gaps(str(path), day, at(12, 30)) == [(at(9, 36), at(11, 4))]
+    # the stretch after the last stored bar is the live edge (or an outage still running), never a closed gap
+    assert self_heal.session_gaps(str(path), day, at(15, 50)) == [(at(9, 36), at(11, 4))]
+    assert self_heal.session_gaps(str(path), date(2026, 11, 17), datetime(2026, 11, 17, 12, 0, tzinfo=IST)) == []
+
+
+class GapBroker:
+    def __init__(self):
+        self.asked = []
+
+    async def history_range(self, symbol, timeframe, start, end):
+        from macd_trader.brokers import HISTORY_HOLD_EXEMPT
+        self.asked.append((symbol, HISTORY_HOLD_EXEMPT.get()))
+        if symbol == "NSE:GONE26SEP100CE":
+            raise RuntimeError("expired contract")
+        t, out = start, []
+        while t <= end:
+            out.append(Candle(symbol, int(t.timestamp()), 2, 2, 2, 2)); t += timedelta(minutes=1)
+        return out
+
+
+def test_a_gap_repair_writes_only_missing_minutes_and_passes_the_hold(tmp_path):
+    from datetime import time as clock
+    day, path = date(2026, 11, 16), tmp_path / "h.sqlite3"
+    _history(path, [*_minutes(self_heal.NIFTY, day, clock(9, 15), clock(9, 36)),
+                    *_minutes(self_heal.NIFTY, day, clock(11, 4), clock(11, 30)),
+                    *_minutes("NSE:SBIN-EQ", day, clock(9, 15), clock(9, 36)),
+                    ("NSE:SBIN-EQ", datetime(2026, 11, 16, 10, 0, tzinfo=IST), 100.0),     # one minute did arrive
+                    *_minutes("MCX:GOLD26DECFUT", day, clock(9, 15), clock(9, 36))])
+    at = lambda h, m: datetime(2026, 11, 16, h, m, tzinfo=IST)
+    windows = self_heal.session_gaps(str(path), day, at(11, 30))
+    symbols = self_heal.gap_symbols(str(path), windows[0][0])
+    assert set(symbols) == {self_heal.NIFTY, "NSE:SBIN-EQ"}                      # MCX has its own store
+    symbols["NSE:GONE26SEP100CE"] = None
+    stored: dict[str, list] = {}
+    broker = GapBroker()
+    report = asyncio.run(self_heal.repair_session_gaps(
+        broker, str(path), windows, symbols, pace=0,
+        store=lambda p, rows, expiry: stored.setdefault(rows[0].symbol, []).extend(rows) or len(rows)))
+    assert all(exempt for _, exempt in broker.asked)                             # through the hold, this task only
+    from macd_trader.brokers import HISTORY_HOLD_EXEMPT
+    assert HISTORY_HOLD_EXEMPT.get() is False
+    nifty = sorted(c.timestamp for c in stored[self_heal.NIFTY])
+    assert nifty[0] == int(at(9, 36).timestamp()) and nifty[-1] == int(at(11, 3).timestamp()) and len(nifty) == 88
+    assert len(stored["NSE:SBIN-EQ"]) == 87                                      # the stored 10:00 bar is kept
+    assert int(at(10, 0).timestamp()) not in {c.timestamp for c in stored["NSE:SBIN-EQ"]}
+    assert report["rows"] == 175 and report["filled_symbols"] == 2 and report["errors"] == 1 and report["minutes"] == 88

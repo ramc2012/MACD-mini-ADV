@@ -457,6 +457,9 @@ class TradingEngine(DeskMixin):
         # One book of latest quotes for every lane: paper fills cross the bid/ask carried by the tick that
         # priced them, and the blast journal reads the spread and IV inputs at each candidate.
         self.outage_repair: dict | None = None
+        # Mid-session feed gaps repaired (self_heal.repair_session_gaps), newest first; attempts per gap start.
+        self.gap_repairs: list[dict] = []
+        self._gap_attempts: dict[str, int] = {}
         # Pre-rollover lot-size check (audit_lot_sizes): the last report, and when the master was last re-read.
         self.lot_audit: dict | None = None
         self._lot_master_read_at: datetime | None = None
@@ -504,6 +507,7 @@ class TradingEngine(DeskMixin):
         self.events.publish("snapshot_required", {"reason": "startup_complete"})
         await self._settle_expired()
         self._self_heal_task = asyncio.create_task(self._self_heal_loop())
+        self._gap_repair_task = asyncio.create_task(self._session_gap_loop())
         self._rollover_task = asyncio.create_task(self._rollover_loop())
         self._session_close_task = asyncio.create_task(self._session_close_loop())
         self._watchdog_task = asyncio.create_task(self._feed_watchdog_loop())
@@ -1038,8 +1042,9 @@ class TradingEngine(DeskMixin):
             # Self-heal: download the session minutes the app did not capture (host down, feed dead) BEFORE
             # warm-up, so no indicator steps across a hole. On 15 Oct 2026 this took a manual backfill.
             try:
-                self.outage_repair = await self_heal.repair_outage(
-                    self.broker, self.settings.research_database_path, list(self.all_symbols))
+                with self_heal.history_hold_exempt(self.settings.session_gap_repair):
+                    self.outage_repair = await self_heal.repair_outage(
+                        self.broker, self.settings.research_database_path, list(self.all_symbols))
             except Exception as exc:  # noqa: BLE001 -- a repair must never block the feed
                 self.outage_repair = {"error": f"{type(exc).__name__}: {exc}"[:300]}
 
@@ -2637,6 +2642,44 @@ class TradingEngine(DeskMixin):
                 done = now.date().isoformat()
                 await self._settle_expired()
 
+    async def _session_gap_loop(self) -> None:
+        """Every 2 minutes in the session (and to 16:00 IST): repair a mid-session feed gap once the feed is back.
+
+        16 Nov 2026: the feed was silent 09:36-11:04 IST while the engine ran, and no restart meant no repair.
+        """
+        while True:
+            await asyncio.sleep(120)
+            try:
+                await self._repair_session_gaps()
+            except Exception as exc:  # noqa: BLE001 -- the loop must outlive one bad sweep
+                self.lane_errors["gap_repair"] = {"at": datetime.now(UTC).isoformat(), "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+    async def _repair_session_gaps(self, now: datetime | None = None) -> list[dict]:
+        now = now or datetime.now(IST)
+        if not self.settings.session_gap_repair or not market_calendar.is_trading_day(now.date()) \
+                or not (9, 20) <= (now.hour, now.minute) < (16, 0):
+            return []
+        database = self.settings.research_database_path
+        windows = await asyncio.to_thread(self_heal.session_gaps, database, now.date(), now)
+        done = []
+        for start, end in windows:
+            key = start.isoformat()
+            if self._gap_attempts.get(key, 0) >= self_heal.GAP_ATTEMPTS:
+                continue
+            symbols = await asyncio.to_thread(self_heal.gap_symbols, database, start)
+            for symbol in self.all_symbols:          # the watched set, even one that had no bar just before
+                if not symbol.startswith("MCX:"):
+                    symbols.setdefault(symbol, None)
+            self._gap_attempts[key] = self._gap_attempts.get(key, 0) + 1
+            report = await self_heal.repair_session_gaps(self.broker, database, [(start, end)], symbols)
+            report["attempt"] = self._gap_attempts[key]
+            if report["errors"] <= report["symbols"] // 2 and report["skipped"] is None:
+                self._gap_attempts[key] = self_heal.GAP_ATTEMPTS        # done; a later sweep finds no gap anyway
+            self.gap_repairs = [report, *self.gap_repairs][:20]
+            done.append(report)
+            self.lane_errors.pop("gap_repair", None)
+        return done
+
     async def _exit_expiring_position(self, symbol: str) -> None:
         # The blast lane judges expiry from its own recorded contract, so a
         # holding that rolled out of the selector's band is still flattened.
@@ -3373,7 +3416,7 @@ class TradingEngine(DeskMixin):
             "entry_flow": self.entry_flow.health(),
             "context_indices": self.context_indices_status,
             "self_heal": {"outage_repair": self.outage_repair, "expired_settlements": self.expired_settlements[:10],
-                          "lot_audit": self.lot_audit},
+                          "lot_audit": self.lot_audit, "gap_repairs": self.gap_repairs[:10]},
             "boot": self_heal.boot_report(self.settings.database_path, self.settings.engine_role, self.warmup_status(),
                                           getattr(self, "warmup_report", None), getattr(self, "history_backfill", None),
                                           self.status),

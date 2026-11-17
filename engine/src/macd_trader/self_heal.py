@@ -5,6 +5,13 @@ step is here:
   * missed_windows / repair_outage: the session minutes the app did not capture (host down, feed dead) are
     downloaded from broker history BEFORE warm-up, so indicators never jump across a hole. The last stored
     NIFTY 50 minute bar is the record of when capture stopped; no extra state is kept.
+  * session_gaps / repair_session_gaps (owner, 17 Nov 2026): a feed that goes quiet MID-session while the engine
+    keeps running leaves no restart behind, so repair_outage never sees it (16 Nov: 09:36-11:04 IST, filled by
+    hand). Once the feed is back, the stretch with no stored NIFTY 50 minute is downloaded for every symbol that
+    had bars just before it, and only the minutes the store lacks are written. Today's live indicators keep the
+    hole; the next warm-up (08:45 rollover or a restart) reads the filled bars.
+  * Both repairs pass the local-archive hold (MACD_HISTORY_DOWNLOADS_ENABLED=false) through
+    history_hold_exempt(), switch `session_gap_repair`; every other history request stays held.
   * expired_positions / settlement_price: a contract that expired while the app was down cannot be sold on
     the feed. It is closed at its settlement value: intrinsic from the underlying's last close on expiry day,
     otherwise the holding remains unresolved.
@@ -15,6 +22,7 @@ Read-only database integrity checks gate startup after a crash (engine/db_doctor
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sqlite3
 import sys
@@ -33,6 +41,22 @@ MIN_GAP_MINUTES = 5          # a restart shorter than this is not worth a histor
 MAX_LOOKBACK_DAYS = 10       # older holes are the warm-up's whole-session staleness rule's job
 REPAIR_CONCURRENCY = 4
 REPAIR_TIMEOUT_SECONDS = 15 * 60
+GAP_SETTLE_MINUTES = 3       # the feed must have been back this long before a gap is repaired
+GAP_LOOKBACK_MINUTES = 30    # symbols with a bar this close before the gap are the ones the feed carried
+GAP_CONCURRENCY = 2          # mid-session: leave Fyers' rate budget to quotes and orders
+GAP_PACE_SECONDS = 0.4       # ~150 history requests a minute at most
+GAP_ATTEMPTS = 3             # a gap whose repair mostly failed (network still flaky) is tried again
+
+
+@contextlib.contextmanager
+def history_hold_exempt(enabled: bool = True):
+    """Let this task's (and its child tasks') history requests through the local-archive hold."""
+    from .brokers import HISTORY_HOLD_EXEMPT
+    token = HISTORY_HOLD_EXEMPT.set(bool(enabled))
+    try:
+        yield
+    finally:
+        HISTORY_HOLD_EXEMPT.reset(token)
 
 
 def _session(day: date) -> tuple[datetime, datetime]:
@@ -107,6 +131,112 @@ async def repair_outage(broker, database_path: str, symbols: list[str], now: dat
         await asyncio.wait_for(asyncio.gather(*(one(s) for s in dict.fromkeys(symbols))), REPAIR_TIMEOUT_SECONDS)
     except TimeoutError:
         report["skipped"] = "timed out; partial"
+    report["errors"] = len(errors)
+    report["error_samples"] = errors[:10]
+    return report
+
+
+# --------------------------------------------------------------------------- mid-session feed gaps
+
+def session_gaps(database_path: str, day: date, now: datetime, symbol: str = NIFTY,
+                 min_minutes: int = MIN_GAP_MINUTES) -> list[tuple[datetime, datetime]]:
+    """Stretches of `day`'s session with no stored `symbol` minute that the feed has since come back from.
+
+    Each window is [first missing minute, first minute stored again). A stretch still open at `now` (feed down,
+    or the last few minutes before the feed has settled) is not returned; neither is a day with no bar at all
+    (holiday, or the boot repair's job). NIFTY 50 prints every minute of the session, so a missing NIFTY minute
+    is a feed hole, not a quiet market.
+    """
+    open_, close = _session(day)
+    settled = min(close, now.astimezone(IST) - timedelta(minutes=GAP_SETTLE_MINUTES))
+    if settled <= open_:
+        return []
+    try:
+        with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True, timeout=30) as db:
+            have = {row[0] for row in db.execute(
+                "SELECT timestamp FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60 "
+                "AND timestamp >= ? AND timestamp < ?", (symbol, int(open_.timestamp()), int(close.timestamp())))}
+    except sqlite3.Error:
+        return []
+    if not have:
+        return []
+    windows, run_start = [], None
+    minute = int(open_.timestamp())
+    while minute < int(settled.timestamp()):
+        if minute not in have:
+            run_start = minute if run_start is None else run_start
+        elif run_start is not None:
+            if (minute - run_start) // 60 >= min_minutes:
+                windows.append((datetime.fromtimestamp(run_start, IST), datetime.fromtimestamp(minute, IST)))
+            run_start = None
+        minute += 60
+    return windows
+
+
+def gap_symbols(database_path: str, start: datetime, lookback_minutes: int = GAP_LOOKBACK_MINUTES) -> dict[str, str | None]:
+    """{symbol: expiry} for every non-MCX symbol with a minute bar in the stretch just before the gap."""
+    lo = int((start - timedelta(minutes=lookback_minutes)).timestamp())
+    try:
+        with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True, timeout=60) as db:
+            rows = db.execute("SELECT symbol, MAX(expiry) FROM historical_candles WHERE timeframe_seconds = 60 "
+                              "AND timestamp >= ? AND timestamp < ? GROUP BY symbol", (lo, int(start.timestamp()))).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {symbol: expiry for symbol, expiry in rows if not symbol.startswith("MCX:")}
+
+
+def _stored_minutes(database_path: str, symbol: str, lo: int, hi: int) -> set[int]:
+    with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True, timeout=30) as db:
+        return {row[0] for row in db.execute(
+            "SELECT timestamp FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60 "
+            "AND timestamp >= ? AND timestamp < ?", (symbol, lo, hi))}
+
+
+async def repair_session_gaps(broker, database_path: str, windows: list[tuple[datetime, datetime]],
+                              symbols: dict[str, str | None], store=None, pace: float = GAP_PACE_SECONDS,
+                              concurrency: int = GAP_CONCURRENCY) -> dict:
+    """Download each window for every symbol and write only the minutes the store lacks. Never raises.
+
+    `symbols` maps symbol -> expiry (kept on the written rows, as the warm-up and pruning read it).
+    """
+    from .candle_store import store_historical_candles
+    store = store or store_historical_candles
+    report = {"at": datetime.now(IST).isoformat(timespec="seconds"),
+              "windows": [(a.isoformat(), b.isoformat()) for a, b in windows],
+              "minutes": round(missed_minutes(windows)), "symbols": len(symbols), "filled_symbols": 0,
+              "rows": 0, "nothing_new": 0, "errors": 0, "skipped": None}
+    if not windows or not symbols:
+        report["skipped"] = "nothing to repair"
+        return report
+    spans = [(int(a.timestamp()), int(b.timestamp())) for a, b in windows]
+    lo, hi = spans[0][0], spans[-1][1]
+    start, end = windows[0][0] - timedelta(minutes=1), windows[-1][1] + timedelta(minutes=1)
+    slots, pacing = asyncio.Semaphore(concurrency), asyncio.Lock()
+    errors: list[str] = []
+
+    async def one(symbol: str, expiry: str | None) -> None:
+        async with slots:
+            try:
+                async with pacing:
+                    await asyncio.sleep(pace)
+                bars = await broker.history_range(symbol, 60, start, end)
+                have = await asyncio.to_thread(_stored_minutes, database_path, symbol, lo, hi)
+                new = [bar for bar in bars if bar.symbol == symbol and bar.timestamp not in have
+                       and any(a <= bar.timestamp < b for a, b in spans)]
+                if not new:
+                    report["nothing_new"] += 1
+                    return
+                stored = await asyncio.to_thread(store, database_path, new, expiry)
+                report["rows"] += stored
+                report["filled_symbols"] += 1
+            except Exception as exc:  # noqa: BLE001 -- an expired or unknown symbol must not stop the sweep
+                errors.append(f"{symbol}: {type(exc).__name__}: {exc}"[:160])
+
+    with history_hold_exempt():
+        try:
+            await asyncio.wait_for(asyncio.gather(*(one(s, e) for s, e in symbols.items())), REPAIR_TIMEOUT_SECONDS * 2)
+        except TimeoutError:
+            report["skipped"] = "timed out; partial"
     report["errors"] = len(errors)
     report["error_samples"] = errors[:10]
     return report
