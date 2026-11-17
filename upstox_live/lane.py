@@ -9,7 +9,12 @@ What it does, every few seconds:
     cap + booked P&L - deployed; the default 0 means no cap. A stale or failed funds read means no new entries;
   * EXIT: when the MACD paper lane closes that contract (or never took it within 10 minutes), a LIMIT SELL of the
     whole held quantity at a small discount to the last price, re-priced up to three times;
-  * reads the Upstox order book, trades, positions and funds, and serves the lane at /api/upstox-live/snapshot.
+  * reads the Upstox order book, trades, positions and funds, and serves the lane at /api/upstox-live/snapshot;
+  * OWNER TRADES (owner, 17 Nov 2026): an option the owner bought by hand in the account is adopted and managed: it
+    follows the MACD paper lane out if that lane holds the contract, otherwise the MACD lane's own price rules apply
+    (30% hard stop; once 30% up, a 25% trail from the peak, never below the average; sold at 15:10 on expiry day).
+    A lane position the owner sold by hand is recorded as closed by the owner (no SELL is sent for it), and units
+    the owner adds to a lane position are managed with it. Contracts on the owner_managed list are left alone.
 
 Real orders go out ONLY while the arm file exists and contains "yes" (runtime/upstox_live/ARMED). Without it the lane
 sends nothing and keeps no would-be orders (owner, 8 Nov 2026: no dry-run records); a signal it is offered is journalled
@@ -58,6 +63,18 @@ EXIT_BUFFERS = [0.03, 0.06, 0.10]
 ENTRY_TIMEOUT = float(os.environ.get("ENTRY_TIMEOUT_SECONDS", "90"))
 EXIT_TIMEOUT = float(os.environ.get("EXIT_TIMEOUT_SECONDS", "60"))
 MACD_ADOPT_SECONDS = 600
+# Owner-opened positions (17 Nov 2026): the MACD lane's price exits (config.py hard_stop_pct, trailing_activation_pct,
+# trailing_stop_pct, expiry_flatten_ist). A difference between the lane's book and the account is acted on only when
+# it shows on RECONCILE_READS reads in a row (3 when the account has no row at all) and no lane order on that
+# contract is open or was sent in the last RECONCILE_QUIET_SECONDS: a lane fill can reach the positions list a read
+# before it reaches the trade list.
+OWNER_HARD_STOP = float(os.environ.get("OWNER_HARD_STOP_PCT", "30")) / 100
+OWNER_TRAIL_ACTIVATION = float(os.environ.get("OWNER_TRAIL_ACTIVATION_PCT", "30")) / 100
+OWNER_TRAIL = float(os.environ.get("OWNER_TRAIL_PCT", "25")) / 100
+EXPIRY_FLATTEN_IST = os.environ.get("EXPIRY_FLATTEN_IST", "15:10")
+RECONCILE_READS = 2
+RECONCILE_QUIET_SECONDS = 120
+ADOPT_EXCHANGES = {"NFO": "NSE", "BFO": "BSE"}   # NSE/BSE options only; MCX trades outside this lane's order window
 MAX_ORDERS_PER_DAY = int(os.environ.get("MAX_ORDERS_PER_DAY", "30"))
 TAG = "MACDLIVE"
 ORDER_HOST = os.environ.get("UPSTOX_ORDER_HOST", "https://api-hft.upstox.com")
@@ -263,6 +280,7 @@ def read_upstox() -> None:
         with lock:
             cache.update(out, read_at=iso(), read_error=None, funds_at=asked)
             record_fills()
+            reconcile_account()
     except Exception as e:  # keep the last good read on screen
         with lock:
             cache["read_error"] = str(e)[:400]
@@ -318,6 +336,165 @@ def record_fills() -> None:
             o["status"] = b.get("status")
             o["filled"] = int(b.get("filled_quantity") or 0)
             o["message"] = b.get("status_message") or b.get("status_message_raw")
+
+
+# ---------------------------------------------------------------- the account vs the lane's book (owner trades)
+
+def lane_order_busy(instrument: str) -> bool:
+    """A lane order on this contract is open, was sent recently, or shows filled units in the order book that are not
+    yet in the lane's recorded fills: the account may already show a lane fill the trade list does not."""
+    t = time.time()
+    recorded: dict[str, int] = {}
+    for f in state["fills"].values():
+        recorded[str(f.get("order_id"))] = recorded.get(str(f.get("order_id")), 0) + int(f.get("quantity") or 0)
+    for oid, o in state["orders"].items():
+        if o.get("instrument") != instrument or o.get("dry"):
+            continue
+        placed = o.get("placed_ts") or (parse_time(o.get("placed_at")) or now()).timestamp()
+        if o.get("open") or t - placed < RECONCILE_QUIET_SECONDS or int(o.get("filled") or 0) > recorded.get(oid, 0):
+            return True
+    return False
+
+
+def owner_price(instrument: str, side: str, row: dict | None, fallback: float) -> tuple[float, str]:
+    """Average price of the owner's own trades on this contract today (orders the lane did not place)."""
+    ours = set(state["orders"])
+    qty = value = 0.0
+    for t in cache["trades"]:
+        if str(t.get("instrument_token")) != instrument or str(t.get("order_id")) in ours:
+            continue
+        if str(t.get("transaction_type") or "").upper() != side:
+            continue
+        q = float(t.get("quantity") or 0)
+        qty, value = qty + q, value + q * float(t.get("average_price") or t.get("price") or 0)
+    if qty and value:
+        return value / qty, "the owner's trades today"
+    row = row or {}
+    keys = ("day_sell_price", "sell_price") if side == "SELL" else ("day_buy_price", "buy_price", "average_price")
+    for k in keys:
+        if float(row.get(k) or 0) > 0:
+            return float(row[k]), f"Upstox position {k}"
+    if float(row.get("last_price") or 0) > 0:
+        return float(row["last_price"]), "last price"
+    return fallback, "the lane's last mark"
+
+
+def owner_closed(sym: str, p: dict, qty: int, row: dict | None) -> None:
+    price, source = owner_price(p["instrument"], "SELL", row, float(p.get("last_price") or p["average_price"]))
+    pnl = (price - p["average_price"]) * qty
+    p["realized"] = p.get("realized", 0.0) + pnl
+    state["realized"] += pnl
+    p["quantity"] -= qty
+    journal("CLOSED_BY_OWNER", symbol=sym, quantity=qty, price=round(price, 2), price_from=source, realized=round(pnl, 2),
+            left=p["quantity"], note="sold outside the lane (or no longer in the account): no SELL sent for it")
+    if p["quantity"] <= 0:
+        state.setdefault("closed", []).append({**p, "quantity": p.get("bought") or qty, "closed_at": iso(),
+                                               "exit_price": price, "closed_by": "owner"})
+        del state["positions"][sym]
+
+
+def owner_added(sym: str, p: dict, qty: int, row: dict | None) -> None:
+    price, source = owner_price(p["instrument"], "BUY", row, float(p.get("last_price") or p["average_price"]))
+    total = p["average_price"] * p["quantity"] + price * qty
+    p["quantity"] += qty
+    p["bought"] = p.get("bought", 0) + qty
+    p["average_price"] = total / p["quantity"]
+    p["owner_added"] = p.get("owner_added", 0) + qty
+    journal("OWNER_ADDED", symbol=sym, quantity=qty, price=round(price, 2), price_from=source, now_held=p["quantity"],
+            average_price=round(p["average_price"], 4))
+
+
+def adopt(row: dict) -> None:
+    inst_key = str(row["instrument_token"])
+    label = f"{ADOPT_EXCHANGES[str(row.get('exchange')).upper()]}:{row.get('trading_symbol')}"
+    info = resolve(label) or {}
+    if info.get("upstox") != inst_key:   # the Upstox name is not the Fyers name (e.g. weekly index): keep it as a label
+        info = {}
+    sym = label if label not in state["positions"] else f"{label}|{inst_key}"
+    qty = int(row.get("quantity") or 0)
+    avg, source = owner_price(inst_key, "BUY", row, float(row.get("last_price") or 0))
+    if float(row.get("average_price") or 0) > 0:
+        avg, source = float(row["average_price"]), "Upstox position average_price"
+    last = float(row.get("last_price") or 0)
+    state["positions"][sym] = {"symbol": sym, "instrument": inst_key, "quantity": qty, "average_price": avg,
+                               "lot_size": info.get("lot_size"), "tick": info.get("tick_size") or 0.05,
+                               "opened_at": iso(), "macd_seen": False, "realized": 0.0, "bought": qty,
+                               "origin": "owner", "product": str(row.get("product") or "D"), "peak": max(avg, last),
+                               "last_price": last or None, "expiry_ms": info.get("expiry_ms"), "adopted_at": iso()}
+    journal("ADOPTED", symbol=sym, quantity=qty, average_price=round(avg, 4), price_from=source,
+            product=row.get("product"), rules=("follows the MACD paper lane if it holds the contract, else "
+            f"{OWNER_HARD_STOP*100:.0f}% stop, {OWNER_TRAIL*100:.0f}% trail after +{OWNER_TRAIL_ACTIVATION*100:.0f}%, "
+            f"expiry day {EXPIRY_FLATTEN_IST}"))
+
+
+def reconcile_account() -> None:
+    """After each good read: the lane's book against the account's positions (owner trades both ways)."""
+    rows = {str(r.get("instrument_token")): r for r in cache["positions"] if r.get("instrument_token")}
+    pending = cache.setdefault("reconcile_pending", {})
+    live_keys = set()
+    held = {p["instrument"]: sym for sym, p in state["positions"].items()}
+    handed = {str(v.get("instrument")) for v in state["owner_managed"].values() if v.get("instrument")}
+
+    def settled(key: str, net: int, need: int) -> bool:
+        live_keys.add(key)
+        mark = pending.get(key)
+        if not mark or mark["net"] != net:
+            pending[key] = {"net": net, "reads": 1}
+        else:
+            mark["reads"] += 1
+        if pending[key]["reads"] >= need:
+            pending.pop(key)
+            return True
+        return False
+
+    for inst, sym in held.items():
+        p = state["positions"][sym]
+        row = rows.get(inst)
+        if row and float(row.get("last_price") or 0) > 0:
+            p["last_price"] = float(row["last_price"])
+            if p.get("origin") == "owner":
+                p["peak"] = max(float(p.get("peak") or 0), p["last_price"])
+        net = int(row.get("quantity") or 0) if row else 0
+        if net == p["quantity"] or lane_order_busy(inst):
+            continue
+        if not settled("held|" + inst, net, RECONCILE_READS if row else RECONCILE_READS + 1):
+            continue
+        if net < p["quantity"]:
+            owner_closed(sym, p, p["quantity"] - max(net, 0), row)
+        else:
+            owner_added(sym, p, net - p["quantity"], row)
+    for inst, row in rows.items():
+        net = int(row.get("quantity") or 0)
+        if (inst in held or inst in handed or net <= 0 or str(row.get("exchange") or "").upper() not in ADOPT_EXCHANGES
+                or not OPTION_RE.search(str(row.get("trading_symbol") or "")) or lane_order_busy(inst)):
+            continue
+        if settled("adopt|" + inst, net, RECONCILE_READS):
+            adopt(row)
+    for key in list(pending):
+        if key not in live_keys:
+            pending.pop(key)
+
+
+def owner_exit_reason(p: dict, last: float | None) -> str | None:
+    """The MACD lane's price exits for a position the owner opened (when the MACD paper lane does not hold it)."""
+    if not last:
+        return None
+    avg, peak = float(p["average_price"] or 0), max(float(p.get("peak") or 0), last)
+    p["peak"] = peak
+    if avg <= 0:
+        return None
+    if last <= avg * (1 - OWNER_HARD_STOP):
+        return f"owner position: hard stop ({last} is {OWNER_HARD_STOP*100:.0f}% or more under the average {avg:.2f})"
+    if peak >= avg * (1 + OWNER_TRAIL_ACTIVATION):
+        stop = max(peak * (1 - OWNER_TRAIL), avg)
+        if last <= stop:
+            return f"owner position: trailing stop ({last} <= {stop:.2f}; peak {peak})"
+    if p.get("expiry_ms"):
+        ist_now = now().astimezone(IST)
+        expiry = datetime.fromtimestamp(float(p["expiry_ms"]) / 1000, IST).date()
+        if expiry <= ist_now.date() and ist_now.strftime("%H:%M") >= EXPIRY_FLATTEN_IST:
+            return f"owner position: expiry day, sold from {EXPIRY_FLATTEN_IST}"
+    return None
 
 
 # ---------------------------------------------------------------- decisions
@@ -376,14 +553,15 @@ def count_order() -> bool:
     return True
 
 
-def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: str, force_live: bool = False) -> None:
+def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: str, force_live: bool = False,
+          product: str = "D") -> None:
     live = armed() or force_live
     if not live:        # callers check armed() first; nothing is recorded for an order that is not sent
         return
     if not in_order_window():
         cache["held_outside_window"] = {"symbol": symbol, "side": side, "at": iso()}
         return
-    body = {"quantity": qty, "product": "D", "validity": "DAY", "price": price, "tag": TAG,
+    body = {"quantity": qty, "product": product, "validity": "DAY", "price": price, "tag": TAG,
             "instrument_token": inst["upstox"], "order_type": "LIMIT", "transaction_type": side,
             "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False, "slice": False}
     if not count_order():
@@ -506,15 +684,21 @@ def step() -> None:
         if sym in macd_open:
             p["macd_seen"] = True
             continue
-        opened = parse_time(p.get("opened_at")) or now()
-        if not p["macd_seen"] and (now() - opened).total_seconds() < MACD_ADOPT_SECONDS:
-            continue
+        if p.get("origin") == "owner" and not p["macd_seen"]:
+            why = owner_exit_reason(p, ltp(sym))
+            if not why:
+                continue
+        else:
+            opened = parse_time(p.get("opened_at")) or now()
+            if not p["macd_seen"] and (now() - opened).total_seconds() < MACD_ADOPT_SECONDS:
+                continue
+            why = "MACD lane closed it" if p["macd_seen"] else "MACD lane did not take this signal within 10 min"
         if any(o["symbol"] == sym and o["side"] == "SELL" and o.get("open") for o in state["orders"].values()):
             continue
         if not armed():
             if not p.get("exit_unsent_noted"):
                 p["exit_unsent_noted"] = True
-                journal("EXIT_NOT_SENT", symbol=sym, reason="the MACD lane closed it, but the lane is not armed: use Exit all")
+                journal("EXIT_NOT_SENT", symbol=sym, reason=f"{why}, but the lane is not armed: use Exit all")
             continue
         p.pop("exit_unsent_noted", None)
         attempts = sum(1 for o in state["orders"].values() if o["symbol"] == sym and o["side"] == "SELL" and not o.get("dry"))
@@ -523,9 +707,9 @@ def step() -> None:
             journal("EXIT_WAIT", symbol=sym, reason="no last price from Upstox yet")
             continue
         buffer = EXIT_BUFFERS[min(attempts, len(EXIT_BUFFERS) - 1)]
-        why = "MACD lane closed it" if p["macd_seen"] else "MACD lane did not take this signal within 10 min"
         place(sym, {"upstox": p["instrument"], "lot_size": p.get("lot_size"), "tick_size": p.get("tick")}, "SELL",
-              int(p["quantity"]), tick_round(last * (1 - buffer), p.get("tick") or 0.05, up=False), why)
+              int(p["quantity"]), tick_round(last * (1 - buffer), p.get("tick") or 0.05, up=False), why,
+              product=p.get("product") or "D")
 
     # Entries: weekly-index signals (NIFTY, SENSEX) first, then the rest, each in time order; the first that fits the
     # fund is taken. Other signals wait PREFER_WAIT seconds so a weekly-index signal arriving meanwhile gets the money.
@@ -556,6 +740,9 @@ def step() -> None:
         inst = resolve(sym)
         if not inst or not inst.get("upstox"):
             journal("SKIP", symbol=sym, reason="no Upstox instrument for this symbol in the hub's master")
+            continue
+        if any(p["instrument"] == inst["upstox"] for p in state["positions"].values()):
+            journal("SKIP", symbol=sym, reason="already held (an owner position the lane manages)")
             continue
         lot, price = int(inst.get("lot_size") or 1), float(s.get("price") or 0)
         limit = tick_round(price * (1 + ENTRY_BUFFER), float(inst.get("tick_size") or 0.05), up=True)
@@ -666,7 +853,7 @@ def exit_all(who: str) -> dict:
             continue
         place(sym, {"upstox": p["instrument"], "lot_size": p.get("lot_size"), "tick_size": p.get("tick")}, "SELL",
               int(p["quantity"]), tick_round(last * (1 - EXIT_BUFFERS[0]), p.get("tick") or 0.05, up=False),
-              "owner: exit all", force_live=True)
+              "owner: exit all", force_live=True, product=p.get("product") or "D")
         p["macd_seen"] = True
         sent.append(sym)
     journal("EXIT_ALL", by=who, sent=sent, no_price=waiting)
@@ -707,6 +894,10 @@ def snapshot() -> dict:
             "settings": lane_settings(), "weekly_index_roots": sorted(WEEKLY_INDEX_ROOTS), "prefer_wait_seconds": PREFER_WAIT,
             "rules": {"entry": f"Every new MACD BUY option signal whose 1-lot LIMIT cost (signal price +{ENTRY_BUFFER*100:.0f}%) plus Rs {CHARGES_ALLOWANCE:,.0f} charges fits the free fund; cancelled if unfilled in {int(ENTRY_TIMEOUT)} s",
                       "exit": "LIMIT SELL of the whole quantity when the MACD paper lane closes the contract (or never takes it within 10 min); 3% under the last price, then 6%, then 10%",
+                      "owner_trades": (f"Options bought by hand in the account are adopted: they follow the MACD paper lane out if it holds the contract, "
+                                       f"else a {OWNER_HARD_STOP*100:.0f}% hard stop, a {OWNER_TRAIL*100:.0f}% trail from the peak once {OWNER_TRAIL_ACTIVATION*100:.0f}% up "
+                                       f"(never below the average), and a sale at {EXPIRY_FLATTEN_IST} on expiry day. A lane position sold by hand is recorded as "
+                                       "closed by the owner (no SELL sent); units added by hand are managed with it"),
                       "fund": ("Upstox available margin, read every 15 s (top-ups count at the next read), minus entries sent since that read"
                                + (f"; capped at Rs {CAPITAL:,.0f} + booked P&L - deployed" if CAPITAL > 0 else "; no lane cap")
                                + f"; no entries if the read is older than {int(FUNDS_MAX_AGE)} s"),

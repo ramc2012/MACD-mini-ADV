@@ -306,3 +306,113 @@ assert left == [1] and not os.path.exists(lane.STATE_FILE), "a stuck step: exit 
 holder.join(); lane.stopping.clear()
 print("stop: waits for the running step, saves, exits 0; stuck step exits 1 without saving")
 
+
+# 13. (17 Nov 2026) owner trades: an option bought by hand is adopted after two reads and managed with the MACD
+#     lane's price exits (or follows the MACD paper lane if it holds it); a lane position sold by hand is recorded as
+#     closed by the owner and no SELL is sent; units added by hand join the position; lane fills are never adopted.
+L = lane
+L.lock = threading.RLock()   # section 12's stop test leaves the old lock held by its finished stop thread (os._exit in production)
+L.set_armed(False, "test")
+L.state.update(orders={}, positions={}, fills={}, decisions=[], realized=0.0, closed=[])
+L.cache.pop("reconcile_pending", None)
+L.ORDER_WINDOW = None
+world.update(signals=[], macd=[], orders=[], trades=[], margin=30000.0)
+lots.update({"NSE:VOLT26NOV1160CE": (375, "NSE_FO|500")})
+L.resolve = lambda s: ({"upstox": lots[s][1], "lot_size": lots[s][0], "tick_size": 0.05,
+                        "expiry_ms": (datetime.now(timezone.utc) + timedelta(days=8)).timestamp() * 1000} if s in lots else None)
+volt = {"instrument_token": "NSE_FO|500", "exchange": "NFO", "trading_symbol": "VOLT26NOV1160CE", "product": "D",
+        "quantity": 1500, "average_price": 19.44, "last_price": 18.0}
+weekly = {"instrument_token": "NSE_FO|600", "exchange": "NFO", "trading_symbol": "NIFTY2611824000CE", "product": "I",
+          "quantity": 65, "average_price": 100.0, "last_price": 100.0}
+fut = {"instrument_token": "NSE_FO|700", "exchange": "NFO", "trading_symbol": "VOLT26NOVFUT", "product": "D", "quantity": 375,
+       "average_price": 1150.0, "last_price": 1150.0}
+handed = {"instrument_token": "NSE_FO|119232", "exchange": "NFO", "trading_symbol": "HIND26NOV970CE", "product": "D",
+          "quantity": 700, "average_price": 17.0, "last_price": 17.0}
+L.state["owner_managed"] = {"NSE:HIND26NOV970CE": {"instrument": "NSE_FO|119232", "since": L.iso(), "by": "test"}}
+world["positions"] = [dict(volt), dict(weekly), dict(fut), dict(handed)]
+L.read_upstox(); assert not L.state["positions"], "one read is not enough"
+L.read_upstox()
+assert set(L.state["positions"]) == {"NSE:VOLT26NOV1160CE", "NSE:NIFTY2611824000CE"}, L.state["positions"].keys()
+v = L.state["positions"]["NSE:VOLT26NOV1160CE"]
+assert v["origin"] == "owner" and v["quantity"] == 1500 and v["average_price"] == 19.44 and v["lot_size"] == 375
+assert L.state["positions"]["NSE:NIFTY2611824000CE"]["lot_size"] is None, "Upstox name is not a Fyers name: label only"
+assert [d["kind"] for d in L.state["decisions"]].count("ADOPTED") == 2
+# a signal on the adopted contract does not buy more
+open(L.ARM_FILE, "w").write("yes"); L.cache["order_api"] = {"ok": True}; L.PREFER_WAIT = 0
+world["signals"] = [fresh_now(300, "NSE:VOLT26NOV1160CE", 18.0, 1)]
+n = len(sent); L.step(); assert len(sent) == n and L.state["decisions"][-1]["reason"].startswith("already held")
+# above the stop: nothing; at the 30% stop: SELL of the whole quantity with the position's product
+world["signals"] = []
+L.step(); assert len(sent) == n
+world["positions"][0]["last_price"] = 13.6; L.read_upstox(); L.step()
+assert sent[-1][1]["transaction_type"] == "SELL" and sent[-1][1]["quantity"] == 1500 and sent[-1][1]["product"] == "D"
+assert sent[-1][1]["instrument_token"] == "NSE_FO|500" and "hard stop" in L.state["orders"][f"OID{len(sent)}"]["reason"]
+# the weekly (intraday product): trail arms at +30%, sells when 25% off the peak, with product I
+world["positions"][1]["last_price"] = 140.0; L.read_upstox(); n = len(sent); L.step(); assert len(sent) == n
+world["positions"][1]["last_price"] = 105.0; L.read_upstox(); L.step()
+assert sent[-1][1]["instrument_token"] == "NSE_FO|600" and sent[-1][1]["product"] == "I" and sent[-1][1]["quantity"] == 65
+# the lane's own SELL fills: recorded as a lane fill (not as an owner close), the position closes
+oid = f"OID{len(sent)}"
+world["orders"] = [{"order_id": oid, "status": "complete", "filled_quantity": 65}]
+world["trades"] = [{"order_id": oid, "trade_id": "TW", "instrument_token": "NSE_FO|600", "quantity": 65, "average_price": 104.9, "transaction_type": "SELL"}]
+world["positions"][1]["quantity"] = 0
+L.read_upstox(); L.read_upstox()
+assert "NSE:NIFTY2611824000CE" not in L.state["positions"] and not [d for d in L.state["decisions"] if d["kind"] == "CLOSED_BY_OWNER"]
+assert abs(L.state["closed"][-1]["exit_price"] - 104.9) < 1e-9
+# follows the MACD paper lane when it holds the contract: no price exit while it holds, out when it closes
+L.state["orders"] = {}; L.state["positions"]["NSE:VOLT26NOV1160CE"]["peak"] = 19.44
+world["positions"][0]["last_price"] = 13.0; world["macd"] = ["NSE:VOLT26NOV1160CE"]
+L.read_upstox(); n = len(sent); L.step(); assert len(sent) == n, "MACD lane holds it: its exits rule"
+world["macd"] = []; L.step(); assert sent[-1][1]["instrument_token"] == "NSE_FO|500" and L.state["orders"][f"OID{len(sent)}"]["reason"] == "MACD lane closed it"
+# the owner sells it by hand meanwhile: the lane's SELL is cancelled by timeout elsewhere; here the account goes flat
+L.state["orders"] = {}
+world.update(orders=[], trades=[{"order_id": "MANUAL1", "trade_id": "M1", "instrument_token": "NSE_FO|500", "quantity": 1500,
+                                 "average_price": 14.2, "transaction_type": "SELL"}])
+world["positions"][0].update(quantity=0, day_sell_price=14.1)
+L.read_upstox(); assert "NSE:VOLT26NOV1160CE" in L.state["positions"]
+L.read_upstox(); assert "NSE:VOLT26NOV1160CE" not in L.state["positions"]
+row = [d for d in L.state["decisions"] if d["kind"] == "CLOSED_BY_OWNER"][-1]
+assert row["quantity"] == 1500 and row["price"] == 14.2 and row["price_from"] == "the owner's trades today"
+assert L.state["closed"][-1]["closed_by"] == "owner"
+n = len(sent); L.step(); assert len(sent) == n, "no SELL for a position the owner closed"
+# a lane position: the owner adds units, then sells part by hand
+L.state["positions"]["NSE:CHEAP26NOV100CE"] = {"symbol": "NSE:CHEAP26NOV100CE", "instrument": "NSE_FO|1", "quantity": 500,
+    "average_price": 20.0, "lot_size": 500, "tick": 0.05, "opened_at": L.iso(), "macd_seen": True, "realized": 0.0, "bought": 500}
+world["macd"] = ["NSE:CHEAP26NOV100CE"]
+world["trades"] = [{"order_id": "MANUAL2", "trade_id": "M2", "instrument_token": "NSE_FO|1", "quantity": 500, "average_price": 22.0, "transaction_type": "BUY"}]
+world["positions"] = [{"instrument_token": "NSE_FO|1", "exchange": "NFO", "trading_symbol": "CHEAP26NOV100CE", "product": "D",
+                       "quantity": 1000, "average_price": 21.0, "last_price": 23.0}]
+L.read_upstox(); L.read_upstox()
+c = L.state["positions"]["NSE:CHEAP26NOV100CE"]
+assert c["quantity"] == 1000 and abs(c["average_price"] - 21.0) < 1e-9 and c["owner_added"] == 500
+world["trades"].append({"order_id": "MANUAL3", "trade_id": "M3", "instrument_token": "NSE_FO|1", "quantity": 500, "average_price": 25.0, "transaction_type": "SELL"})
+world["positions"][0]["quantity"] = 500
+L.read_upstox(); L.read_upstox()
+assert L.state["positions"]["NSE:CHEAP26NOV100CE"]["quantity"] == 500 and abs(L.state["realized"] - ((14.2 - 19.44) * 1500 + (104.9 - 100) * 65 + (25 - 21) * 500)) < 0.01, L.state["realized"]
+# a lane BUY whose fill reaches the positions list before the trade list is never adopted as the owner's
+L.state["positions"] = {}
+L.state["orders"]["LANEBUY"] = {"order_id": "LANEBUY", "symbol": "NSE:VOLT26NOV1160CE", "instrument": "NSE_FO|500", "side": "BUY",
+    "quantity": 375, "price": 18.0, "placed_at": "2026-11-17T09:20:00+05:30", "placed_ts": 1.0, "open": False, "status": "complete", "filled": 375}
+world.update(trades=[], orders=[{"order_id": "LANEBUY", "status": "complete", "filled_quantity": 375}])
+world["positions"] = [{**volt, "quantity": 375}]
+for _ in range(3): L.read_upstox()
+assert not L.state["positions"], "unrecorded lane fill: not adopted"
+world["trades"] = [{"order_id": "LANEBUY", "trade_id": "LB", "instrument_token": "NSE_FO|500", "quantity": 375, "average_price": 18.0, "transaction_type": "BUY"}]
+for _ in range(3): L.read_upstox()
+assert list(L.state["positions"]) == ["NSE:VOLT26NOV1160CE"] and L.state["positions"]["NSE:VOLT26NOV1160CE"].get("origin") is None
+# no row at all in the account: three reads before it counts as closed
+world.update(positions=[], trades=[])
+L.read_upstox(); L.read_upstox(); assert L.state["positions"]
+L.read_upstox(); assert not L.state["positions"] and L.state["decisions"][-1]["price_from"] in ("the lane's last mark", "last price")
+# expiry day: an adopted position is sold from the flatten time
+lots["NSE:VOLT26NOV1160CE"] = (375, "NSE_FO|500")
+L.resolve = lambda s: {"upstox": "NSE_FO|500", "lot_size": 375, "tick_size": 0.05, "expiry_ms": datetime.now(timezone.utc).timestamp() * 1000}
+L.state["orders"] = {}; world["positions"] = [dict(volt)]
+L.read_upstox(); L.read_upstox(); assert L.state["positions"]["NSE:VOLT26NOV1160CE"]["origin"] == "owner"
+L.EXPIRY_FLATTEN_IST = "23:59" if datetime.now(L.IST).strftime("%H:%M") < "23:59" else "23:59"
+n = len(sent); L.step()
+if datetime.now(L.IST).strftime("%H:%M") < "23:59":
+    assert len(sent) == n, "before the flatten time: held"
+L.EXPIRY_FLATTEN_IST = "00:00"; L.step(); assert "expiry day" in L.state["orders"][f"OID{len(sent)}"]["reason"]
+L.set_armed(False, "test")
+print("owner trades: adopt + manage, owner closes/adds acknowledged, lane fills never adopted OK")
