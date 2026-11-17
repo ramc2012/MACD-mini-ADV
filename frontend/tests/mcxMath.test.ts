@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { changedSettings, fromForm, macdState, newestMcxQuote, orderedRoots, sessionLabel, toForm, verdictMeta } from "../src/mcxMath.ts";
-import type { McxContractRow, McxQuote, McxSettings } from "../src/mcxMath.ts";
+import { changedSettings, fromForm, macdState, newestMcxQuote, orderedRoots, sessionLabel, shortChanges, toForm, toShortForm, verdictMeta } from "../src/mcxMath.ts";
+import type { McxContractRow, McxQuote, McxSettings, McxShortSettings } from "../src/mcxMath.ts";
 
 const SETTINGS: McxSettings = {
   enabled: true, auto_trade: false, roots_csv: "GOLD,SILVER,CRUDEOIL,COPPER,NATURALGAS", initial_capital: 1_000_000,
@@ -70,4 +70,18 @@ test("a late polling snapshot cannot overwrite a newer MCX price move or OI", ()
   assert.equal(newestMcxQuote(older, price), price);
   const oiUpdate = { ...price, oi: 800, oi_change: 75, oi_ms: 1500, updated_ms: 1500 };
   assert.equal(newestMcxQuote(oiUpdate, price), oiUpdate);
+});
+
+const SHORT: McxShortSettings = {
+  auto_trade: true, capital: 2_500_000, ticket: 300_000, max_lots: 300, max_positions: 1,
+  price_scan_csv: "GOLD:8,SILVER:12,CRUDEOIL:30,NATURALGAS:13,COPPER:9", volatility_scan_pct: 25, extreme_cover: 0.35,
+  min_charge_pct: 3, elm_pct: 1,
+};
+
+test("selling settings send only changed short_ fields and refuse a malformed scan list", () => {
+  assert.deepEqual(shortChanges(SHORT, toShortForm(SHORT)).payload, {});
+  const form = { ...toShortForm(SHORT), ticket: "500000", price_scan_csv: "gold:9, silver:12" };
+  assert.deepEqual(shortChanges(SHORT, form).payload, { short_ticket: 500_000, short_price_scan_csv: "GOLD:9,SILVER:12" });
+  assert.match(shortChanges(SHORT, { ...toShortForm(SHORT), price_scan_csv: "GOLD=9" }).error ?? "", /GOLD:8/);
+  assert.match(shortChanges(SHORT, { ...toShortForm(SHORT), extreme_cover: "2" }).error ?? "", /0 to 1/);
 });

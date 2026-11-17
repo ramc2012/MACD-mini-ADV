@@ -87,6 +87,7 @@ from .config import RUNTIME_DIR, Settings
 from .contracts import liquidity_window, select_liquid_contract
 from .events import EventHub, json_value
 from .execution import ExecutionManager
+from .mcx_short import McxShortBook
 from .mcx_store import McxBarStore, valid_minute
 from .models import Candle, Signal, Tick, Trade
 from .portfolio import Portfolio, breakeven_exit_price
@@ -673,6 +674,11 @@ class McxLane:
         # Opposite-cross exits refused for want of a fresh quote: retried on the holding's next tick and
         # on every maintenance pass until they fill.
         self.pending_exits: dict[str, str] = {}
+        # The selling book (mcx_short.py): writes options on its own capital and margin.
+        short_book = settings.mcx_short_database_path
+        if short_book == str(RUNTIME_DIR / "mcx_short.sqlite3"):
+            short_book = str(Path(book).parent / "mcx_short.sqlite3")       # beside the lane's own book
+        self.shorts = McxShortBook(self, short_book, commodity)
         self._mini_selection_complete = False
         self.selection: dict = {"date": None, "selected_at": None, "roots": {}, "errors": {}}
         self.decisions: deque[dict] = deque(maxlen=200)
@@ -822,7 +828,7 @@ class McxLane:
         payload = self._load_snapshot()
         rows = {row.get("symbol"): row for row in payload.get("contracts") or [] if isinstance(row, dict)}
         rows.update({symbol: row for symbol, row in (payload.get("held") or {}).items() if isinstance(row, dict)})
-        for symbol in self.portfolio.positions:
+        for symbol in self.held_symbols():
             row = rows.get(symbol)
             if row:
                 try:
@@ -841,7 +847,7 @@ class McxLane:
         self.execution.set_contract_expiries({symbol: row.expiry for symbol, row in self.contracts.items()})
 
     def _save_snapshot(self) -> None:
-        held = {symbol: asdict(self.contracts[symbol]) for symbol in self.portfolio.positions if symbol in self.contracts}
+        held = {symbol: asdict(self.contracts[symbol]) for symbol in self.held_symbols() if symbol in self.contracts}
         payload = {
             "date": self.selection.get("date"),
             "selected_at": self.selection.get("selected_at"),
@@ -864,6 +870,10 @@ class McxLane:
 
     # --------------------------------------------------------------- selection
 
+    def held_symbols(self) -> list[str]:
+        """Contracts either book holds: the buying book's positions and the selling book's shorts."""
+        return list(dict.fromkeys([*self.portfolio.positions, *self.shorts.open]))
+
     def owns(self, symbol: str) -> bool:
         return symbol.startswith(EXCHANGE + ":")
 
@@ -878,7 +888,7 @@ class McxLane:
         the invalidation exit, as on the MACD lane.
         """
         return list(dict.fromkeys([*self.option_symbols(),
-                                   *[s for s in self.portfolio.positions if s in self.contracts]]))
+                                   *[s for s in self.held_symbols() if s in self.contracts]]))
 
     def futures_symbols(self) -> list[str]:
         return list(dict.fromkeys([*self.futures_by_root.values(), *self.mini_front_futures]))
@@ -893,9 +903,9 @@ class McxLane:
     def core_symbols(self) -> list[str]:
         """Today's options, their futures and every holding: what the lane trades and prices from."""
         if not self.settings.mcx_enabled:
-            return list(dict.fromkeys(self.portfolio.positions))
+            return self.held_symbols()
         return list(dict.fromkeys([
-            *self.option_symbols(), *self.futures_symbols(), *self.portfolio.positions,
+            *self.option_symbols(), *self.futures_symbols(), *self.held_symbols(),
         ]))
 
     def subscription_symbols(self) -> list[str]:
@@ -924,7 +934,7 @@ class McxLane:
         except Exception as exc:  # noqa: BLE001
             self._lane_error("settle", exc)
         if not self.settings.mcx_enabled:
-            self.contracts = {s: c for s, c in self.contracts.items() if s in self.portfolio.positions}
+            self.contracts = {s: c for s, c in self.contracts.items() if s in self.held_symbols()}
             for contract in self.contracts.values():
                 contract.retained = True
             self.futures_by_root = {}
@@ -939,7 +949,7 @@ class McxLane:
             self.error = f"contract selection failed: {type(exc).__name__}: {exc}"[:300]
             if self.selection.get("date") != datetime.now(IST).date().isoformat() or not self.option_symbols():
                 # Never trade on yesterday's strikes: keep only what is held.
-                self.contracts = {s: c for s, c in self.contracts.items() if s in self.portfolio.positions}
+                self.contracts = {s: c for s, c in self.contracts.items() if s in self.held_symbols()}
                 for contract in self.contracts.values():
                     contract.retained = True
                 self.futures_by_root = {}
@@ -1138,7 +1148,7 @@ class McxLane:
     def _install(self, rows: list[McxContract], roots: dict, errors: dict, selected_at, *, source: str,
                  ladder: dict[str, dict] | None = None) -> None:
         today = datetime.now(IST).date().isoformat()
-        held = {symbol: contract for symbol, contract in self.contracts.items() if symbol in self.portfolio.positions}
+        held = {symbol: contract for symbol, contract in self.contracts.items() if symbol in self.held_symbols()}
         self.contracts = {row.symbol: row for row in rows}
         for symbol, contract in held.items():
             if symbol not in self.contracts:
@@ -1174,6 +1184,7 @@ class McxLane:
                 continue
             price = position.last_price if position.last_price > 0 else position.average_price
             await self.execution.settle_expired(symbol, price, "EXPIRED_WHILE_OFFLINE_LAST_MARK")
+        self.shorts.settle_expired(today)
 
     # ----------------------------------------------------------------- warm-up
 
@@ -1466,6 +1477,11 @@ class McxLane:
                     self.portfolio.mark(tick.symbol, tick.ltp)
             except Exception as exc:  # noqa: BLE001 - one bad print must not stop the feed
                 self._lane_error("execution", exc, tick.symbol)
+        if tick.symbol in self.shorts.open:
+            try:
+                await self.shorts.on_tick(tick.symbol, tick.ltp, tradable=current, now=received_at)
+            except Exception as exc:  # noqa: BLE001
+                self._lane_error("short_execution", exc, tick.symbol)
         if current:
             # Every watched contract's minute goes to the lane's database, traded or not.
             self._record_minute(tick)
@@ -1473,7 +1489,7 @@ class McxLane:
         future = self.is_future(tick.symbol)
         if not current or not self.settings.mcx_enabled or (contract is None and not future):
             return
-        if contract is not None and contract.retained and tick.symbol not in self.portfolio.positions:
+        if contract is not None and contract.retained and tick.symbol not in self.held_symbols():
             return
         candle, closed = self.aggregator.on_tick(tick)
         if closed is not None:
@@ -1485,6 +1501,10 @@ class McxLane:
             signal = self.strategy.on_live_candle(candle)
             if signal is not None:
                 await self._on_signal(signal)
+            try:
+                await self.shorts.on_live_candle(candle)
+            except Exception as exc:  # noqa: BLE001
+                self._lane_error("short_signal", exc, candle.symbol)
 
     def _record_minute(self, tick: Tick) -> None:
         written = self._last_minute.get(tick.symbol)
@@ -1583,6 +1603,10 @@ class McxLane:
                 self._lane_error("invalidation", exc, candle.symbol)
         if signal is not None:
             await self._on_signal(signal)
+        try:
+            await self.shorts.on_closed_candle(candle)
+        except Exception as exc:  # noqa: BLE001
+            self._lane_error("short_signal", exc, candle.symbol)
 
     def _bar_is_current(self, signal: Signal) -> bool:
         bar = signal.evaluated_candle_timestamp
@@ -1603,6 +1627,10 @@ class McxLane:
         if not self.settings.mcx_enabled:
             self._decide(signal, DISABLED)
             return
+        try:
+            await self.shorts.on_buy_signal(signal)       # covers a short in it, writes the opposite leg
+        except Exception as exc:  # noqa: BLE001 - the selling book must never block a buy
+            self._lane_error("short_signal", exc, signal.symbol)
         if signal.symbol in self.portfolio.positions:
             self._decide(signal, ALREADY_HELD)
             return
@@ -1822,12 +1850,17 @@ class McxLane:
             await self.poll_stale_quotes(now)
             for symbol in list(self.pending_exits):
                 await self._retry_pending_exit(symbol)
+        if self.shorts.open:
+            try:
+                await self.shorts.maintain(now)
+            except Exception as exc:  # noqa: BLE001
+                self._lane_error("short_maintenance", exc)
         self.execution.sweep_closed_positions()
         if self.portfolio.positions or self.calendar.in_session(now):
             self.repository.save_equity_point(self.portfolio.snapshot())
         if self.portfolio.positions:
             self.repository.save_position_excursions(self.portfolio.positions.values())
-        if frozenset(self.portfolio.positions) != self._held_saved:
+        if frozenset(self.held_symbols()) != self._held_saved:
             self._save_snapshot()
 
     async def poll_stale_quotes(self, now: datetime | None = None) -> int:
@@ -2097,6 +2130,7 @@ class McxLane:
             "selection": self.selection,
             "contracts": len(self.option_symbols()),
             "held": len(self.portfolio.positions),
+            "shorts": self.shorts.health(),
             "subscribed": len(self.subscription_symbols()),
             "futures": len(self.futures_symbols()),
             "ladder": len(self.ladder),
@@ -2134,6 +2168,7 @@ class McxLane:
             "portfolio": self.execution.portfolio_snapshot(),
             "closed_positions": self.execution.visible_closed_positions(),
             "decisions": list(self.decisions)[:60],
+            "shorts": self.shorts.view(),
         })
 
     def book(self) -> dict:

@@ -151,6 +151,30 @@ The owner saw the lane stacking the same trade (NATURALGAS 290 PE and NATGASMINI
   is queued (`pending_exits`), closed on its next tick or maintenance pass, and the signal is recorded as
   `LANE_FULL`. Applies even with auto-trade off (it is an exit).
 
+## Option selling (17 Nov 2026, `mcx_short.py`)
+
+A separate paper book that writes today's ATM options (owner's choices: both triggers, own book, SPAN-style margin):
+
+- **Entries.** (1) A premium MACD zero-cross DOWN of a selected ATM option (forming bar or close, once per bar)
+  writes that option. (2) Every buy signal writes the opposite leg of the same root (call crosses up -> write the put).
+- **Book.** `mcx_short_capital` (Rs 25 L), one short at a time (`mcx_short_max_positions`), whole lots whose margin
+  fits under `mcx_short_ticket` (Rs 3 L), at most `mcx_short_max_lots`. File: `mcx_short.sqlite3` beside the MCX book.
+- **Margin (estimates, not MCXCCL's daily SPAN files).** Black-76 on the futures price with the option's implied vol;
+  worst loss of 16 scenarios (futures 0, +/-1/3, 2/3, 3/3 of the price scan range x vol +/- `mcx_short_volatility_scan_pct`,
+  plus two extreme moves of 2 x scan counted at `mcx_short_extreme_cover`), floored by the short option minimum
+  (`mcx_short_min_charge_pct` of futures notional), plus ELM (`mcx_short_elm_pct`). Price scan per commodity in
+  `mcx_short_price_scan_csv` (gold 8, silver 12, crude 30, natural gas 13, copper 9 from published 2026 initial
+  margin rates); minis use their full-size root. Re-marked every maintenance pass; free margin = equity - margin.
+  At 17 Nov prices one ATM lot needed ~Rs 10 L (GOLD), 5.4 L (SILVER), 2.1 L (CRUDEOIL), 2.6-2.9 L (COPPER),
+  39 k (NATURALGAS), 1 L (GOLDM), 0.9 L (SILVERM), 21 k (CRUDEOILM), 8 k (NATGASMINI).
+- **Exits.** The option's own premium cross UP (`SHORT_PREMIUM_CROSS_UP`); a short trigger on the other side of the
+  same commodity (`SHORT_OPPOSITE_TRIGGER`, then that trigger takes the slot); premium +30% (`SHORT_HARD_STOP_30_PCT`);
+  trail armed once the premium has fallen 30%, at 25% above its low, never above breakeven (`SHORT_TRAIL_25_PCT`);
+  the expiry exit time on expiry day; never written on expiry day. Fills at the last websocket price (<= 10 s old)
+  with slippage; a buy-back without a fresh price waits for the next tick. `POST /api/mcx/shorts/cover {symbol}`.
+- **Verdicts.** `SHORT_TAKEN`, `SHORT_AUTO_OFF`, `ALREADY_SHORT`, `SHORT_FULL`, `NO_PRICE`, `NO_FUTURES`,
+  `MARGIN_ABOVE_TICKET`, `NO_MARGIN`, `SESSION_CLOSED`, `NOT_SELECTED`, `EXPIRY_DAY`.
+
 ## Operating it
 
 1. Deploy and open **MCX lane** in the terminal. Check the contracts table:

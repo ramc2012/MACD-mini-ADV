@@ -391,6 +391,31 @@ class Settings(BaseSettings):
     mcx_evening_only_csv: str = ""
     mcx_database_path: str = str(RUNTIME_DIR / "mcx_trader.sqlite3")
     mcx_contract_snapshot_path: str = str(RUNTIME_DIR / "mcx_contracts.json")
+    # --- MCX option selling (mcx_short.py; owner, 17 Nov 2026) ----------------
+    # A separate paper book that WRITES today's ATM options: on a premium MACD
+    # zero-cross DOWN of the option itself, and on the opposite leg of every buy
+    # signal (call crosses up -> write the put of that commodity, and the
+    # reverse). Bought back on the option's own premium cross UP, an opposite
+    # short trigger of the same commodity, the MACD lane's stop/trail mirrored,
+    # or the expiry exit. Paper only by construction.
+    mcx_short_auto_trade: bool = True
+    mcx_short_capital: float = Field(default=2_500_000.0, ge=1)
+    # Margin ticket per short position: whole lots whose margin fits under it.
+    mcx_short_ticket: float = Field(default=300_000.0, ge=1, le=50_000_000)
+    mcx_short_max_lots: int = Field(default=300, ge=1, le=1000)
+    mcx_short_max_positions: int = Field(default=1, ge=1, le=20)
+    # SPAN-style margin (estimates, not MCXCCL's daily risk files): price scan
+    # range % of the futures price per commodity (minis use their full-size
+    # root), volatility scan +/- % of implied vol, 16 scenarios with the two
+    # extreme moves (2 x price scan) counted at mcx_short_extreme_cover, short
+    # option minimum charge and extreme loss margin as % of futures notional.
+    mcx_short_price_scan_csv: str = "GOLD:8,SILVER:12,CRUDEOIL:30,NATURALGAS:13,COPPER:9"
+    mcx_short_default_price_scan_pct: float = Field(default=12.0, gt=0, le=100)
+    mcx_short_volatility_scan_pct: float = Field(default=25.0, ge=0, le=100)
+    mcx_short_extreme_cover: float = Field(default=0.35, ge=0, le=1)
+    mcx_short_min_charge_pct: float = Field(default=3.0, ge=0, le=100)
+    mcx_short_elm_pct: float = Field(default=1.0, ge=0, le=100)
+    mcx_short_database_path: str = str(RUNTIME_DIR / "mcx_short.sqlite3")
 
     # Raw tick capture. Ticks cannot be backfilled -- Fyers' finest history is
     # 5-second OHLCV -- so the socket's output is the only copy that will ever
@@ -517,6 +542,6 @@ ENVIRONMENT_ONLY = frozenset({
     "database_path", "runtime_settings_path", "credentials_path", "research_database_path",
     "research_report_path", "contract_snapshot_path", "mp_database_path",
     "blast_database_path", "tick_database_path", "api_token", "allowed_origins_csv",
-    "mcx_database_path", "mcx_contract_snapshot_path", "mcx_bar_store_path",
+    "mcx_database_path", "mcx_contract_snapshot_path", "mcx_bar_store_path", "mcx_short_database_path",
     "engine_role", "nats_url", "strategy_url", "desk_url", "market_hub_url",
 })

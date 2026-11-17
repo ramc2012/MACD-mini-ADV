@@ -644,6 +644,21 @@ class McxSettingsInput(BaseModel):
     rest_fallback_seconds: float | None = Field(default=None, ge=0, le=3600)
     lot_multipliers_csv: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:, ]*$", max_length=300)
     history_downloads: bool | None = None
+    # The selling book (mcx_short.py)
+    short_auto_trade: bool | None = None
+    short_capital: float | None = Field(default=None, ge=1)
+    short_ticket: float | None = Field(default=None, ge=1, le=50_000_000)
+    short_max_lots: int | None = Field(default=None, ge=1, le=1000)
+    short_max_positions: int | None = Field(default=None, ge=1, le=20)
+    short_price_scan_csv: str | None = Field(default=None, pattern=r"^[A-Za-z0-9:., ]*$", max_length=300)
+    short_volatility_scan_pct: float | None = Field(default=None, ge=0, le=100)
+    short_extreme_cover: float | None = Field(default=None, ge=0, le=1)
+    short_min_charge_pct: float | None = Field(default=None, ge=0, le=100)
+    short_elm_pct: float | None = Field(default=None, ge=0, le=100)
+
+
+class McxShortCoverInput(BaseModel):
+    symbol: str = Field(pattern=r"^MCX:[A-Z0-9]+$", max_length=60)
 
 
 def _smart_lane(name: str):
@@ -942,6 +957,17 @@ async def mcx_settings(payload: McxSettingsInput):
     engine.settings = new_settings
     await engine.apply_mcx_settings(new_settings)
     persist_settings(new_settings)
+    return fast_json(engine.mcx.snapshot())
+
+
+@app.post("/api/mcx/shorts/cover", dependencies=[Depends(authorize)])
+async def mcx_short_cover(payload: McxShortCoverInput):
+    """Buy back one short of the MCX selling book (paper) at the fresh price."""
+    if payload.symbol not in engine.mcx.shorts.open:
+        raise HTTPException(404, "No open short in that contract")
+    done = await engine.mcx.shorts.cover(payload.symbol, "MANUAL")
+    if not done:
+        raise HTTPException(409, "No fresh price yet; the buy-back will fill on the next tick")
     return fast_json(engine.mcx.snapshot())
 
 

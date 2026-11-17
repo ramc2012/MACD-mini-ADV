@@ -91,7 +91,99 @@ export type McxSnapshot = {
   lane: "mcx"; settings: McxSettings; health: McxHealth; risk: McxRisk; contracts: McxContractRow[];
   portfolio: McxPortfolio; closed_positions: McxClosed[]; decisions: McxDecision[];
   quotes?: Record<string, McxQuote>;
+  shorts?: McxShorts;
 };
+
+// ------------------------------------------------------------ selling book
+
+export type McxShortSettings = {
+  auto_trade: boolean; capital: number; ticket: number; max_lots: number; max_positions: number;
+  price_scan_csv: string; volatility_scan_pct: number; extreme_cover: number; min_charge_pct: number; elm_pct: number;
+};
+
+export type McxShortRow = {
+  short_id: string; symbol: string; root: string; option_type: string; strike: number; expiry: string;
+  lots: number; lot_size: number; quantity: number; entry_price: number; entry_at: string; trigger: string;
+  margin: number; margin_now: number; iv: number; last_price: number; low_price: number; high_price: number;
+  status: string; exit_price: number | null; exit_at: string | null; exit_reason: string | null; pnl: number;
+  unrealized: number; hard_stop: number | null; trail_stop: number | null; pending_exit: string | null;
+};
+
+export type McxShortDecision = {
+  at: string; symbol: string; root: string; option_type: string; trigger: string; source: string | null;
+  verdict: string; price: number | null; macd: number | null; lots: number; detail: string; margin_per_lot: number | null;
+};
+
+export type McxMarginQuote = {
+  symbol: string; root: string; option_type: string; premium: number; lot_size: number; iv: number;
+  scanning_risk: number; short_option_minimum: number; span: number; elm: number; total: number; lots_in_ticket: number;
+};
+
+export type McxShorts = {
+  settings: McxShortSettings;
+  account: { capital: number; realized: number; realized_today: number; unrealized: number; equity: number;
+    margin_used: number; free_margin: number };
+  open: McxShortRow[]; closed: McxShortRow[]; decisions: McxShortDecision[]; margin_quotes: McxMarginQuote[];
+  errors: Record<string, string>;
+};
+
+export const SHORT_VERDICT: Record<string, { label: string; help: string }> = {
+  SHORT_TAKEN: { label: "Written", help: "Sold in the selling book." },
+  SHORT_AUTO_OFF: { label: "Selling off", help: "A valid trigger; the selling book is set not to write." },
+  ALREADY_SHORT: { label: "Already short", help: "The book is already short this contract." },
+  SHORT_FULL: { label: "Book full", help: "The selling book already holds its one short." },
+  NO_PRICE: { label: "No fresh price", help: "No websocket price for the option in the last few seconds." },
+  NO_FUTURES: { label: "No futures price", help: "Margin needs the underlying futures price." },
+  MARGIN_ABOVE_TICKET: { label: "Margin above ticket", help: "One lot needs more margin than the per-position ticket." },
+  NO_MARGIN: { label: "No free margin", help: "Free margin does not cover one lot." },
+  SESSION_CLOSED: { label: "Session closed", help: "MCX was shut." },
+  NOT_SELECTED: { label: "Not selected", help: "Shorts use today's ATM legs only." },
+  EXPIRY_DAY: { label: "Expiry day", help: "Never written on its expiry day." },
+};
+
+export const TRIGGER_LABEL: Record<string, string> = {
+  PREMIUM_MACD_ZERO_CROSS_DOWN: "Premium crossed down",
+  OPPOSITE_LEG_OF_BUY: "Opposite leg of a buy",
+};
+
+export type McxShortForm = {
+  auto_trade: boolean; capital: string; ticket: string; max_lots: string; max_positions: string; price_scan_csv: string;
+  volatility_scan_pct: string; extreme_cover: string; min_charge_pct: string; elm_pct: string;
+};
+
+export function toShortForm(settings: McxShortSettings): McxShortForm {
+  return {
+    auto_trade: settings.auto_trade, capital: String(settings.capital), ticket: String(settings.ticket),
+    max_lots: String(settings.max_lots), max_positions: String(settings.max_positions), price_scan_csv: settings.price_scan_csv,
+    volatility_scan_pct: String(settings.volatility_scan_pct), extreme_cover: String(settings.extreme_cover),
+    min_charge_pct: String(settings.min_charge_pct), elm_pct: String(settings.elm_pct),
+  };
+}
+
+/** The changed selling settings as the API's short_* fields, or the first error. */
+export function shortChanges(current: McxShortSettings, form: McxShortForm): { payload?: Record<string, unknown>; error?: string } {
+  const num = (raw: string) => (raw.trim() === "" ? Number.NaN : Number(raw));
+  const next: McxShortSettings = {
+    auto_trade: form.auto_trade, capital: num(form.capital), ticket: num(form.ticket), max_lots: num(form.max_lots),
+    max_positions: num(form.max_positions), price_scan_csv: form.price_scan_csv.trim().toUpperCase().replace(/\s+/g, ""),
+    volatility_scan_pct: num(form.volatility_scan_pct), extreme_cover: num(form.extreme_cover),
+    min_charge_pct: num(form.min_charge_pct), elm_pct: num(form.elm_pct),
+  };
+  if (!(next.capital >= 1)) return { error: "Capital must be at least ₹1." };
+  if (!(next.ticket >= 1)) return { error: "Margin ticket must be at least ₹1." };
+  if (!Number.isInteger(next.max_lots) || next.max_lots < 1 || next.max_lots > 1000) return { error: "Max lots must be a whole number from 1 to 1000." };
+  if (!Number.isInteger(next.max_positions) || next.max_positions < 1 || next.max_positions > 20) return { error: "Max shorts must be 1 to 20." };
+  if (!/^([A-Z0-9]+:\d+(\.\d+)?)(,[A-Z0-9]+:\d+(\.\d+)?)*$/.test(next.price_scan_csv)) return { error: "Price scan must look like GOLD:8,SILVER:12." };
+  for (const key of ["volatility_scan_pct", "min_charge_pct", "elm_pct"] as const) {
+    if (!(next[key] >= 0 && next[key] <= 100)) return { error: "Percentages must be 0 to 100." };
+  }
+  if (!(next.extreme_cover >= 0 && next.extreme_cover <= 1)) return { error: "Extreme-move weight must be 0 to 1." };
+  const payload: Record<string, unknown> = {};
+  (Object.keys(next) as (keyof McxShortSettings)[]).forEach((key) => {
+    if (next[key] !== current[key]) payload[`short_${key}`] = next[key];
+  });
+  return { payload };
+}
 
 export type McxForm = {
   enabled: boolean; auto_trade: boolean; roots: string[]; initial_capital: string; target_notional: string;

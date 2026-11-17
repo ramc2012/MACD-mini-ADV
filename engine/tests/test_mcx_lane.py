@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from macd_trader import execution, mcx_lane, models, rollover
+from macd_trader import execution, mcx_lane, mcx_short, models, rollover
 from macd_trader.config import Settings
 from macd_trader.events import EventHub
 from macd_trader.mcx_lane import (
@@ -41,7 +41,7 @@ class Clock(datetime):
 def mcx_clock(monkeypatch):
     """A Wednesday in the winter schedule (US standard time, close 23:55), 11:00 IST."""
     Clock.moment = datetime(2026, 11, 18, 11, 0, tzinfo=IST)
-    for module in (mcx_lane, execution, models, rollover):
+    for module in (mcx_lane, mcx_short, execution, models, rollover):
         monkeypatch.setattr(module, "datetime", Clock)
     monkeypatch.setattr(mcx_lane, "WARMUP_PACING_SECONDS", 0)
     monkeypatch.delenv("MACD_HISTORY_DOWNLOADS_ENABLED", raising=False)
@@ -987,3 +987,112 @@ def test_chart_uses_mcx_buckets_and_forming_minutes_without_broker_requests(tmp_
     assert asyncio.run(lane.chart("MCX:UNKNOWN", 60)) is None
     assert lane.broker.history_requests == requests and not lane.decisions
     asyncio.run(lane.stop())
+
+
+# ------------------------------------------------------------ selling book
+
+FUT = "MCX:CRUDEOIL26DECFUT"
+
+
+class TestSelling:
+    def legs(self, tmp_path, **overrides):
+        lane, call = ready_lane(tmp_path, **overrides)
+        put = next(row for row in lane.contracts.values() if row.option_type == "PE" and row.root == call.root)
+        return lane, call, put
+
+    def prices(self, lane, moment, **symbols):
+        feed(lane, FUT, 5823.0, moment)
+        for symbol, price in symbols.items():
+            feed(lane, symbol, price, moment)
+
+    def buy_signal(self, lane, symbol, price, minute):
+        Clock.moment = at(11, minute, 10)
+        asyncio.run(lane._on_signal(Signal(symbol, "BUY", "K", price, 0.5, 0.1, 0.4,
+                                           evaluated_candle_timestamp=int(at(11, minute).timestamp()))))
+
+    def test_black76_parity_and_implied_vol_round_trip(self):
+        call = mcx_short.black76(5800, 5850, 0.05, 0.3, "CE")
+        put = mcx_short.black76(5800, 5850, 0.05, 0.3, "PE")
+        assert call - put == pytest.approx(5800 - 5850, abs=1e-6)
+        assert mcx_short.implied_vol(call, 5800, 5850, 0.05, "CE") == pytest.approx(0.3, abs=1e-4)
+
+    def test_span_margin_takes_the_worst_scenario_floored_by_the_minimum_and_adds_elm(self):
+        params = mcx_short.MarginParams(30, 25, 0.35, 3, 1)
+        atm = mcx_short.span_margin(5800, 5800, 0.05, 150, "PE", 100, params)
+        assert atm["scanning_risk"] > 150 * 100 and atm["span"] == atm["scanning_risk"]
+        assert atm["total"] == pytest.approx(atm["span"] + 0.01 * 5800 * 100)
+        far = mcx_short.span_margin(5800, 2000, 0.01, 0.05, "PE", 100, mcx_short.MarginParams(5, 25, 0.35, 3, 1))
+        assert far["span"] == far["short_option_minimum"] == pytest.approx(0.03 * 5800 * 100)
+
+    def test_a_buy_signal_writes_the_opposite_leg_inside_the_ticket(self, tmp_path):
+        lane, call, put = self.legs(tmp_path)
+        self.prices(lane, at(11, 0, 5), **{call.symbol: 100.0, put.symbol: 80.0})
+        self.buy_signal(lane, call.symbol, 100.0, 0)
+        short = lane.shorts.open[put.symbol]
+        decision = lane.shorts.decisions[0]
+        assert decision["verdict"] == mcx_short.SHORT_TAKEN and decision["trigger"] == mcx_short.OPPOSITE_LEG
+        assert short.lots == min(300, int(300_000 // decision["margin_per_lot"]))
+        assert short.margin <= 300_000 and short.entry_price == 80.0
+        assert put.symbol in lane.subscription_symbols() and put.symbol in lane.strategy_symbols()
+
+    def test_the_shorted_contracts_own_cross_up_buys_it_back_and_writes_the_other_side(self, tmp_path):
+        lane, call, put = self.legs(tmp_path)
+        self.prices(lane, at(11, 0, 5), **{call.symbol: 100.0, put.symbol: 80.0})
+        self.buy_signal(lane, call.symbol, 100.0, 0)
+        self.prices(lane, at(11, 1, 5), **{call.symbol: 95.0, put.symbol: 70.0})
+        self.buy_signal(lane, put.symbol, 70.0, 1)
+        closed = lane.shorts.closed[-1]
+        assert closed.symbol == put.symbol and closed.exit_reason == mcx_short.COVER_CROSS_UP
+        assert closed.pnl == pytest.approx((80.0 - 70.0) * closed.quantity)
+        assert call.symbol in lane.shorts.open and put.symbol not in lane.shorts.open
+
+    def test_a_premium_cross_down_writes_the_option(self, tmp_path):
+        lane, call, put = self.legs(tmp_path)
+        start = at(11, 0)
+        path = [100, 104, 108, 112, 115, 117, 118, 117.5, 116, 112, 106, 99, 92]
+        for minute, price in enumerate(path):
+            for second in (5, 50):
+                moment = start + timedelta(minutes=minute, seconds=second)
+                feed(lane, FUT, 5823.0, moment)
+                feed(lane, call.symbol, price, moment)
+        taken = [row for row in lane.shorts.decisions if row["trigger"] == mcx_short.CROSS_DOWN]
+        assert taken and taken[-1]["verdict"] == mcx_short.SHORT_TAKEN
+        assert call.symbol in lane.shorts.open
+
+    def test_short_hard_stop_trail_and_restart(self, tmp_path):
+        lane, call, put = self.legs(tmp_path)
+        self.prices(lane, at(11, 0, 5), **{call.symbol: 100.0, put.symbol: 100.0})
+        self.buy_signal(lane, call.symbol, 100.0, 0)
+        assert put.symbol in lane.shorts.open
+        again = build(tmp_path, crude_broker())                  # restart: the short is restored and subscribed
+        assert put.symbol in again.shorts.open and put.symbol in again.subscription_symbols()
+        feed(lane, put.symbol, 69.0, at(11, 2, 0))               # -31%: trail armed at 69 x 1.25
+        assert lane.shorts.stop_levels(lane.shorts.open[put.symbol])[1] == pytest.approx(86.25)
+        feed(lane, put.symbol, 87.0, at(11, 3, 0))
+        assert lane.shorts.closed[-1].exit_reason == "SHORT_TRAIL_25_PCT"
+        assert lane.shorts.closed[-1].pnl == pytest.approx((100 - 87) * lane.shorts.closed[-1].quantity)
+        self.prices(lane, at(11, 4, 5), **{put.symbol: 100.0, call.symbol: 100.0})
+        self.buy_signal(lane, put.symbol, 100.0, 4)              # put crosses up -> write the call
+        feed(lane, call.symbol, 131.0, at(11, 5, 0))
+        assert lane.shorts.closed[-1].symbol == call.symbol
+        assert lane.shorts.closed[-1].exit_reason == "SHORT_HARD_STOP_30_PCT"
+
+    def test_margin_above_the_ticket_and_auto_off_write_nothing(self, tmp_path):
+        lane, call, put = self.legs(tmp_path, mcx_short_ticket=1_000)
+        self.prices(lane, at(11, 0, 5), **{call.symbol: 100.0, put.symbol: 80.0})
+        self.buy_signal(lane, call.symbol, 100.0, 0)
+        assert lane.shorts.decisions[0]["verdict"] == mcx_short.MARGIN_ABOVE_TICKET and not lane.shorts.open
+        off, call2, put2 = self.legs(tmp_path / "off", mcx_short_auto_trade=False)
+        self.prices(off, at(11, 0, 5), **{call2.symbol: 100.0, put2.symbol: 80.0})
+        self.buy_signal(off, call2.symbol, 100.0, 0)
+        assert off.shorts.decisions[0]["verdict"] == mcx_short.SHORT_AUTO_OFF and not off.shorts.open
+
+    def test_a_stale_put_price_writes_nothing_and_a_stale_buy_back_waits(self, tmp_path):
+        lane, call, put = self.legs(tmp_path)
+        self.prices(lane, at(11, 0, 5), **{call.symbol: 100.0, put.symbol: 80.0})
+        self.buy_signal(lane, call.symbol, 100.0, 0)
+        Clock.moment = at(11, 3)
+        assert not asyncio.run(lane.shorts.cover(put.symbol, "MANUAL"))
+        assert lane.shorts.pending == {put.symbol: "MANUAL"}
+        feed(lane, put.symbol, 75.0, at(11, 3, 30))
+        assert put.symbol not in lane.shorts.open and lane.shorts.closed[-1].exit_reason == "MANUAL"

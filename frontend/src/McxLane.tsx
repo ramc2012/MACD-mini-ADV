@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
 import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
+import { SellingTab } from "./McxSelling";
 import {
   MCX_QUOTES_EVENT, MCX_ROOTS, ROOT_LABEL, ROOT_UNIT, changedSettings, fromForm, macdState, newestMcxQuote, sessionLabel, toForm, verdictMeta,
   type McxDecision, type McxForm, type McxQuote, type McxSnapshot,
@@ -11,12 +12,13 @@ import {
  * existing terminal stream supplies frequent quotes while this page is open. */
 const WATCHLIST = { FUTURES: "FUT", CALLS: "CE", PUTS: "PE" } as const;
 type WatchTab = keyof typeof WATCHLIST;
-type Tab = WatchTab | "POSITIONS" | "SIGNALS" | "BOOK" | "RULES" | "SETTINGS";
+type Tab = WatchTab | "POSITIONS" | "SELLING" | "SIGNALS" | "BOOK" | "RULES" | "SETTINGS";
 const TABS: { key: Tab; label: string }[] = [
   { key: "FUTURES", label: "Futures" },
   { key: "CALLS", label: "Calls" },
   { key: "PUTS", label: "Puts" },
   { key: "POSITIONS", label: "Positions" },
+  { key: "SELLING", label: "Selling" },
   { key: "SIGNALS", label: "Signals" },
   { key: "BOOK", label: "Orders & trades" },
   { key: "RULES", label: "Rules & data" },
@@ -107,6 +109,7 @@ export function McxLanePage({ connected }: { connected: boolean }) {
     CALLS: snapshot.contracts.filter((row) => row.option_type === "CE").length,
     PUTS: snapshot.contracts.filter((row) => row.option_type === "PE").length,
     POSITIONS: portfolio.positions.length,
+    SELLING: snapshot.shorts?.open.length ?? 0,
     SIGNALS: snapshot.decisions.length,
   };
   const problems = [
@@ -154,6 +157,7 @@ export function McxLanePage({ connected }: { connected: boolean }) {
       {error && <div className="settings-error blast-inline-error" role="alert">Refresh failed: {error}. Showing the last snapshot.</div>}
       {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} onChart={openChart} />}
       {tab === "POSITIONS" && <PositionsTab snapshot={snapshot} quoteFor={quoteFor} />}
+      {tab === "SELLING" && <SellingTab snapshot={snapshot} onSaved={setSnapshot} />}
       {tab === "SIGNALS" && <SignalsTab rows={snapshot.decisions} counts={health.decisions} />}
       {tab === "BOOK" && <BookTab />}
       {tab === "RULES" && <RulesTab snapshot={snapshot} problems={problems} />}
