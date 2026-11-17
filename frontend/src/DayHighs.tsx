@@ -17,7 +17,7 @@ type Payload = {
   at_high: Record<Kind, number>; at_low: Record<Kind, number>; listed: Record<Kind, number>;
   rules: Record<string, string>;
 };
-type Extreme = "HIGH" | "LOW";
+export type Extreme = "HIGH" | "LOW";
 type Scope = "ALL" | "INDEX" | "STOCK";
 
 const KINDS: readonly (readonly [Kind, string])[] = [["SPOT", "Spot"], ["CE", "ATM CE"], ["PE", "ATM PE"]];
@@ -28,13 +28,12 @@ const pct = (value: number | null) => value === null ? "—" : `${value > 0 ? "+
 const sign = (value: number | null): "positive" | "negative" | "" => value === null || value === 0 ? "" : value > 0 ? "positive" : "negative";
 const name = (row: Row) => row.kind === "SPOT" ? row.label : `${row.label} ${row.strike ?? ""} ${row.kind}`;
 
-/** Spots and today's ATM CE / PE legs whose last completed 15-minute bar closed at a new day high (or low):
- *  owner, 4 Nov 2026. */
-export function DayHighs({ onOpen }: { onOpen?: (symbol: string) => void }) {
+/** Spots and today's ATM CE / PE legs whose last completed 15-minute bar closed at a new day high (owner, 4 Nov
+ *  2026) -- or, as the separate "Day lows" tab (owner, 17 Nov 2026), at a new day low. */
+export function DayHighs({ extreme, onOpen }: { extreme: Extreme; onOpen?: (symbol: string) => void }) {
   const [data, setData] = useState<Payload | null>(null);
   const [error, setError] = useState("");
   const [kind, setKind] = useState<Kind>("SPOT");
-  const [extreme, setExtreme] = useState<Extreme>("HIGH");
   const [scope, setScope] = useState<Scope>("ALL");
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortState>({ key: "streak", direction: "desc" });
@@ -74,15 +73,10 @@ export function DayHighs({ onOpen }: { onOpen?: (symbol: string) => void }) {
   const barStart = data?.as_of[kind];
   const asOf = barStart ? `${clock(barStart)}–${clock(data?.as_of_end[kind] ?? barStart + 900)} IST bar` : "no completed bar yet";
   const noun = option ? `ATM ${kind} legs` : "spots";
-  const count = (counts: Record<Kind, number> | undefined) => counts?.[kind] ?? "…";
   return <section className="panel atm-heatmap">
     <div className="heatmap-toolbar">
       <div className="risk-tabs" role="group" aria-label="Instrument">{KINDS.map(([key, label]) =>
         <button key={key} aria-pressed={kind === key} onClick={() => setKind(key)}>{label} <b>{data ? (high ? data.at_high : data.at_low)[key] : "…"}</b></button>)}</div>
-      <div className="risk-tabs" role="group" aria-label="Extreme">
-        <button aria-pressed={high} onClick={() => setExtreme("HIGH")}>At day high <b>{count(data?.at_high)}</b></button>
-        <button aria-pressed={!high} onClick={() => setExtreme("LOW")}>At day low <b>{count(data?.at_low)}</b></button>
-      </div>
       <div className="risk-tabs" role="group" aria-label="Universe">{(["ALL", "INDEX", "STOCK"] as const).map((key) =>
         <button key={key} aria-pressed={scope === key} onClick={() => setScope(key)}>{key === "ALL" ? "All" : key === "INDEX" ? "Indices" : "Stocks"}</button>)}</div>
       <input className="heatmap-search" placeholder="Filter instrument or sector" value={query} onChange={(event) => setQuery(event.target.value)} />
