@@ -16,7 +16,19 @@ What is the same as the MACD lane
 * **Exit.** ``ExecutionManager`` itself, with the MACD lane's risk settings:
   hard stop, trailing stop armed at +activation and floored at breakeven,
   scale-in at +7.5/15/22.5%, scale-out at +30/50/75%, optional MACD
-  invalidation exit. Sizing is whole lots nearest ``mcx_target_notional``.
+  invalidation exit.
+
+Owner's rules (17 Nov 2026)
+---------------------------
+* **Rs 1 L per position** (``mcx_target_notional`` with ``mcx_ticket_ceiling``):
+  whole lots that fit under the ticket, no pyramid adds; a contract whose one
+  lot costs more than the ticket (ATM GOLD, often SILVER) is not bought, and
+  its mini carries the commodity.
+* **One position at a time** (``mcx_max_positions`` = 1): the lane had been
+  stacking the same trade (NATURALGAS 290 PE and NATGASMINI 290 PE together).
+* **An opposite cross closes the trade** (``mcx_opposite_cross_exit``): a
+  premium zero-cross UP on the other side of the same commodity (CE vs PE,
+  full-size or mini) exits the holding, and the new signal may then enter.
 
 What is different, and why
 --------------------------
@@ -105,6 +117,12 @@ DISPLAY_NAMES = {
     "GOLDM": "Gold mini", "SILVERM": "Silver mini", "CRUDEOILM": "Crude oil mini", "NATGASMINI": "Natural gas mini",
 }
 MINI_ROOTS = {"GOLD": "GOLDM", "SILVER": "SILVERM", "CRUDEOIL": "CRUDEOILM", "NATURALGAS": "NATGASMINI"}
+FULL_ROOTS = {mini: full for full, mini in MINI_ROOTS.items()}
+
+
+def commodity(root: str) -> str:
+    """The commodity a contract trades: a mini counts as its full-size root."""
+    return FULL_ROOTS.get(root, root)
 
 # --------------------------------------------------------------------- calendar
 MCX_OPEN = time(9, 0)
@@ -513,6 +531,7 @@ def mcx_execution_settings(settings: Settings) -> Settings:
         "target_position_notional": settings.mcx_target_notional,
         "max_target_entry_lots": settings.mcx_max_entry_lots,
         "max_positions": settings.mcx_max_positions,
+        "pyramid_adds": not settings.mcx_ticket_ceiling,
         "min_cash_reserve": 0.0,
     })
 
@@ -551,6 +570,10 @@ STALE_BAR = "STALE_BAR"
 DISABLED = "DISABLED"
 SESSION_CLOSED = "SESSION_CLOSED"
 NOT_SELECTED = "NOT_SELECTED"
+LANE_FULL = "LANE_FULL"
+LOT_ABOVE_TICKET = "LOT_ABOVE_TICKET"
+
+OPPOSITE_CROSS_EXIT = "MCX_OPPOSITE_CROSS"
 
 REST_POLL_INTERVAL_SECONDS = 15.0
 MAINTENANCE_INTERVAL_SECONDS = 15.0
@@ -647,6 +670,9 @@ class McxLane:
         self.contracts: dict[str, McxContract] = {}      # symbol -> today's selected or held contract
         self.futures_by_root: dict[str, str] = {}
         self.mini_front_futures: dict[str, dict[str, str]] = {}
+        # Opposite-cross exits refused for want of a fresh quote: retried on the holding's next tick and
+        # on every maintenance pass until they fill.
+        self.pending_exits: dict[str, str] = {}
         self._mini_selection_complete = False
         self.selection: dict = {"date": None, "selected_at": None, "roots": {}, "errors": {}}
         self.decisions: deque[dict] = deque(maxlen=200)
@@ -1435,6 +1461,7 @@ class McxLane:
                     # it is still the best valuation there is.
                     self.portfolio.mark(tick.symbol, tick.ltp)
                     await self._exit_if_expiring(tick.symbol, received_at)
+                    await self._retry_pending_exit(tick.symbol)
                 else:
                     self.portfolio.mark(tick.symbol, tick.ltp)
             except Exception as exc:  # noqa: BLE001 - one bad print must not stop the feed
@@ -1586,13 +1613,22 @@ class McxLane:
         if not self.session_open():
             self._decide(signal, SESSION_CLOSED)
             return
+        closed = await self._exit_opposite(contract)
+        note = f"closed {', '.join(closed)} (opposite cross)" if closed else ""
         if not self.settings.mcx_auto_trade:
-            self._decide(signal, AUTO_TRADE_OFF)
+            self._decide(signal, AUTO_TRADE_OFF, detail=note)
+            return
+        held = [symbol for symbol, position in self.portfolio.positions.items() if position.quantity > 0]
+        if len(held) >= self.settings.mcx_max_positions:
+            self._decide(signal, LANE_FULL, detail="; ".join(filter(None, [
+                f"holds {', '.join(held)}; the lane holds {self.settings.mcx_max_positions} position(s) at a time",
+                note,
+                f"closing {', '.join(self.pending_exits)} on its next fresh quote" if self.pending_exits else ""])))
             return
         price = self.execution.last_prices.get(signal.symbol, signal.price)
-        lots = self.execution.entry_lots(signal.symbol, price)
+        lots, why = self.ticket_lots(signal.symbol, price)
         if lots < 1:
-            self._decide(signal, NO_CASH, detail="one lot is more than the lane's free cash")
+            self._decide(signal, why, detail="; ".join(filter(None, [self._lot_detail(signal.symbol, price, why), note])))
             return
         try:
             order = await self.execution.submit(signal.symbol, "BUY", lots=lots, signal=signal)
@@ -1604,6 +1640,74 @@ class McxLane:
             self._save_snapshot()
         else:
             self._decide(signal, ENTRY_REJECTED, lots=lots, detail=f"order {order.status}", order_id=order.order_id)
+
+    def ticket_lots(self, symbol: str, price: float) -> tuple[int, str]:
+        """Lots for a new entry and, when none, the verdict that says why.
+
+        With the ticket as a ceiling: whole lots that fit under it, so a
+        position never costs more than the ticket; a contract whose one lot is
+        dearer than the ticket is not bought. Otherwise the MACD lane's sizing.
+        """
+        if not self.settings.mcx_ticket_ceiling or self.settings.mcx_target_notional <= 0:
+            lots = self.execution.entry_lots(symbol, price)
+            return lots, ("" if lots >= 1 else NO_CASH)
+        lot_size = self.execution.lot_sizes.get(symbol, 0)
+        per_lot = price * lot_size * (1 + self.settings.slippage_bps / 10_000)
+        if lot_size < 1 or per_lot <= 0:
+            return 0, NO_CASH
+        fit = int(self.settings.mcx_target_notional // per_lot)
+        if fit < 1:
+            return 0, LOT_ABOVE_TICKET
+        affordable = int(self.portfolio.cash // per_lot)
+        if affordable < 1:
+            return 0, NO_CASH
+        return min(fit, self.settings.mcx_max_entry_lots, affordable), ""
+
+    def _lot_detail(self, symbol: str, price: float, why: str) -> str:
+        lot_value = price * self.execution.lot_sizes.get(symbol, 0)
+        if why == LOT_ABOVE_TICKET:
+            return f"one lot is Rs {lot_value:,.0f}, above the Rs {self.settings.mcx_target_notional:,.0f} ticket"
+        return "one lot is more than the lane's free cash"
+
+    async def _exit_opposite(self, contract: McxContract) -> list[str]:
+        """Close holdings on the other side of the same commodity (CE vs PE, full-size or mini).
+
+        A holding whose last quote is too old to fill on is queued in
+        ``pending_exits`` and closed on its next tick (or maintenance pass).
+        """
+        if not self.settings.mcx_opposite_cross_exit:
+            return []
+        mine = commodity(contract.root)
+        closed = []
+        for symbol, position in list(self.portfolio.positions.items()):
+            held = self.contracts.get(symbol)
+            if (held is None or position.quantity <= 0 or commodity(held.root) != mine
+                    or held.option_type == contract.option_type):
+                continue
+            if self._quote_fresh(symbol) and await self.flatten(symbol, OPPOSITE_CROSS_EXIT):
+                closed.append(symbol)
+                self.pending_exits.pop(symbol, None)
+            else:
+                self.pending_exits[symbol] = OPPOSITE_CROSS_EXIT
+        return closed
+
+    def _quote_fresh(self, symbol: str) -> bool:
+        """Whether a paper exit can fill now (a stale quote is waited for, not counted as a refused exit)."""
+        try:
+            self.execution._fresh_price(symbol)
+        except RuntimeError:
+            return False
+        return True
+
+    async def _retry_pending_exit(self, symbol: str) -> None:
+        reason = self.pending_exits.get(symbol)
+        if reason is None:
+            return
+        position = self.portfolio.positions.get(symbol)
+        if position is None or position.quantity <= 0:
+            self.pending_exits.pop(symbol, None)
+        elif self._quote_fresh(symbol) and await self.flatten(symbol, reason):
+            self.pending_exits.pop(symbol, None)
 
     def _decide(self, signal: Signal, verdict: str, *, lots: int = 0, detail: str = "",
                 order_id: str | None = None) -> None:
@@ -1716,6 +1820,8 @@ class McxLane:
         if self.calendar.in_session(now):
             self._schedule_oi(now)
             await self.poll_stale_quotes(now)
+            for symbol in list(self.pending_exits):
+                await self._retry_pending_exit(symbol)
         self.execution.sweep_closed_positions()
         if self.portfolio.positions or self.calendar.in_session(now):
             self.repository.save_equity_point(self.portfolio.snapshot())
@@ -1877,6 +1983,8 @@ class McxLane:
             "roots_csv": current.mcx_roots_csv,
             "initial_capital": current.mcx_initial_capital,
             "target_notional": current.mcx_target_notional,
+            "ticket_ceiling": current.mcx_ticket_ceiling,
+            "opposite_cross_exit": current.mcx_opposite_cross_exit,
             "max_entry_lots": current.mcx_max_entry_lots,
             "max_positions": current.mcx_max_positions,
             "timeframe_seconds": current.mcx_timeframe_seconds,
@@ -1897,7 +2005,7 @@ class McxLane:
             "trailing_activation_profit_pct": risk.trailing_activation_pct * 100,
             "trailing_stop_pct": risk.trailing_stop_pct * 100,
             "max_trade_lots": risk.max_trade_lots,
-            "scale_in_profit_pct": [7.5, 15, 22.5] if risk.max_trade_lots > 1 else [],
+            "scale_in_profit_pct": [7.5, 15, 22.5] if risk.max_trade_lots > 1 and risk.pyramid_adds else [],
             "scale_out_profit_pct": [30, 50, 75] if risk.max_trade_lots > 1 else [],
             "macd_invalidation_exit": risk.macd_invalidation_exit,
             "slippage_bps": risk.slippage_bps,

@@ -16,6 +16,7 @@ export type McxSettings = {
   enabled: boolean; auto_trade: boolean; roots_csv: string; initial_capital: number; target_notional: number;
   max_entry_lots: number; max_positions: number; timeframe_seconds: number; min_days_to_expiry: number;
   expiry_flatten_ist: string; rest_fallback_seconds: number; lot_multipliers_csv: string; history_downloads?: boolean;
+  ticket_ceiling?: boolean; opposite_cross_exit?: boolean;
 };
 
 export type McxContractRow = {
@@ -96,6 +97,7 @@ export type McxForm = {
   enabled: boolean; auto_trade: boolean; roots: string[]; initial_capital: string; target_notional: string;
   max_entry_lots: string; max_positions: string; timeframe_minutes: string; min_days_to_expiry: string;
   expiry_flatten_ist: string; rest_fallback_seconds: string; history_downloads: boolean;
+  ticket_ceiling: boolean; opposite_cross_exit: boolean;
 };
 
 export const VERDICT_LABEL: Record<string, { label: string; help: string }> = {
@@ -107,6 +109,8 @@ export const VERDICT_LABEL: Record<string, { label: string; help: string }> = {
   STALE_BAR: { label: "Stale bar", help: "The signal's bar belongs to an earlier period than now." },
   SESSION_CLOSED: { label: "Session closed", help: "Fired on the closing bar after MCX had shut." },
   NOT_SELECTED: { label: "Not selected", help: "A holding carried from an earlier selection; entries use today's ATM legs." },
+  LANE_FULL: { label: "Lane full", help: "The lane already holds its one position; this signal waits for it to close." },
+  LOT_ABOVE_TICKET: { label: "Lot above ticket", help: "One lot costs more than the per-position ticket; the commodity's mini carries it." },
   DISABLED: { label: "Lane off", help: "The lane is switched off." },
 };
 
@@ -136,6 +140,8 @@ export function toForm(settings: McxSettings): McxForm {
     expiry_flatten_ist: settings.expiry_flatten_ist,
     rest_fallback_seconds: String(settings.rest_fallback_seconds),
     history_downloads: Boolean(settings.history_downloads),
+    ticket_ceiling: settings.ticket_ceiling !== false,
+    opposite_cross_exit: settings.opposite_cross_exit !== false,
   };
 }
 
@@ -167,6 +173,7 @@ export function fromForm(form: McxForm): { payload?: Payload; error?: string } {
       initial_capital: capital, target_notional: notional, max_entry_lots: lots, max_positions: positions,
       timeframe_seconds: minutes * 60, min_days_to_expiry: days, expiry_flatten_ist: flatten, rest_fallback_seconds: fallback,
       history_downloads: form.history_downloads,
+      ticket_ceiling: form.ticket_ceiling, opposite_cross_exit: form.opposite_cross_exit,
     },
   };
 }
@@ -176,7 +183,8 @@ export function changedSettings(current: McxSettings, next: Payload): Partial<Pa
   const changes: Partial<Payload> = {};
   (Object.keys(next) as (keyof Payload)[]).forEach((key) => {
     const before = key === "roots_csv" ? orderedRoots(rootsFrom(current.roots_csv)).join(",") : current[key];
-    if (key === "history_downloads" ? Boolean(before) !== Boolean(next[key]) : before !== next[key]) (changes as Record<string, unknown>)[key] = next[key];
+    const flag = key === "history_downloads" || key === "ticket_ceiling" || key === "opposite_cross_exit";
+    if (flag ? Boolean(before ?? key !== "history_downloads") !== Boolean(next[key]) : before !== next[key]) (changes as Record<string, unknown>)[key] = next[key];
   });
   return changes;
 }

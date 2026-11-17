@@ -132,6 +132,24 @@ a verdict, kept in memory for the page and published as `mcx_decision`:
 | `ENTRY_REJECTED` | the paper order was refused (stale quote, position cap, cash) |
 | `STALE_BAR` | the bar is from an earlier period than now |
 | `DISABLED` | the lane is switched off |
+| `LANE_FULL` | the lane already holds `mcx_max_positions` (1) position(s); the detail names the holding |
+| `LOT_ABOVE_TICKET` | one lot costs more than the ticket (`mcx_ticket_ceiling` on); the commodity's mini carries it |
+
+## Owner's rules (17 Nov 2026)
+
+The owner saw the lane stacking the same trade (NATURALGAS 290 PE and NATGASMINI 290 PE together) and set:
+
+- **Rs 1 L per position** (`mcx_target_notional` 100000 with `mcx_ticket_ceiling`): whole lots that fit
+  under the ticket (never rounded up), no pyramid adds (`pyramid_adds` off in the lane's execution settings;
+  the scale-out at +30/50/75% is unchanged). One ATM GOLD lot (~Rs 1.8-2.7 L) and one SILVER lot
+  (~Rs 1.4 L) are above the ticket, so GOLDM and SILVERM carry those commodities. `mcx_max_entry_lots`
+  is 100 so a cheap mini (NATGASMINI ~Rs 2 k a lot) can fill the ticket.
+- **One position at a time** (`mcx_max_positions` 1), across commodities, sides and minis.
+- **An opposite cross closes the trade** (`mcx_opposite_cross_exit`): a premium zero-cross UP on the
+  other side (CE vs PE) of the same commodity, full-size or mini, sells the holding with exit reason
+  `MCX_OPPOSITE_CROSS`; the new signal then takes the slot. A holding whose quote is too old to fill on
+  is queued (`pending_exits`), closed on its next tick or maintenance pass, and the signal is recorded as
+  `LANE_FULL`. Applies even with auto-trade off (it is an exit).
 
 ## Operating it
 

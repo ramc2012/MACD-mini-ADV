@@ -634,6 +634,8 @@ class McxSettingsInput(BaseModel):
     roots_csv: str | None = Field(default=None, pattern=r"^[A-Za-z, ]*$", max_length=200)
     initial_capital: float | None = Field(default=None, ge=1)
     target_notional: float | None = Field(default=None, ge=0, le=10_000_000)
+    ticket_ceiling: bool | None = None
+    opposite_cross_exit: bool | None = None
     max_entry_lots: int | None = Field(default=None, ge=1, le=500)
     max_positions: int | None = Field(default=None, ge=1, le=100)
     timeframe_seconds: int | None = Field(default=None, ge=0, le=3600)

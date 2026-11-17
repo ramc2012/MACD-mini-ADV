@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     auto_trade: bool = False
     order_quantity: int = 1
     max_trade_lots: int = 4
+    # Pyramid adds at +7.5/15/22.5% (up to max_trade_lots). The MCX lane turns
+    # them off when its ticket is a ceiling: a position never grows past it.
+    pyramid_adds: bool = True
     order_quote_max_age_seconds: float = Field(default=10.0, gt=0, le=60)
     # Exit a position whose entry thesis has failed BEFORE it ever worked.
     # Measured over 3-10 Sep on 109 hard-stopped positions: MACD closed back
@@ -340,11 +343,18 @@ class Settings(BaseSettings):
     mcx_auto_trade: bool = False
     mcx_roots_csv: str = "GOLD,SILVER,CRUDEOIL,COPPER,NATURALGAS"
     mcx_initial_capital: float = Field(default=1_000_000.0, ge=1)
-    # Whole lots nearest this rupee value per entry (premium x lot units). One
-    # ATM GOLD lot alone can be worth ~2 lakh; an entry is never below one lot.
+    # Rupee ticket per position (premium x lot units). Owner, 17 Nov 2026: Rs 1 L
+    # per position, one position at a time. With mcx_ticket_ceiling the ticket is
+    # a ceiling: whole lots that fit under it, no pyramid adds, and a contract
+    # whose one lot costs more (an ATM GOLD lot is ~Rs 2 L) is not bought -- its
+    # mini carries the commodity. Off: whole lots nearest the ticket, never below one.
     mcx_target_notional: float = Field(default=100_000.0, ge=0, le=10_000_000)
-    mcx_max_entry_lots: int = Field(default=10, ge=1, le=500)
-    mcx_max_positions: int = Field(default=10, ge=1, le=100)
+    mcx_ticket_ceiling: bool = True
+    mcx_max_entry_lots: int = Field(default=100, ge=1, le=500)
+    mcx_max_positions: int = Field(default=1, ge=1, le=100)
+    # A premium MACD zero-cross UP on the other side (CE vs PE) of the same
+    # commodity -- full-size or mini -- closes the held trade (owner, 17 Nov 2026).
+    mcx_opposite_cross_exit: bool = True
     # Bar length for the lane's premium MACD. 0 follows the MACD lane's
     # timeframe_seconds.
     mcx_timeframe_seconds: int = Field(default=0, ge=0, le=3600)

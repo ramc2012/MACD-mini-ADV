@@ -22,6 +22,16 @@ test("only changed fields are sent, with minutes turned into seconds", () => {
   assert.deepEqual(changedSettings(SETTINGS, parsed.payload), { auto_trade: true, timeframe_seconds: 1800, roots_csv: "GOLD,CRUDEOIL" });
 });
 
+test("the owner's ticket and opposite-cross rules default on and save only when switched", () => {
+  const form = toForm(SETTINGS);
+  assert.equal(form.ticket_ceiling, true);
+  assert.equal(form.opposite_cross_exit, true);
+  const off = fromForm({ ...form, opposite_cross_exit: false });
+  assert.ok(off.payload);
+  assert.deepEqual(changedSettings(SETTINGS, off.payload), { opposite_cross_exit: false });
+  assert.equal(verdictMeta("LANE_FULL").label, "Lane full");
+});
+
 test("roots keep the display order whatever order they were ticked in", () => {
   assert.deepEqual(orderedRoots(["NATURALGAS", "GOLD", "ZINC"]), ["GOLD", "NATURALGAS", "ZINC"]);
   const server = { ...SETTINGS, roots_csv: "CRUDEOIL,GOLD" };

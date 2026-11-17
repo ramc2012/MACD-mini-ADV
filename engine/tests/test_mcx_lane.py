@@ -319,8 +319,9 @@ class TestTrading:
         assert len(taken) == 1
         position = lane.portfolio.positions[call.symbol]
         assert position.lot_size == 100
-        # Whole lots nearest 1 lakh at the entry premium (premium x 100 units per lot), capped at 10.
-        assert position.lots == min(10, round(100_000 / (position.average_price * 100)))
+        # Whole lots that fit under the Rs 1 L ticket at the entry premium (premium x 100 units per lot).
+        assert position.lots == int(100_000 // (position.average_price * 100))
+        assert position.lots * position.average_price * 100 <= 100_000
         signals = lane.repository.rows("signals", 10)
         assert signals and signals[0]["kind"].startswith("PREMIUM_MACD_ZERO_CROSS_UP")
 
@@ -419,6 +420,58 @@ class TestTrading:
         lane = build(tmp_path, execution_mode="live", allow_live_orders=True)
         assert lane.execution.settings.execution_mode == "paper"
         assert not lane.execution.settings.allow_live_orders
+
+    def _hold(self, lane, symbol, price, minute):
+        feed(lane, symbol, price, at(11, minute, 5))
+        asyncio.run(lane._on_signal(Signal(symbol, "BUY", "K", price, 0.5, 0.1, 0.4,
+                                           evaluated_candle_timestamp=int(at(11, minute).timestamp()))))
+
+    def test_an_opposite_cross_closes_the_held_side_and_enters_the_new_one(self, tmp_path):
+        lane, call = ready_lane(tmp_path)
+        put = next(row for row in lane.contracts.values() if row.option_type == "PE" and row.root == call.root)
+        self._hold(lane, call.symbol, 100.0, 0)
+        assert lane.decisions[0]["verdict"] == TAKEN
+        feed(lane, call.symbol, 101.0, at(11, 1, 2))
+        self._hold(lane, put.symbol, 80.0, 1)
+        assert call.symbol not in lane.portfolio.positions
+        assert lane.execution.exit_reasons[call.symbol] == mcx_lane.OPPOSITE_CROSS_EXIT
+        assert put.symbol in lane.portfolio.positions
+        assert lane.decisions[0]["verdict"] == TAKEN
+
+    def test_an_opposite_exit_without_a_fresh_quote_closes_on_the_next_tick(self, tmp_path):
+        lane, call = ready_lane(tmp_path)
+        put = next(row for row in lane.contracts.values() if row.option_type == "PE" and row.root == call.root)
+        self._hold(lane, call.symbol, 100.0, 0)
+        self._hold(lane, put.symbol, 80.0, 2)          # the call last printed 2 minutes ago
+        assert call.symbol in lane.portfolio.positions and put.symbol not in lane.portfolio.positions
+        assert lane.decisions[0]["verdict"] == mcx_lane.LANE_FULL
+        assert lane.pending_exits == {call.symbol: mcx_lane.OPPOSITE_CROSS_EXIT}
+        feed(lane, call.symbol, 99.0, at(11, 2, 30))
+        assert call.symbol not in lane.portfolio.positions and not lane.pending_exits
+        assert lane.execution.exit_reasons[call.symbol] == mcx_lane.OPPOSITE_CROSS_EXIT
+
+    def test_one_position_at_a_time(self, tmp_path):
+        lane, call = ready_lane(tmp_path, mcx_opposite_cross_exit=False)
+        put = next(row for row in lane.contracts.values() if row.option_type == "PE")
+        self._hold(lane, call.symbol, 100.0, 0)
+        self._hold(lane, put.symbol, 80.0, 1)
+        assert call.symbol in lane.portfolio.positions and put.symbol not in lane.portfolio.positions
+        assert lane.decisions[0]["verdict"] == mcx_lane.LANE_FULL
+        assert call.symbol in lane.decisions[0]["detail"]
+
+    def test_a_lot_dearer_than_the_ticket_is_not_bought_and_positions_never_grow(self, tmp_path):
+        lane, call = ready_lane(tmp_path, mcx_target_notional=5_000)   # one lot = 100 x 100 = Rs 10,000
+        self._hold(lane, call.symbol, 100.0, 0)
+        assert lane.decisions[0]["verdict"] == mcx_lane.LOT_ABOVE_TICKET
+        assert not lane.portfolio.positions
+        assert not lane.execution.settings.pyramid_adds and lane.risk_view()["scale_in_profit_pct"] == []
+        off = build(tmp_path / "off", crude_broker(), mcx_ticket_ceiling=False, mcx_target_notional=5_000)
+        assert off.execution.settings.pyramid_adds
+
+    def test_a_mini_is_the_same_commodity_as_its_full_size_root(self):
+        assert mcx_lane.commodity("NATGASMINI") == "NATURALGAS"
+        assert mcx_lane.commodity("GOLDM") == "GOLD"
+        assert mcx_lane.commodity("COPPER") == "COPPER"
 
     def test_manual_order_is_scoped_to_mcx(self, tmp_path):
         lane, _call = ready_lane(tmp_path)
@@ -875,7 +928,7 @@ def test_mini_upgrade_preserves_full_size_contracts_and_trades_only_options(tmp_
                    strike=5800, side="PE", underlying_token="M-DEC"),
     ]
     broker.quote_map[underlying] = quote(underlying, 5823)
-    lane = build(tmp_path, broker, execution_mode="live", allow_live_orders=True)
+    lane = build(tmp_path, broker, execution_mode="live", allow_live_orders=True, mcx_max_positions=2)
     asyncio.run(lane.prepare())
     minis = {row.option_type: row for row in lane.contracts.values() if row.root == "CRUDEOILM"}
     assert set(lane.option_symbols()) == original | {row.symbol for row in minis.values()}

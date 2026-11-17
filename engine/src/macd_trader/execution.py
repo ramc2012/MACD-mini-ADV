@@ -660,7 +660,7 @@ class ExecutionManager:
         # one exchange lot and the position can never exceed four lots.
         anchor = position.entry_anchor or position.average_price
         scale_in_levels = (0.075, 0.15, 0.225)
-        if self.settings.auto_trade and position.entry_stage < self.settings.max_trade_lots:
+        if self.settings.auto_trade and self.settings.pyramid_adds and position.entry_stage < self.settings.max_trade_lots:
             stage_index = max(0, position.entry_stage - 1)
             threshold = round(anchor * (1 + scale_in_levels[stage_index]), 4) if stage_index < len(scale_in_levels) else None
             if threshold is not None and price >= threshold and self._add_allowed(symbol, price, position.lot_size):
@@ -726,7 +726,7 @@ class ExecutionManager:
                 "paper_fill_basis": dict(self.paper_fill_basis),
                 "target_position_notional": self.settings.target_position_notional,
                 "max_target_entry_lots": self.settings.max_target_entry_lots,
-                "scale_in_profit_pct": [7.5, 15, 22.5] if self.settings.max_trade_lots > 1 else [],
+                "scale_in_profit_pct": [7.5, 15, 22.5] if self.settings.max_trade_lots > 1 and self.settings.pyramid_adds else [],
                 "scale_out_profit_pct": [30, 50, 75] if self.settings.max_trade_lots > 1 else [],
                 "last_exit_reasons": self.exit_reasons,
                 "closed_positions_visible_until": "08:00 IST next trading morning",

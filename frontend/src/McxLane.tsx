@@ -418,11 +418,17 @@ function SettingsTab({ snapshot, onSaved }: { snapshot: McxSnapshot; onSaved: (n
     <div className="settings-section">
       <h3>Book</h3>
       <div className="settings-grid three">
-        {field("target_notional", "Size per entry · ₹", "Whole lots nearest this, never below one lot. One ATM GOLD lot is often ₹1.5–2.5 lakh.", "1000")}
+        {field("target_notional", "Ticket per position · ₹", form.ticket_ceiling
+          ? "Whole lots that fit under this; the position never grows past it. One ATM GOLD lot is often ₹1.5–2.5 lakh, so its mini carries gold."
+          : "Whole lots nearest this, never below one lot, plus the MACD lane's adds.", "1000")}
         {field("max_entry_lots", "Max lots per entry", "Ceiling on the notional sizing.", "1")}
-        {field("max_positions", "Max open positions", "Across all commodities and both legs.", "1")}
+        {field("max_positions", "Max open positions", "Across all commodities, both legs and minis. 1 = one trade at a time.", "1")}
         {field("initial_capital", "Capital · ₹", held ? `Locked while ${held} position${held === 1 ? " is" : "s are"} open.` : "The lane's own paper capital.", "10000", held > 0)}
       </div>
+      <label className="toggle"><input type="checkbox" checked={form.ticket_ceiling} onChange={(event) => setField("ticket_ceiling", event.target.checked)} />The ticket is a ceiling</label>
+      <p className="field-help">On: never more than the ticket in one position, no pyramid adds, and a contract whose one lot costs more is not bought. Off: whole lots nearest the ticket, at least one, with the MACD lane's adds.</p>
+      <label className="toggle"><input type="checkbox" checked={form.opposite_cross_exit} onChange={(event) => setField("opposite_cross_exit", event.target.checked)} />An opposite cross closes the trade</label>
+      <p className="field-help">A premium zero-cross on the other side of the same commodity (call vs put, full-size or mini) sells the holding; the new signal can then take the slot.</p>
     </div>
 
     {error && <div className="settings-error" role="alert">{error}</div>}
