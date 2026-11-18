@@ -257,7 +257,8 @@ class MPEngine:
         self.last_price_at: dict[str, datetime] = {}
         # (ltp, bid, ask) of the latest tick per symbol: paper fills cross the quoted spread (see _fill_price).
         self.last_quotes: dict[str, tuple] = {}
-        self.fill_basis = {"quoted_spread": 0, "last_price_bps": 0}
+        self.fill_basis = {"quoted_spread": 0, "last_known_spread": 0, "default_spread": 0, "last_price_bps": 0}
+        self._half_spreads: dict[str, float] = {}
         self.signals: list[Signal] = []
         self.entry_state: dict[str, dict] = {}     # symbol -> risk state
         self._setup_state: dict[str, dict] = {}    # symbol -> edge-trigger marks
@@ -1062,20 +1063,28 @@ class MPEngine:
     # -- execution (paper, this desk's own book) -----------------------------
 
     def _fill_price(self, symbol: str, side: str, price: float) -> float:
+        """Quote side (owner, 18 Nov 2026, S1): a BUY at the latest ask, a SELL at the latest bid; with no quote,
+        the half spread last seen on the symbol (else 0.7% for an option, 0.08% otherwise), never under slippage."""
+        buy = side == "BUY"
         slip = price * self.settings.slippage_bps / 10_000
-        fallback = price + slip if side == "BUY" else price - slip
-        quote = self.last_quotes.get(symbol) if self.settings.cross_spread else None
-        if quote is None:
-            self.fill_basis["last_price_bps"] += 1
-            return fallback
-        ltp, bid, ask = quote
-        if not (abs((ltp or 0) - price) <= 1e-9 and bid and ask and 0 < bid <= ask
-                and math.isfinite(bid) and math.isfinite(ask)):
-            self.fill_basis["last_price_bps"] += 1
-            return fallback
         cap = price * self.settings.max_half_spread_pct / 100
-        self.fill_basis["quoted_spread"] += 1
-        return min(ask, price + cap) if side == "BUY" else max(bid, price - cap)
+        if not self.settings.cross_spread:
+            self.fill_basis["last_price_bps"] += 1
+            return price + slip if buy else price - slip
+        quote = self.last_quotes.get(symbol)
+        _ltp, bid, ask = quote if quote is not None else (None, None, None)
+        if bid and ask and 0 < bid <= ask and math.isfinite(bid) and math.isfinite(ask):
+            self._half_spreads[symbol] = (ask - bid) / (ask + bid)
+            self.fill_basis["quoted_spread"] += 1
+            return min(ask, price + cap) if buy else max(bid, price - cap)
+        half = self._half_spreads.get(symbol)
+        if half is None:
+            half = 0.007 if symbol.endswith(("CE", "PE")) else 0.0008
+            self.fill_basis["default_spread"] = self.fill_basis.get("default_spread", 0) + 1
+        else:
+            self.fill_basis["last_known_spread"] = self.fill_basis.get("last_known_spread", 0) + 1
+        cost = min(max(slip, price * half), cap)
+        return price + cost if buy else price - cost
 
     async def submit(self, symbol: str, side: str, quantity: int, *,
                      signal: Signal | None = None, note: str = "") -> Order | None:

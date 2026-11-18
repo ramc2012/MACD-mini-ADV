@@ -275,6 +275,12 @@ def build(engine) -> dict:
                                # paper cash, shorts receive it), so the board's "cash" is the free margin.
                                now={**portfolio_now(spot.portfolio), "cash": spot.free_margin()},
                                note="stock futures long + short since 4 Nov 2026; not proven"))
+    trend = getattr(engine, "trend_lane", None)
+    if trend is not None:
+        add(lambda: score_book("trend_index", "Trend index", slices=repository_slices(trend.repository, trend.name),
+                               curve=equity_curve(trend.database_path), capital=trend.capital,
+                               now=portfolio_now(trend.portfolio),
+                               note="index options on trend states since 18 Nov 2026; not proven"))
 
     def blast():
         return score_book("blast", "Blast", slices=repository_slices(engine.blast.repository),

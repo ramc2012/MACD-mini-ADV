@@ -6,6 +6,8 @@ were a strike list with zero volume everywhere), every expiry, the SENSEX roll
 and the NEXT series, in nine seconds.
 """
 import asyncio
+
+import pytest
 import json
 from datetime import date, timedelta
 
@@ -18,6 +20,15 @@ FRONT = (TODAY + timedelta(days=7)).isoformat()
 NEXT = (TODAY + timedelta(days=14)).isoformat()
 EXPIRING = TODAY.isoformat()
 SBIN = "NSE:SBIN-EQ"
+
+
+@pytest.fixture(autouse=True)
+def _old_series_rule():
+    """These fixtures put the stock front series a week out: ladder mechanics, not the E-5 / R3 series rule."""
+    from macd_trader import rollover
+    rollover.set_stock_exit_sessions(2, 1)
+    yield
+    rollover.set_stock_exit_sessions(5, 5)
 NIFTY = "NSE:NIFTY50-INDEX"
 
 

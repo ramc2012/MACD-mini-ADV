@@ -337,6 +337,24 @@ async def builder_positions(underlying: str = Query(max_length=30, pattern=r"^[A
     return {"rows": engine.builder_positions(underlying)}
 
 
+@app.get("/api/rollover/plan", dependencies=[Depends(authorize)])
+async def rollover_plan():
+    """Stock F&O held at or past its series' last day (E-5) and what the roll would book (series_roll.py)."""
+    from . import series_roll
+    return fast_json({"rows": series_roll.view(await series_roll.plan(engine)),
+                      "last_day_sessions": __import__("macd_trader.rollover", fromlist=["x"]).STOCK_EXIT_SESSIONS})
+
+
+class RollInput(BaseModel):
+    confirm: Literal["ROLL"]
+
+
+@app.post("/api/rollover/execute", dependencies=[Depends(authorize)])
+async def rollover_execute(body: RollInput):
+    """Close every such leg on the quote side and open the next series' equivalent (paper books only)."""
+    return fast_json(await engine.series_roll())
+
+
 @app.get("/api/expiry-exposure", dependencies=[Depends(authorize)])
 async def expiry_exposure():
     """Lanes' stock options / futures vs the physical-settlement margin calendar (E-4..E-1). Read-only."""
@@ -707,6 +725,9 @@ def _smart_lane(name: str):
     spot = getattr(engine, "spot_lane", None)
     if lane is None and spot is not None and spot.name == name:
         lane = spot            # the spot MACD lane shares the smart lanes' views (spot_lane.py)
+    trend = getattr(engine, "trend_lane", None)
+    if lane is None and trend is not None and trend.name == name:
+        lane = trend           # the trend-state index lane too (trend_lane.py)
     if lane is None:
         raise HTTPException(404, f"no smart lane {name}")
     return lane

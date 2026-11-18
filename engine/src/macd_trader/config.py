@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     # last price, so a one-sided or junk quote cannot book a fiction in the other direction.
     paper_cross_spread: bool = True
     paper_max_half_spread_pct: float = Field(default=5.0, ge=0.0, le=50.0)
+    # S1 (owner, 18 Nov 2026): every paper fill takes the quote side. With no quote in hand a fill pays the
+    # symbol's last seen half spread, else these defaults (median stock-option entry spread 1.4% of mid, so
+    # 0.7% half; stock futures 0.15%, so ~0.08%).
+    paper_fallback_half_spread_pct: float = Field(default=0.7, ge=0.0, le=10.0)
+    paper_fallback_half_spread_other_pct: float = Field(default=0.08, ge=0.0, le=5.0)
     api_token: str = ""
     # Extra browser origins allowed to open the stream socket, comma-separated
     # (e.g. "https://desk.example.ts.net"). Loopback origins are always allowed.
@@ -317,6 +322,19 @@ class Settings(BaseSettings):
     spot_min_hold_sessions: int = Field(default=3, ge=0, le=250)
     spot_max_hold_sessions: int = Field(default=5, ge=0, le=250)
 
+    # Trend-state index lane (trend_lane.py; owner, 18 Nov 2026: U1 at Rs 5 L): policy P1 of the 27 Oct trend
+    # episodes study on 30-minute index bars -- initiate at a K x ATR directional-change confirmation, add on a
+    # resumed strong running trend, reduce when old and fading, flip at the reversal -- trading about 2% ITM
+    # options of the nearest monthly series >= 20 days out. Not proven forward.
+    trend_lane_enabled: bool = True
+    trend_lane_capital: float = Field(default=500_000.0, gt=0)
+    trend_lane_indices_csv: str = "NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX"
+    trend_lane_k: float = Field(default=2.0, gt=0, le=10)
+    trend_lane_min_days: int = Field(default=20, ge=0, le=90)
+    trend_lane_itm_pct: float = Field(default=0.02, ge=0, le=0.2)
+    trend_lane_max_units: int = Field(default=3, ge=1, le=10)
+    trend_lane_lots_per_unit: int = Field(default=1, ge=1, le=20)
+
     # Agentic lane (agentic_lane.py): a paper options book run by a Grok model that opens, adds, reduces,
     # closes and re-levels positions every cycle with written reasoning. The API key comes from the
     # XAI_API_KEY environment variable (never a setting); without it the lane only manages open positions.
@@ -490,7 +508,10 @@ class Settings(BaseSettings):
     # Stock options leave a series on its last day: this many trading sessions before expiry (T-2 for a
     # Tuesday expiry is the Friday). From that day new risk goes to the next series and anything still held
     # is closed by expiry_flatten_ist (at once if the day has passed). Index options are unaffected. 0 = off.
-    stock_option_exit_sessions: int = Field(default=2, ge=0, le=5)
+    # Owner, 18 Nov 2026 (R1): E-5, before the delivery margin starts on E-4. R3: a new entry goes to the next
+    # series when its expected hold (stock_option_entry_hold_sessions, today included) would reach the last day.
+    stock_option_exit_sessions: int = Field(default=5, ge=0, le=5)
+    stock_option_entry_hold_sessions: int = Field(default=5, ge=0, le=15)
     # IST time at which any position still held in a contract expiring TODAY
     # is flattened. Nothing else closes them: an expired option simply stops
     # ticking, so the paper book would carry its last mark forever. Blank

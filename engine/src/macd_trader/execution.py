@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 import math
 import time
 from datetime import UTC, date, datetime
@@ -79,7 +80,10 @@ class ExecutionManager:
         self.quote_source = None
         # symbol -> the underlying's session order flow (entry_context.EntryFlow.context), logged at entries.
         self.entry_context = None
-        self.paper_fill_basis = {"quoted_spread": 0, "last_price_bps": 0}
+        self.paper_fill_basis = {"quoted_spread": 0, "last_known_spread": 0, "default_spread": 0, "last_price_bps": 0}
+        # symbol -> the half spread (fraction of mid) of its latest two-sided quote: the quote-side fill falls
+        # back to it when a fill has no quote in hand (S1, owner 18 Nov 2026).
+        self.half_spreads: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self.tradable_symbols: set[str] = set(settings.symbols)
         self.lot_sizes: dict[str, int] = {symbol: 1 for symbol in settings.symbols}
@@ -534,6 +538,50 @@ class ExecutionManager:
         self.events.publish("portfolio", self.portfolio_snapshot())
         return json_value(closed) if closed is not None else {}
 
+    async def administered_fill(self, symbol: str, side: str, quantity: int, lot_size: int, quote, reason: str, *,
+                                expiry: str | None = None, signal_id: str | None = None) -> Order:
+        """One paper fill against an administered quote -- the series roll (series_roll.py, owner 18 Nov 2026)
+        books tonight's stored closing quotes after the close, when no live price exists.
+
+        ``quote`` is a Tick-like object (ltp, bid, ask, timestamp). The fill goes through this book's own
+        _paper_fill, so its quote side, capacity checks, stops and journal apply exactly as for a live fill; only
+        the price source and the watchlist check differ. A held position's opposite side is its exit (``reason``).
+        """
+        position = self.portfolio.positions.get(symbol)
+        closing = position is not None and position.quantity != 0 and (side == "SELL") == (position.quantity > 0)
+        if quantity < 1 or lot_size < 1:
+            raise ValueError("quantity and lot size must be positive")
+        if expiry:
+            self.contract_expiries[symbol] = expiry
+        if not closing:
+            self.lot_sizes[symbol] = lot_size
+            self.tradable_symbols.add(symbol)
+        order = Order(symbol, side, quantity, lots=max(1, quantity // lot_size), lot_size=lot_size,
+                      signal_id=None if closing else (signal_id or f"ROLL:{symbol}"))
+        order.broker_order_id = f"PAPER-ROLL-{order.order_id[:8]}"
+        saved = self.quote_source
+        # The administered quote is the price of record for this fill, whatever its age.
+        tick = SimpleNamespace(symbol=symbol, ltp=float(quote.ltp), bid=float(quote.bid), ask=float(quote.ask),
+                               timestamp=datetime.now(UTC))
+        self.quote_source = lambda s, _q=tick, _o=saved: _q if s == symbol else (_o(s) if _o is not None else None)
+        self.set_quote(symbol, float(quote.ltp))
+        try:
+            async with self._lock:
+                if closing:
+                    self.exit_reasons[symbol] = reason
+                self.orders[order.order_id] = order
+                self.repository.save_order(order)
+                try:
+                    await self._paper_fill(order)
+                except Exception as exc:
+                    order.status = "REJECTED"
+                    order.reject_reason = f"{type(exc).__name__}: {exc}"[:160]
+                    self.repository.save_order(order)
+                    raise
+        finally:
+            self.quote_source = saved
+        return order
+
     def _note_reentry_entry(self, order: Order, position) -> None:
         if self.reentry is None:
             return
@@ -562,20 +610,57 @@ class ExecutionManager:
             pass
 
     def _paper_price(self, symbol: str, side: str, price: float) -> float:
-        """Where a paper order fills: across the quoted spread when a two-sided quote from the same tick as the
-        fresh price is in hand (settings.paper_cross_spread), else last price +/- slippage_bps."""
+        """Where a paper order fills: on the quote side (owner, 18 Nov 2026, S1).
+
+        A BUY takes the ask and a SELL the bid of the symbol's latest two-sided quote (no longer only when the
+        quote rode on the same tick as the price). With no quote in hand the fill pays the half spread last seen
+        on that symbol, else a default half spread for its kind (options ``paper_fallback_half_spread_pct``,
+        futures and cash ``paper_fallback_half_spread_other_pct``), never less than slippage_bps. A side never
+        fills more than paper_max_half_spread_pct beyond the last price, so a junk quote cannot book a fiction.
+        """
+        return self.estimate_fill(symbol, side, price, count=True)
+
+    def estimate_fill(self, symbol: str, side: str, price: float, *, count: bool = False) -> float:
+        """The paper fill price _paper_price would give now (lanes size entries with it)."""
+        buy = side == "BUY"
         slip = price * self.settings.slippage_bps / 10_000
-        fallback = price + slip if side == "BUY" else price - slip
+        cap = price * self.settings.paper_max_half_spread_pct / 100
         tick = self.quote_source(symbol) if self.quote_source is not None and self.settings.paper_cross_spread else None
         bid, ask = getattr(tick, "bid", None), getattr(tick, "ask", None)
-        # The quote must ride on the tick that delivered this price, or it describes a different moment.
-        same_tick = tick is not None and abs(float(getattr(tick, "ltp", 0) or 0) - price) <= 1e-9
-        if not (same_tick and bid and ask and 0 < bid <= ask and math.isfinite(bid) and math.isfinite(ask)):
-            self.paper_fill_basis["last_price_bps"] += 1
-            return fallback
-        cap = price * self.settings.paper_max_half_spread_pct / 100
-        self.paper_fill_basis["quoted_spread"] += 1
-        return min(ask, price + cap) if side == "BUY" else max(bid, price - cap)
+        quoted = (tick is not None and bid and ask and math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask
+                  and self._quote_recent(tick))
+        if quoted:
+            mid = (bid + ask) / 2
+            self.half_spreads[symbol] = (ask - bid) / 2 / mid if mid > 0 else 0.0
+            if count:
+                self.paper_fill_basis["quoted_spread"] += 1
+            return min(ask, price + cap) if buy else max(bid, price - cap)
+        if not self.settings.paper_cross_spread or self.quote_source is None:
+            # No quote book wired (tests, a bare manager): last price +/- slippage, as before.
+            if count:
+                self.paper_fill_basis["last_price_bps"] += 1
+            return price + slip if buy else price - slip
+        half = self.half_spreads.get(symbol)
+        basis = "last_known_spread"
+        if half is None:
+            option = symbol.endswith(("CE", "PE"))
+            half = (self.settings.paper_fallback_half_spread_pct if option
+                    else self.settings.paper_fallback_half_spread_other_pct) / 100
+            basis = "default_spread"
+        if count:
+            self.paper_fill_basis[basis] += 1
+        cost = min(max(slip, price * half), cap)
+        return price + cost if buy else price - cost
+
+    @staticmethod
+    def _quote_recent(tick, max_age_seconds: float = 900.0) -> bool:
+        """A quote older than 15 minutes (a dead contract, yesterday's snapshot) is not a quote to fill on."""
+        stamp = getattr(tick, "timestamp", None)
+        if stamp is None:
+            return True
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - stamp).total_seconds() <= max_age_seconds
 
     def _fresh_price(self, symbol: str) -> float:
         price = self.last_prices.get(symbol)

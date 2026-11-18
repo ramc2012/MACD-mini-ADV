@@ -261,6 +261,10 @@ def books(engine) -> list[dict]:
     if spot is not None:
         add("spot_macd", "Spot MACD", lambda: repo_book(spot.repository, spot.capital, spot.name,
                                                         note="stock futures long + short"))
+    trend = getattr(engine, "trend_lane", None)
+    if trend is not None:
+        add("trend_index", "Trend index", lambda: repo_book(trend.repository, trend.capital, trend.name,
+                                                            note="index options on trend states"))
     add("blast", "Blast", lambda: repo_book(engine.blast.repository, engine.blast.portfolio.initial_capital))
     agentic = getattr(engine, "agentic", None)
     if agentic is not None:
@@ -444,6 +448,9 @@ class BackOffice:
         spot = getattr(e, "spot_lane", None)
         if spot is not None and lane == "spot_macd":
             return spot.repository
+        trend = getattr(e, "trend_lane", None)
+        if trend is not None and lane == "trend_index":
+            return trend.repository
         if lane == "blast":
             return e.blast.repository
         if lane == "agentic" and getattr(e, "agentic", None) is not None:

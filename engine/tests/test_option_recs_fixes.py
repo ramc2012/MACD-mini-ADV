@@ -49,19 +49,23 @@ def test_paper_buy_fills_at_the_ask_and_sell_at_the_bid(tmp_path):
     m.set_quote(OPTION, 10.0, datetime.now(UTC))
     assert m._paper_price(OPTION, "BUY", 10.0) == approx(10.2)
     assert m._paper_price(OPTION, "SELL", 10.0) == approx(9.8)
-    assert m.paper_fill_basis == {"quoted_spread": 2, "last_price_bps": 0}
+    assert m.paper_fill_basis["quoted_spread"] == 2 and m.paper_fill_basis["last_price_bps"] == 0
     order = asyncio.run(m.submit(OPTION, "BUY", 750))
     assert order.status == "FILLED" and order.fill_price == approx(10.2)
 
 
-def test_a_quote_from_another_tick_or_none_falls_back_to_bps(tmp_path):
+def test_the_quote_side_is_taken_even_off_the_price_tick_and_without_a_quote_the_spread_is_charged(tmp_path):
+    """S1 (owner, 18 Nov 2026): every paper fill takes the quote side."""
     m = _manager(tmp_path, slippage_bps=5)
     assert m._paper_price(OPTION, "BUY", 10.0) == approx(10.005)              # no quote source (tests, desk)
     m.quote_source = _book({OPTION: Tick(OPTION, 10.1, bid=9.9, ask=10.3)})   # quote rode a different price
-    assert m._paper_price(OPTION, "BUY", 10.0) == approx(10.005)
-    m.quote_source = _book({OPTION: Tick(OPTION, 10.0, bid=0, ask=10.3)})     # one-sided
-    assert m._paper_price(OPTION, "SELL", 10.0) == approx(9.995)
-    assert m.paper_fill_basis["last_price_bps"] == 3
+    assert m._paper_price(OPTION, "BUY", 10.0) == approx(10.3)
+    m.quote_source = _book({OPTION: Tick(OPTION, 10.0, bid=0, ask=10.3)})     # one-sided: the last seen half spread
+    assert m._paper_price(OPTION, "SELL", 10.0) == approx(10.0 * (1 - 0.2 / 10.1))
+    m.quote_source = _book({})                                                # never quoted: the default half spread
+    assert m._paper_price("NSE:XYZ26DEC100CE", "BUY", 10.0) == approx(10.07)
+    assert m.paper_fill_basis["quoted_spread"] == 1 and m.paper_fill_basis["last_known_spread"] == 1
+    assert m.paper_fill_basis["default_spread"] == 1 and m.paper_fill_basis["last_price_bps"] == 1
 
 
 def test_a_junk_wide_quote_is_capped_and_the_switch_turns_it_off(tmp_path):

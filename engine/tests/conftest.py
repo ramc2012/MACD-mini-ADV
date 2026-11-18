@@ -35,4 +35,4 @@ def no_stock_t2(monkeypatch):
     from macd_trader import desk_app, engine, rollover
     monkeypatch.setattr(rollover, "STOCK_EXIT_SESSIONS", 0)
     for module in (engine, desk_app):
-        monkeypatch.setattr(module, "set_stock_exit_sessions", lambda sessions: None)
+        monkeypatch.setattr(module, "set_stock_exit_sessions", lambda *args, **kwargs: None)

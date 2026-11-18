@@ -88,7 +88,7 @@ export function ScoreboardPage() {
 
     <section className="panel agent-panel">
       <div className="panel-title">Return on capital over time <small>one % axis for every book · click a name to show or hide it · hover for the IST time</small></div>
-      {books.length > 0 && <ReturnsChart books={returnBooks} height={300} initial={["macd", "smart_1l", "smart_50l", "spot_macd", "blast", "agentic"]} />}
+      {books.length > 0 && <ReturnsChart books={returnBooks} height={300} initial={["macd", "smart_1l", "smart_50l", "spot_macd", "trend_index", "blast", "agentic"]} />}
     </section>
 
     <section className="panel agent-panel">

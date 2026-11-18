@@ -19,9 +19,9 @@ OCT, NOV = "2026-10-27", "2026-11-24"
 
 @pytest.fixture(autouse=True)
 def t2():
-    rollover.set_stock_exit_sessions(2)
+    rollover.set_stock_exit_sessions(2, 1)       # the old T-2 rule; a one-session hold = no R3 look-ahead
     yield
-    rollover.set_stock_exit_sessions(2)
+    rollover.set_stock_exit_sessions(5, 5)
 
 
 def test_t2_of_a_tuesday_expiry_is_the_friday_before():
@@ -58,3 +58,19 @@ def test_a_buy_or_add_in_the_outgoing_stock_series_is_blocked(tmp_path, monkeypa
         manager._check_buy_expiry("NSE:SBIN26OCT800CE")
     manager._check_buy_expiry("NSE:SBIN26NOV800CE")
     manager._check_buy_expiry("NSE:NIFTY26OCT23000PE")
+
+
+def test_r3_an_entry_that_could_not_be_held_five_sessions_goes_to_the_next_series():
+    """Owner, 18 Nov 2026: E-5 last day, and an entry needs its expected 5-session hold to end before it."""
+    rollover.set_stock_exit_sessions(5, 5)
+    dec, jan = "2026-12-29", "2027-01-26"
+    assert rollover.stock_last_day(dec) == date(2026, 12, 21)                 # E-5 of the 29 Dec expiry
+    expiries = [Expiry(dec), Expiry(jan)]
+    # 14 Dec + 4 more sessions = 18 Dec, before the 21 Dec last day: December is still open for entries
+    assert rollover.first_tradable(expiries, 1, date(2026, 12, 14), stock=True).date == dec
+    # 15 Dec: the hold would end on the last day itself, so the entry goes to January
+    assert rollover.first_tradable(expiries, 1, date(2026, 12, 15), stock=True).date == jan
+    # held December positions are not forced out by R3: only from the last day
+    assert not rollover.stock_entry_closed("NSE:SBIN26DEC800CE", dec, date(2026, 12, 18))
+    assert rollover.stock_entry_closed("NSE:SBIN26DEC800CE", dec, date(2026, 12, 21))
+    assert rollover.first_tradable(expiries, 1, date(2026, 12, 15), stock=False).date == dec   # indices unaffected

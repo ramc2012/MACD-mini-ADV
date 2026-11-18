@@ -67,8 +67,22 @@ def is_tradable(expiry: str | None, min_days: int = 1, today: date | None = None
     if remaining is None or remaining < min_days:
         return False
     if stock and STOCK_EXIT_SESSIONS > 0:
-        return (today or datetime.now(IST).date()) < stock_last_day(expiry)
+        return entry_room(expiry, today or datetime.now(IST).date())
     return True
+
+
+def entry_room(expiry: str | date | None, today: date) -> bool:
+    """R3 (owner, 18 Nov 2026): a new stock-option entry goes to a series only if its expected hold
+    (``STOCK_ENTRY_HOLD_SESSIONS`` sessions, today included) ends before the series' last day; otherwise straight
+    to the next series, so nothing is opened only to be forced out a session or two later."""
+    from . import market_calendar
+    last = stock_last_day(expiry)
+    if last is None or today >= last:
+        return False
+    day = today if market_calendar.is_trading_day(today) else market_calendar.next_trading_day(today)
+    for _ in range(max(0, STOCK_ENTRY_HOLD_SESSIONS - 1)):
+        day = market_calendar.next_trading_day(day)
+    return day < last
 
 
 def first_tradable(expiries: list[Expiry], min_days: int = 1, today: date | None = None,
@@ -85,13 +99,20 @@ def first_tradable(expiries: list[Expiry], min_days: int = 1, today: date | None
 # new positions go to the next series, and what is still held is closed by the
 # expiry-flatten time (15:10) on T-2, at once if T-2 has already passed. Index
 # options are cash-settled and keep the expiry-day rules. 0 disables.
-STOCK_EXIT_SESSIONS = 2
+#
+# Owner, 18 Nov 2026 (R1): the last day moved to E-5, before the clearing corporation's delivery margin starts
+# on E-4 (10/25/45/70% of it on E-4..E-1, blocked by brokers at the start of the day). R3: an entry whose expected
+# hold (STOCK_ENTRY_HOLD_SESSIONS) would run into the last day goes straight to the next series.
+STOCK_EXIT_SESSIONS = 5
+STOCK_ENTRY_HOLD_SESSIONS = 5
 _INDEX_OPTION = re.compile(r"^(?:NSE|BSE):(?:NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY|NIFTYNXT50|NIFTYFPI|SENSEX|BANKEX|FOCIT)\d{2}")
 
 
-def set_stock_exit_sessions(sessions: int) -> None:
-    global STOCK_EXIT_SESSIONS
+def set_stock_exit_sessions(sessions: int, entry_hold_sessions: int | None = None) -> None:
+    global STOCK_EXIT_SESSIONS, STOCK_ENTRY_HOLD_SESSIONS
     STOCK_EXIT_SESSIONS = max(0, int(sessions))
+    if entry_hold_sessions is not None:
+        STOCK_ENTRY_HOLD_SESSIONS = max(0, int(entry_hold_sessions))
 
 
 def is_stock_option(symbol: str) -> bool:

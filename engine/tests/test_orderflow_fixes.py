@@ -78,11 +78,13 @@ def test_desk_fills_cross_the_quoted_spread(tmp_path):
     mp.last_quotes[OPTION] = (10.0, 9.8, 10.2)
     assert mp._fill_price(OPTION, "BUY", 10.0) == approx(10.2)
     assert mp._fill_price(OPTION, "SELL", 10.0) == approx(9.8)
-    mp.last_quotes[OPTION] = (10.1, 9.8, 10.2)                       # quote from another tick
-    assert mp._fill_price(OPTION, "BUY", 10.0) == approx(10.025)
+    mp.last_quotes[OPTION] = (10.1, 9.8, 10.2)                       # quote from another tick: still the ask (S1)
+    assert mp._fill_price(OPTION, "BUY", 10.0) == approx(10.2)
     mp.last_quotes[OPTION] = (10.0, 2.0, 30.0)                       # junk quote: capped at 5%
     assert mp._fill_price(OPTION, "BUY", 10.0) == approx(10.5)
-    assert mp.fill_basis == {"quoted_spread": 3, "last_price_bps": 1}
+    del mp.last_quotes[OPTION]                                       # no quote now: the last seen half spread
+    assert mp._fill_price(OPTION, "SELL", 10.0) == approx(9.5)       # junk half spread, capped at 5%
+    assert mp.fill_basis["quoted_spread"] == 4 and mp.fill_basis["last_known_spread"] == 1
 
 
 def test_ib_day_type_is_the_live_rule():

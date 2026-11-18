@@ -112,7 +112,8 @@ class StrategyClient:
 
 class DeskEngine(DeskMixin):
     def __init__(self, settings: Settings):
-        set_stock_exit_sessions(settings.stock_option_exit_sessions)   # T-2 for stock options (rollover.py)
+        set_stock_exit_sessions(settings.stock_option_exit_sessions,   # E-5 for stock options (rollover.py)
+                                settings.stock_option_entry_hold_sessions)
         self.settings = settings
         self.events = EventHub()
         self.init_desk_state()

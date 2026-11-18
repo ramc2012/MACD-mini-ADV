@@ -25,9 +25,10 @@ with margin rules as prescribed by mcx". Chosen with the owner:
   30%, at 25% above its low, never above breakeven); and from the expiry exit
   time on expiry day (an MCX option devolves into futures).
 
-Paper only: nothing here can place an order. Fills are the last websocket
-price (no older than ``order_quote_max_age_seconds``) with the lane's slippage;
-an exit without a fresh price waits for the next tick.
+Paper only: nothing here can place an order. Fills take the quote side (owner,
+18 Nov 2026): a sell to open at the latest bid, a cover at the ask (the lane's
+execution.estimate_fill), on a websocket price no older than
+``order_quote_max_age_seconds``; an exit without a fresh price waits for the next tick.
 """
 
 from __future__ import annotations
@@ -395,7 +396,7 @@ class McxShortBook:
         if affordable < 1:
             return decide(NO_MARGIN, margin=margin, detail=f"free margin Rs {self.free_margin():,.0f}")
         lots = min(fit, affordable, self.settings.mcx_short_max_lots)
-        fill = round(live * (1 - self.settings.slippage_bps / 10_000), 4)
+        fill = round(self._quote_side(contract.symbol, "SELL", live), 4)   # S1: the bid
         quantity = lots * contract.lot_size
         position = ShortPosition(
             short_id=uuid.uuid4().hex, symbol=contract.symbol, root=contract.root, option_type=contract.option_type,
@@ -419,6 +420,15 @@ class McxShortBook:
 
     # --------------------------------------------------------------- exits
 
+    def _quote_side(self, symbol: str, side: str, live: float) -> float:
+        """Owner, 18 Nov 2026 (S1): the quote side of the lane's latest tick (execution.estimate_fill), else
+        slippage_bps when the lane's book is not wired (tests)."""
+        execution = getattr(self.lane, "execution", None)
+        if execution is not None and hasattr(execution, "estimate_fill"):
+            return execution.estimate_fill(symbol, side, live)
+        slip = self.settings.slippage_bps / 10_000
+        return live * (1 + slip) if side == "BUY" else live * (1 - slip)
+
     async def cover(self, symbol: str, reason: str, now: datetime | None = None) -> bool:
         """Buy a short back at the fresh price; without one, wait for the next tick."""
         position = self.open.get(symbol)
@@ -430,7 +440,7 @@ class McxShortBook:
         if live is None:
             self.pending[symbol] = reason
             return False
-        fill = round(live * (1 + self.settings.slippage_bps / 10_000), 4)
+        fill = round(self._quote_side(symbol, "BUY", live), 4)            # S1: the ask
         position.status = "CLOSED"
         position.exit_price = fill
         position.exit_at = now.isoformat()

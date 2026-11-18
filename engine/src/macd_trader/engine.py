@@ -39,6 +39,7 @@ from .mcx_lane import McxLane
 from .smart_lane import SmartLanes
 from .agentic_lane import INDEX_SPOTS as AGENTIC_INDICES, AgenticLane
 from .spot_lane import SpotLane
+from .trend_lane import TrendLane
 from .agentic_telegram import TelegramBridge
 from .extreme_booking import ExtremeBooker, SPOT_TO_ROOT as EXTREME_SPOTS
 from .option_greeks import book_greeks
@@ -227,11 +228,12 @@ def _smart_lanes(engine) -> list:
     lanes = getattr(engine, "smart_lanes", None)
     agentic = getattr(engine, "agentic", None)
     spot = getattr(engine, "spot_lane", None)
+    trend = getattr(engine, "trend_lane", None)
     # The agentic lane (agentic_lane.py) and the spot MACD lane (spot_lane.py) wear the same surface, so ticks,
     # subscriptions, settlement and sweeps reach them through every loop below; the /api/smart_lanes routes list
     # smart_lanes.lanes only.
     return [*(lanes.lanes if lanes is not None else []), *([agentic] if agentic is not None else []),
-            *([spot] if spot is not None else [])]
+            *([spot] if spot is not None else []), *([trend] if trend is not None else [])]
 
 
 def _held_contract_lots(engine) -> dict[str, int]:
@@ -294,7 +296,8 @@ class _WarmupRun:
 
 class TradingEngine(DeskMixin):
     def __init__(self, settings: Settings):
-        set_stock_exit_sessions(settings.stock_option_exit_sessions)   # T-2 for stock options (rollover.py)
+        set_stock_exit_sessions(settings.stock_option_exit_sessions,   # E-5 for stock options (rollover.py)
+                                settings.stock_option_entry_hold_sessions)
         self.settings = settings
         self.calendar_rejected = market_calendar.configure(settings.market_holidays_csv)
         self.events = EventHub()
@@ -333,6 +336,7 @@ class TradingEngine(DeskMixin):
         self._flushed_session: str | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._expiry_flatten_task: asyncio.Task | None = None
+        self._series_roll_task: asyncio.Task | None = None
         self._dispersion_task: asyncio.Task | None = None
         self._nightly_task: asyncio.Task | None = None
         self._chain_task: asyncio.Task | None = None
@@ -447,6 +451,12 @@ class TradingEngine(DeskMixin):
         self.spot_lane = (SpotLane(settings, self.broker, self.events,
                                    str(Path(settings.database_path).parent / "spot_macd.sqlite3"))
                           if settings.spot_lane_enabled else None)
+        # Ninth book: the trend-state index lane (trend_lane.py), index options on P1 trend states.
+        self.trend_lane = (TrendLane(settings, self.broker, self.events,
+                                     str(Path(settings.database_path).parent / "trend_index.sqlite3"))
+                           if settings.trend_lane_enabled else None)
+        if self.trend_lane is not None:
+            self.trend_lane.subscribe = self._trend_subscribe
         # Eighth book: the MCX lane (mcx_lane.py) -- the MACD lane's rules on
         # MCX commodity options, on the MCX clock, in its own paper book. Its
         # contracts ride this engine's websocket; every MCX print goes to it
@@ -512,6 +522,7 @@ class TradingEngine(DeskMixin):
         self._session_close_task = asyncio.create_task(self._session_close_loop())
         self._watchdog_task = asyncio.create_task(self._feed_watchdog_loop())
         self._expiry_flatten_task = asyncio.create_task(self._expiry_flatten_loop())
+        self._series_roll_task = asyncio.create_task(self._series_roll_loop())
         self._dispersion_task = asyncio.create_task(self._dispersion_loop())
         self._blast_task = asyncio.create_task(self._blast_maintenance_loop())
         self.mcx.start()
@@ -521,6 +532,8 @@ class TradingEngine(DeskMixin):
             self.agentic.telegram.start()
         if self.spot_lane is not None:
             self.spot_lane.start()
+        if self.trend_lane is not None:
+            self.trend_lane.start()
         self._entry_gate_task = asyncio.create_task(self.entry_gate.run(
             lambda: self.execution, lambda: self.portfolio, self._queued_macd_entry_rejection,
         ))
@@ -1023,6 +1036,7 @@ class TradingEngine(DeskMixin):
                  *self.blast.portfolio.positions, *[s for smart in _smart_lanes(self) for s in smart.held_symbols()],
                  # Every stock's chosen future: a spot-lane entry fills on a fresh futures quote.
                  *(self.spot_lane.feed_symbols() if getattr(self, "spot_lane", None) is not None else []),
+                 *(self.trend_lane.feed_symbols() if getattr(self, "trend_lane", None) is not None else []),
                  *mcx_symbols])),
                 {**self.mcx.known_expiries(), **{row.symbol: row.expiry for row in contracts}},
                 datetime.now(IST).date())
@@ -1129,7 +1143,7 @@ class TradingEngine(DeskMixin):
         }
         for lane in _smart_lanes(self):
             lane.set_tradable_contracts(tradable)
-            if lane is not getattr(self, "spot_lane", None):       # stock futures: its own one-per-stock rule
+            if lane not in (getattr(self, "spot_lane", None), getattr(self, "trend_lane", None)):   # own universes
                 lane.execution.set_entry_universe(atm)
             lane.set_contract_context(lane_context)
             lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
@@ -1879,7 +1893,7 @@ class TradingEngine(DeskMixin):
             except Exception as exc:  # noqa: BLE001 - the remaining stores must still be closed
                 failures.append(f"{name}: {type(exc).__name__}: {exc}"[:200])
 
-        for name in ("_startup_task", "_expiry_flatten_task", "_tick_maintenance_task", "_blast_task",
+        for name in ("_startup_task", "_expiry_flatten_task", "_series_roll_task", "_tick_maintenance_task", "_blast_task",
                      "_history_prune_task", "_desk_status_task", "_self_heal_task", "_rollover_task",
                      "_watchdog_task", "_session_close_task", "_nightly_task", "_chain_task", "_stock_chain_task",
                      "_dispersion_task", "_lag_task", "_context_backfill_task"):
@@ -1899,6 +1913,8 @@ class TradingEngine(DeskMixin):
                 await step("telegram", self.agentic.telegram.stop)
         if getattr(self, "spot_lane", None) is not None:
             await step("spot lane", self.spot_lane.stop)
+        if getattr(self, "trend_lane", None) is not None:
+            await step("trend lane", self.trend_lane.stop)
         if self.bus is not None:
             await step("bus", self.bus.stop)
             if self.flow_snapshots is not None:
@@ -2661,12 +2677,22 @@ class TradingEngine(DeskMixin):
         return int(next(iter(series.values()))) if series else None
 
     def _option_lanes(self) -> list[tuple[str, object]]:
-        lanes = list(self._books())
-        if getattr(self, "agentic", None) is not None:
-            lanes.append(("agentic", self.agentic.execution))
-        if getattr(self, "spot_lane", None) is not None:
-            lanes.append(("spot_macd", self.spot_lane.execution))
+        # _books() already carries the agentic, spot and trend lanes (_smart_lanes): adding them again listed every
+        # spot-lane future twice in the expiry view (found 18 Nov 2026).
+        lanes, seen = [], set()
+        for name, execution in self._books():
+            if id(execution) not in seen:
+                seen.add(id(execution))
+                lanes.append((name, execution))
         return lanes
+
+    async def _trend_subscribe(self, symbols: list[str]) -> None:
+        """The trend lane's chosen contract joins the live feed (one socket; no fetch)."""
+        new = [s for s in symbols if s not in set(getattr(self, "all_symbols", []) or [])]
+        if not new:
+            return
+        if await self.broker.add_symbols(new):
+            self.all_symbols = list(dict.fromkeys([*(self.all_symbols or []), *new]))
 
     def builder_positions(self, underlying: str) -> list[dict]:
         """Open option positions on one underlying in every engine lane, for loading into the strategy builder."""
@@ -2682,6 +2708,35 @@ class TradingEngine(DeskMixin):
                             "average_price": position.average_price, "last_price": position.last_price,
                             "lot_size": getattr(position, "lot_size", 1) or 1})
         return out
+
+    async def series_roll(self) -> dict:
+        """Roll stock F&O at or past its series' last day into the next series (series_roll.py). One at a time."""
+        from . import series_roll
+        lock = self.__dict__.setdefault("_series_roll_lock", asyncio.Lock())
+        async with lock:
+            journal = str(Path(self.settings.runtime_settings_path).parent)
+            result = await series_roll.execute(self, journal_dir=journal)
+        self.__dict__["_series_roll_last"] = {k: v for k, v in result.items() if k != "rows"}
+        self.events.publish("snapshot_required", {"reason": "series_roll"})
+        return result
+
+    async def _series_roll_loop(self) -> None:
+        """R2 (owner, 18 Nov 2026: "complete rollover"): on a series' last day, at 15:05 IST, before the 15:10
+        flatten, every held stock option / future of that series is rolled into the next one."""
+        from . import series_roll
+        while True:
+            await asyncio.sleep(30)
+            now = datetime.now(IST)
+            if not market_calendar.is_trading_day(now.date()) or not ((15, 5) <= (now.hour, now.minute) < (15, 10)):
+                continue
+            if self.__dict__.get("_series_rolled_on") == now.date():
+                continue
+            try:
+                if any(r["status"] == "PLANNED" for r in await series_roll.plan(self, now)):
+                    await self.series_roll()
+                self.__dict__["_series_rolled_on"] = now.date()
+            except Exception as exc:  # noqa: BLE001 -- the 15:10 flatten still runs
+                self.rollover_errors["series_roll"] = f"{type(exc).__name__}: {exc}"[:300]
 
     def expiry_exposure(self) -> dict:
         """Every engine lane's stock options and futures against the delivery-margin calendar (expiry_exposure.py)."""

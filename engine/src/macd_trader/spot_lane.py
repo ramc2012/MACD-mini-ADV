@@ -473,17 +473,8 @@ class SpotLane(SmartLane):
         return len(due)
 
     def _estimated_fill(self, symbol: str, side: str, price: float) -> float:
-        """The worse of adverse LTP slippage and the shared quoted touch (as the paper fill will take it)."""
-        execution = self.execution
-        slip = price * self.settings.slippage_bps / 10_000
-        estimated = price + slip if side == "BUY" else price - slip
-        tick = execution.quote_source(symbol) if execution.quote_source and self.settings.paper_cross_spread else None
-        bid, ask = getattr(tick, "bid", None), getattr(tick, "ask", None)
-        if (tick and abs(float(tick.ltp) - price) <= 1e-9 and bid and ask and
-                math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
-            cap = price * self.settings.paper_max_half_spread_pct / 100
-            estimated = max(estimated, min(ask, price + cap)) if side == "BUY" else min(estimated, max(bid, price - cap))
-        return estimated
+        """The quote-side price the paper fill will take (execution.estimate_fill, S1)."""
+        return self.execution.estimate_fill(symbol, side, price)
 
     async def _decide(self, item: Pending, now: datetime, cut: float) -> None:
         stock, side = item.symbol, item.option_type
