@@ -141,7 +141,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
       {health && <div className="agent-actions">
         <span className="agent-chip">Local ranking · no score veto</span>
         <span className="agent-chip">{health.pending} waiting</span>
-        {rules && <span className="agent-chip">MACD: stop {Math.round(rules.macd.hard * 100)}% · trail {Math.round(rules.macd.trail * 100)}% from +{Math.round(rules.macd.act * 100)}% · target +{Math.round((rules.macd.target || 0) * 100)}% · hold {rules.macd.hold} sessions</span>}
+        {rules && !health.grok?.enabled && <span className="agent-chip">MACD: stop {Math.round(rules.macd.hard * 100)}% · trail {Math.round(rules.macd.trail * 100)}% from +{Math.round(rules.macd.act * 100)}% · target +{Math.round((rules.macd.target || 0) * 100)}% · hold {rules.macd.hold} sessions</span>}
         {rules?.blast && <span className="agent-chip">Blast: stop {Math.round(rules.blast.hard * 100)}% · trail {Math.round(rules.blast.trail * 100)}% from +{Math.round(rules.blast.act * 100)}%</span>}
       </div>}
     </div>
