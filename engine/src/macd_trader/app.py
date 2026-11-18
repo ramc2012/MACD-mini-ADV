@@ -65,7 +65,11 @@ async def lifespan(_: FastAPI):
     persist_settings(engine.settings)
     persist_credentials(engine.settings)
     alert_manager.start()
+    # Market breadth views every 15 minutes, stored for an instant page load (analytics_schedule.py, owner 18 Nov 2026).
+    from . import analytics_schedule
+    analytics_task = asyncio.create_task(analytics_schedule.run(engine, _compute_and_store_rrg))
     yield
+    analytics_task.cancel()
     await alert_manager.stop()
     await engine.stop()
 
@@ -1121,6 +1125,35 @@ async def mcx_book(today: bool = False):
     return fast_json(engine.mcx.book(_since(today)))
 
 
+@app.get("/api/mcx/straddle/instruments", dependencies=[Depends(authorize)])
+async def mcx_straddle_instruments():
+    """Commodities with recorded MCX option chains (mcx_chains.py) for the MCX lane's Straddle & OI tab."""
+    from . import straddle_views
+    path = engine.mcx.chains.path
+    if not path or not Path(path).exists():
+        return {"instruments": []}
+    out = await asyncio.to_thread(straddle_views.instruments, path)
+    order = {root: i for i, root in enumerate(engine.mcx.roots)}
+    rows = [{**row, "kind": "commodity"} for row in out["instruments"]]
+    rows.sort(key=lambda row: (order.get(row["underlying"], len(order)), row["underlying"]))
+    return {"instruments": rows}
+
+
+@app.get("/api/mcx/straddle/series/{underlying}", dependencies=[Depends(authorize)])
+async def mcx_straddle_series(underlying: str, expiry: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                              span: str = Query(default="day", pattern="^(day|week|expiry)$"),
+                              day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                              strike: float | None = Query(default=None, gt=0)):
+    """The MCX ATM straddle with day/week/month VWAPs and CE/PE open interest, from the recorded MCX chains."""
+    from . import straddle_views
+    path = engine.mcx.chains.path
+    root = underlying.upper()
+    if not path or not Path(path).exists():
+        return {"underlying": root, "span": span, "expiries": [], "strike_mode": "fixed" if strike else "atm", "points": [],
+                "note": "No MCX chain recorded yet: the lane records one per commodity every two minutes in session."}
+    return await asyncio.to_thread(straddle_views.series, path, root, expiry, span, day, strike)
+
+
 @app.put("/api/mcx/settings", dependencies=[Depends(authorize)])
 async def mcx_settings(payload: McxSettingsInput):
     updates = payload.model_dump(exclude_none=True)
@@ -1239,6 +1272,15 @@ async def _compute_and_store_rrg(key: str, timeframe_seconds: int, window: int, 
     )
     await asyncio.to_thread(engine.repository.save_rrg, key, value)
     return value
+
+
+@app.get("/api/analytics/status", dependencies=[Depends(authorize)])
+async def analytics_status():
+    """The 15-minute market breadth refresh: last run, each view's time and error, the next slot."""
+    from . import analytics_schedule
+    report = dict(getattr(engine, "analytics_report", None) or {"runs": 0, "views": {}})
+    return {**report, "next_slot": analytics_schedule.next_slot(datetime.now(UTC)),
+            "every_minutes": analytics_schedule.SLOT_MINUTES}
 
 
 @app.get("/api/rrg", dependencies=[Depends(authorize)])

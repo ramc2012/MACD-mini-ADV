@@ -92,6 +92,15 @@ class TradeRepository:
                     generated_at TEXT NOT NULL,
                     payload TEXT NOT NULL
                 );
+                -- Market breadth views (day highs/lows, trend rotation, sector wheel/coil, ATM heat map, IV scanner):
+                -- the last computed answer per view and parameters, so a page opens at once, even after a restart.
+                CREATE TABLE IF NOT EXISTS analytics_snapshots (
+                    view TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    computed_at TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (view, key)
+                );
                 -- One row per closing slice. exit_time and visible_until are
                 -- stored UTC-normalised so lexical ORDER/WHERE is correct; the
                 -- JSON payload keeps the +05:30 form for display.
@@ -384,6 +393,22 @@ class TradeRepository:
                 "SELECT payload FROM rrg_snapshots WHERE key = ?", (key,)
             ).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def save_analytics(self, view: str, key: str, computed_at: str, payload: dict) -> None:
+        text = json.dumps(payload, separators=(",", ":"), default=str)
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO analytics_snapshots(view, key, computed_at, payload) VALUES (?, ?, ?, ?)",
+                (view, key, computed_at, text),
+            )
+
+    def load_analytics(self, view: str, key: str) -> tuple[str, dict] | None:
+        """(computed_at ISO, payload) of the stored answer, or None."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT computed_at, payload FROM analytics_snapshots WHERE view = ? AND key = ?", (view, key)
+            ).fetchone()
+        return (row["computed_at"], json.loads(row["payload"])) if row else None
 
     def save_session_state(self, day: str, payload: dict) -> int:
         """Store the desk's live aggregation, gzipped — it is mostly repeated

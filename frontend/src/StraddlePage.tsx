@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { requestJson } from "./requestJson";
 import { API_TOKEN, API_URL } from "./runtime";
 
-type Instrument = { underlying: string; kind: "index" | "stock"; first_day: string; last_day: string; days: number };
+type Instrument = { underlying: string; kind: "index" | "stock" | "commodity"; first_day: string; last_day: string; days: number };
 type Point = { t: number; spot: number; strike: number; ce: number; pe: number; straddle: number; ce_oi: number | null; pe_oi: number | null;
   ce_oi_band?: number | null; pe_oi_band?: number | null; band?: [number, number] | null; volume: number; vwap_day: number | null; vwap_week: number | null; vwap_month: number | null };
 type Series = { underlying: string; expiry?: string; span: Span; day?: string; days?: string[]; strike_mode: "atm" | "fixed";
@@ -30,16 +30,24 @@ const full = (ts?: number | null) => ts ? `${FULL.format(new Date(ts * 1000)).re
 const asDate = (value: Time) => typeof value === "number" ? new Date(value * 1000) : new Date(String(value));
 const num = (v: number | null | undefined, d = 2) => v == null ? "—" : v.toLocaleString("en-IN", { maximumFractionDigits: d, minimumFractionDigits: v >= 1000 ? 0 : d });
 const qty = (v: number | null | undefined) => v == null ? "—" : v >= 1e7 ? `${(v / 1e7).toFixed(2)} Cr` : v >= 1e5 ? `${(v / 1e5).toFixed(2)} L` : v.toLocaleString("en-IN");
-const STORE = "macd.straddle";
-const recall = (): Record<string, string> => { try { return JSON.parse(window.localStorage.getItem(STORE) || "{}"); } catch { return {}; } };
-const remember = (value: Record<string, string>) => { try { window.localStorage.setItem(STORE, JSON.stringify(value)); } catch { return; } };
+// The same view over two chain stores: NSE (Market breadth) and the MCX lane's recorded commodity chains (18 Nov 2026).
+export type StraddleSource = "nse" | "mcx";
+const SOURCE = {
+  nse: { api: "/api/auction/straddle", store: "macd.straddle", fallback: "NIFTY", title: "ATM Straddle & Open Interest", spot: "Spot",
+    blurb: "ATM CE + PE premium with anchored VWAPs · ATM CE / PE open interest · stored option chains, no downloads", oiUnit: "contracts × lot" },
+  mcx: { api: "/api/mcx/straddle", store: "macd.mcxStraddle", fallback: "CRUDEOIL", title: "MCX ATM Straddle & Open Interest", spot: "Futures",
+    blurb: "ATM CE + PE premium with anchored VWAPs · CE / PE open interest · MCX chains the lane records every two minutes in session (since 18 Nov 2026, 23:31 IST)", oiUnit: "open contracts" },
+} as const;
+const recall = (store: string): Record<string, string> => { try { return JSON.parse(window.localStorage.getItem(store) || "{}"); } catch { return {}; } };
+const remember = (store: string, value: Record<string, string>) => { try { window.localStorage.setItem(store, JSON.stringify(value)); } catch { return; } };
 const headers = API_TOKEN ? { "x-macd-token": API_TOKEN } : undefined;
 
 /** ATM straddle with day/week/month-anchored VWAPs and ATM CE/PE open interest, from the stored option chains. */
-export function StraddlePage() {
-  const saved = useMemo(recall, []);
+export function StraddlePage({ source = "nse" }: { source?: StraddleSource }) {
+  const src = SOURCE[source];
+  const saved = useMemo(() => recall(src.store), [src.store]);
   const [instruments, setInstruments] = useState<Instrument[]>([]);
-  const [underlying, setUnderlying] = useState(saved.underlying || "NIFTY");
+  const [underlying, setUnderlying] = useState(saved.underlying || src.fallback);
   const [expiry, setExpiry] = useState("");
   const [span, setSpan] = useState<Span>((saved.span as Span) || "day");
   const [day, setDay] = useState("");
@@ -52,11 +60,11 @@ export function StraddlePage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    requestJson<{ instruments: Instrument[] }>(`${API_URL}/api/auction/straddle/instruments`, { headers, signal: controller.signal })
+    requestJson<{ instruments: Instrument[] }>(`${API_URL}${src.api}/instruments`, { headers, signal: controller.signal })
       .then((r) => setInstruments(r.instruments)).catch(() => undefined);
     return () => controller.abort();
-  }, []);
-  useEffect(() => remember({ underlying, span, oi: oiMode, vwap_day: shown.day ? "1" : "0", vwap_week: shown.week ? "1" : "0", vwap_month: shown.month ? "1" : "0" }), [underlying, span, shown, oiMode]);
+  }, [src.api]);
+  useEffect(() => remember(src.store, { underlying, span, oi: oiMode, vwap_day: shown.day ? "1" : "0", vwap_week: shown.week ? "1" : "0", vwap_month: shown.month ? "1" : "0" }), [underlying, span, shown, oiMode]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -66,7 +74,7 @@ export function StraddlePage() {
     if (strike) query.set("strike", strike);
     const load = (quiet = false) => {
       if (!quiet) { setLoading(true); setError(""); }
-      requestJson<Series>(`${API_URL}/api/auction/straddle/series/${encodeURIComponent(underlying)}?${query}`, { headers, signal: controller.signal })
+      requestJson<Series>(`${API_URL}${src.api}/series/${encodeURIComponent(underlying)}?${query}`, { headers, signal: controller.signal })
         .then((r) => { setData(r); setError(""); })
         .catch((reason) => { if (reason.name !== "AbortError") setError(reason instanceof Error ? reason.message : "Straddle series request failed"); })
         .finally(() => { if (!controller.signal.aborted) setLoading(false); });
@@ -75,22 +83,23 @@ export function StraddlePage() {
     // A past day is fixed; the latest one refreshes as new chains are stored.
     const timer = day ? undefined : window.setInterval(() => load(true), 60_000);
     return () => { controller.abort(); if (timer) clearInterval(timer); };
-  }, [underlying, expiry, span, day, strike]);
+  }, [src.api, underlying, expiry, span, day, strike]);
 
   const pickUnderlying = (value: string) => { setUnderlying(value); setExpiry(""); setDay(""); setStrike(""); };
   const last = data?.points[data.points.length - 1];
-  const indices = instruments.filter((r) => r.kind === "index"), stocks = instruments.filter((r) => r.kind === "stock");
+  const indices = instruments.filter((r) => r.kind === "index"), stocks = instruments.filter((r) => r.kind === "stock"), commodities = instruments.filter((r) => r.kind === "commodity");
   const cadence = data?.cadence_seconds ? (data.cadence_seconds < 120 ? "1-minute chains" : `${Math.round(data.cadence_seconds / 60)}-minute chain sweep`) : "";
   const vsDay = last?.vwap_day ? last.straddle - last.vwap_day : null;
 
   return <section className="ledger-page straddle-page">
     <div className="page-heading ratio-heading">
-      <div><h1>ATM Straddle &amp; Open Interest</h1><p>ATM CE + PE premium with anchored VWAPs · ATM CE / PE open interest · stored option chains, no downloads</p></div>
+      <div><h1>{src.title}</h1><p>{src.blurb}</p></div>
       <div className="straddle-controls">
         <select className="rrg-select" value={underlying} onChange={(e) => pickUnderlying(e.target.value)} aria-label="Instrument">
           {!instruments.length && <option value={underlying}>{underlying}</option>}
           {!!indices.length && <optgroup label="Indices">{indices.map((r) => <option key={r.underlying} value={r.underlying}>{r.underlying}</option>)}</optgroup>}
           {!!stocks.length && <optgroup label="F&O stocks">{stocks.map((r) => <option key={r.underlying} value={r.underlying}>{r.underlying}</option>)}</optgroup>}
+          {!!commodities.length && <optgroup label="Commodities">{commodities.map((r) => <option key={r.underlying} value={r.underlying}>{r.underlying}</option>)}</optgroup>}
         </select>
         <select className="rrg-select" value={expiry} onChange={(e) => { setExpiry(e.target.value); setDay(""); setStrike(""); }} aria-label="Expiry">
           <option value="">Front expiry{data?.expiry && !expiry ? ` · ${data.expiry}` : ""}</option>
@@ -113,9 +122,9 @@ export function StraddlePage() {
     <div className="straddle-tiles">
       <div><span>Straddle {data?.strike_mode === "fixed" ? `· ${strike}` : "· ATM"}</span><b>{num(last?.straddle)}</b><small>{last ? `${last.strike} · CE ${num(last.ce)} + PE ${num(last.pe)}` : "—"}</small></div>
       <div><span>vs day VWAP</span><b className={vsDay == null ? "" : vsDay >= 0 ? "positive" : "negative"}>{vsDay == null ? "—" : `${vsDay >= 0 ? "+" : ""}${num(vsDay)}`}</b><small>{vsDay == null ? "No traded volume yet" : vsDay >= 0 ? "Premium above day VWAP" : "Premium below day VWAP"}</small></div>
-      <div><span>CE {OI_LABEL[oiMode]}</span><b>{qty(oiOf(last, "ce", oiMode))}</b><small>{oiMode === "band" && last?.band ? `strikes ${last.band[0]}–${last.band[1]} · contracts × lot` : "open contracts × lot"}</small></div>
+      <div><span>CE {OI_LABEL[oiMode]}</span><b>{qty(oiOf(last, "ce", oiMode))}</b><small>{oiMode === "band" && last?.band ? `strikes ${last.band[0]}–${last.band[1]} · ${src.oiUnit}` : src.oiUnit}</small></div>
       <div><span>PE {OI_LABEL[oiMode]}</span><b>{qty(oiOf(last, "pe", oiMode))}</b><small>PE/CE {oiOf(last, "ce", oiMode) ? (Number(oiOf(last, "pe", oiMode)) / Number(oiOf(last, "ce", oiMode))).toFixed(2) : "—"}</small></div>
-      <div><span>Spot</span><b>{num(last?.spot)}</b><small>{full(last?.t)}</small></div>
+      <div><span>{src.spot}</span><b>{num(last?.spot)}</b><small>{full(last?.t)}</small></div>
     </div>
     <section className="panel straddle-panel">
       <div className="straddle-legend" aria-label="Chart legend">
@@ -126,7 +135,7 @@ export function StraddlePage() {
       <StraddleChart data={data} shown={shown} oiMode={oiMode} loading={loading} error={error} fitKey={`${underlying}:${data?.expiry}:${span}:${data?.day}:${strike}`} />
     </section>
     <div className="ratio-footer">
-      <span>{data?.points.length ? `${data.underlying} ${data.expiry} · ${data.points.length} points at ${Math.round((data.resolution_seconds || 60) / 60)}-minute resolution · ${cadence} · series stored ${full(data.series_first_ts)} → ${full(data.series_last_ts)}` : "Select an instrument with stored option chains."}</span>
+      <span>{data?.points.length ? `${data.underlying} ${data.expiry} · ${data.points.length} points at ${Math.round((data.resolution_seconds || 60) / 60)}-minute resolution · ${cadence} · series stored ${full(data.series_first_ts)} → ${full(data.series_last_ts)}` : source === "mcx" ? "No MCX chain recorded for this commodity yet." : "Select an instrument with stored option chains."}</span>
       <span role={error ? "alert" : undefined} className={error ? "negative" : "muted"}>{error || [data?.note, data?.skipped_partial_snapshots ? `${data.skipped_partial_snapshots} partial chain snapshots skipped` : ""].filter(Boolean).join(" · ")}</span>
     </div>
     <details className="panel straddle-table"><summary>Data table · latest first</summary>

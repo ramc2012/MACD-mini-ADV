@@ -107,15 +107,16 @@ def test_market_views_serve_the_cached_answer_at_once_and_refresh_behind():
         host = SimpleNamespace()
         swr = TradingEngine._stale_while_revalidate.__get__(host)
         first = await swr("view", "k", 30, compute)                  # nothing cached: waits
-        assert first == {"n": 1}
+        assert first["n"] == 1 and first["computed_at"]
         cache = host.__dict__["_view_cache_swr"]
-        cache["k"] = (clock.monotonic() - 40, first)                   # stale, not too old
+        cache["k"] = (clock.monotonic() - 40, first)                   # stale
         started = clock.monotonic()
         again = await swr("view", "k", 30, compute)
-        assert again == {"n": 1} and clock.monotonic() - started < 0.04   # served at once
+        assert again["n"] == 1 and clock.monotonic() - started < 0.04   # served at once
         await asyncio.sleep(0.1)                                       # the refresh ran behind
-        assert cache["k"][1] == {"n": 2}
-        cache["k"] = (clock.monotonic() - 9999, cache["k"][1])         # far too old: waits for a fresh one
-        assert await swr("view", "k", 30, compute) == {"n": 3}
+        assert cache["k"][1]["n"] == 2
+        cache["k"] = (clock.monotonic() - 9999, cache["k"][1])         # however old: still served at once
+        assert (await swr("view", "k", 30, compute))["n"] == 2
+        assert (await swr("view", "k", 30, compute, force=True))["n"] >= 3   # the 15-minute job waits for a fresh one
 
     asyncio.run(scenario())

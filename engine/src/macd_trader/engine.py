@@ -266,8 +266,11 @@ def _kick_daily_close_refresh(engine) -> None:
         if report.get("held") or (not report["errors"] and not await asyncio.to_thread(
                 sector_wheel.stale_symbols, engine.settings.research_database_path, engine._wheel_symbols(), datetime.now(IST))):
             engine._wheel_refreshed_for = due
-        engine._sector_wheel_cache = None
-        engine.__dict__.get("_sector_coil_cache", {}).clear()
+        # New daily closes: the next read serves the stored views once more and recomputes them behind.
+        for name in ("_sector_wheel_cache_swr", "_sector_coil_cache_swr"):
+            cache = engine.__dict__.get(name, {})
+            for key, (_, value) in list(cache.items()):
+                cache[key] = (time.monotonic() - 1e9, value)
     engine._wheel_refresh_task = asyncio.create_task(run())
 
 
@@ -2516,18 +2519,33 @@ class TradingEngine(DeskMixin):
             return db.execute("SELECT COUNT(*) FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60",
                               (symbol,)).fetchone()[0]
 
-    async def _stale_while_revalidate(self, name: str, key, ttl: float, compute, max_stale: float = 600.0):
+    async def _stale_while_revalidate(self, name: str, key, ttl: float, compute, *, force: bool = False):
         """Serve a market view from its cache; past ``ttl`` return the cached answer at once and refresh it in the
         background (18 Nov 2026: trend rotation took 6 s, day highs 2.5 s, the ATM heat map 2.3 s on every miss).
-        A cache older than ``max_stale`` (or none) is computed while the caller waits. ``compute`` returns
-        ``(result, cacheable)``; one computation runs per key at a time."""
+        ``compute`` returns ``(result, cacheable)``; one computation runs per key at a time.
+
+        Owner, 18 Nov 2026 ("compute ... every 15 mins and maintain in DB so that opening the page load them
+        instantly"): every cacheable answer is also stored in analytics_snapshots with its ``computed_at``. A cold
+        cache (a restart, a first visit) serves the stored answer at once, whatever its age, and refreshes it
+        behind; only a view never computed makes the caller wait. analytics_schedule refreshes the default views
+        every 15 minutes with ``force``."""
         cache = self.__dict__.setdefault(f"_{name}_cache_swr", {})
         tasks = self.__dict__.setdefault(f"_{name}_tasks_swr", {})
+        store_key = ":".join(map(str, key)) if isinstance(key, tuple) else str(key)
 
         async def run():
             result, cacheable = await compute()
             if cacheable:
+                computed = datetime.now(UTC).isoformat()
+                if isinstance(result, dict):
+                    result["computed_at"] = computed
                 cache[key] = (time.monotonic(), result)
+                try:
+                    await asyncio.to_thread(self.repository.save_analytics, name, store_key, computed, result)
+                except Exception as exc:  # noqa: BLE001 -- the stored copy is a convenience; the answer still serves
+                    errors = getattr(self, "lane_errors", None)
+                    if isinstance(errors, dict):
+                        errors[f"analytics_{name}"] = {"at": computed, "error": f"{type(exc).__name__}: {exc}"[:300]}
             return result
 
         def start():
@@ -2535,16 +2553,28 @@ class TradingEngine(DeskMixin):
                 tasks[key] = asyncio.create_task(run())
             return tasks[key]
 
+        if force:
+            return await asyncio.shield(start())
         hit = cache.get(key)
-        age = time.monotonic() - hit[0] if hit else None
-        if hit and age < ttl:
-            return hit[1]
-        if hit and age < max_stale:
+        if hit is None:
+            try:
+                stored = await asyncio.to_thread(self.repository.load_analytics, name, store_key)
+            except Exception:  # noqa: BLE001
+                stored = None
+            if stored:
+                computed_at, payload = stored
+                try:
+                    age = (datetime.now(UTC) - datetime.fromisoformat(computed_at)).total_seconds()
+                except ValueError:
+                    age = ttl + 1
+                hit = cache[key] = (time.monotonic() - max(0.0, age), payload)
+        if hit is None:
+            return await asyncio.shield(start())
+        if time.monotonic() - hit[0] >= ttl:
             start()
-            return hit[1]
-        return await asyncio.shield(start())
+        return hit[1]
 
-    async def atm_heatmap(self, as_of: date | None = None) -> dict:
+    async def atm_heatmap(self, as_of: date | None = None, force: bool = False) -> dict:
         """ATM CE/PE premium changes over 1H..1M per underlying (atm_heatmap.py); cached for 30 s.
 
         ``as_of`` replays the map at that day's close with the ATM contracts of that day (a past day never
@@ -2565,7 +2595,7 @@ class TradingEngine(DeskMixin):
                     return result
                 history[as_of] = result
             return history[as_of]
-        return await self._stale_while_revalidate("atm_heatmap", "live", 30, self._atm_heatmap_live)
+        return await self._stale_while_revalidate("atm_heatmap", "live", 30, self._atm_heatmap_live, force=force)
 
     async def _atm_heatmap_live(self) -> tuple[dict, bool]:
         from . import atm_heatmap
@@ -2601,40 +2631,36 @@ class TradingEngine(DeskMixin):
         return list(dict.fromkeys([*broad, *(self.context_indices or self.settings.context_indices),
                                    *[s for s in self.settings.symbols if s.endswith("-EQ")]]))
 
-    async def sector_wheel(self) -> dict:
-        """Own and NIFTY-relative 1/5/20/60-session returns (sector_wheel.py); cached 60 s. Daily closes are
-        refreshed in the background once per completed session."""
+    async def sector_wheel(self, force: bool = False) -> dict:
+        """Own and NIFTY-relative 1/5/20/60-session returns (sector_wheel.py); cached 60 s and stored (served stale
+        while it refreshes). Daily closes are refreshed in the background once per completed session."""
         from . import sector_wheel
         _kick_daily_close_refresh(self)
-        cached = getattr(self, "_sector_wheel_cache", None)
-        if cached and time.monotonic() - cached[0] < 60:
-            return cached[1]
-        live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
-        result = await asyncio.to_thread(sector_wheel.build, self.settings.research_database_path, self._wheel_symbols(), live)
-        result["refreshing"] = not self._wheel_refresh_task.done()
-        if result["rows"]:
-            self._sector_wheel_cache = (time.monotonic(), result)
-        return result
 
-    async def sector_coil(self, base: str, step: str, measure: str) -> dict:
-        """Index and sector returns from a base close at every checkpoint (sector_coil.py); cached 60 s per view.
-        Shares the sector wheel's daily closes and their once-a-session refresh."""
+        async def compute():
+            live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
+            result = await asyncio.to_thread(sector_wheel.build, self.settings.research_database_path,
+                                             self._wheel_symbols(), live)
+            return result, bool(result["rows"])
+        result = await self._stale_while_revalidate("sector_wheel", "live", 60, compute, force=force)
+        return {**result, "refreshing": not self._wheel_refresh_task.done()}
+
+    async def sector_coil(self, base: str, step: str, measure: str, force: bool = False) -> dict:
+        """Index and sector returns from a base close at every checkpoint (sector_coil.py); cached 60 s per view and
+        stored. Shares the sector wheel's daily closes and their once-a-session refresh."""
         from . import sector_coil
         _kick_daily_close_refresh(self)
-        key = (base, step, measure)
-        cache = self.__dict__.setdefault("_sector_coil_cache", {})
-        if key in cache and time.monotonic() - cache[key][0] < 60:
-            return cache[key][1]
-        live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
-        symbols = [s for s in self._wheel_symbols() if s.endswith("-INDEX") and "VIX" not in s]
-        result = await asyncio.to_thread(sector_coil.build, self.settings.research_database_path, symbols, live,
-                                         None, base, step, measure)
-        result["refreshing"] = not self._wheel_refresh_task.done()
-        if result["rows"]:
-            cache[key] = (time.monotonic(), result)
-        return result
 
-    async def trend_rotation(self, kind: str, timeframe: int) -> dict:
+        async def compute():
+            live = {symbol: tick.ltp for symbol, tick in self.latest_ticks.items() if tick.ltp and tick.ltp > 0}
+            symbols = [s for s in self._wheel_symbols() if s.endswith("-INDEX") and "VIX" not in s]
+            result = await asyncio.to_thread(sector_coil.build, self.settings.research_database_path, symbols, live,
+                                             None, base, step, measure)
+            return result, bool(result["rows"])
+        result = await self._stale_while_revalidate("sector_coil", (base, step, measure), 60, compute, force=force)
+        return {**result, "refreshing": not self._wheel_refresh_task.done()}
+
+    async def trend_rotation(self, kind: str, timeframe: int, force: bool = False) -> dict:
         from . import trend_rotation
         key = (kind, timeframe)
 
@@ -2653,9 +2679,9 @@ class TradingEngine(DeskMixin):
             result = await asyncio.to_thread(trend_rotation.build, self.settings.research_database_path,
                                              instruments, kind, timeframe)
             return result, bool(instruments)
-        return await self._stale_while_revalidate("trend_rotation", key, 60, compute)
+        return await self._stale_while_revalidate("trend_rotation", key, 60, compute, force=force)
 
-    async def iv_scanner(self) -> dict:
+    async def iv_scanner(self, force: bool = False) -> dict:
         """30-day ATM IV, IV rank / percentile and HV20 per F&O underlying from the stored chains (iv_scanner.py);
         cached 2 min, served stale while it refreshes."""
         from . import iv_scanner
@@ -2667,7 +2693,7 @@ class TradingEngine(DeskMixin):
         async def compute():
             result = await asyncio.to_thread(scanner.scan)
             return result, bool(result["rows"])
-        return await self._stale_while_revalidate("iv_scanner", "live", 120, compute)
+        return await self._stale_while_revalidate("iv_scanner", "live", 120, compute, force=force)
 
     async def builder_chain(self, underlying: str, expiry: str | None = None) -> dict:
         """Strategy builder chain (strategy_builder.py) with the live spot when fresh and the series lot size."""
@@ -2799,9 +2825,9 @@ class TradingEngine(DeskMixin):
         stored = stored_spots(self.settings.research_database_path)   # no live print after an out-of-hours restart
         return expiry_exposure.report(self._option_lanes(), lambda symbol: prices.get(symbol) or stored(symbol))
 
-    async def day_highs(self) -> dict:
+    async def day_highs(self, force: bool = False) -> dict:
         """Spots and ATM legs whose last completed 15-min bar closed at a new day high or low (day_highs.py); cached 30 s."""
-        return await self._stale_while_revalidate("day_highs", "live", 30, self._day_highs_live)
+        return await self._stale_while_revalidate("day_highs", "live", 30, self._day_highs_live, force=force)
 
     async def _day_highs_live(self) -> tuple[dict, bool]:
         from . import day_highs

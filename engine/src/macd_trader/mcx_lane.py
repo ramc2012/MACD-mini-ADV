@@ -87,6 +87,7 @@ from .config import RUNTIME_DIR, Settings
 from .contracts import liquidity_window, select_liquid_contract
 from .events import EventHub, json_value
 from .execution import ExecutionManager
+from .mcx_chains import McxChainRecorder, chain_path
 from .mcx_short import McxShortBook
 from .mcx_store import McxBarStore, valid_minute
 from .models import Candle, Signal, Tick, Trade
@@ -640,6 +641,8 @@ class McxLane:
         self.repository = TradeRepository(book)
         # One-minute bars of every watched contract: downloaded once, then kept up from live ticks.
         self.store = McxBarStore(_store_file(settings, book))
+        # MCX option chains every two minutes for the Straddle & OI tab (mcx_chains.py, owner 18 Nov 2026).
+        self.chains = McxChainRecorder(self, chain_path(self.store.path))
         self.minute_bars = McxCandleAggregator(60, self.calendar)
         self._minute_pending: list[Candle] = []
         self._last_chart_minute: dict[str, Candle] = {}
@@ -1847,6 +1850,8 @@ class McxLane:
                 await self.flatten(symbol, f"MCX_EXPIRY_FLATTEN_{cutoff[0]:02d}{cutoff[1]:02d}_IST")
         if self.calendar.in_session(now):
             self._schedule_oi(now)
+            if self.settings.mcx_enabled:
+                self.chains.schedule(now)
             await self.poll_stale_quotes(now)
             for symbol in list(self.pending_exits):
                 await self._retry_pending_exit(symbol)
@@ -1900,6 +1905,7 @@ class McxLane:
         return fed
 
     async def stop(self) -> None:
+        await self.chains.stop()
         if self._oi_task is not None:
             self._oi_task.cancel()
             try:
@@ -2134,6 +2140,7 @@ class McxLane:
             "subscribed": len(self.subscription_symbols()),
             "futures": len(self.futures_symbols()),
             "ladder": len(self.ladder),
+            "chains": dict(self.chains.report),
             "store": self._store_stats,
             "quiet_minutes": dict(self.quiet_minutes),
             "history": {"downloads_allowed": self.downloads_allowed(), **self.downloads,

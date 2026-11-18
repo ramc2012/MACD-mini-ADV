@@ -3,6 +3,7 @@ import { API_TOKEN, API_URL } from "./runtime";
 import { requestJson } from "./requestJson";
 import { LaneChartModal, type LaneChartFocus } from "./LaneChart";
 import { SellingTab } from "./McxSelling";
+import { StraddlePage } from "./StraddlePage";
 import {
   MCX_QUOTES_EVENT, MCX_ROOTS, ROOT_LABEL, ROOT_UNIT, changedSettings, fromForm, macdState, newestMcxQuote, sessionLabel, toForm, verdictMeta,
   type McxDecision, type McxForm, type McxQuote, type McxSnapshot,
@@ -12,13 +13,14 @@ import {
  * existing terminal stream supplies frequent quotes while this page is open. */
 const WATCHLIST = { FUTURES: "FUT", CALLS: "CE", PUTS: "PE" } as const;
 type WatchTab = keyof typeof WATCHLIST;
-type Tab = WatchTab | "POSITIONS" | "SELLING" | "SIGNALS" | "BOOK" | "RULES" | "SETTINGS";
+type Tab = WatchTab | "POSITIONS" | "SELLING" | "STRADDLE" | "SIGNALS" | "BOOK" | "RULES" | "SETTINGS";
 const TABS: { key: Tab; label: string }[] = [
   { key: "FUTURES", label: "Futures" },
   { key: "CALLS", label: "Calls" },
   { key: "PUTS", label: "Puts" },
   { key: "POSITIONS", label: "Positions" },
   { key: "SELLING", label: "Selling" },
+  { key: "STRADDLE", label: "Straddle & OI" },
   { key: "SIGNALS", label: "Signals" },
   { key: "BOOK", label: "Orders & trades" },
   { key: "RULES", label: "Rules & data" },
@@ -158,6 +160,7 @@ export function McxLanePage({ connected }: { connected: boolean }) {
       {watch && <ContractsTab snapshot={snapshot} side={watch} quoteFor={quoteFor} clock={clock} onChart={openChart} />}
       {tab === "POSITIONS" && <PositionsTab snapshot={snapshot} quoteFor={quoteFor} />}
       {tab === "SELLING" && <SellingTab snapshot={snapshot} onSaved={setSnapshot} />}
+      {tab === "STRADDLE" && <StraddlePage source="mcx" />}
       {tab === "SIGNALS" && <SignalsTab rows={snapshot.decisions} counts={health.decisions} />}
       {tab === "BOOK" && <BookTab />}
       {tab === "RULES" && <RulesTab snapshot={snapshot} problems={problems} />}

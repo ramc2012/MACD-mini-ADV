@@ -1516,3 +1516,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .mcx-chart-row { cursor: pointer; }
 .mcx-chart-link { padding: 0; background: transparent; border: 0; color: var(--text-1); font: inherit; text-align: left; cursor: pointer; }
 .mcx-chart-link:hover, .mcx-chart-link:focus-visible { color: var(--accent); text-decoration: underline; }
+
+/* Smart lanes inner views (18 Nov 2026): the book picker sits above the tabs, as in the MACD lane. */
+.lanes-page .smart-views { margin: 0 -2px; padding-left: 4px; border-radius: 6px 6px 0 0; }
+.lanes-page .agent-chip.active { border-color: var(--accent); color: var(--accent-text); }
+.lanes-page button.agent-chip { cursor: pointer; font: inherit; }
+.analytics-stamp { margin: 0; }

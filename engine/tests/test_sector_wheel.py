@@ -93,6 +93,7 @@ def test_partial_refresh_retries_failed_symbols_before_marking_day_done(tmp_path
     monkeypatch.setattr(sw, 'build', lambda *_: {'rows': [{}]})
     engine = SimpleNamespace(broker=None, settings=SimpleNamespace(research_database_path=db),
                              latest_ticks={}, _wheel_symbols=lambda: [symbol])
+    engine._stale_while_revalidate = TradingEngine._stale_while_revalidate.__get__(engine)   # no repository: not stored
     async def run():
         await TradingEngine.sector_wheel(engine)
         await engine._wheel_refresh_task
