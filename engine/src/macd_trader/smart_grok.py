@@ -216,7 +216,9 @@ class GrokDesk:
         return float(self.lane.settings.smart_grok_hard_stop_pct)
 
     def book_label(self) -> str:
-        scope = "index options only (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX)" if self.index_only \
+        # No fixed list: every index the MACD lane signals (BANKEX and NIFTYNXT50 too) is in scope. Naming five
+        # made Grok skip a BANKEX signal as "not allowed" in the 18 Nov readiness replay.
+        scope = "index options only; every candidate shown is an index option" if self.index_only \
             else "index and F&O stock options"
         return f"{self.lane.name} (Rs {self.capital:,.0f} paper capital; {scope})"
 
