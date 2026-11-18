@@ -10,6 +10,7 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     proxy: {
+      "/mi/api/logins": { target: process.env.MI_CONSOLE_PROXY || "http://localhost:8410", rewrite: (path) => path.replace(/^\/mi/, "") },
       "/api": gateway,
       "/health": gateway,
       "/parallel": gateway,

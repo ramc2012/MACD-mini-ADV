@@ -30,9 +30,10 @@ type Snapshot = { label: string; armed: boolean; mode: string; capital: number; 
   started_at?: string; rules: Record<string, string>; checked_at: string };
 
 type Tab = "TERMINAL" | "PORTFOLIO" | "STATUS" | "ORDERS" | "TRADES" | "PERFORMANCE" | "JOURNAL";
-const TABS: [Tab, string][] = [["TERMINAL", "Terminal"], ["PORTFOLIO", "Portfolio"], ["STATUS", "Status"], ["ORDERS", "Orders"], ["TRADES", "Trades"],
+// Portfolio first and the default (owner, 18 Nov 2026); a new store key drops the "Terminal" every browser had saved.
+const TABS: [Tab, string][] = [["PORTFOLIO", "Portfolio"], ["TERMINAL", "Terminal"], ["STATUS", "Status"], ["ORDERS", "Orders"], ["TRADES", "Trades"],
   ["PERFORMANCE", "Performance"], ["JOURNAL", "Journal"]];
-const TAB_STORE = "macd.upstoxTab";
+const TAB_STORE = "macd.upstoxTab.v2";
 const recall = (key: string) => { try { return window.localStorage.getItem(key) || ""; } catch { return ""; } };
 const remember = (key: string, value: string) => { try { window.localStorage.setItem(key, value); } catch { /* not kept */ } };
 
@@ -64,7 +65,7 @@ function visibleUntil(exit: string, holidays: string[] = []): string {
 }
 
 export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string, Tick>; holidays?: string[] }) {
-  const [tab, setTab] = useState<Tab>(() => (TABS.some(([key]) => key === recall(TAB_STORE)) ? recall(TAB_STORE) as Tab : "TERMINAL"));
+  const [tab, setTab] = useState<Tab>(() => (TABS.some(([key]) => key === recall(TAB_STORE)) ? recall(TAB_STORE) as Tab : "PORTFOLIO"));
   const [data, setData] = useState<Snapshot | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState("");

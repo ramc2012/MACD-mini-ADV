@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { readableUpstreamError, responseErrorMessage } from "./apiError";
 import { extractAuthCode, tokenLeft } from "./sessionClock";
 import { API_TOKEN, API_URL } from "./runtime";
+import { UpstoxLogin } from "./UpstoxLogin";
 
 type RuntimeSettings = {
   feed_mode: "simulation" | "fyers";
@@ -49,7 +50,7 @@ type RuntimeSettings = {
 
 const headers = { "content-type": "application/json", ...(API_TOKEN ? { "x-macd-token": API_TOKEN } : {}) };
 
-type PanelTab = "FYERS" | "UPSTOX" | "ALERTS" | "STRATEGY";
+type PanelTab = "FYERS" | "UPSTOX_LOGIN" | "UPSTOX" | "ALERTS" | "STRATEGY";
 type LiveBroker = { status: string; error?: string | null; token_expires_at?: string | null; symbol_count?: number };
 
 const IST_EXPIRY = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
@@ -316,7 +317,8 @@ export function SettingsPanel({ open, onClose, initialTab = "FYERS" }: { open: b
     <section ref={panelRef} className="settings-panel" role="dialog" aria-modal="true" aria-label="Trading settings">
       <div className="settings-heading"><div><h2>Trading settings</h2><p>Real broker data · local paper execution</p></div><button aria-label="Close settings" onClick={onClose}>×</button></div>
       {!settings ? <div className="settings-loading">{error ? <><strong>Settings unavailable</strong><p>{error}</p><button onClick={() => window.location.reload()}>Retry</button></> : "Loading settings…"}</div> : <div className="settings-body">
-        <div className="watch-tabs settings-tabs">{(["FYERS", "UPSTOX", "ALERTS", "STRATEGY"] as const).map((key) => <button key={key} className={panelTab === key ? "active" : ""} onClick={() => setPanelTab(key)}>{key === "FYERS" ? "Fyers login" : key === "UPSTOX" ? "Upstox live" : key === "ALERTS" ? "Alerts" : "Strategy"}</button>)}</div>
+        <div className="watch-tabs settings-tabs">{(["FYERS", "UPSTOX_LOGIN", "UPSTOX", "ALERTS", "STRATEGY"] as const).map((key) => <button key={key} className={panelTab === key ? "active" : ""} onClick={() => setPanelTab(key)}>{key === "FYERS" ? "Fyers login" : key === "UPSTOX_LOGIN" ? "Upstox login" : key === "UPSTOX" ? "Upstox live" : key === "ALERTS" ? "Alerts" : "Strategy"}</button>)}</div>
+        {panelTab === "UPSTOX_LOGIN" && <UpstoxLogin />}
         {panelTab === "UPSTOX" && <UpstoxControls />}
         {panelTab === "FYERS" && <FyersLogin
           settings={settings} live={live} clock={clock} saving={saving} progress={progress} message={message} error={error}
