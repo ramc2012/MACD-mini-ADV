@@ -91,9 +91,9 @@ export function StraddlePage({ source = "nse" }: { source?: StraddleSource }) {
   const cadence = data?.cadence_seconds ? (data.cadence_seconds < 120 ? "1-minute chains" : `${Math.round(data.cadence_seconds / 60)}-minute chain sweep`) : "";
   const vsDay = last?.vwap_day ? last.straddle - last.vwap_day : null;
 
-  return <section className="ledger-page straddle-page">
+  return <section className={`ledger-page straddle-page straddle-${source}`}>
     <div className="page-heading ratio-heading">
-      <div><h1>{src.title}</h1><p>{src.blurb}</p></div>
+      <div title={src.blurb}><h1>{src.title}</h1><p>{src.blurb}</p></div>
       <div className="straddle-controls">
         <select className="rrg-select" value={underlying} onChange={(e) => pickUnderlying(e.target.value)} aria-label="Instrument">
           {!instruments.length && <option value={underlying}>{underlying}</option>}
@@ -163,6 +163,10 @@ function StraddleChart({ data, shown, oiMode, loading, error, fitKey }: { data?:
       timeScale: { borderColor: "#263144", timeVisible: true, secondsVisible: false, rightOffset: 3, tickMarkFormatter: (value: Time) => CLOCK.format(asDate(value)) },
       localization: { locale: "en-IN", timeFormatter: (value: Time) => full(typeof value === "number" ? value : asDate(value).getTime() / 1000) },
       crosshair: { vertLine: { color: "#61728a", labelBackgroundColor: "#243247" }, horzLine: { color: "#61728a", labelBackgroundColor: "#243247" } },
+      // The chart covers most of the screen: the wheel and a vertical swipe scroll the page (owner, 18 Nov 2026: "not
+      // able to scroll down"). Pan by dragging; zoom by pinching or dragging the time / price axis.
+      handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+      handleScale: { mouseWheel: false, pinch: true, axisPressedMouseMove: true, axisDoubleClickReset: true },
     });
     const line = (color: string, pane: number, style = LineStyle.Solid, width: 1 | 2 = 2, format?: (v: number) => string) =>
       chart.addSeries(LineSeries, { color, lineWidth: width, lineStyle: style, priceLineVisible: false, lastValueVisible: true,

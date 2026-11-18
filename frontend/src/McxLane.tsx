@@ -124,7 +124,7 @@ export function McxLanePage({ connected }: { connected: boolean }) {
     health.session.calendar_covers_year ? null : "The MCX holiday list has no entries for this year; add them with mcx_holidays_csv.",
   ].filter(Boolean) as string[];
 
-  return <section className="ledger-page blast-page">
+  return <section className={`ledger-page blast-page${tab === "STRADDLE" ? " mcx-wide" : ""}`}>
     <div className="page-heading blast-heading">
       <div><h1>MCX lane</h1>
         <p>Premium MACD zero-cross on ATM {[...health.roots, ...(health.mini_roots ?? [])].map((root) => ROOT_LABEL[root] ?? root).join(", ")} options · MACD lane rules · its own paper book</p></div>

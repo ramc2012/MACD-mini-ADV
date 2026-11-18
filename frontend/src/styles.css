@@ -1522,3 +1522,28 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .lanes-page .agent-chip.active { border-color: var(--accent); color: var(--accent-text); }
 .lanes-page button.agent-chip { cursor: pointer; font: inherit; }
 .analytics-stamp { margin: 0; }
+
+/* Lane tabs taller than the window scroll inside the lane body instead of being clipped (18 Nov 2026). */
+.blast-body { overflow: auto; }
+/* MCX Straddle & OI: the lane header folds to its badges and the chart takes the rest of the window. */
+.mcx-wide .blast-heading { height: auto; align-items: center; }
+.mcx-wide .blast-heading p, .mcx-wide .blast-metrics { display: none; }
+.mcx-wide .blast-heading h1 { font-size: 16px; }
+.straddle-mcx { gap: 6px; }
+.straddle-mcx .page-heading { align-items: center; }
+.straddle-mcx .page-heading h1 { font-size: 15px; }
+.straddle-mcx .page-heading p { display: none; }
+.straddle-mcx .straddle-tiles { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 6px; }
+.straddle-mcx .straddle-tiles > div { padding: 5px 10px; gap: 1px; }
+.straddle-mcx .straddle-tiles b { font-size: 15px; }
+.straddle-mcx .straddle-legend { padding-bottom: 4px; gap: 10px; }
+.straddle-mcx .straddle-legend small { display: none; }
+.blast-body > .straddle-mcx { height: 100%; }
+.blast-body > .straddle-mcx .straddle-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 420px; padding: 4px 6px; }
+.blast-body > .straddle-mcx .straddle-chart { flex: 1 1 auto; height: auto; min-height: 380px; }
+.blast-body > .straddle-mcx .ratio-footer, .blast-body > .straddle-mcx .straddle-table { flex: none; }
+@media (max-width: 1050px) {
+  /* The page scrolls as a whole here: the chart gets most of the screen height. */
+  .blast-body > .straddle-mcx { height: auto; }
+  .blast-body > .straddle-mcx .straddle-chart { height: calc(100dvh - 300px); min-height: 380px; flex: none; }
+}
