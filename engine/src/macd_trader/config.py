@@ -373,6 +373,9 @@ class Settings(BaseSettings):
     # Owner, 18 Nov 2026: trade only the lane's strengths -- swing horizon, setups agentic_brain.STRENGTH_SETUPS,
     # matrix grade A/B (C/D skipped). New opens/arms/adds that miss any of these are rejected with the reason.
     agentic_strengths_only: bool = True
+    # Owner, 18 Nov 2026: "trade near the money contracts". New opens/adds/arms only within this many listed strikes of
+    # the live index (1 = the strike nearest the index and the one either side); 0 turns the rule off.
+    agentic_near_money_steps: int = Field(default=1, ge=0, le=10)
 
     # --- MCX lane (mcx_lane.py) -------------------------------------------
     # The MACD lane's entry and exit rules on MCX commodity options, in its own

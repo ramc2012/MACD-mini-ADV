@@ -481,3 +481,46 @@ def test_finnifty_is_the_fifth_traded_index():
 def test_deeper_effort_waits_longer_for_a_decision():
     assert brain.EFFORT_TIMEOUT["medium"] == 240.0 and brain.EFFORT_TIMEOUT["high"] == 420.0
     assert set(brain.EFFORT_TIMEOUT) == set(brain.EFFORTS)
+
+
+# ----------------------------------------------------------------------------------- near the money (owner, 18 Nov 2026)
+
+NIFTY_ITM = "NSE:NIFTY26OCT22600CE"
+
+
+def test_new_risk_only_near_the_money_from_the_live_index():
+    far = {"C01": {"symbol": NIFTY_ITM, "ltp": 420.0, "lot_size": 75, "expiry": "2099-12-30", "underlying": "NIFTY",
+                   "type": "CE", "strike": 22600}}
+    near = {"C01": {**far["C01"], "symbol": "NSE:NIFTY26OCT22950CE", "strike": 22950, "ltp": 120.0}}
+    live = {"index_prices": {"NIFTY": 23000.0}, "strike_steps": {"NIFTY": 50.0}}
+    out = brain.validate(decision(act("open", "C01", lots=1)), ctx(candidates=far, **live), limits(near_money_steps=1))
+    assert not out.accepted and "8.0 strikes ITM of NIFTY 23,000" in out.rejected[0]["rejected"]
+    assert brain.validate(decision(act("open", "C01", lots=1)), ctx(candidates=near, **live),
+                          limits(near_money_steps=1)).accepted
+    # A call bought at the money that the rally carried four strikes in: no adding to it.
+    pos = {"P01": {"symbol": "NSE:NIFTY26OCT22800CE", "lots": 1, "lot_size": 75, "ltp": 250.0, "value": 18_750,
+                   "return_pct": 60, "expiry": "2099-12-30", "underlying": "NIFTY", "type": "CE", "strike": 22800}}
+    add = brain.validate(decision(act("add", position_id="P01", lots=1)), ctx(positions=pos, **live), limits(near_money_steps=1))
+    assert not add.accepted and "near-the-money" in add.rejected[0]["rejected"]
+    close = brain.validate(decision(act("close", position_id="P01")), ctx(positions=pos, **live), limits(near_money_steps=1))
+    assert close.accepted                                              # managing a held leg is unaffected
+    assert brain.validate(decision(act("open", "C01", lots=1)), ctx(candidates=far, **live),
+                          limits(near_money_steps=0)).accepted       # 0 turns the rule off
+
+
+def test_the_lane_lists_only_near_the_money_index_legs_for_new_risk(tmp_path):
+    lane = build(tmp_path)
+    universe = {f"NSE:NIFTY26OCT{k}CE": {"spot_symbol": "NSE:NIFTY50-INDEX", "option_type": "CE", "strike": k,
+                                         "expiry": "2099-12-30", "lot_size": 75, "volume": 1, "oi": 1}
+                for k in range(22800, 23201, 50)}
+    lane.set_index_universe(universe)
+    for symbol in universe:
+        lane.engine.latest_ticks[symbol] = Tick(symbol, 100.0)
+        lane.execution.set_quote(symbol, 100.0)
+    assert lane.strike_steps()["NIFTY"] == 50
+    prompt, validation = lane.build_context(NOW)
+    strikes = sorted(row["strike"] for row in validation["candidates"].values()
+                     if row["symbol"].startswith("NSE:NIFTY26OCT") and row["symbol"].endswith("CE"))
+    assert strikes == [22950, 23000, 23050]                           # NIFTY 23,000: ATM and one either side
+    assert json.loads(prompt)["data_quality"]["contracts_left_out_far_from_money"] == 6
+    assert validation["strike_steps"]["NIFTY"] == 50 and lane.limits().near_money_steps == 1

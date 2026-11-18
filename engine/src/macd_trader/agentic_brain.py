@@ -124,6 +124,8 @@ Reading the inputs:
   The matrix's first-hour-volume factor is the same kind of read: heavy first hour = wider rest of day.
 - candidates: moneyness, iv_pct, delta, theta_rs_per_lot_day, breakeven, move_needed_pct. Prefer contracts whose
   needed move is realistic against daily_atr and the time left.
+  Only near-the-money contracts are listed for new risk (the strike nearest the index and the one either side, from
+  the live index price); a held contract stays listed for close/reduce but an add needs it to be near the money too.
 - armed_triggers: your pending conditional entries. your_track_record: your recent closed trades.
 - data_quality: freshness flags. Missing VIX or a stale option chain lowers confidence; it is rarely a reason by
   itself to skip a trade whose price structure is clear.
@@ -450,6 +452,28 @@ class Limits:
     no_new_after: str = "15:10"          # HH:MM IST
     expiry_no_new_after: str = "13:30"   # on a contract's expiry day
     strengths_only: bool = False         # the live lane sets it from settings.agentic_strengths_only (owner, 18 Nov 2026)
+    near_money_steps: int = 0            # >0: open/add/arm only within this many listed strikes of the live index (owner, 18 Nov 2026)
+
+
+def far_from_money(row: dict, context: dict, steps: int) -> str | None:
+    """Why a contract is too far from the money to open or add to, or None.
+
+    Measured at the moment of the order from the live index price, in the index's own strike interval: with steps 1,
+    the strike nearest the index and the one either side are allowed (|strike - index| <= 1.5 intervals). A leg the
+    morning selection called ATM drifts into the money on a trending day; this keeps new risk near the money."""
+    if steps <= 0:
+        return None
+    strike = _num(row.get("strike"))
+    price = _num((context.get("index_prices") or {}).get(row.get("underlying")))
+    step = _num((context.get("strike_steps") or {}).get(row.get("underlying")))
+    if strike is None or not price or not step:
+        return None
+    away = abs(strike - price) / step
+    if away <= steps + 0.5:
+        return None
+    side = "ITM" if (strike < price) == (row.get("type") == "CE") else "OTM"
+    return (f"strike {strike:g} is {away:.1f} strikes {side} of {row.get('underlying')} {price:,.0f}: only near-the-money "
+            f"contracts (ATM ±{steps} strike) may be opened or added (owner, 18 Nov 2026)")
 
 
 @dataclass
@@ -566,11 +590,15 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                 if pos.get("horizon") in HORIZONS:          # an add belongs to the position's own horizon
                     action["horizon"] = pos["horizon"]
                 row = {"symbol": pos["symbol"], "ltp": pos["ltp"], "lot_size": pos["lot_size"], "expiry": pos.get("expiry"),
-                       "underlying": pos.get("underlying"), "type": pos.get("type")}
+                       "underlying": pos.get("underlying"), "type": pos.get("type"), "strike": pos.get("strike")}
                 held_value = float(pos.get("value", 0.0))
             ltp, lot_size = _num(row.get("ltp")), int(row.get("lot_size") or 0)
             if not ltp or ltp <= 0 or lot_size < 1:
                 reject(action, "no live price or lot size")
+                continue
+            far = far_from_money(row, context, limits.near_money_steps)
+            if far:
+                reject(action, far)
                 continue
             if row.get("expiry") == context["today"] and now >= limits.expiry_no_new_after:
                 reject(action, "contract expires today: no new risk this late")

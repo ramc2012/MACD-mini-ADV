@@ -521,7 +521,26 @@ class AgenticLane:
         return brain.Limits(capital=self.capital, max_positions=s.agentic_max_positions,
                             max_position_pct=s.agentic_max_position_pct, max_deployed_pct=s.agentic_max_deployed_pct,
                             daily_loss_stop_pct=s.agentic_daily_loss_stop_pct, max_lots_per_order=s.agentic_max_lots_per_order,
-                            strengths_only=bool(getattr(s, "agentic_strengths_only", True)))
+                            strengths_only=bool(getattr(s, "agentic_strengths_only", True)),
+                            near_money_steps=int(getattr(s, "agentic_near_money_steps", 1)))
+
+    def strike_steps(self) -> dict[str, float]:
+        """Each index's listed strike interval, from the strikes the lane can trade (smallest gap between them)."""
+        by_root: dict[str, set[float]] = {}
+        for row in self._index_ctx.values():
+            try:
+                strike = float(row.get("strike") or 0)
+            except (TypeError, ValueError):
+                continue
+            if strike > 0:
+                by_root.setdefault(_underlying_of(row.get("spot_symbol", "")), set()).add(strike)
+        out = {}
+        for root, strikes in by_root.items():
+            ordered = sorted(strikes)
+            gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b - a > 0]
+            if gaps:
+                out[root] = min(gaps)
+        return out
 
     def _restore(self) -> None:
         rows = sorted(self.repository.rows("trades", 1_000_000), key=lambda row: row["timestamp"])
@@ -836,6 +855,9 @@ class AgenticLane:
                 by_spot.setdefault((row["spot_symbol"], row.get("option_type", "")), []).append((symbol, row))
         candidates, cand_rows = {}, []
         stale_skipped = 0
+        far_skipped = 0
+        steps = self.strike_steps()
+        near_steps = int(getattr(self.settings, "agentic_near_money_steps", 1))
         for (spot, side), rows in sorted(by_spot.items()):
             spot_price = self._price(spot)
             keep = sorted(rows, key=lambda item: (str(item[1].get("expiry") or ""), float(item[1].get("strike") or 0))) \
@@ -844,6 +866,11 @@ class AgenticLane:
             for symbol, row in keep:
                 ltp = self._price(symbol)
                 if not ltp:
+                    continue
+                step = steps.get(_underlying_of(spot))
+                if (near_steps > 0 and step and spot_price and symbol not in held
+                        and abs(float(row.get("strike") or 0) - spot_price) / step > near_steps + 0.5):
+                    far_skipped += 1            # owner, 18 Nov 2026: new risk near the money only
                     continue
                 age = self._tick_age(symbol, now)
                 if in_session(now) and (age is None or age > STALE_CANDIDATE_SECONDS):
@@ -859,7 +886,8 @@ class AgenticLane:
                     spread = _r((tick.ask - tick.bid) / ((tick.ask + tick.bid) / 2) * 100)
                 st = stats.get(spot, {})
                 candidates[cid] = {"symbol": symbol, "ltp": ltp, "lot_size": lot, "expiry": expiry,
-                                   "underlying": _underlying_of(spot), "type": side, "sessions_to_expiry": dte}
+                                   "underlying": _underlying_of(spot), "type": side, "sessions_to_expiry": dte,
+                                   "strike": row.get("strike")}
                 is_index = spot in INDEX_SPOTS.values()
                 risk = feat.contract_risk(ltp, spot_price or 0.0, float(row.get("strike") or 0), expiry, side == "CE", lot, now)
                 cand_rows.append({"id": cid, "underlying": _underlying_of(spot), "type": side, "strike": row.get("strike"),
@@ -968,7 +996,7 @@ class AgenticLane:
             positions[pid] = {"symbol": symbol, "lots": p.lots, "lot_size": p.lot_size, "ltp": ltp, "value": value,
                               "horizon": meta.get("horizon"),
                               "underlying": _underlying_of(contract.get("spot_symbol", "")), "type": contract.get("option_type"),
-                              "stop_premium": meta.get("stop_premium"),
+                              "strike": contract.get("strike"), "stop_premium": meta.get("stop_premium"),
                               "return_pct": ret, "expiry": str(expiry or "")[:10], "booked": bool(meta.get("booked"))}
             pos_rows.append({"position_id": pid, "contract": symbol, "lots": p.lots, "avg_premium": _r(p.average_price),
                              "premium_now": _r(ltp), "return_pct": _r(ret, 1), "best_pct": _r(p.max_return_pct, 1),
@@ -1021,13 +1049,15 @@ class AgenticLane:
             "your_recent_notes": [{"at": c["at"][11:16], "view": c["market_view"], "note": c["notes"]} for c in recent],
             "your_track_record": feat.track_record(self.repository.closed_positions(lane=self.name, limit=80)),
             "data_quality": {**self._data_quality(now, stats, features, signals),
-                             "contracts_left_out_no_live_price": stale_skipped},
+                             "contracts_left_out_no_live_price": stale_skipped,
+                             "contracts_left_out_far_from_money": far_skipped},
         }
         validation = {"candidates": candidates, "positions": positions, "book": book, "matrix": matrix,
                       "entries_today": self.entries_today(today), "settle_until": SETTLE_UNTIL.strftime("%H:%M"),
                       "clock": now.strftime("%H:%M"), "today": today, "market_open": in_session(now),
                       "triggers": dict(self.armed), "armed_count": len(self.armed),
-                      "index_prices": {root: self._price(spot) for root, spot in INDEX_SPOTS.items()}}
+                      "index_prices": {root: self._price(spot) for root, spot in INDEX_SPOTS.items()},
+                      "strike_steps": steps}
         return json.dumps(prompt, separators=(",", ":"), default=str), validation
 
     def _data_quality(self, now: datetime, stats: dict, features: dict, signals: dict) -> dict:
@@ -1283,16 +1313,20 @@ class AgenticLane:
         for i, (s, p) in enumerate(((s, p) for s, p in self.portfolio.positions.items() if p.quantity > 0), 1):
             ltp = self._price(s) or p.last_price
             positions[f"P{i:02d}"] = {"symbol": s, "lots": p.lots, "lot_size": p.lot_size, "ltp": ltp, "value": ltp * p.quantity,
-                                      "expiry": str(self._contracts.get(s, {}).get("expiry") or "")[:10]}
+                                      "expiry": str(self._contracts.get(s, {}).get("expiry") or "")[:10],
+                                      "strike": self._contracts.get(s, {}).get("strike"),
+                                      "underlying": _underlying_of(self._contracts.get(s, {}).get("spot_symbol", "")),
+                                      "type": self._contracts.get(s, {}).get("option_type")}
             deployed += p.average_price * p.quantity
         snap = self.portfolio.snapshot()
         contract = self._contracts.get(symbol, {})
         context = {"candidates": {"C": {"symbol": symbol, "ltp": price, "lot_size": self.execution.lot_sizes.get(symbol, 0),
                                         "expiry": str(contract.get("expiry") or "")[:10],
                                         "underlying": _underlying_of(contract.get("spot_symbol", "")),
-                                        "type": contract.get("option_type")}},
+                                        "type": contract.get("option_type"), "strike": contract.get("strike")}},
                    "entries_today": self.entries_today(now.date().isoformat()),
                    "index_prices": {root: self._price(spot) for root, spot in INDEX_SPOTS.items()},
+                   "strike_steps": self.strike_steps(),
                    "positions": positions, "book": {"cash": self.portfolio.cash, "deployed": deployed, "day_pnl": self._day_pnl(snap)},
                    "clock": now.strftime("%H:%M"), "today": now.date().isoformat(), "market_open": in_session(now)}
         pid = next((k for k, v in positions.items() if v["symbol"] == symbol), None)
