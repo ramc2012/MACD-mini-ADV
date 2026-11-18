@@ -18,8 +18,14 @@ type Position = {
   symbol: string; quantity: number; lots: number; lot_size: number; average_price: number; last_price: number; opened_at: string;
   hard_stop: number; trailing_stop: number | null; source: string; expiry: string | null; target_price: number | null;
   hold_until: string | null; score: number | null; dispersion: number | null; unrealized_pnl: number;
+  stop_price?: number | null; grok?: { stop: number | null; target: number | null; conviction: string | null; reason: string | null };
 };
-type Health = { pending: number; cutoff: number; rolling_scores: number; error: string | null; last_batch_at: string | null;
+type GrokHealth = { enabled: boolean; ticket?: string; slots?: number; index_only?: boolean; queued?: number; effort?: string; error?: string | null;
+  entry_in_flight?: boolean; exit_in_flight?: boolean; safety_stop_pct?: number;
+  today?: { calls: number; cost_usd: number; errors: number; avg_latency_ms: number | null; taken: number; candidates: number };
+  last_entry?: { at: string; market_read: string; candidates: number; taken: number } | null;
+  last_exit?: { at: string; market_read: string; actions: { symbol: string; action: string; reason: string }[] } | null };
+type Health = { grok?: GrokHealth; pending: number; cutoff: number; rolling_scores: number; error: string | null; last_batch_at: string | null;
   intelligence?:{policy:string;mode:string;qwen_required:boolean;validation:string;last_allocation?:{priority:number;observed_at:string}};
   rules: { entry_delay_seconds: number; skip_fraction: number; ticket_fraction: number | null; slots?: number | null; sizing?: string; liquidity_share_pct: number;
     macd: { hard: number; act: number; trail: number; target: number | null; hold: number }; blast: { hard: number; act: number; trail: number } | null } };
@@ -43,7 +49,7 @@ const short = (symbol: string) => symbol.replace(/^(NSE|BSE):/, "");
 const percent = (value: number | null | undefined, digits = 1) => value == null || !Number.isFinite(value) ? "—" : `${value > 0 ? "+" : ""}${value.toFixed(digits)}%`;
 const money = (value: number) => `₹${value >= 100_000 ? `${(value / 100_000).toFixed(2)} L` : `${(value / 1000).toFixed(1)}k`}`;
 const label = (lane: string) => lane.replace("smart_", "₹").toUpperCase();
-const DECISIONS = ["", "TAKEN", "WAITING_PRICE", "NO_PRICE", "SESSION_CLOSED", "QWEN_REJECTED", "QWEN_UNAVAILABLE", "QWEN_STALE", "SKIPPED_LOW_SCORE", "MACD_FADED", "LOT_ABOVE_TICKET", "NO_CASH", "POSITION_LIMIT", "TOO_ILLIQUID", "ALREADY_HELD", "STALE", "NOT_TRADABLE", "ENTRY_REJECTED"];
+const DECISIONS = ["", "TAKEN", "WAITING_PRICE", "NO_PRICE", "SESSION_CLOSED", "QWEN_REJECTED", "QWEN_UNAVAILABLE", "QWEN_STALE", "SKIPPED_LOW_SCORE", "MACD_FADED", "LOT_ABOVE_TICKET", "NO_CASH", "POSITION_LIMIT", "TOO_ILLIQUID", "ALREADY_HELD", "STALE", "NOT_TRADABLE", "ENTRY_REJECTED", "GROK_SKIP", "GROK_UNAVAILABLE", "GROK_PRICE_MOVED", "GROK_STALE"];
 
 function LaneCard({ summary, active, curve, onSelect }: { summary: Summary; active: boolean; curve: number[]; onSelect: () => void }) {
   const all = summary.all;
@@ -140,6 +146,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
       </div>}
     </div>
     <section className="panel agent-panel" aria-label="Local allocation status"><div className="panel-title">{health?.intelligence?.policy??'Checking allocation policy…'}</div><div className="agent-actions"><span className="agent-chip">{marked?`${Math.max(0,(1-marked.cash/Math.max(1,marked.equity))*100).toFixed(1)}%`:'—'} capital deployed</span>{rules?.slots?<span className="agent-chip" title="Owner limit: no new entry while every slot is used">{marked?.positions.length??0} / {rules.slots} slots used</span>:null}<span className="agent-chip">{health?.pending??0} queued</span><span className="agent-chip">Last batch {when(health?.last_batch_at)}</span></div><details><summary>ⓘ Allocation policy and limits</summary><p>Same MACD BUY signals, rechecked after {rules?rules.entry_delay_seconds/60:5} minutes. Local research rank, current premium MACD, side breadth, fresh spot alignment and existing exposure determine priority. {rules?.slots?`Up to ${rules.slots} open positions; each entry gets the available cash divided by the free slots, sized down on the weaker side by CE/PE breadth, in whole lots.`:`Side breadth sizes whole-lot tickets within ${rules?.ticket_fraction?Math.round(rules.ticket_fraction*100):10}% of equity and available cash.`} The research rank no longer changes the size: live, it did not separate winners from losers. Missing quotes retry for up to ten minutes; a fill always needs a fresh quote. No Qwen call is required. Flow is recorded as context, without a directional veto. Existing exits are retained. Priority is a heuristic, not a calibrated profit probability; prospective improvement is unproven.</p></details></section>
+    {health?.grok?.enabled && <GrokPanel grok={health.grok} />}
     {(error || health?.error) && <div className="agent-error">{error || health?.error}</div>}
     <small>Retained book history · totals below include earlier policies and do not measure the new allocation policy.</small>
     <div className="lane-cards">{lanes.map((lane) => {
@@ -168,7 +175,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
               <td>{short(p.symbol)}<small> {p.expiry ? `exp ${p.expiry.slice(5)}` : ""}</small></td><td>{p.source}</td><td>{p.lots}</td>
               <td>{p.average_price.toFixed(2)}</td><td>{ltp.toFixed(2)}</td>
               <td className={tone(ret)}>{percent(ret)}<small> {rupees((ltp - p.average_price) * p.quantity)}</small></td>
-              <td>{p.hard_stop.toFixed(2)}</td><td>{p.trailing_stop ? p.trailing_stop.toFixed(2) : "—"}</td><td>{p.target_price ? p.target_price.toFixed(2) : "—"}</td>
+              <td>{p.stop_price ? <>{p.stop_price.toFixed(2)}<small> Grok · safety {p.hard_stop.toFixed(2)}</small></> : p.hard_stop.toFixed(2)}</td><td>{p.trailing_stop ? p.trailing_stop.toFixed(2) : "—"}</td><td>{p.target_price ? p.target_price.toFixed(2) : "—"}</td>
               <td>{when(p.hold_until)}</td><td>{p.score == null ? "—" : p.score.toFixed(3)}</td><td>{p.dispersion == null ? "—" : p.dispersion.toFixed(2)}</td><td>{when(p.opened_at)}</td>
             </tr>;
           })}</tbody></table></div>}
@@ -196,7 +203,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
               <th>Time</th><th>Source</th><th>Contract</th><th>Decision</th><th>Priority / research score</th><th>Size×</th><th>Ticket</th><th>Lots</th><th>Signal → check</th>
             </tr></thead><tbody>{journal.map((row) => <tr key={row.id}>
               <td>{when(row.at)}</td><td>{row.source}</td><td>{short(row.symbol)}</td>
-              <td className={row.decision === "TAKEN" ? "positive" : ""}>{row.decision.replace(/_/g, " ").toLowerCase()}</td>
+              <td className={row.decision === "TAKEN" ? "positive" : ""}>{row.decision.replace(/_/g, " ").toLowerCase()}{grokReason(row) && <small> · Grok: {grokReason(row)}</small>}</td>
               <td>{typeof (row.detail.allocation as {priority?:number}|undefined)?.priority==='number'?(row.detail.allocation as {priority:number}).priority.toFixed(3):'—'}<small> / {row.score == null ? '—' : row.score.toFixed(3)}</small><details><summary>ⓘ Inputs</summary><pre>{JSON.stringify(row.detail,null,2)}</pre></details></td>
               <td>{row.dispersion == null ? "—" : row.dispersion.toFixed(2)}</td><td>{row.ticket == null ? "—" : money(row.ticket)}</td><td>{row.lots ?? "—"}</td>
               <td>{row.signal_price?.toFixed(2) ?? "—"}{row.check_price != null && <small> → {row.check_price.toFixed(2)}</small>}</td>
@@ -206,4 +213,26 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
     </>}
     {focus && <LaneChartModal list={focus.list} index={focus.index} onIndex={(index) => setFocus((old) => old && { ...old, index })} onClose={() => setFocus(undefined)} />}
   </div>;
+}
+
+function grokReason(row: JournalRow): string | null {
+  const grok = row.detail.grok as { reason?: string | null } | undefined;
+  return grok?.reason || null;
+}
+
+function GrokPanel({ grok }: { grok: GrokHealth }) {
+  const t = grok.today;
+  return <section className="panel agent-panel" aria-label="Grok picks">
+    <div className="panel-title">Grok picks and exits <small>{grok.ticket} · up to {grok.slots} positions{grok.index_only ? " · index signals only" : ""} · not proven</small></div>
+    <div className="agent-actions">
+      <span className="agent-chip">Today {t?.candidates ?? 0} shown → {t?.taken ?? 0} taken</span>
+      <span className="agent-chip">{t?.calls ?? 0} calls · ${(t?.cost_usd ?? 0).toFixed(2)}{t?.avg_latency_ms ? ` · ${(t.avg_latency_ms / 1000).toFixed(0)} s avg` : ""}{t?.errors ? ` · ${t.errors} failed` : ""}</span>
+      <span className="agent-chip">{grok.queued ?? 0} queued{grok.entry_in_flight ? " · picking…" : ""}{grok.exit_in_flight ? " · reviewing…" : ""}</span>
+      <span className="agent-chip">Safety stop {Math.round((grok.safety_stop_pct ?? 0.5) * 100)}%</span>
+    </div>
+    {grok.last_entry && <p><b>Last pick</b> {when(grok.last_entry.at)} — {grok.last_entry.taken} of {grok.last_entry.candidates} taken. {grok.last_entry.market_read}</p>}
+    {grok.last_exit && <p><b>Last review</b> {when(grok.last_exit.at)} — {grok.last_exit.market_read}{grok.last_exit.actions.filter((a) => a.action !== "hold").map((a) => ` · ${short(a.symbol)} ${a.action.replace("_", " ")}: ${a.reason}`).join("")}</p>}
+    {grok.error && <small className="negative">{grok.error}</small>}
+    <details><summary>ⓘ How these books trade</summary><p>MACD BUY signals that pass the usual checks (not held, today's ATM leg, one per stock, in session, fresh quote, MACD still above zero after five minutes) are sent to Grok in batches. Grok takes only the ones it judges the best probable winners and may skip them all. Each take is a fixed ticket in whole lots. Grok sets a stop and a target premium and reviews open positions every 30 minutes (hold, close, halve, move the levels); the code also keeps the safety stop and the expiry-day and stock-series exits. Every call, with what was sent and what came back, is kept in the book's database.</p></details>
+  </section>;
 }

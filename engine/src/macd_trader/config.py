@@ -294,6 +294,24 @@ class Settings(BaseSettings):
     smart_max_hold_sessions: int = Field(default=4, ge=0, le=60)
     smart_min_dispersion_size: float = Field(default=0.25, gt=0, le=1)
     smart_blast_source: bool = False
+    # Grok picks and manages the smart books' trades (smart_grok.py; owner, 18 Nov 2026, live from 19 Nov): MACD
+    # signals that pass the structural checks are batched to Grok, which takes the best probable winners and may skip
+    # all. Tickets: values <= 1 are a fraction of equity (Rs 1 L index-only book: a third), larger are rupees (Rs 50 L
+    # book: Rs 1 L). Grok sets stop/target premiums and reviews open positions every 30 minutes; the code keeps a
+    # safety stop and the expiry/series exits. The key, model and endpoint are the agentic lane panel's.
+    smart_grok_enabled: bool = True
+    smart_grok_lanes_csv: str = "smart_1l,smart_50l"
+    smart_grok_index_only_csv: str = "smart_1l"
+    smart_grok_tickets_csv: str = "100000:0.33,5000000:100000"
+    smart_grok_slots_csv: str = "100000:3,5000000:50"
+    smart_grok_one_lot_stretch: float = Field(default=1.5, ge=1, le=5)
+    smart_grok_hard_stop_pct: float = Field(default=0.50, gt=0, lt=1)
+    smart_grok_max_drift_pct: float = Field(default=0.08, ge=0, le=1)
+    smart_grok_batch_seconds: float = Field(default=60.0, ge=0, le=900)
+    smart_grok_max_batch: int = Field(default=30, ge=1, le=100)
+    smart_grok_effort: str = "low"
+    smart_grok_timeout_seconds: float = Field(default=180.0, ge=10, le=900)
+    smart_grok_max_tokens: int = Field(default=6000, ge=500, le=32000)
 
     # Spot MACD lane (spot_lane.py; owner, 3 Nov 2026: "a positional trading system with macd rules but to trade
     # spot with ticket size of 1L"). Long-only cash equities on the MACD lane's own EQ signals (30-min MACD zero

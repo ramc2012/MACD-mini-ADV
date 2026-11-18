@@ -1024,6 +1024,18 @@ async def smart_lane_journal(name: str, day: str | None = Query(default=None, pa
     return {"rows": rows, "days": await asyncio.to_thread(lane.journal_days)}
 
 
+@app.get("/api/lanes/{name}/grok", dependencies=[Depends(authorize)])
+async def smart_lane_grok(name: str, day: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                          limit: int = Query(default=40, ge=1, le=500)):
+    """The book's Grok calls (smart_grok.py): what was sent, what came back, latency and cost."""
+    lane = _smart_lane(name)
+    grok = getattr(lane, "grok", None)
+    if grok is None:
+        return {"enabled": False, "calls": []}
+    calls = await asyncio.to_thread(lambda: grok.calls(day=day, limit=limit))
+    return {"enabled": True, "health": grok.health(), "calls": calls}
+
+
 @app.get("/api/lanes/{name}/book", dependencies=[Depends(authorize)])
 async def smart_lane_book(name: str, limit: int = Query(default=500, ge=1, le=5000), today: bool = False):
     """A lane's own orders, fills, portfolio and recently closed positions, in the MACD lane's shapes (its ledger)."""

@@ -1147,7 +1147,8 @@ class TradingEngine(DeskMixin):
                 lane.execution.set_entry_universe(atm)
             lane.set_contract_context(lane_context)
             lane.set_resolvers(macd_confirm=self._smart_macd_confirm, dispersion=self.dispersion_point,
-                               entry_context=self._smart_entry_context, whale=self.whale_interest.reading)
+                               entry_context=self._smart_entry_context, whale=self.whale_interest.reading,
+                               market_frame=self._smart_market_frame)
         if getattr(self, "agentic", None) is not None:
             # The agentic lane may pick any selected index strike or roll to the next expiry.
             self.agentic.set_index_universe({
@@ -2372,6 +2373,38 @@ class TradingEngine(DeskMixin):
         if indicator is None or not price or price <= 0:
             return None
         return indicator.preview(price).macd > 0
+
+    def _smart_market_frame(self, now: datetime) -> dict:
+        """What Grok sees of the market for the smart books: the five indices, VIX, CE/PE MACD breadth and the
+        agentic lane's last view. Read from live ticks and stored state only; no broker request."""
+        from .universe import INDEX_SPOTS
+
+        def pct(a, b):
+            return round(100 * (a / b - 1), 2) if a and b and a > 0 and b > 0 else None
+
+        out: dict = {"indices": {}}
+        for root in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+            symbol = INDEX_SPOTS[root]
+            tick = self.latest_ticks.get(symbol)
+            if not tick:
+                continue
+            opened, high, low = self.entry_gate.days.get(symbol)
+            out["indices"][root] = {"ltp": round(tick.ltp, 2), "vs_prev_close_pct": pct(tick.ltp, tick.prev_close),
+                                    "vs_open_pct": pct(tick.ltp, opened), "vs_vwap_pct": pct(tick.ltp, tick.avg_trade_price),
+                                    "day_high": high, "day_low": low,
+                                    "age_s": round((now - tick.timestamp).total_seconds())}
+        vix = self.latest_ticks.get(self.settings.vix_symbol)
+        if vix:
+            out["india_vix"] = {"ltp": round(vix.ltp, 2), "vs_prev_close_pct": pct(vix.ltp, vix.prev_close)}
+        point = self.dispersion_point()
+        if point is not None:
+            out["option_macd_breadth"] = {"ce_above_zero": point.ce_above, "ce_cohort": point.ce_eligible,
+                                          "pe_above_zero": point.pe_above, "pe_cohort": point.pe_eligible}
+        last = getattr(getattr(self, "agentic", None), "last_cycle", None)
+        if last:
+            out["agentic_view"] = {"at": last.get("at"), "regime": last.get("regime"),
+                                   "market_view": str(last.get("market_view") or "")[:600]}
+        return out
 
     def _smart_entry_context(self, item, now: datetime) -> dict:
         """Read existing quotes/indicators/flow; no broker request or signal/crowd recomputation."""

@@ -19,6 +19,7 @@ from threading import Lock
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .config import RUNTIME_DIR
 from .rollover import stock_exit_due
 from . import market_calendar, sessions
 from .blast_engine import LaneEvents, OrderOnlyBroker
@@ -28,6 +29,8 @@ from .portfolio import Portfolio, breakeven_exit_price
 from .repository import TradeRepository
 from .smart_model import MODEL
 from . import smart_intelligence
+from . import smart_grok
+from .smart_grok import GROK_SOURCE
 
 IST = ZoneInfo("Asia/Kolkata")
 MACD_SOURCE = "macd"
@@ -169,6 +172,11 @@ class SmartExecutionManager(ExecutionManager):
         if source == BLAST_SOURCE:
             return {"hard": s.blast_hard_stop_pct, "act": s.blast_trail_activation_pct, "trail": s.blast_trail_pct,
                     "target": None, "staged": False, "hold": 0, "invalidate": False}
+        if source == GROK_SOURCE:
+            # Grok manages the exit (owner, 18 Nov 2026): its own stop/target levels plus a safety stop; no
+            # trail, fixed target, staged thirds, hold limit or MACD invalidation.
+            return {"hard": s.smart_grok_hard_stop_pct, "act": math.inf, "trail": s.smart_trail_pct,
+                    "target": None, "staged": False, "hold": 0, "invalidate": False}
         return {"hard": s.smart_hard_stop_pct, "act": s.smart_trail_activation_pct, "trail": s.smart_trail_pct,
                 "target": s.smart_target_pct, "staged": True, "hold": s.smart_max_hold_sessions, "invalidate": True}
 
@@ -205,12 +213,17 @@ class SmartExecutionManager(ExecutionManager):
         reason = None
         expiry = meta.get("expiry")
         today = now.date().isoformat()
+        levels = self.lane.grok_levels.get(symbol) or {}
         if expiry and (expiry < today or (expiry == today and now.time() >= FLATTEN_AT)):
             reason = "EXPIRY_DAY_FLATTEN"
         elif expiry and stock_exit_due(symbol, expiry, now, (FLATTEN_AT.hour, FLATTEN_AT.minute)):
             reason = "STOCK_SERIES_LAST_DAY_EXIT"     # T-2 for stock options (rollover.py)
         elif price <= position.hard_stop:
             reason = f"HARD_STOP_{round(rules['hard'] * 100)}_PCT"
+        elif levels.get("stop") and price <= levels["stop"]:
+            reason = "GROK_STOP"
+        elif levels.get("target") and price >= levels["target"]:
+            reason = "GROK_TARGET"
         elif position.trailing_stop and price <= position.trailing_stop:
             reason = f"TRAILING_STOP_{round(rules['trail'] * 100)}_PCT"
         elif rules["target"] and price >= position.average_price * (1 + rules["target"]):
@@ -276,6 +289,9 @@ class SmartLane:
         self._dispersion = lambda: None
         self._entry_context = lambda item, now: {}
         self._whale = lambda symbol: None    # the underlying's live whale reading (engine.whale_interest)
+        self._market_frame = lambda now: {}  # indices, VIX, breadth, agentic view (engine._smart_market_frame)
+        self.grok: smart_grok.GrokDesk | None = None     # Grok picks and exits (configure_grok)
+        self.grok_levels: dict[str, dict] = {}           # symbol -> Grok's stop/target premiums
         self._last_equity = 0.0
         self._last_equity_write = -1e9
         self._last_equity_value = float("nan")
@@ -303,6 +319,66 @@ class SmartLane:
     def apply_settings(self, settings) -> None:
         self.settings = settings
         self.execution.settings = self.execution_settings(settings)
+
+    def configure_grok(self, enabled: bool, runtime_dir: str | None = None) -> None:
+        """Grok mode on or off for this book; its levels for open Grok positions are restored either way."""
+        if enabled and self.grok is None:
+            self.grok = smart_grok.GrokDesk(self, runtime_dir)
+        elif not enabled:
+            self.grok = None
+        with self._db_lock, self._db:
+            self._db.executescript(smart_grok.CALLS_SCHEMA)
+            rows = self._db.execute("SELECT * FROM smart_grok_levels").fetchall()
+        open_ids = {p.position_id: s for s, p in self.portfolio.positions.items() if p.quantity > 0}
+        self.grok_levels = {open_ids[r["position_id"]]: {"stop": r["stop"], "target": r["target"],
+                                                         "conviction": r["conviction"], "reason": r["reason"],
+                                                         "updated_at": r["updated_at"]}
+                            for r in rows if r["position_id"] in open_ids}
+
+    def set_grok_levels(self, symbol: str, stop, target, *, conviction: str | None = None, reason: str | None = None,
+                        now: datetime | None = None, keep_reason: bool = False) -> dict:
+        """Check and keep Grok's stop/target premiums for an open position.
+
+        A stop at or above the current premium, or a target at or below it, is not a level (Grok closes instead):
+        the previous level stays. A stop below the safety stop is dropped -- the safety stop already covers it.
+        None clears that side.
+        """
+        position = self.portfolio.positions.get(symbol)
+        if position is None or position.quantity <= 0:
+            return {}
+        now = now or datetime.now(UTC)
+        previous = self.grok_levels.get(symbol) or {}
+        price = self.execution.last_prices.get(symbol) or position.last_price or position.average_price
+        floor = position.average_price * (1 - self.settings.smart_grok_hard_stop_pct)
+        notes = []
+
+        def number(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) and value > 0 else None
+
+        stop, target = number(stop), number(target)
+        if stop is not None and stop >= price:
+            notes.append("stop at or above the premium ignored")
+            stop = previous.get("stop")
+        elif stop is not None and stop <= floor:
+            notes.append("stop below the safety stop dropped")
+            stop = None
+        if target is not None and target <= price:
+            notes.append("target at or below the premium ignored")
+            target = previous.get("target")
+        row = {"stop": None if stop is None else round(stop, 2), "target": None if target is None else round(target, 2),
+               "conviction": conviction or previous.get("conviction"),
+               "reason": previous.get("reason") if keep_reason and previous.get("reason") else reason,
+               "updated_at": now.isoformat()}
+        self.grok_levels[symbol] = row
+        with self._db_lock, self._db:
+            self._db.execute("INSERT OR REPLACE INTO smart_grok_levels VALUES (?,?,?,?,?,?,?)",
+                             (position.position_id, symbol, row["stop"], row["target"], row["conviction"],
+                              row["reason"], row["updated_at"]))
+        return {"stop": row["stop"], "target": row["target"], "notes": notes}
 
     # ---------------------------------------------------------------- restore
 
@@ -368,7 +444,10 @@ class SmartLane:
             symbol: row.get("expiry") for symbol, row in self._contracts.items()
         })
 
-    def set_resolvers(self, *, macd_confirm=None, dispersion=None, entry_context=None, whale=None) -> None:
+    def set_resolvers(self, *, macd_confirm=None, dispersion=None, entry_context=None, whale=None,
+                      market_frame=None) -> None:
+        if market_frame is not None:
+            self._market_frame = market_frame
         if whale is not None:
             self._whale = whale
         if macd_confirm is not None:
@@ -389,6 +468,8 @@ class SmartLane:
         now = now or datetime.now(UTC)
         if signal.side != 'BUY' or option_type not in ('CE', 'PE'):
             return
+        if self.grok is not None and self.grok.index_only and not smart_grok.is_index_option(signal.symbol):
+            return                       # the Rs 1 L Grok book takes index signals only (owner, 18 Nov 2026)
         if any(p.source == MACD_SOURCE and p.symbol == signal.symbol and
                (p.signal.signal_id == signal.signal_id or p.bucket == signal.evaluated_candle_timestamp
                 and p.bucket is not None) for p in self._pending):
@@ -430,6 +511,8 @@ class SmartLane:
     async def step(self, now: datetime | None = None) -> int:
         """Act on every due entry; MACD-sourced ones best-first within the rank window."""
         now = now or datetime.now(UTC)
+        if self.grok is not None:
+            await self.grok.tick(now)
         due = [p for p in self._pending if p.due <= now and (p.retry_at is None or p.retry_at <= now)]
         if not due:
             return 0
@@ -548,7 +631,14 @@ class SmartLane:
         if item.source == MACD_SOURCE:
             if self._macd_confirm(symbol, item.bucket, price) is not True:
                 return self._record(item, MACD_FADED, now, price=price, cut=cut)
-            base = dispersion_size(item.option_type, self._dispersion(), self.settings.smart_min_dispersion_size)
+            if self.grok is not None:
+                held = len(self.held_symbols())
+                if held >= self.grok.slots:
+                    return self._record(item, POSITION_LIMIT, now, price=price, cut=cut,
+                                        detail={"held": held, "slots": self.grok.slots})
+                self.grok.enqueue(item, price, now)          # Grok takes or skips it in the next batch
+                return None
+            base =dispersion_size(item.option_type, self._dispersion(), self.settings.smart_min_dispersion_size)
             ranked = score_size(item.score, self._scores, getattr(self.settings, "smart_min_score_size", 0.25))
             if item.detail.get('whale'):
                 ranked = 1.0          # owner, 3 Nov 2026: no score cut-down on a whale-interesting underlying
@@ -557,14 +647,7 @@ class SmartLane:
         else:
             base = size
         lot = execution.lot_sizes[symbol]
-        # Reserve the larger of adverse LTP slippage and the shared quoted ask.
-        # Budgeting only LTP used to reject otherwise affordable fills at the ask.
-        estimated = price * (1 + self.settings.slippage_bps / 10_000)
-        tick = execution.quote_source(symbol) if execution.quote_source and self.settings.paper_cross_spread else None
-        bid, ask = getattr(tick, 'bid', None), getattr(tick, 'ask', None)
-        if (tick and abs(float(tick.ltp) - price) <= 1e-9 and bid and ask and
-                math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
-            estimated = max(estimated, min(ask, price * (1 + self.settings.paper_max_half_spread_pct / 100)))
+        estimated = self._estimate_buy(symbol, price)
         per_lot = estimated * lot
         item.detail['estimated_buy_price'] = estimated
         equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
@@ -606,10 +689,88 @@ class SmartLane:
                                 detail={"status": order.status})
         journal_id = self._record(item, TAKEN, now, price=order.fill_price, cut=cut, size=size, ticket=ticket,
                                   lots=lots, order_id=order.order_id)
+        self._store_meta(item, item.source, now, size, journal_id)
+
+    def _estimate_buy(self, symbol: str, price: float) -> float:
+        """Reserve the larger of adverse LTP slippage and the shared quoted ask.
+
+        Budgeting only LTP used to reject otherwise affordable fills at the ask."""
+        execution = self.execution
+        estimated = price * (1 + self.settings.slippage_bps / 10_000)
+        tick = execution.quote_source(symbol) if execution.quote_source and self.settings.paper_cross_spread else None
+        bid, ask = getattr(tick, 'bid', None), getattr(tick, 'ask', None)
+        if (tick and abs(float(tick.ltp) - price) <= 1e-9 and bid and ask and
+                math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
+            estimated = max(estimated, min(ask, price * (1 + self.settings.paper_max_half_spread_pct / 100)))
+        return estimated
+
+    async def _grok_enter(self, item: Pending, queued_price: float, pick: dict, now: datetime) -> None:
+        """Buy a signal Grok took: the structural checks again, a drift check, then the fixed ticket in whole lots."""
+        symbol = item.symbol
+        execution = self.execution
+        grok = self.grok
+        if grok is None:
+            return
+        if symbol in self.portfolio.positions:
+            return self._record(item, ALREADY_HELD, now)
+        blocked = execution.entry_block(symbol)
+        if blocked:
+            execution.note_entry_block(symbol, blocked)
+            return self._record(item, blocked, now)
+        if not sessions.in_session(symbol, now):
+            return self._record(item, SESSION_CLOSED, now)
+        if symbol not in execution.tradable_symbols or execution.lot_sizes.get(symbol, 0) < 1:
+            return self._record(item, NOT_TRADABLE, now)
+        try:
+            price = execution._fresh_price(symbol)
+        except RuntimeError:
+            return self._record(item, NO_PRICE, now, detail={"reason": "no fresh quote when Grok's answer came"})
+        drift = self.settings.smart_grok_max_drift_pct
+        if queued_price > 0 and price > queued_price * (1 + drift):
+            return self._record(item, smart_grok.GROK_PRICE_MOVED, now, price=price,
+                                detail={"queued_price": queued_price, "max_drift_pct": drift * 100})
+        held = len(self.held_symbols())
+        if held >= grok.slots:
+            return self._record(item, POSITION_LIMIT, now, price=price, detail={"held": held, "slots": grok.slots})
+        lot = execution.lot_sizes[symbol]
+        per_lot = self._estimate_buy(symbol, price) * lot
+        equity = self.portfolio.cash + sum(p.last_price * p.quantity for p in self.portfolio.positions.values())
+        ticket = grok.ticket(equity)
+        cash = self.portfolio.cash
+        lots = int(min(ticket, cash) // per_lot)
+        if lots < 1 and per_lot <= min(ticket * self.settings.smart_grok_one_lot_stretch, cash):
+            lots = 1                  # one lot a little above the ticket is still the trade Grok chose
+        cap = self._liquidity_lots(symbol, lot)
+        if lots >= 1 and cap is not None and cap < lots:
+            lots = cap
+            if lots < 1:
+                return self._record(item, TOO_ILLIQUID, now, price=price, ticket=ticket)
+        if lots < 1:
+            decision = TOO_SMALL if cash >= per_lot else NO_CASH
+            return self._record(item, decision, now, price=price, ticket=ticket, detail={"one_lot": round(per_lot, 2)})
+        try:
+            order = await execution.submit(symbol, "BUY", lots=lots, signal=item.signal)
+        except (ValueError, RuntimeError, PermissionError) as exc:
+            return self._record(item, ENTRY_REJECTED, now, price=price, ticket=ticket, detail={"error": str(exc)[:200]})
+        if order.status != "FILLED":
+            return self._record(item, ENTRY_REJECTED, now, price=price, ticket=ticket, detail={"status": order.status})
+        journal_id = self._record(item, TAKEN, now, price=order.fill_price, size=1.0, ticket=ticket, lots=lots,
+                                  order_id=order.order_id)
+        self._store_meta(item, GROK_SOURCE, now, 1.0, journal_id)
+        position = self.portfolio.positions.get(symbol)
+        if position is not None:          # the fill set the MACD-source stop; this book's safety stop is wider
+            position.hard_stop = round(position.average_price * (1 - self.settings.smart_grok_hard_stop_pct), 4)
+        levels =self.set_grok_levels(symbol, pick.get("stop_premium"), pick.get("target_premium"),
+                                      conviction=pick.get("conviction"), reason=pick.get("reason"), now=now)
+        if levels.get("notes"):
+            self.error = f"{symbol} levels: {'; '.join(levels['notes'])}"[:300]
+
+    def _store_meta(self, item: Pending, source: str, now: datetime, size: float, journal_id: str) -> None:
+        symbol = item.symbol
         position = self.portfolio.positions.get(symbol)
         contract = self._contracts.get(symbol) or {}
         meta = {"position_id": position.position_id if position else f"{symbol}|{now.isoformat()}",
-                "symbol": symbol, "source": item.source, "opened_at": now.isoformat(),
+                "symbol": symbol, "source": source, "opened_at": now.isoformat(),
                 "expiry": contract.get("expiry"), "strike": contract.get("strike"), "option_type": item.option_type,
                 "spot_symbol": contract.get("spot_symbol"), "score": item.score, "dispersion": size,
                 "journal_id": journal_id}
@@ -763,7 +924,7 @@ class SmartLane:
             "return_pct": (snap["equity"] / self.capital - 1) * 100, "realized": snap["realized_pnl"],
             "unrealized": snap["unrealized_pnl"], "open_positions": len(snap["positions"]),
             "max_drawdown": max_dd, "all": stats(trades),
-            "by_source": {src: stats([t for t in trades if t["source"] == src]) for src in (MACD_SOURCE, BLAST_SOURCE)},
+            "by_source": {src: stats([t for t in trades if t["source"] == src]) for src in (MACD_SOURCE, BLAST_SOURCE, GROK_SOURCE)},
             "by_exit_reason": {k: stats(v) for k, v in sorted(by_reason.items())},
             "decisions": decisions,
             "decisions_by_source": {f"{s}:{d}": n for (s, d), n in by_source.items()},
@@ -783,6 +944,11 @@ class SmartLane:
             row["score"] = meta.get("score")
             row["dispersion"] = meta.get("dispersion")
             row["target_price"] = (round(row["average_price"] * (1 + rules["target"]), 4) if rules["target"] else None)
+            levels = self.grok_levels.get(row["symbol"])
+            if levels:
+                row["target_price"] = levels.get("target")
+                row["stop_price"] = levels.get("stop")
+                row["grok"] = levels
             try:
                 opened = datetime.fromisoformat(str(row["opened_at"]))
                 row["hold_until"] = hold_until(opened, rules["hold"]).isoformat() if rules["hold"] else None
@@ -814,7 +980,8 @@ class SmartLane:
                     "blast": self.execution.exit_rules(BLAST_SOURCE) if self.settings.smart_blast_source else None,
                     "liquidity_share_pct": self.settings.blast_max_volume_share_pct,
                 },
-                "model": {"trained_on": MODEL["trained_on"], "walk_forward": MODEL["walk_forward"]}}
+                "model": {"trained_on": MODEL["trained_on"], "walk_forward": MODEL["walk_forward"]},
+                "grok": self.grok.health() if self.grok is not None else {"enabled": False}}
 
     def sweep_closed_positions(self) -> bool:
         return self.execution.sweep_closed_positions()
@@ -839,6 +1006,7 @@ class SmartLanes:
             name = f"smart_{lane_label(capital)}"
             self.lanes.append(SmartLane(name, capital, settings, broker, events, str(base / f"{name}.sqlite3"),
                                         slots=slots.get(capital, 0)))
+            self.lanes[-1].configure_grok(grok_enabled(settings, name), str(RUNTIME_DIR))
 
     def get(self, name: str) -> SmartLane | None:
         return next((lane for lane in self.lanes if lane.name == name), None)
@@ -868,6 +1036,7 @@ class SmartLanes:
         for lane in self.lanes:
             lane.slots = slots.get(lane.capital, 0)
             lane.apply_settings(settings)
+            lane.configure_grok(grok_enabled(settings, lane.name), str(RUNTIME_DIR))
 
     def rebind_broker(self, broker) -> None:
         for lane in self.lanes:
@@ -898,3 +1067,9 @@ def lane_label(capital: float) -> str:
     if capital >= 1e3 and capital % 1e3 == 0:
         return f"{int(capital // 1e3)}k"
     return str(int(capital))
+
+
+def grok_enabled(settings, name: str) -> bool:
+    """Grok picks and exits for this book (owner, 18 Nov 2026: both smart books, live from 19 Nov)."""
+    names = {n.strip() for n in str(getattr(settings, "smart_grok_lanes_csv", "")).split(",") if n.strip()}
+    return bool(getattr(settings, "smart_grok_enabled", False)) and name in names

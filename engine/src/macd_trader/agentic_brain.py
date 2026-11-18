@@ -355,15 +355,17 @@ class GrokClient:
             await asyncio.sleep(RETRY_PAUSE_S)
         raise AssertionError("unreachable")
 
-    async def decide(self, system: str, user: str, max_tokens: int = 4000) -> tuple[dict, dict]:
-        """Returns (decision, meta). Raises BrainError on transport or parse failure."""
+    async def decide(self, system: str, user: str, max_tokens: int = 4000, schema: dict | None = None,
+                     schema_name: str = "trading_decision") -> tuple[dict, dict]:
+        """Returns (decision, meta). Raises BrainError on transport or parse failure. The agentic schema by default."""
+        schema = schema or DECISION_SCHEMA
         body = {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                 "max_completion_tokens": max_tokens}
         if self.reasoning_effort:
             body["reasoning_effort"] = self.reasoning_effort
         if self.json_schema_supported:
             body["response_format"] = {"type": "json_schema",
-                                       "json_schema": {"name": "trading_decision", "strict": True, "schema": DECISION_SCHEMA}}
+                                       "json_schema": {"name": schema_name, "strict": True, "schema": schema}}
         else:
             body["response_format"] = {"type": "json_object"}
         started = clock.monotonic()
@@ -374,7 +376,7 @@ class GrokClient:
                     # Older models: fall back to plain JSON mode once and remember it.
                     self.json_schema_supported = False
                     body["response_format"] = {"type": "json_object"}
-                    body["messages"][0]["content"] = system + "\n\nJSON schema:\n" + json.dumps(DECISION_SCHEMA)
+                    body["messages"][0]["content"] = system + "\n\nJSON schema:\n" + json.dumps(schema)
                     response = await client.post(f"{self.base_url}/chat/completions", json=body)
         except httpx.HTTPError as exc:
             raise BrainError(f"{type(exc).__name__}: {exc}"[:300]) from exc
