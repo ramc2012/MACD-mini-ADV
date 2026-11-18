@@ -30,7 +30,8 @@ gates the feed, bars and entries.
 
 from __future__ import annotations
 
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # NSE trading holidays, Equity and Equity Derivatives segments, calendar 2026.
 NSE_TRADING_HOLIDAYS: dict[date, str] = {
@@ -171,3 +172,28 @@ def status(today: date) -> dict:
         "calendar_covers_year": covers_year(today.year),
         "configured_extra_holidays": sorted(day.isoformat() for day in _extra),
     }
+
+
+LANE_DAY_ROLL = time(8, 0)
+
+
+def lane_day_start(now: datetime | None = None) -> datetime:
+    """When the lanes' "today" began: 08:00 IST on the latest trading day whose 08:00 has passed (owner, 18 Nov 2026).
+
+    Lane pages show only this day's orders, fills and closes; everything older is in the back office. It is the same
+    roll as a closed position's ``visible_until`` (08:00 IST on the next trading morning), so over a weekend or a
+    holiday the pages keep showing the last session, and MCX's evening session (to 23:55) stays in its own day.
+    """
+    ist = ZoneInfo("Asia/Kolkata")
+    now = (now or datetime.now(ist)).astimezone(ist)
+    day = now.date()
+    if now.time() < LANE_DAY_ROLL or not is_trading_day(day):
+        day -= timedelta(days=1)
+        while not is_trading_day(day):
+            day -= timedelta(days=1)
+    return datetime.combine(day, LANE_DAY_ROLL, ist)
+
+
+def lane_day_since(now: datetime | None = None) -> str:
+    """lane_day_start as the UTC ISO text the books store, for ``timestamp >= ?`` comparisons."""
+    return lane_day_start(now).astimezone(timezone.utc).isoformat()

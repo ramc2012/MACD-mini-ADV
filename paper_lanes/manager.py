@@ -311,12 +311,12 @@ class Manager:
             return result
         finally:c.close()
 
-    def snapshot(self,lane):
+    def snapshot(self,lane,since=None):
         from .local_intelligence import status
         daily=self.books[lane].terms.get('holding_mode')=='daily_trend'
         intelligence={'policy':self.books[lane].terms['strategy_version'],'mode':'completed_daily_rules','qwen_required':False,
                       'validation':'Prospective daily trend policy; profitability unproven'} if daily else status(lane)
-        return {**self.books[lane].snapshot(datetime.now(IST)),'market_error':self.last_error,'market_checked_at':self.last_poll,
+        return {**self.books[lane].snapshot(datetime.now(IST),since),'market_error':self.last_error,'market_checked_at':self.last_poll,
                 'model_required':not daily,'qwen_required':False,'intelligence':{**intelligence,'last_review':self.last_review.get(lane)},
                 'live_orders_possible':False,'legacy_history_preserved':True}
 

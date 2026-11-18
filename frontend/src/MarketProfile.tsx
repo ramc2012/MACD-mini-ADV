@@ -141,7 +141,7 @@ export function MarketProfilePage() {
       // every badge read 0 until you clicked into it — the desk looked empty
       // while it actually held six round trips and four open positions. The
       // MACD lane's counts are always live; this is what makes MP's match.
-      requests.push(fetch(`${API_URL}/api/mp/book`, { headers })
+      requests.push(fetch(`${API_URL}/api/mp/book?today=true`, { headers })
         .then(r => r.ok ? r.json() : undefined).then(d => { if (!stopped && d) setBook(d as Book); }).catch(() => undefined));
       requests.push(fetch(`${API_URL}/api/mp/statistics`, { headers })
         .then(r => r.ok ? r.json() : undefined).then(d => { if (!stopped && d) setStats(d as Stats); }).catch(() => undefined));

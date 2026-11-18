@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Body
+from fastapi import Depends, FastAPI, Header, HTTPException, Body, Query
 import psycopg2
 from psycopg2.extensions import make_dsn
 
@@ -250,10 +250,11 @@ def create_app(store=None, worker_enabled=None, paper_manager=None):
                 "execution_mode":"paper","live_orders_possible":False,"worker_enabled": enabled}
 
     @api.get('/api/paper-lanes/{lane}',dependencies=[Depends(authorize)])
-    def paper_snapshot(lane:str):
+    def paper_snapshot(lane:str,since:str|None=Query(default=None,pattern=r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+05:30$')):
+        """``since`` (IST): only the lane day's closes, orders, fills, decisions and marks (the app's lane page)."""
         if lane not in LANES:raise HTTPException(404,'Unknown lane')
         if not paper:return {'enabled':False,'lane':lane}
-        return {'enabled':True,**paper.snapshot(lane),'readiness':store.snapshot(lane)['readiness']}
+        return {'enabled':True,**paper.snapshot(lane,since),'readiness':store.snapshot(lane)['readiness']}
 
     @api.post('/api/paper-lanes/{lane}/control',dependencies=[Depends(authorize)])
     def paper_control(lane:str,body:dict=Body(...)):

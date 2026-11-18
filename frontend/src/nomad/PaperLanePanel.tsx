@@ -52,7 +52,7 @@ function chartFocus(r:any,live:any,closed:boolean):LaneChartFocus|null{
  return {symbol,title:`${r.symbol} · ${symbol}`,subtitle:`${r.quantity} @ ${formatMoney(r.entry)} · opened ${formatIST(r.opened_at)}${closed&&r.closed_at?` · closed ${formatIST(r.closed_at)}`:''}${pnl}`,markers,levels};
 }
 
-export function usePaper(lane:string){return useQuery({queryKey:['macd-paper',lane],queryFn:async()=>(await api.get(`/api/paper-lanes/${lane}`)).data as Paper,refetchInterval:5000});}
+export function usePaper(lane:string){return useQuery({queryKey:['macd-paper',lane],queryFn:async()=>(await api.get(`/api/paper-lanes/${lane}`,{params:{today:true}})).data as Paper,refetchInterval:5000,placeholderData:(previous:Paper|undefined)=>previous});}
 
 export function PaperLanePanel({lane,performance=false}:{lane:string;performance?:boolean}){
  const live=useLaneLive();

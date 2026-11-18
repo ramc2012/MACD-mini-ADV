@@ -769,8 +769,8 @@ class SmartLane:
             "decisions_by_source": {f"{s}:{d}": n for (s, d), n in by_source.items()},
         }
 
-    def equity_curve(self, limit: int = 3000) -> list[dict]:
-        rows = self.repository.equity_rows(limit)
+    def equity_curve(self, limit: int = 3000, since: str | None = None) -> list[dict]:
+        rows = self.repository.equity_rows(limit, since)
         return [{"at": r.get("timestamp") or r.get("at"), "equity": r.get("equity")} for r in rows]
 
     def snapshot(self) -> dict:

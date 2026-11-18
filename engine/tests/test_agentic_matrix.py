@@ -197,3 +197,29 @@ def test_matrix_inputs_read_atr_prior_day_open_type_and_first_hour(tmp_path):
     assert got["prev_nr7"] is True and got["prev_range_atr"] < 0.6
     early = feat.matrix_inputs(db, SPOT, at(DAY, 9, 40))
     assert "open_type" not in early and "ib_high" not in early
+
+
+# ----------------------------------------------------------------------------- strengths only (owner, 18 Nov 2026)
+
+def test_strengths_only_takes_swing_strength_setups_at_grade_a_or_b_and_rejects_the_rest():
+    strict = brain.Limits(capital=1_000_000, strengths_only=True)
+    m = matrix_of(scorecard="CE")
+    assert m["NIFTY"]["CE"]["swing"]["grade"] in ("A", "B") and m["NIFTY"]["PE"]["swing"]["grade"] in ("C", "D")
+
+    def one(**kw):
+        return brain.validate({"actions": [order("open", lots=2, **kw)]}, ctx(m), strict)
+    taken = one(cid="C02", horizon="swing", setup="scorecard_overnight")                  # the strength: taken
+    assert [a["setup"] for a in taken.accepted] == ["scorecard_overnight"]
+    intraday = one(cid="C02", horizon="intraday", setup="ib_breakout")                    # not its strength
+    assert "swing trades, not intraday" in intraday.rejected[0]["rejected"]
+    setup = one(cid="C02", horizon="swing", setup="failed_breakout_reversal")              # swing, losing setup
+    assert "failed_breakout_reversal is not one of" in setup.rejected[0]["rejected"]
+    graded = one(cid="C01", horizon="swing", setup="multiday_breakout")                    # PE swing grade C/D
+    assert not graded.accepted and "only A and B are traded" in graded.rejected[0]["rejected"]
+
+
+def test_strengths_only_is_off_unless_the_lane_sets_it():
+    out = brain.validate({"actions": [order("open", "C02", lots=2, horizon="intraday", setup="ib_breakout")]},
+                         ctx(matrix_of()), brain.Limits(capital=1_000_000))
+    assert len(out.accepted) == 1
+    assert "STRENGTHS ONLY" in brain.PLAYBOOK

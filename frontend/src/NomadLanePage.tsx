@@ -18,13 +18,18 @@ class DeskBoundary extends Component<{children:ReactNode},{failed:boolean}>{stat
 
 function FeedStatus(){const connected=useLaneLiveValue(l=>l.connected),lastQuote=useLaneLiveValue(l=>Math.max(0,...Object.values(l.quotes).map((q:any)=>q.exchange_ts_ms??0)));return <span role="status" className="lane-diagnostics">{connected?'Shared feed connected':'Shared feed reconnecting'} · Latest market quote {lastQuote?formatIST(new Date(lastQuote)):'awaiting quotes'}</span>;}
 
+// One query cache per lane and ledger for the browser tab (18 Nov 2026): returning to Vanguard or CBE shows the last
+// book at once and refreshes behind it, instead of starting empty on every visit.
+const clients=new Map<string,QueryClient>();
+function laneClient(key:string){let client=clients.get(key);if(!client){client=new QueryClient({defaultOptions:{queries:{retry:false,refetchOnWindowFocus:false,gcTime:30*60_000}}});clients.set(key,client);}return client;}
+
 export function NomadLanePage({lane,ticks,connected}:{lane:'vanguard'|'cbe';ticks:Record<string,Tick>;connected:boolean}){
  const [scope,setScope]=useState(dataScope);const [view,setView]=useState(window.location.hash);const [notices,setNotices]=useState<string[]>([]);
  useLaneLiveConnection(scope==='shadow');
- const client=useMemo(()=>new QueryClient({defaultOptions:{queries:{retry:false,refetchOnWindowFocus:false}}}),[lane,scope]);
+ const client=useMemo(()=>laneClient(`${lane}|${scope}`),[lane,scope]);
  useEffect(()=>{updateQuotes(ticks,connected&&scope==='shadow');},[ticks,connected,scope]);
  useEffect(()=>{const sync=()=>{setScope(dataScope());setView(window.location.hash);setNotices([]);};const failed=(e:Event)=>setNotices(v=>[...new Set([...v,(e as CustomEvent<string>).detail])].slice(-4));window.addEventListener('hashchange',sync);window.addEventListener('nomad-data-error',failed);return()=>{window.removeEventListener('hashchange',sync);window.removeEventListener('nomad-data-error',failed);};},[]);
- useEffect(()=>{setNotices([]);return()=>client.clear();},[client]);
+ useEffect(()=>{setNotices([]);},[client]);
  // The desk element is kept across tick and live-frame renders of this page; desks subscribe to the quotes they show.
  const desk=useMemo(()=><QueryClientProvider client={client}><DeskBoundary key={view}><div key={`${lane}-${scope}`}><SortableTables>{lane==='vanguard'?<VanguardDesk/>:<CbeDesk/>}</SortableTables></div></DeskBoundary></QueryClientProvider>,[client,view,lane,scope]);
  const choose=(next:'shadow'|'retained')=>{const p=new URLSearchParams();if(next==='retained')p.set('scope',next);window.history.replaceState(null,'',`#/${lane.toUpperCase()}${p.size?'?'+p:''}`);window.dispatchEvent(new HashChangeEvent('hashchange'));};

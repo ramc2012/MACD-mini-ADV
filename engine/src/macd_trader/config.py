@@ -330,6 +330,9 @@ class Settings(BaseSettings):
     agentic_max_deployed_pct: float = Field(default=0.60, gt=0, le=1)
     agentic_daily_loss_stop_pct: float = Field(default=0.03, gt=0, le=1)
     agentic_max_lots_per_order: int = Field(default=20, ge=1, le=500)
+    # Owner, 18 Nov 2026: trade only the lane's strengths -- swing horizon, setups agentic_brain.STRENGTH_SETUPS,
+    # matrix grade A/B (C/D skipped). New opens/arms/adds that miss any of these are rejected with the reason.
+    agentic_strengths_only: bool = True
 
     # --- MCX lane (mcx_lane.py) -------------------------------------------
     # The MACD lane's entry and exit rules on MCX commodity options, in its own

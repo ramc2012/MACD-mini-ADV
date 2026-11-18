@@ -56,7 +56,8 @@ def generous_lots(monkeypatch):
 
 def build(tmp_path: Path, *decisions) -> AgenticLane:
     settings = Settings(execution_mode="paper", slippage_bps=0, database_path=str(tmp_path / "macd.sqlite3"),
-                        research_database_path=str(tmp_path / "hist.sqlite3"), agentic_capital=1_000_000)
+                        research_database_path=str(tmp_path / "hist.sqlite3"), agentic_capital=1_000_000,
+                        agentic_strengths_only=False)   # book mechanics; the strength gate has its own tests
     engine = SimpleNamespace(latest_ticks={
         "NSE:NIFTY50-INDEX": Tick("NSE:NIFTY50-INDEX", 23000.0, change_pct=-0.5),
         "NSE:SBIN-EQ": Tick("NSE:SBIN-EQ", 805.0, change_pct=1.2),

@@ -1,0 +1,21 @@
+/* Back office (18 Nov 2026): filters row, P&L heat cells, split tables, pager. Tokens only. */
+.backoffice-page .backoffice-filters { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: var(--space-2) var(--space-3); padding: var(--space-2) var(--space-3); }
+.backoffice-filters label { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); font-size: var(--fs-sm); }
+.backoffice-filters input, .backoffice-filters select { height: var(--control-h); background: var(--bg-control); color: var(--text-1); border: 1px solid var(--line-control); border-radius: var(--radius); padding: 0 6px; font-size: var(--fs-sm); }
+.backoffice-page .panel-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
+.backoffice-page .panel-title > .settings-button { margin-left: auto; }
+.bo-matrix td, .bo-matrix th { white-space: nowrap; text-align: right; }
+.bo-matrix td:first-child, .bo-matrix th:first-child { text-align: left; position: sticky; left: 0; background: var(--bg-panel); z-index: 1; }
+.bo-heat-1 { background: color-mix(in srgb, var(--bg-up-soft) 55%, transparent); }
+.bo-heat-2 { background: var(--bg-up-soft); }
+.bo-heat-3 { background: color-mix(in srgb, var(--up) 28%, var(--bg-up-soft)); }
+.bo-heat--1 { background: color-mix(in srgb, var(--bg-down-soft) 55%, transparent); }
+.bo-heat--2 { background: var(--bg-down-soft); }
+.bo-heat--3 { background: color-mix(in srgb, var(--down) 28%, var(--bg-down-soft)); }
+.bo-total td { border-top: 1px solid var(--line-strong); font-weight: 650; }
+.bo-real td { border-top: 1px dashed var(--line-warn); }
+.bo-splits { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--space-3); }
+.bo-split { min-width: 0; overflow-x: auto; }
+.bo-pager { display: flex; align-items: center; justify-content: flex-end; gap: var(--space-3); padding: var(--space-2) 0; color: var(--text-3); font-size: var(--fs-sm); }
+.bo-note { display: block; margin: 0 0 var(--space-2); line-height: 1.45; max-width: 110ch; }
+@media (max-width: 640px) { .backoffice-filters label { flex: 1 1 140px; } .bo-pager { justify-content: space-between; } }

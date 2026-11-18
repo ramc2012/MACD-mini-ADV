@@ -2467,6 +2467,34 @@ class TradingEngine(DeskMixin):
             return db.execute("SELECT COUNT(*) FROM historical_candles WHERE symbol = ? AND timeframe_seconds = 60",
                               (symbol,)).fetchone()[0]
 
+    async def _stale_while_revalidate(self, name: str, key, ttl: float, compute, max_stale: float = 600.0):
+        """Serve a market view from its cache; past ``ttl`` return the cached answer at once and refresh it in the
+        background (18 Nov 2026: trend rotation took 6 s, day highs 2.5 s, the ATM heat map 2.3 s on every miss).
+        A cache older than ``max_stale`` (or none) is computed while the caller waits. ``compute`` returns
+        ``(result, cacheable)``; one computation runs per key at a time."""
+        cache = self.__dict__.setdefault(f"_{name}_cache_swr", {})
+        tasks = self.__dict__.setdefault(f"_{name}_tasks_swr", {})
+
+        async def run():
+            result, cacheable = await compute()
+            if cacheable:
+                cache[key] = (time.monotonic(), result)
+            return result
+
+        def start():
+            if key not in tasks or tasks[key].done():
+                tasks[key] = asyncio.create_task(run())
+            return tasks[key]
+
+        hit = cache.get(key)
+        age = time.monotonic() - hit[0] if hit else None
+        if hit and age < ttl:
+            return hit[1]
+        if hit and age < max_stale:
+            start()
+            return hit[1]
+        return await asyncio.shield(start())
+
     async def atm_heatmap(self, as_of: date | None = None) -> dict:
         """ATM CE/PE premium changes over 1H..1M per underlying (atm_heatmap.py); cached for 30 s.
 
@@ -2488,9 +2516,12 @@ class TradingEngine(DeskMixin):
                     return result
                 history[as_of] = result
             return history[as_of]
-        cached = getattr(self, "_atm_heatmap_cache", None)
-        if cached and time.monotonic() - cached[0] < 30:
-            return cached[1]
+        return await self._stale_while_revalidate("atm_heatmap", "live", 30, self._atm_heatmap_live)
+
+    async def _atm_heatmap_live(self) -> tuple[dict, bool]:
+        from . import atm_heatmap
+        context = list(dict.fromkeys([*(self.context_indices or self.settings.context_indices),
+                                      *([self.settings.vix_symbol] if self.settings.vix_symbol else [])]))
         contracts = [
             {"underlying": c.underlying, "spot_symbol": c.spot_symbol, "option_type": c.option_type,
              "symbol": c.symbol, "strike": c.strike, "expiry": c.expiry}
@@ -2514,9 +2545,7 @@ class TradingEngine(DeskMixin):
         previous = {symbol: tick.prev_close for symbol, tick in session_ticks.items() if tick.prev_close is not None}
         result = await asyncio.to_thread(atm_heatmap.build, self.settings.research_database_path, contracts, live,
                                          now, context, previous_closes=previous)
-        if result["rows"]:                       # never cache the empty answer of a still-selecting engine
-            self._atm_heatmap_cache = (time.monotonic(), result)
-        return result
+        return result, bool(result["rows"])      # never cache the empty answer of a still-selecting engine
 
     def _wheel_symbols(self) -> list[str]:
         broad = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX", "NSE:MIDCPNIFTY-INDEX"]
@@ -2559,37 +2588,115 @@ class TradingEngine(DeskMixin):
     async def trend_rotation(self, kind: str, timeframe: int) -> dict:
         from . import trend_rotation
         key = (kind, timeframe)
-        cache = self.__dict__.setdefault("_trend_rotation_cache", {})
-        tasks = self.__dict__.setdefault("_trend_rotation_tasks", {})
-        if key in cache and time.monotonic() - cache[key][0] < 60:
-            return cache[key][1]
-        if key not in tasks or tasks[key].done():
-            async def compute():
-                if kind == "SPOT":
-                    instruments = [{"symbol": s, "spot_symbol": s} for s in dict.fromkeys(
-                        [*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
-                        if s.endswith(("-EQ", "-INDEX"))]
-                else:
-                    # Reuse the current ATM identities, including saved selection during connection warm-up.
-                    heatmap = await self.atm_heatmap()
-                    instruments = [{"symbol": row[kind.lower()]["symbol"], "underlying": row["underlying"],
-                                    "spot_symbol": row["spot_symbol"], "strike": row[kind.lower()]["strike"],
-                                    "expiry": row["expiry"]}
-                                   for row in heatmap["rows"] if kind.lower() in row]
-                result = await asyncio.to_thread(trend_rotation.build, self.settings.research_database_path,
-                                                 instruments, kind, timeframe)
-                if instruments:
-                    cache[key] = (time.monotonic(), result)
-                return result
-            tasks[key] = asyncio.create_task(compute())
-        return await asyncio.shield(tasks[key])
+
+        async def compute():
+            if kind == "SPOT":
+                instruments = [{"symbol": s, "spot_symbol": s} for s in dict.fromkeys(
+                    [*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
+                    if s.endswith(("-EQ", "-INDEX"))]
+            else:
+                # Reuse the current ATM identities, including saved selection during connection warm-up.
+                heatmap = await self.atm_heatmap()
+                instruments = [{"symbol": row[kind.lower()]["symbol"], "underlying": row["underlying"],
+                                "spot_symbol": row["spot_symbol"], "strike": row[kind.lower()]["strike"],
+                                "expiry": row["expiry"]}
+                               for row in heatmap["rows"] if kind.lower() in row]
+            result = await asyncio.to_thread(trend_rotation.build, self.settings.research_database_path,
+                                             instruments, kind, timeframe)
+            return result, bool(instruments)
+        return await self._stale_while_revalidate("trend_rotation", key, 60, compute)
+
+    async def iv_scanner(self) -> dict:
+        """30-day ATM IV, IV rank / percentile and HV20 per F&O underlying from the stored chains (iv_scanner.py);
+        cached 2 min, served stale while it refreshes."""
+        from . import iv_scanner
+        scanner = self.__dict__.get("_iv_scanner")
+        if scanner is None:
+            scanner = self.__dict__["_iv_scanner"] = iv_scanner.IvScanner(
+                self.settings.research_database_path, Path(self.settings.runtime_settings_path).parent / "iv_history.json")
+
+        async def compute():
+            result = await asyncio.to_thread(scanner.scan)
+            return result, bool(result["rows"])
+        return await self._stale_while_revalidate("iv_scanner", "live", 120, compute)
+
+    async def builder_chain(self, underlying: str, expiry: str | None = None) -> dict:
+        """Strategy builder chain (strategy_builder.py) with the live spot when fresh and the series lot size."""
+        from fastapi import HTTPException
+        from . import strategy_builder
+        from .iv_scanner import spot_symbol
+        spot = None
+        symbol = spot_symbol(underlying)
+        stamp = self.execution.last_price_at.get(symbol)
+        if stamp is not None and (datetime.now(UTC) - stamp).total_seconds() < 120:
+            spot = self.execution.last_prices.get(symbol)
+        try:
+            out = await asyncio.to_thread(strategy_builder.chain, self.settings.research_database_path, underlying, expiry, spot)
+        except KeyError:
+            raise HTTPException(404, f"no stored option chain for {underlying}") from None
+        out["spot_symbol"] = symbol
+        out["lot_size"] = await self._builder_lot(underlying, out)
+        return out
+
+    async def _builder_lot(self, underlying: str, chain: dict) -> int | None:
+        """The series lot size: a known contract of the chain, else the master's series sizes (read once a day)."""
+        lots = getattr(self.execution, "lot_sizes", {}) or {}
+        for row in chain["rows"]:
+            for leg in ("ce", "pe"):
+                lot = lots.get((row.get(leg) or {}).get("symbol"))
+                if lot:
+                    return int(lot)
+        day = datetime.now(IST).date().isoformat()
+        cache = self.__dict__.get("_series_lots")
+        if not cache or cache[0] != day:
+            try:
+                cache = self.__dict__["_series_lots"] = (day, await self.broker.series_lot_sizes(["NSE", "BSE"]))
+            except Exception:  # noqa: BLE001 -- the builder works without a lot size (the field is editable)
+                return None
+        exchange = "BSE" if underlying in ("SENSEX", "BANKEX", "FOCIT") else "NSE"
+        series = cache[1].get(f"{exchange}:{underlying}") or {}
+        for key, lot in series.items():
+            if str(key)[:10] == chain["expiry"]:
+                return int(lot)
+        return int(next(iter(series.values()))) if series else None
+
+    def _option_lanes(self) -> list[tuple[str, object]]:
+        lanes = list(self._books())
+        if getattr(self, "agentic", None) is not None:
+            lanes.append(("agentic", self.agentic.execution))
+        if getattr(self, "spot_lane", None) is not None:
+            lanes.append(("spot_macd", self.spot_lane.execution))
+        return lanes
+
+    def builder_positions(self, underlying: str) -> list[dict]:
+        """Open option positions on one underlying in every engine lane, for loading into the strategy builder."""
+        from .option_agent import parse_option
+        out = []
+        for lane, execution in self._option_lanes():
+            for symbol, position in list(getattr(getattr(execution, "portfolio", None), "positions", {}).items()):
+                parsed = parse_option(symbol)
+                if not parsed or parsed["root"] != underlying or not position.quantity:
+                    continue
+                out.append({"lane": lane, "symbol": symbol, "kind": "CE" if parsed["side"] == 1 else "PE",
+                            "strike": parsed["strike"], "expiry": parsed["expiry"], "quantity": position.quantity,
+                            "average_price": position.average_price, "last_price": position.last_price,
+                            "lot_size": getattr(position, "lot_size", 1) or 1})
+        return out
+
+    def expiry_exposure(self) -> dict:
+        """Every engine lane's stock options and futures against the delivery-margin calendar (expiry_exposure.py)."""
+        from . import expiry_exposure
+        from .strategy_builder import stored_spots
+        prices = self.execution.last_prices
+        stored = stored_spots(self.settings.research_database_path)   # no live print after an out-of-hours restart
+        return expiry_exposure.report(self._option_lanes(), lambda symbol: prices.get(symbol) or stored(symbol))
 
     async def day_highs(self) -> dict:
         """Spots and ATM legs whose last completed 15-min bar closed at a new day high or low (day_highs.py); cached 30 s."""
+        return await self._stale_while_revalidate("day_highs", "live", 30, self._day_highs_live)
+
+    async def _day_highs_live(self) -> tuple[dict, bool]:
         from . import day_highs
-        cached = getattr(self, "_day_highs_cache", None)
-        if cached and time.monotonic() - cached[0] < 30:
-            return cached[1]
         vix = self.settings.vix_symbol
         symbols = [s for s in dict.fromkeys([*self.settings.symbols, *(self.context_indices or self.settings.context_indices)])
                    if s.endswith(("-EQ", "-INDEX")) and s != vix]
@@ -2598,8 +2705,7 @@ class TradingEngine(DeskMixin):
                     "option_type": c.option_type, "strike": c.strike, "expiry": str(c.expiry)}
                    for c in self.contract_selector.todays_atm()]
         result = await asyncio.to_thread(day_highs.build, self.settings.research_database_path, symbols, None, options)
-        self._day_highs_cache = (time.monotonic(), result)
-        return result
+        return result, True
 
     def warmup_status(self) -> dict:
         wanted = set(self.settings.symbols) | set(self.option_symbols)

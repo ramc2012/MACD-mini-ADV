@@ -87,7 +87,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
       setSnapshots(Object.fromEntries(books));
       setSelected((current) => current ?? index.lanes[0]?.lane ?? null);
       const pairs = await Promise.all(index.lanes.map(async (lane) =>
-        [lane.lane, (await call<{ equity: EquityPoint[] }>(`/api/lanes/${lane.lane}/equity`)).equity] as const));
+        [lane.lane, (await call<{ equity: EquityPoint[] }>(`/api/lanes/${lane.lane}/equity?today=true`)).equity] as const));
       setCurves(Object.fromEntries(pairs));
       setError(null);
     } catch (exc) { setError(String(exc instanceof Error ? exc.message : exc)); }
@@ -100,7 +100,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
       const requestedAt=Date.now();
       const [snap, closed, rows] = await Promise.all([
         call<Snapshot>(`/api/lanes/${selected}/snapshot`),
-        call<{ trades: Trade[] }>(`/api/lanes/${selected}/trades?limit=300`),
+        call<{ trades: Trade[] }>(`/api/lanes/${selected}/trades?limit=300&today=true`),
         call<{ rows: JournalRow[]; days: string[] }>(`/api/lanes/${selected}/journal?${query}`),
       ]);
       setSnapshot({...snap,requestedAt}); setTrades(closed.trades); setJournal(rows.rows); setDays(rows.days);
@@ -111,7 +111,7 @@ export function LanesPage({ ticks, portfolios }: { ticks: Record<string, Tick>; 
   // The lane's own fills, for the position charts' buy / sell markers.
   const loadFills = useCallback(async () => {
     if (!selected) return;
-    try { setFills((await call<{ trades: Fill[] }>(`/api/lanes/${selected}/book?limit=3000`)).trades); } catch { /* markers only */ }
+    try { setFills((await call<{ trades: Fill[] }>(`/api/lanes/${selected}/book?limit=3000&today=true`)).trades); } catch { /* markers only */ }
   }, [selected]);
   useEffect(() => { setFills([]); void loadFills(); const id = window.setInterval(loadFills, 20_000); return () => window.clearInterval(id); }, [loadFills]);
   useEffect(() => { void loadIndex(); const id = window.setInterval(loadIndex, 15_000); return () => window.clearInterval(id); }, [loadIndex]);

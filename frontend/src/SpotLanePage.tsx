@@ -90,8 +90,8 @@ export function SpotLanePage({ ticks, portfolio, holidays }: { ticks: Record<str
   const loadSlow = useCallback(async () => {
     try {
       const [sum, eq, done, ledger] = await Promise.all([call<Summary>(`/api/lanes/${LANE}/summary`),
-        call<{ equity: { at: string; equity: number }[] }>(`/api/lanes/${LANE}/equity`), call<{ trades: ClosedTrade[] }>(`/api/lanes/${LANE}/trades?limit=500`),
-        call<Book>(`/api/lanes/${LANE}/book?limit=2000`)]);
+        call<{ equity: { at: string; equity: number }[] }>(`/api/lanes/${LANE}/equity?today=true`), call<{ trades: ClosedTrade[] }>(`/api/lanes/${LANE}/trades?limit=500&today=true`),
+        call<Book>(`/api/lanes/${LANE}/book?limit=2000&today=true`)]);
       setSummary(sum); setCurve(eq.equity); setClosed(done.trades); setBook(ledger); setError(null);
     } catch (exc) { setError(String(exc instanceof Error ? exc.message : exc)); }
   }, []);

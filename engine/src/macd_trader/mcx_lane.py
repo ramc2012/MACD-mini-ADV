@@ -2171,12 +2171,12 @@ class McxLane:
             "shorts": self.shorts.view(),
         })
 
-    def book(self) -> dict:
+    def book(self, since: str | None = None) -> dict:
         return json_value({
-            "orders": self.repository.rows("orders", 500),
-            "trades": self.repository.rows("trades", 500),
-            "signals": self.repository.rows("signals", 500),
-            "equity": self.repository.equity_rows(5000),
+            "orders": self.repository.rows("orders", 500, since),
+            "trades": self.repository.rows("trades", 500, since),
+            "signals": self.repository.rows("signals", 500, since),
+            "equity": self.repository.equity_rows(5000, since),
             "portfolio": self.execution.portfolio_snapshot(),
             "closed_positions": self.execution.visible_closed_positions(),
         })

@@ -327,11 +327,11 @@ export function AgenticPage() {
       const [s, c, e] = await Promise.all([
         requestJson<Snapshot>(`${API_URL}/api/agentic`, { headers: headers() }),
         requestJson<{ cycles: Cycle[]; days: string[] }>(`${API_URL}/api/agentic/cycles?limit=60${day ? `&day=${day}` : ""}`, { headers: headers() }),
-        requestJson<{ equity: { at: string; equity: number }[] }>(`${API_URL}/api/agentic/equity`, { headers: headers() }),
+        requestJson<{ equity: { at: string; equity: number }[] }>(`${API_URL}/api/agentic/equity?today=true`, { headers: headers() }),
       ]);
       setSnap(s); setCycles(c.cycles); setDays(c.days); setEquity(e.equity); setError("");
       // Fills only feed the chart markers; an older backend without the route leaves them empty.
-      requestJson<{ trades: Fill[]; closed_positions: ClosedPosition[] }>(`${API_URL}/api/agentic/book`, { headers: headers() })
+      requestJson<{ trades: Fill[]; closed_positions: ClosedPosition[] }>(`${API_URL}/api/agentic/book?today=true`, { headers: headers() })
         .then((book) => { setFills(book.trades); setClosed(book.closed_positions); }).catch(() => undefined);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Unavailable");
@@ -362,7 +362,8 @@ export function AgenticPage() {
     if (!equity.length || !p) return null;
     const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
     const before = equity.filter((row) => row.at.slice(0, 10) < today);
-    return p.equity - (before.length ? before[before.length - 1].equity : snap!.capital);
+    // Today's marks only (lane day from 08:00 IST): the first one is the opening level.
+    return p.equity - (before.length ? before[before.length - 1].equity : equity[0]?.equity ?? snap!.capital);
   }, [equity, p, snap]);
   const spark = useMemo(() => {
     const pts = equity.slice(-400);
@@ -403,7 +404,7 @@ export function AgenticPage() {
     <UsagePanel />
 
     <div className="panel agentic-section lane-equity">
-      <div className="panel-title">Equity and drawdown <small>hover for the IST time, equity, return and fall from the peak</small></div>
+      <div className="panel-title">Equity today <small>hover for the IST time, equity, return and fall from the peak · full history in Back office</small></div>
       <EquityChart points={equity} capital={snap?.capital ?? 0} height={230} />
     </div>
 
@@ -444,7 +445,7 @@ export function AgenticPage() {
     </div>
 
     {closed.length > 0 && <div className="panel agentic-section">
-      <div className="panel-title">Closed recently ({closed.length}) <small>click a row for its chart</small></div>
+      <div className="panel-title">Closed today ({closed.length}) <small>click a row for its chart</small></div>
       <table className="ledger-table agentic-table"><thead><tr><th>Contract</th><th>Lots</th><th>Entry → exit</th><th>P&amp;L</th><th>Best / worst</th><th>Exit reason</th></tr></thead>
         <tbody>{closed.map((row, index) => <tr key={row.closed_id} className="openable-row" onClick={() => setFocus({ index, list: closed.map((x) => ({
           symbol: x.symbol, title: x.symbol.split(":")[1], subtitle: `${x.lots} lots · ${(x.exit_reason || "").replace(/_/g, " ").toLowerCase()} ${pct(x.return_pct)}`,

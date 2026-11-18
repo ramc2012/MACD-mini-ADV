@@ -27,7 +27,8 @@ const QuantAnalyticsPage = lazy(() => import("./QuantAnalytics").then((m) => ({ 
 const AgentPage = lazy(() => import("./AgentPage").then((m) => ({ default: m.AgentPage })));
 const AgenticPage = lazy(() => import("./AgenticPage").then((m) => ({ default: m.AgenticPage })));
 const LanesPage = lazy(() => import("./LanesPage").then((m) => ({ default: m.LanesPage })));
-const ScoreboardPage = lazy(() => import("./ScoreboardPage").then((m) => ({ default: m.ScoreboardPage })));
+const OptionsLabPage = lazy(() => import("./OptionsLab").then((m) => ({ default: m.OptionsLabPage })));
+const BackOfficePage = lazy(() => import("./BackOfficePage").then((m) => ({ default: m.BackOfficePage })));
 const SpotLanePage = lazy(() => import("./SpotLanePage").then((m) => ({ default: m.SpotLanePage })));
 const NomadLanePage = lazy(() => import("./NomadLanePage").then((m) => ({ default: m.NomadLanePage })));
 const UpstoxLanePage = lazy(() => import("./UpstoxLanePage").then((m) => ({ default: m.UpstoxLanePage })));
@@ -48,6 +49,10 @@ import { useStream } from "./useStream";
 import { MCX_QUOTES_EVENT } from "./mcxMath";
 import { optionRowsForTab, WATCH_TABS, type WatchTab } from "./watchTabs";
 import { observedBrokerStatus } from "./feedStatus";
+import { inLaneDay, laneDayLabel, laneDayStart } from "./laneDay";
+import { VIEWS as BACKOFFICE_VIEWS, type View as BackOfficeView } from "./backofficeMath";
+const LAB_VIEWS = [["IV", "IV scanner"], ["BUILDER", "Strategy builder"], ["EXPIRY", "Expiry & rollover"]] as const;
+type LabView = typeof LAB_VIEWS[number][0];
 import type { BlastCandidate, BlastSnapshot, Candle, ChartLayers, ChartMarker, EquityPoint, HealthInfo, Indicator, OptionWatchRow, Order, PaneCollapse, Portfolio, ResearchOpenPosition, ResearchSummary, ResearchTrade, Signal, Snapshot, SpotWatchRow, StreamEvent, Tick, Trade } from "./types";
 import { PlatformWorkstation } from "./PlatformWorkstation";
 
@@ -134,7 +139,10 @@ export default function App() {
   // The open page lives in the URL hash (#/MACD/MARKET/HEATMAP) so a browser refresh reopens it.
   const [route] = useState(readRoute);
   // Market breadth was a MACD view until 4 Nov 2026; old #/MACD/MARKET/... links still open it.
-  const [lane, setLane] = useState<Lane>(() => route[0] === "MACD" && route[1] === "MARKET" ? "MARKET" : pick(LANES, route[0], "MACD"));
+  // The Scoreboard tab moved into Back office → Overview (18 Nov 2026); old #/SCORE links open it there.
+  const [lane, setLane] = useState<Lane>(() => route[0] === "MACD" && route[1] === "MARKET" ? "MARKET" : route[0] === "SCORE" ? "BACKOFFICE" : pick(LANES, route[0], "MACD"));
+  const [backofficeView, setBackofficeView] = useState<BackOfficeView>(() => pick(BACKOFFICE_VIEWS, route[0] === "BACKOFFICE" ? route[1] : undefined, "OVERVIEW"));
+  const [labView, setLabView] = useState<LabView>(() => pick(LAB_VIEWS, route[0] === "OPTLAB" ? route[1] : undefined, "IV"));
   const [macdView, setMacdView] = useState<MacdView>(() => pick(MACD_VIEWS, route[0] === "MACD" ? route[1] : undefined, "TERMINAL"));
   const [auctionView, setAuctionView] = useState<"AUCTION" | "OPTIONS" | "PROFILE" | "WORKSTATION">(() => pick(AUCTION_VIEWS, route[0] === "AUCTION" ? route[1] : undefined, "AUCTION"));
   const page = lane === "MACD" ? macdView : lane === "AUCTION" ? auctionView : lane;
@@ -148,16 +156,20 @@ export default function App() {
       if (macdView === "PERFORMANCE") parts.push(performanceView);
     } else if (lane === "AUCTION") parts.push(auctionView);
     else if (lane === "MARKET") parts.push(marketView);
+    else if (lane === "BACKOFFICE") parts.push(backofficeView);
+    else if (lane === "OPTLAB") parts.push(labView);
     const query = ["VANGUARD", "CBE"].includes(lane) && window.location.hash.split("?")[0] === `#/${lane}` ? window.location.hash.split("?")[1] : "";
     const hash = `#/${parts.join("/")}${query ? "?" + query : ""}`;
     if (window.location.hash !== hash) { window.history.replaceState(null, "", hash); window.dispatchEvent(new HashChangeEvent("hashchange")); }
-  }, [lane, macdView, auctionView, performanceView, marketView]);
+  }, [lane, macdView, auctionView, performanceView, marketView, backofficeView, labView]);
   useEffect(() => {
     // Manual edits of the hash (or a pasted link) switch the page without a reload.
     const onHash = () => {
       const next = readRoute();
       const oldMarket = next[0] === "MACD" && next[1] === "MARKET";
-      setLane(oldMarket ? "MARKET" : pick(LANES, next[0], "MACD"));
+      setLane(oldMarket ? "MARKET" : next[0] === "SCORE" ? "BACKOFFICE" : pick(LANES, next[0], "MACD"));
+      if (next[0] === "BACKOFFICE") setBackofficeView(pick(BACKOFFICE_VIEWS, next[1], "OVERVIEW"));
+      if (next[0] === "OPTLAB") setLabView(pick(LAB_VIEWS, next[1], "IV"));
       if (next[0] === "MACD") setMacdView(pick(MACD_VIEWS, next[1], "TERMINAL"));
       if (next[0] === "AUCTION") setAuctionView(pick(AUCTION_VIEWS, next[1], "AUCTION"));
       if (next[1] === "PERFORMANCE") setPerformanceView(pick(PERFORMANCE_VIEWS, next[2], "STATISTICS"));
@@ -249,8 +261,10 @@ export default function App() {
       setSnapshotRevision((n) => n + 1);
       setCurrent({}); setClosedLive({}); lastCurrent.current = {};
       setSignals(next.strategy.signals || []);
-      setOrders((old) => mergeRows(old, next.execution.orders || [], "order_id"));
-      setTrades((old) => mergeRows(old, next.execution.trades || [], "trade_id"));
+      // Lane pages hold today's rows only (owner, 18 Nov 2026); history is in the Back office.
+      const dayStart = laneDayStart(new Date(), next.config.market_holidays);
+      setOrders((old) => mergeRows(old, next.execution.orders || [], "order_id").filter((row) => inLaneDay(row.created_at, dayStart)));
+      setTrades((old) => mergeRows(old, next.execution.trades || [], "trade_id").filter((row) => inLaneDay(row.timestamp, dayStart)));
       setPortfolio(next.execution.portfolio || emptyPortfolio);
       // The snapshot's journal summary already counts every candidate so far,
       // so the live list restarts from here rather than double counting.
@@ -313,6 +327,8 @@ export default function App() {
     if (event.type === "blast_trade") setBlastTrades((old) => mergeRows(old, [event.data as Trade], "trade_id"));
   }, []);
   const connected = useStream(onEvent);
+  const holidaysRef = useRef<string[]>([]);
+  holidaysRef.current = snapshot?.config.market_holidays || [];
   const ledgerReady = loadStatus.Orders === "" && loadStatus.Trades === "" && orders.length < 100_000 && trades.length < 100_000;
   const dispersion = useDispersionSeries(snapshot?.option_watchlist || [], indicators, snapshot?.config.timeframe_seconds || 1800);
 
@@ -322,8 +338,9 @@ export default function App() {
     const headers = API_TOKEN ? { "x-macd-token": API_TOKEN } : undefined;
     const timers: ReturnType<typeof setTimeout>[] = [];
     const jobs: [string, string, (data: any, version: number) => void][] = [
-      ["Orders", "/api/orders?limit=100000&collapse=true", (rows: Order[], version) => setOrders((old) => mergeRows(mergeRows(old, rows, "order_id"), [...recentOrders.current.values()].filter((entry) => entry.version > version).map((entry) => entry.row), "order_id"))],
-      ["Trades", "/api/trades?limit=100000", (rows: Trade[]) => setTrades((old) => mergeRows(rows, old, "trade_id"))],
+      // Today's rows only: a resync re-reads a few KB, not the 4.5 MB history (owner, 18 Nov 2026).
+      ["Orders", "/api/orders?limit=100000&collapse=true&today=true", (rows: Order[], version) => { const dayStart = laneDayStart(new Date(), holidaysRef.current); setOrders((old) => mergeRows(mergeRows(old.filter((row) => inLaneDay(row.created_at, dayStart)), rows, "order_id"), [...recentOrders.current.values()].filter((entry) => entry.version > version).map((entry) => entry.row), "order_id")); }],
+      ["Trades", "/api/trades?limit=100000&today=true", (rows: Trade[]) => { const dayStart = laneDayStart(new Date(), holidaysRef.current); setTrades((old) => mergeRows(rows, old.filter((row) => inLaneDay(row.timestamp, dayStart)), "trade_id")); }],
       ["Research trades", "/api/research/trades?limit=5000", (rows: ResearchTrade[]) => setResearchTrades(rows)],
       ["Research report", "/api/research/report", (report) => {
         setResearchSummary(report?.summary); setResearchParameters(report?.parameters);
@@ -374,6 +391,7 @@ export default function App() {
   }, []);
 
 
+  const chartKey = useRef("");
   const laneFrame = snapshot?.config.timeframe_seconds;
   const frame = chartFrame ?? laneFrame;
   const nativeFrame = frame === laneFrame;
@@ -384,9 +402,16 @@ export default function App() {
     // Never combine the previous symbol's full history (or the short live
     // snapshot) with indicators for this symbol.  That was the source of
     // different time domains between the price and indicator panels.
-    setFullChart(undefined);
-    setFullChartError("");
-    setChartLoading(true);
+    // A stream resync for the same symbol and frame keeps the chart on screen
+    // and refreshes it behind (owner, 18 Nov 2026): no blank chart on resync.
+    const key = `${selected}|${frame}`;
+    const resync = chartKey.current === key;
+    chartKey.current = key;
+    if (!resync) {
+      setFullChart(undefined);
+      setFullChartError("");
+      setChartLoading(true);
+    }
     const load = (quiet: boolean) => fetch(`${API_URL}/api/chart/${encodeURIComponent(selected)}?timeframe_seconds=${frame}`, { headers, signal: controller.signal })
       .then(async (response) => {
         if (!response.ok) throw new Error((await response.json()).detail || "Historical chart request failed");
@@ -394,8 +419,8 @@ export default function App() {
       })
       .then((data) => setFullChart({ symbol: selected, timeframe: frame, candles: data.candles, indicators: data.indicators }))
       .catch((error) => { if (error.name !== "AbortError" && !quiet) setFullChartError(error instanceof Error ? error.message : "Historical chart request failed"); })
-      .finally(() => { if (!controller.signal.aborted && !quiet) setChartLoading(false); });
-    void load(false);
+      .finally(() => { if (!controller.signal.aborted) setChartLoading(false); });
+    void load(resync);
     // Only the lane's frame has live bars on the stream; another frame refreshes from the stored minutes.
     const refresh = nativeFrame ? 0 : window.setInterval(() => void load(true), 30_000);
     return () => { controller.abort(); if (refresh) window.clearInterval(refresh); };
@@ -602,6 +627,7 @@ export default function App() {
       titles={{ ORDERS: "Today's order attempts (IST), including filled and rejected orders; the full log is one click away", TRADES: "Today's executed buy and sell fills (IST), including partial exits" }}
       badges={{ PORTFOLIO: portfolio.positions.length || "", ORDERS: loadStatus.Orders === "" ? todayActivity.orders : "…", TRADES: loadStatus.Trades === "" ? todayActivity.fills : "…", SIGNALS: signals.length || "" }} />}
     {lane === "AUCTION" && <SubTabs className="lane-views" value={auctionView} options={AUCTION_VIEWS} onChange={setAuctionView} />}
+    {TODAY_LANES.includes(lane) && <div className="lane-day-note" role="note">Today only · {laneDayLabel(new Date(), snapshot?.config.market_holidays)} from 08:00 IST · <a href="#/BACKOFFICE/LANE" onClick={(event) => { event.preventDefault(); setBackofficeView("LANE"); setLane("BACKOFFICE"); }}>Full history → Back office</a></div>}
     {Object.entries(loadStatus).some(([, message]) => message) && <div className="data-status" role="status">
       {Object.entries(loadStatus).filter(([, message]) => message).map(([name, message]) => <span key={name}>{name}: {message}</span>)}
       <button onClick={() => setSnapshotRevision((n) => n + 1)}>Retry data</button>
@@ -653,7 +679,7 @@ export default function App() {
           timeframe={frame} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource}
           fitKey={`${selected}:${frame}:${chartPeriod}:${chartReady ? "full" : chartLoading ? "loading" : "empty"}:${fitNonce}`} />
       </section>
-    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} reentry={snapshot?.execution.reentry} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "AGENTIC" ? <AgenticPage /> : page === "LANES" ? <LanesPage ticks={ticks} portfolios={smartPortfolios} /> : page === "SCORE" ? <ScoreboardPage /> : page === "SPOT" ? <SpotLanePage ticks={ticks} portfolio={smartPortfolios.spot_macd} holidays={snapshot?.config.market_holidays} /> : page === "UPSTOX" ? <UpstoxLanePage ticks={ticks} holidays={snapshot?.config.market_holidays} /> : page === "MI" ? <MarketIntelligencePage /> : page === "VANGUARD" || page === "CBE" ? <NomadLanePage lane={page === "VANGUARD" ? "vanguard" : "cbe"} ticks={ticks} connected={connected} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage /> : marketView === "DAYHIGH" || marketView === "DAYLOW" ? <DayHighs key={marketView} extreme={marketView === "DAYHIGH" ? "HIGH" : "LOW"} onOpen={(symbol) => { setSelected(symbol); setLane("MACD"); setMacdView("TERMINAL"); }} /> : marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "STRADDLE" ? <StraddlePage /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "COIL" ? <SectorCoil /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage marketOpen={health?.session_open} /> : page === "OPTIONS" ? <OptionsDeskPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "WORKSTATION" ? <PlatformWorkstation /> : page === "MCX" ? <McxLanePage connected={connected} /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} reentry={snapshot?.execution.reentry} />}</Suspense>}
+    </div> : <Suspense fallback={<div className="quant-message panel" role="status">Loading…</div>}>{page === "QUANT" ? <QuantAnalyticsPage symbols={snapshot?.broker.symbols || []} selected={selected} timeframe={snapshot?.config.timeframe_seconds} onSelect={setSelected} /> : page === "PERFORMANCE" ? <><SubTabs value={performanceView} options={PERFORMANCE_VIEWS} onChange={setPerformanceView} />{performanceView === "EQUITY" ? <EquityCurve parameters={researchParameters} snapshot={snapshot} researchStatus={loadStatus["Research report"] || loadStatus["Research trades"]} researchRows={researchEquity} researchTrades={researchTrades} researchOpenPositions={researchOpenPositions} summary={researchSummary} /> : <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} reentry={snapshot?.execution.reentry} />}</> : page === "AGENT" ? <AgentPage ticks={ticks} /> : page === "AGENTIC" ? <AgenticPage /> : page === "LANES" ? <LanesPage ticks={ticks} portfolios={smartPortfolios} /> : page === "BACKOFFICE" ? <BackOfficePage view={backofficeView} onView={setBackofficeView} /> : page === "OPTLAB" ? <OptionsLabPage view={labView} onView={setLabView} /> : page === "SPOT" ? <SpotLanePage ticks={ticks} portfolio={smartPortfolios.spot_macd} holidays={snapshot?.config.market_holidays} /> : page === "UPSTOX" ? <UpstoxLanePage ticks={ticks} holidays={snapshot?.config.market_holidays} /> : page === "MI" ? <MarketIntelligencePage /> : page === "VANGUARD" || page === "CBE" ? <NomadLanePage lane={page === "VANGUARD" ? "vanguard" : "cbe"} ticks={ticks} connected={connected} /> : page === "MARKET" ? <><SubTabs value={marketView} options={MARKET_VIEWS} onChange={setMarketView} />{marketView === "RRG" ? <RRGPage /> : marketView === "DAYHIGH" || marketView === "DAYLOW" ? <DayHighs key={marketView} extreme={marketView === "DAYHIGH" ? "HIGH" : "LOW"} onOpen={(symbol) => { setSelected(symbol); setLane("MACD"); setMacdView("TERMINAL"); }} /> : marketView === "TREND" ? <TrendRotation /> : marketView === "HEATMAP" ? <AtmHeatmap /> : marketView === "STRADDLE" ? <StraddlePage /> : marketView === "WHEEL" ? <SectorWheel /> : marketView === "COIL" ? <SectorCoil /> : marketView === "DISPERSION" ? <DispersionPage current={dispersion.current} history={dispersion.history} error={dispersion.error} timeframe={snapshot?.config.timeframe_seconds || 1800} /> : <RatioPage options={snapshot?.option_watchlist || []} />}</> : page === "AUCTION" ? <AuctionPage marketOpen={health?.session_open} /> : page === "OPTIONS" ? <OptionsDeskPage /> : page === "PROFILE" ? <MarketProfilePage /> : page === "WORKSTATION" ? <PlatformWorkstation /> : page === "MCX" ? <McxLanePage connected={connected} /> : page === "BLAST" ? <BlastLanePage snapshot={blast} policy={health?.blast?.entry_policy} live={blastLive} liveOrders={blastOrders} liveTrades={blastTrades} revision={snapshotRevision} onSnapshot={setBlast} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} /> : page === "SIGNALS" ? <SignalRadar signals={signals} /> : page === "STATUS" ? <section className="ledger-page status-page"><div className="page-heading"><div><h1>Status</h1><p>Readiness, portfolio exposure, and book Greeks.</p></div></div><div className="status-stack"><Readiness health={health} error={healthError} updated={healthUpdated} open /><PortfolioRisk portfolio={portfolio} contracts={snapshot?.option_watchlist || []} limits={snapshot?.execution.risk} open /><BookGreeks /><LedgerCounts orders={orders} trades={trades} ready={ledgerReady} /></div></section> : <TradingLedger tab={page as LedgerTab} orders={orders} trades={trades} portfolio={portfolio} signals={signals} onOpenPosition={openPositionChart} holidays={snapshot?.config.market_holidays} ledgerReady={ledgerReady} reentry={snapshot?.execution.reentry} />}</Suspense>}
     {positionFocus && <PositionChartModal focus={positionFocus} levels={positionChartLevels} candles={visibleCandles} current={chartReady && nativeFrame ? current[selected] : undefined} indicators={visibleIndicators} studies={visibleStudies} markers={positionMarkers} error={fullChartError || snapshot?.history_errors?.[selected]} timeframe={frame} period={chartPeriod} layers={chartLayers} references={chartReferences} paneCollapse={paneCollapse} priceStyle={priceStyle} source={chartSource} onPriceStyle={pickPriceStyle} onPeriod={pickChartPeriod} onPrevious={() => movePositionFocus(-1)} onNext={() => movePositionFocus(1)} onClose={() => setPositionFocus(undefined)} />}
     <SettingsPanel open={settingsOpen} initialTab={settingsTab} onClose={() => setSettingsOpen(false)} />
   </main>;
@@ -671,12 +697,14 @@ function readRoute(): string[] {
 function pick<T extends string>(options: readonly (readonly [T, string])[], value: string | undefined, fallback: T): T {
   return (options.find(([key]) => key === value)?.[0] ?? fallback) as T;
 }
+// Lane pages that show the lane day only (owner, 18 Nov 2026); their history is in the Back office.
+const TODAY_LANES: readonly string[] = ["MACD", "LANES", "SPOT", "BLAST", "MCX", "AUCTION", "AGENTIC", "VANGUARD", "CBE", "UPSTOX"];
 const PERFORMANCE_VIEWS = [["STATISTICS", "Trade statistics"], ["EQUITY", "Equity curve"]] as const;
 const MARKET_VIEWS = [["RRG", "RRG"], ["DAYHIGH", "Day highs"], ["DAYLOW", "Day lows"], ["TREND", "Trend rotation"], ["DISPERSION", "Dispersion"], ["RATIOS", "Premium ratios"], ["HEATMAP", "ATM heat map"], ["STRADDLE", "ATM straddle & OI"], ["WHEEL", "Sector wheel"], ["COIL", "Sector coil"]] as const;
 
-type Lane = "MACD" | "MARKET" | "SCORE" | "LANES" | "SPOT" | "BLAST" | "MCX" | "AUCTION" | "AGENT" | "AGENTIC" | "VANGUARD" | "CBE" | "UPSTOX" | "MI";
+type Lane = "MACD" | "MARKET" | "BACKOFFICE" | "OPTLAB" | "LANES" | "SPOT" | "BLAST" | "MCX" | "AUCTION" | "AGENT" | "AGENTIC" | "VANGUARD" | "CBE" | "UPSTOX" | "MI";
 type MacdView = "TERMINAL" | Exclude<LedgerTab, "STATISTICS"> | "PERFORMANCE" | "QUANT" | "STATUS";
-const LANES = [["MACD", "MACD lane"], ["MARKET", "Market breadth"], ["SCORE", "Scoreboard"], ["LANES", "Smart lanes"], ["SPOT", "Spot MACD"], ["BLAST", "Blast lane"], ["MCX", "MCX lane"], ["AUCTION", "Auction desk"], ["AGENT", "Option agent"], ["AGENTIC", "Agentic lane"], ["VANGUARD", "Vanguard"], ["CBE", "CBE"], ["UPSTOX", "Upstox live"], ["MI", "Market intelligence"]] as const;
+const LANES = [["MACD", "MACD lane"], ["MARKET", "Market breadth"], ["BACKOFFICE", "Back office"], ["OPTLAB", "Options lab"], ["LANES", "Smart lanes"], ["SPOT", "Spot MACD"], ["BLAST", "Blast lane"], ["MCX", "MCX lane"], ["AUCTION", "Auction desk"], ["AGENT", "Option agent"], ["AGENTIC", "Agentic lane"], ["VANGUARD", "Vanguard"], ["CBE", "CBE"], ["UPSTOX", "Upstox live"], ["MI", "Market intelligence"]] as const;
 const MACD_VIEWS = [["TERMINAL", "Terminal"], ["PORTFOLIO", "Portfolio"], ["STATUS", "Status"], ["ORDERS", "Orders"], ["TRADES", "Trades"], ["PERFORMANCE", "Performance"],
   ["SIGNALS", "Signals"], ["QUANT", "Quant analytics"]] as const;
 const AUCTION_VIEWS = [["AUCTION", "Desk"], ["OPTIONS", "Options & flow"], ["PROFILE", "Profile / Flow"], ["WORKSTATION", "Live workstation"]] as const;

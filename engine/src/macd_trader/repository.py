@@ -300,11 +300,12 @@ class TradeRepository:
                 ),
             )
 
-    def equity_rows(self, limit: int = 5000) -> list[dict]:
+    def equity_rows(self, limit: int = 5000, since: str | None = None) -> list[dict]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl FROM equity_points ORDER BY timestamp DESC LIMIT ?",
-                (limit,),
+                "SELECT timestamp, equity, cash, realized_pnl, unrealized_pnl FROM equity_points WHERE timestamp >= ? "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (since or "", limit),
             ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
@@ -356,6 +357,12 @@ class TradeRepository:
     def record_capital_change(self, delta: float, iso_timestamp: str) -> None:
         with self._lock, self._connection:
             self._connection.execute("INSERT INTO capital_changes(timestamp, delta) VALUES (?, ?)", (iso_timestamp, delta))
+
+    def capital_changes(self) -> list[tuple[str, float]]:
+        """Every capital top-up or withdrawal, oldest first (the back office nets these out of daily P&L)."""
+        with self._lock:
+            rows = self._connection.execute("SELECT timestamp, delta FROM capital_changes ORDER BY timestamp").fetchall()
+        return [(str(r["timestamp"]), float(r["delta"])) for r in rows]
 
     def capital_added_after(self, iso_timestamp: str) -> float:
         with self._lock:
@@ -684,17 +691,19 @@ class TradeRepository:
             ],
         }
 
-    def rows(self, table: str, limit: int = 200) -> list[dict]:
+    def rows(self, table: str, limit: int = 200, since: str | None = None) -> list[dict]:
+        """Newest first; ``since`` (UTC ISO text, e.g. market_calendar.lane_day_since()) keeps only the lane's day."""
         if table not in {"orders", "trades", "signals"}:
             raise ValueError("invalid table")
         sort_column = "created_at" if table == "orders" else "timestamp"
         with self._lock:
             rows = self._connection.execute(
-                f"SELECT payload FROM {table} ORDER BY {sort_column} DESC LIMIT ?", (limit,)
+                f"SELECT payload FROM {table} WHERE {sort_column} >= ? ORDER BY {sort_column} DESC LIMIT ?",
+                (since or "", limit),
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
-    def orders_collapsed(self, limit: int = 10_000) -> list[dict]:
+    def orders_collapsed(self, limit: int = 10_000, since: str | None = None) -> list[dict]:
         """The order log with each run of rejects folded into one row per symbol, side and IST day.
 
         A rejected exit used to retry on every tick: one contract left 42,201 REJECTED rows over 29-30 Oct 2026,
@@ -703,15 +712,15 @@ class TradeRepository:
         """
         with self._lock:
             kept = self._connection.execute(
-                "SELECT payload FROM orders WHERE json_extract(payload, '$.status') != 'REJECTED' "
-                "ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+                "SELECT payload FROM orders WHERE created_at >= ? AND json_extract(payload, '$.status') != 'REJECTED' "
+                "ORDER BY created_at DESC LIMIT ?", (since or "", limit)).fetchall()
             runs = self._connection.execute(
                 """SELECT json_extract(payload, '$.symbol') AS symbol, json_extract(payload, '$.side') AS side,
                           date(created_at, '+330 minutes') AS day, COUNT(*) AS n, MIN(created_at) AS first_at,
                           MAX(created_at) AS last_at,
                           group_concat(DISTINCT json_extract(payload, '$.reject_reason')) AS reasons
-                   FROM orders WHERE json_extract(payload, '$.status') = 'REJECTED'
-                   GROUP BY symbol, side, day""").fetchall()
+                   FROM orders WHERE created_at >= ? AND json_extract(payload, '$.status') = 'REJECTED'
+                   GROUP BY symbol, side, day""", (since or "",)).fetchall()
             latest = {}
             for run in runs:
                 row = self._connection.execute(

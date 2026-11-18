@@ -310,6 +310,39 @@ async def trend_rotation(kind: Literal["CE", "PE", "SPOT"] = "CE",
     return await engine.trend_rotation(kind, timeframe_seconds)
 
 
+@app.get("/api/iv-scanner", dependencies=[Depends(authorize)])
+async def iv_scanner():
+    """IV scanner: 30-day ATM IV, IV rank / percentile, HV20 and skew per F&O underlying (stored chains). Read-only."""
+    return await engine.iv_scanner()
+
+
+@app.get("/api/builder/underlyings", dependencies=[Depends(authorize)])
+async def builder_underlyings():
+    """Underlyings with a stored option chain, for the strategy builder."""
+    from . import strategy_builder
+    return {"rows": await asyncio.to_thread(strategy_builder.underlyings, engine.settings.research_database_path)}
+
+
+@app.get("/api/builder/chain", dependencies=[Depends(authorize)])
+async def builder_chain(underlying: str = Query(max_length=30, pattern=r"^[A-Z0-9&\-]+$"),
+                        expiry: str | None = Query(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    """One underlying's latest stored chain (prices, quotes, OI, IV) plus lot size, live spot and, for stock options,
+    the physical-settlement margin schedule of the expiry. Read-only."""
+    return fast_json(await engine.builder_chain(underlying, expiry))
+
+
+@app.get("/api/builder/positions", dependencies=[Depends(authorize)])
+async def builder_positions(underlying: str = Query(max_length=30, pattern=r"^[A-Z0-9&\-]+$")):
+    """Open option positions on one underlying in every engine lane (load a lane's book into the builder)."""
+    return {"rows": engine.builder_positions(underlying)}
+
+
+@app.get("/api/expiry-exposure", dependencies=[Depends(authorize)])
+async def expiry_exposure():
+    """Lanes' stock options / futures vs the physical-settlement margin calendar (E-4..E-1). Read-only."""
+    return fast_json(await asyncio.to_thread(engine.expiry_exposure))
+
+
 @app.get("/api/day-highs", dependencies=[Depends(authorize)])
 async def day_highs():
     """Spots whose last completed 15-min bar closed at a new day high (or low). Read-only market breadth."""
@@ -361,17 +394,24 @@ async def dispersion(
 
 
 
+def _since(today: bool) -> str | None:
+    """Lane pages ask for ``today=true``: only the lane day's rows (market_calendar.lane_day_start, 08:00 IST roll).
+    History is the back office's (backoffice.py); the default stays the whole book for other readers (iOS, scripts)."""
+    from .market_calendar import lane_day_since
+    return lane_day_since() if today else None
+
+
 @app.get("/api/orders", dependencies=[Depends(authorize)])
-async def orders(limit: int = Query(default=10_000, ge=1, le=100_000), collapse: bool = False):
+async def orders(limit: int = Query(default=10_000, ge=1, le=100_000), collapse: bool = False, today: bool = False):
     """The order log; ``collapse`` folds each run of rejects into one row per symbol, side and IST day."""
     if collapse:
-        return await asyncio.to_thread(engine.repository.orders_collapsed, limit)
-    return engine.repository.rows("orders", limit)
+        return await asyncio.to_thread(engine.repository.orders_collapsed, limit, _since(today))
+    return engine.repository.rows("orders", limit, _since(today))
 
 
 @app.get("/api/trades", dependencies=[Depends(authorize)])
-async def trades(limit: int = Query(default=10_000, ge=1, le=100_000)):
-    return engine.repository.rows("trades", limit)
+async def trades(limit: int = Query(default=10_000, ge=1, le=100_000), today: bool = False):
+    return engine.repository.rows("trades", limit, _since(today))
 
 
 @app.get("/api/risk/greeks", dependencies=[Depends(authorize)])
@@ -488,16 +528,17 @@ async def agentic_actions(limit: int = Query(default=300, ge=1, le=2000)):
 
 
 @app.get("/api/agentic/book", dependencies=[Depends(authorize)])
-async def agentic_book(limit: int = Query(default=2000, ge=1, le=5000)):
+async def agentic_book(limit: int = Query(default=2000, ge=1, le=5000), today: bool = False):
     """The agentic lane's fills and recently closed positions, for its position charts' markers."""
     lane = _agentic()
-    return fast_json(await asyncio.to_thread(lambda: {"trades": lane.repository.rows("trades", limit),
+    since = _since(today)
+    return fast_json(await asyncio.to_thread(lambda: {"trades": lane.repository.rows("trades", limit, since),
                                                       "closed_positions": lane.execution.visible_closed_positions()}))
 
 
 @app.get("/api/agentic/equity", dependencies=[Depends(authorize)])
-async def agentic_equity():
-    return {"equity": await asyncio.to_thread(_agentic().equity_curve), "capital": _agentic().capital}
+async def agentic_equity(today: bool = False):
+    return {"equity": await asyncio.to_thread(_agentic().equity_curve, 3000, _since(today)), "capital": _agentic().capital}
 
 
 class AgenticBrainInput(BaseModel):
@@ -749,14 +790,16 @@ async def local_decision_status():
 
 
 @app.get('/api/paper-lanes/{lane}',dependencies=[Depends(authorize)])
-async def funded_lane_snapshot(lane:str):
+async def funded_lane_snapshot(lane:str,today:bool=False):
     import httpx
+    from .market_calendar import lane_day_start
     if lane not in ('vanguard','cbe'):raise HTTPException(404,'Unknown paper lane')
     url=os.environ.get('MACD_SHADOW_LANES_URL','').rstrip('/')
     if not url:raise HTTPException(503,'Paper service not configured')
+    params={'since':lane_day_start().replace(microsecond=0).isoformat()} if today else None   # the books stamp IST
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r=await client.get(f'{url}/api/paper-lanes/{lane}',headers={'X-Macd-Token':engine.settings.api_token})
+            r=await client.get(f'{url}/api/paper-lanes/{lane}',params=params,headers={'X-Macd-Token':engine.settings.api_token})
         return Response(r.content,status_code=r.status_code,media_type='application/json')
     except httpx.HTTPError:raise HTTPException(502,'Paper account reader unavailable') from None
 
@@ -806,6 +849,93 @@ async def lanes_scoreboard(refresh: bool = False):
     return _scoreboard_cache["value"]
 
 
+_backoffice = None
+
+
+def _bo():
+    """Back office (backoffice.py): every lane's history, day-wise / monthly / yearly; read-only, cached a minute."""
+    global _backoffice
+    if _backoffice is None:
+        from .backoffice import BackOffice
+        _backoffice = BackOffice(engine)
+    return _backoffice
+
+
+_DAY = r"^\d{4}-\d{2}-\d{2}$"
+
+
+@app.get("/api/backoffice/summary", dependencies=[Depends(authorize)])
+async def backoffice_summary(refresh: bool = False):
+    return fast_json(await asyncio.to_thread(_bo().summary, refresh))
+
+
+@app.get("/api/backoffice/calendar", dependencies=[Depends(authorize)])
+async def backoffice_calendar(period: str = Query(default="day", pattern="^(day|month|year)$"),
+                              start: str | None = Query(default=None, pattern=_DAY),
+                              end: str | None = Query(default=None, pattern=_DAY)):
+    return fast_json(await asyncio.to_thread(_bo().calendar, period, start, end))
+
+
+@app.get("/api/backoffice/lanes/{lane}", dependencies=[Depends(authorize)])
+async def backoffice_lane(lane: str, start: str | None = Query(default=None, pattern=_DAY),
+                          end: str | None = Query(default=None, pattern=_DAY)):
+    try:
+        return fast_json(await asyncio.to_thread(_bo().lane, lane, start, end))
+    except KeyError:
+        raise HTTPException(404, f"unknown lane {lane}") from None
+
+
+@app.get("/api/backoffice/trades", dependencies=[Depends(authorize)])
+async def backoffice_trades(lane: str | None = None, start: str | None = Query(default=None, pattern=_DAY),
+                            end: str | None = Query(default=None, pattern=_DAY),
+                            symbol: str | None = Query(default=None, max_length=40),
+                            page: int = Query(default=1, ge=1), size: int = Query(default=100, ge=1, le=1000)):
+    return fast_json(await asyncio.to_thread(_bo().trades, lane, start, end, symbol, page, size))
+
+
+@app.get("/api/backoffice/orders", dependencies=[Depends(authorize)])
+async def backoffice_orders(lane: str, start: str | None = Query(default=None, pattern=_DAY),
+                            end: str | None = Query(default=None, pattern=_DAY),
+                            page: int = Query(default=1, ge=1), size: int = Query(default=200, ge=1, le=1000)):
+    try:
+        return fast_json(await asyncio.to_thread(_bo().orders, lane, start, end, page, size))
+    except KeyError:
+        raise HTTPException(404, f"no order log for lane {lane}") from None
+
+
+@app.get("/api/backoffice/spread", dependencies=[Depends(authorize)])
+async def backoffice_spread(start: str | None = Query(default=None, pattern=_DAY),
+                            end: str | None = Query(default=None, pattern=_DAY)):
+    """Second mark: each lane's P&L had every fill crossed half the stored quoted spread (spread_mark.py)."""
+    return fast_json(await asyncio.to_thread(_bo().spread, start, end))
+
+
+@app.get("/api/backoffice/export.csv", dependencies=[Depends(authorize)])
+async def backoffice_export(view: str = Query(default="trades", pattern="^(trades|days|months|years)$"),
+                            lane: str | None = None, start: str | None = Query(default=None, pattern=_DAY),
+                            end: str | None = Query(default=None, pattern=_DAY)):
+    """CSV of the trade register or one lane's day / month / year rows."""
+    import csv
+    import io
+
+    def build() -> str:
+        if view == "trades":
+            rows = _bo().trades(lane, start, end, None, 1, 1_000_000)["rows"]
+        else:
+            if not lane:
+                raise HTTPException(400, "pick a lane for day, month or year rows")
+            rows = _bo().lane(lane, start, end)[view]
+        buffer = io.StringIO()
+        columns = list(dict.fromkeys(k for row in rows for k in row))
+        writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+        return buffer.getvalue()
+    text = await asyncio.to_thread(build)
+    name = f"backoffice-{view}-{lane or 'all'}-{start or 'start'}-{end or 'now'}.csv"
+    return Response(text, media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @app.get("/api/lanes", dependencies=[Depends(authorize)])
 async def smart_lanes_index():
     """The smart lanes (smart_lane.py): one paper book per configured capital, same rules."""
@@ -842,8 +972,10 @@ async def close_smart_position(name: str, payload: CloseSmartPositionInput):
 
 
 @app.get("/api/lanes/{name}/trades", dependencies=[Depends(authorize)])
-async def smart_lane_trades(name: str, limit: int = Query(default=500, ge=1, le=5000)):
-    return {"trades": await asyncio.to_thread(_smart_lane(name).trades, limit)}
+async def smart_lane_trades(name: str, limit: int = Query(default=500, ge=1, le=5000), today: bool = False):
+    since = _since(today)
+    rows = await asyncio.to_thread(_smart_lane(name).trades, limit)
+    return {"trades": [r for r in rows if not since or str(r.get("exit_time") or "") >= since]}
 
 
 @app.get("/api/lanes/{name}/journal", dependencies=[Depends(authorize)])
@@ -857,20 +989,21 @@ async def smart_lane_journal(name: str, day: str | None = Query(default=None, pa
 
 
 @app.get("/api/lanes/{name}/book", dependencies=[Depends(authorize)])
-async def smart_lane_book(name: str, limit: int = Query(default=500, ge=1, le=5000)):
+async def smart_lane_book(name: str, limit: int = Query(default=500, ge=1, le=5000), today: bool = False):
     """A lane's own orders, fills, portfolio and recently closed positions, in the MACD lane's shapes (its ledger)."""
     lane = _smart_lane(name)
+    since = _since(today)
 
     def read() -> dict:
-        return {"orders": lane.repository.rows("orders", limit), "trades": lane.repository.rows("trades", limit),
+        return {"orders": lane.repository.rows("orders", limit, since), "trades": lane.repository.rows("trades", limit, since),
                 "portfolio": lane.execution.portfolio_snapshot(),
                 "closed_positions": lane.execution.visible_closed_positions()}
     return fast_json(await asyncio.to_thread(read))
 
 
 @app.get("/api/lanes/{name}/equity", dependencies=[Depends(authorize)])
-async def smart_lane_equity(name: str):
-    return {"equity": await asyncio.to_thread(_smart_lane(name).equity_curve)}
+async def smart_lane_equity(name: str, today: bool = False):
+    return {"equity": await asyncio.to_thread(_smart_lane(name).equity_curve, 3000, _since(today))}
 
 
 @app.get("/api/blast/snapshot", dependencies=[Depends(authorize)])
@@ -899,12 +1032,13 @@ async def blast_journal(day: str | None = Query(default=None, pattern=r"^\d{4}-\
 
 
 @app.get("/api/blast/book", dependencies=[Depends(authorize)])
-async def blast_book():
+async def blast_book(today: bool = False):
+    since = _since(today)
     return {
-        "orders": engine.blast.repository.rows("orders", 500),
-        "trades": engine.blast.repository.rows("trades", 500),
-        "signals": engine.blast.repository.rows("signals", 500),
-        "equity": engine.blast.repository.equity_rows(5000),
+        "orders": engine.blast.repository.rows("orders", 500, since),
+        "trades": engine.blast.repository.rows("trades", 500, since),
+        "signals": engine.blast.repository.rows("signals", 500, since),
+        "equity": engine.blast.repository.equity_rows(5000, since),
         "portfolio": engine.blast.execution.portfolio_snapshot(),
         "closed_positions": engine.blast.execution.visible_closed_positions(),
     }
@@ -935,8 +1069,8 @@ async def mcx_snapshot():
 
 
 @app.get("/api/mcx/book", dependencies=[Depends(authorize)])
-async def mcx_book():
-    return fast_json(engine.mcx.book())
+async def mcx_book(today: bool = False):
+    return fast_json(engine.mcx.book(_since(today)))
 
 
 @app.put("/api/mcx/settings", dependencies=[Depends(authorize)])

@@ -43,6 +43,13 @@ SETUPS = {
     "expiry_positioning": "expiry-week plays around open-interest walls and max pain",
     "other": "anything else (explain it in the reason)",
 }
+# Owner, 18 Nov 2026: the lane trades only where it has been strong. Its 95 closed positions (20 Oct - 17 Nov):
+# swing 57 trades PF 2.16 (+Rs 2.88 L) vs intraday 32 trades PF 0.63; scorecard_overnight PF 2.94, multiday_breakout
+# 1.79, trend_pullback 3.46, expiry_positioning 2/2; grade B PF 4.88, A 1.07, C 0.76, D 0.01 (C/D: skip). Both sides
+# and every index stay (CE's lead was November's rally; FINNIFTY has 5 trades). Not proven; re-read monthly.
+STRENGTH_HORIZONS = ("swing",)
+STRENGTH_SETUPS = ("scorecard_overnight", "multiday_breakout", "trend_pullback", "expiry_positioning")
+STRENGTH_GRADES = ("A", "B")
 SWING_MIN_SESSIONS_TO_EXPIRY = 3
 SWING_MAX_SESSIONS = 5
 TRIGGER_OPS = ("above", "below")
@@ -84,10 +91,11 @@ Horizon of every entry -- trade BOTH, the operator wants directional moves that 
 Setups -- every open/arm names one in "setup" so the scoreboard learns which ideas work here:
 """ + "\n".join(f"- {k}: {v}" for k, v in SETUPS.items()) + """
 
-LEARNING PHASE: the operator wants varied, liberal trades to learn and firm up setups. Try different setups on both
-horizons when the evidence is reasonable, at the fixed lot sizes of the decision matrix; you do not need a perfect
-setup, you need a defined idea, a stop and an invalidation. Read setup_scoreboard: lean toward setups that are
-working, keep testing the ones with few trades, and drop ones that keep failing.
+STRENGTHS ONLY (owner, 18 Nov 2026; enforced in code): this lane's record says its edge is multi-day index option
+holds and its intraday trades lose (swing PF 2.16 vs intraday 0.63 over 95 trades). New risk (open, add, arm) is
+accepted only when ALL hold: horizon "swing"; setup one of """ + ", ".join(STRENGTH_SETUPS) + """; and the
+swing grade of the decision matrix is A or B (C and D are skipped). Both CE and PE, every index. Do not propose
+intraday trades or other setups: they are rejected. Manage what you hold as before. setup_scoreboard keeps the record.
 
 What the backtests on this market found (Oct 2026 studies, 2019-2026 daily data, one year of real option premiums):
 - Next-day index direction is hard to call; the scorecard above is the tested exception. It is an OVERNIGHT filter,
@@ -439,6 +447,7 @@ class Limits:
     max_lots_per_order: int = 20
     no_new_after: str = "15:10"          # HH:MM IST
     expiry_no_new_after: str = "13:30"   # on a contract's expiry day
+    strengths_only: bool = False         # the live lane sets it from settings.agentic_strengths_only (owner, 18 Nov 2026)
 
 
 @dataclass
@@ -521,6 +530,14 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
         lots = int(lots) if isinstance(lots, (int, float)) and not isinstance(lots, bool) and lots == lots else None
 
         if kind in ("open", "add", "arm"):
+            if kind in ("open", "arm") and limits.strengths_only:
+                if action["horizon"] not in STRENGTH_HORIZONS:
+                    reject(action, "strengths only (owner, 18 Nov 2026): this lane takes swing trades, not intraday")
+                    continue
+                if action["setup"] not in STRENGTH_SETUPS:
+                    reject(action, f"strengths only (owner, 18 Nov 2026): setup {action['setup']} is not one of "
+                                   + ", ".join(STRENGTH_SETUPS))
+                    continue
             if loss_stop_hit:
                 reject(action, f"daily loss stop ({limits.daily_loss_stop_pct:.0%} of capital) reached: no new risk today")
                 continue
@@ -588,6 +605,9 @@ def validate(decision: dict, context: dict, limits: Limits) -> Validated:
                 else:
                     note = f"{note}; {why}" if note else why
             grade = grade or action.get("grade")     # set above only on the matrix-free trigger-fill path
+            if limits.strengths_only and grade not in STRENGTH_GRADES:
+                reject(action, f"strengths only (owner, 18 Nov 2026): grade {grade or 'ungraded'} -- only A and B are traded")
+                continue
             gate = _entry_gate(kind, row, context, grade, now)
             if gate:
                 reject(action, gate)

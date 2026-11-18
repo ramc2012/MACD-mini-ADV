@@ -520,7 +520,8 @@ class AgenticLane:
         s = self.settings
         return brain.Limits(capital=self.capital, max_positions=s.agentic_max_positions,
                             max_position_pct=s.agentic_max_position_pct, max_deployed_pct=s.agentic_max_deployed_pct,
-                            daily_loss_stop_pct=s.agentic_daily_loss_stop_pct, max_lots_per_order=s.agentic_max_lots_per_order)
+                            daily_loss_stop_pct=s.agentic_daily_loss_stop_pct, max_lots_per_order=s.agentic_max_lots_per_order,
+                            strengths_only=bool(getattr(s, "agentic_strengths_only", True)))
 
     def _restore(self) -> None:
         rows = sorted(self.repository.rows("trades", 1_000_000), key=lambda row: row["timestamp"])
@@ -1588,8 +1589,8 @@ class AgenticLane:
         with self._db_lock:
             return [r[0] for r in self._db.execute("SELECT DISTINCT day FROM agentic_cycles ORDER BY day DESC LIMIT ?", (limit,))]
 
-    def equity_curve(self, limit: int = 3000) -> list[dict]:
-        return [{"at": r.get("timestamp") or r.get("at"), "equity": r.get("equity")} for r in self.repository.equity_rows(limit)]
+    def equity_curve(self, limit: int = 3000, since: str | None = None) -> list[dict]:
+        return [{"at": r.get("timestamp") or r.get("at"), "equity": r.get("equity")} for r in self.repository.equity_rows(limit, since)]
 
     def snapshot(self) -> dict:
         snap = self.execution.portfolio_snapshot()

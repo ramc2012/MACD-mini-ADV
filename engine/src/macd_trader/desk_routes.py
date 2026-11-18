@@ -853,14 +853,19 @@ async def mp_statistics():
     return engine.mp.statistics()
 
 @router.get("/api/mp/book", dependencies=[Depends(authorize)])
-async def mp_book():
+async def mp_book(today: bool = False):
+    from .market_calendar import lane_day_since
+    since = lane_day_since() if today else None   # lane pages: the lane day only; history is the back office's
+    closed = engine.mp.closed_view()
+    if since:
+        closed = [r for r in closed if str(r.get("exit_time") or "") >= since]
     return {
         "portfolio": engine.mp.portfolio.snapshot(),
-        "orders": engine.mp.repository.rows("orders", 2000),
-        "trades": engine.mp.repository.rows("trades", 2000),
-        "signals": engine.mp.repository.rows("signals", 500),
-        "equity": engine.mp.repository.equity_rows(5000),
-        "closed_positions": engine.mp.closed_view(),
+        "orders": engine.mp.repository.rows("orders", 2000, since),
+        "trades": engine.mp.repository.rows("trades", 2000, since),
+        "signals": engine.mp.repository.rows("signals", 500, since),
+        "equity": engine.mp.repository.equity_rows(5000, since),
+        "closed_positions": closed,
     }
 
 @router.put("/api/mp/settings", dependencies=[Depends(authorize)])

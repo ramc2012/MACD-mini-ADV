@@ -132,7 +132,7 @@ export function BlastLanePage({ snapshot, policy, live, liveOrders, liveTrades, 
   useEffect(() => {
     if (!wantsBook || !ready) return;
     const controller = new AbortController();
-    void requestJson<BlastBook>(`${API_URL}/api/blast/book`, { headers: authHeaders(), signal: controller.signal })
+    void requestJson<BlastBook>(`${API_URL}/api/blast/book?today=true`, { headers: authHeaders(), signal: controller.signal })
       .then((data) => { setBook(data); setBookError(""); })
       .catch((error) => { if (!controller.signal.aborted) setBookError(errorText(error)); });
     return () => controller.abort();

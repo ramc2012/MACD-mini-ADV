@@ -310,7 +310,7 @@ function BookTab() {
   const [error, setError] = useState("");
   useEffect(() => {
     const controller = new AbortController();
-    requestJson<Book>(`${API_URL}/api/mcx/book`, { headers: authHeaders(), signal: controller.signal })
+    requestJson<Book>(`${API_URL}/api/mcx/book?today=true`, { headers: authHeaders(), signal: controller.signal })
       .then(setBook).catch((reason) => { if (!controller.signal.aborted) setError(errorText(reason)); });
     return () => controller.abort();
   }, []);

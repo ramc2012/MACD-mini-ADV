@@ -214,3 +214,8 @@ main .nomad-port {
 .od-table tbody th.od-strike { position: static; padding: 0; }
 .od-table tr[data-selected="true"] :is(th, td) { background: var(--bg-accent-soft); }
 .od-strike-link:is(:hover, :focus-visible) { color: var(--accent-text); text-decoration: underline; }
+
+/* Lane pages show the lane day only (18 Nov 2026). */
+.lane-day-note { padding: 2px var(--space-3); color: var(--text-4); font-size: var(--fs-xs); }
+.lane-day-note a { color: var(--accent-text); text-decoration: none; }
+.lane-day-note a:hover { text-decoration: underline; }

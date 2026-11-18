@@ -426,16 +426,19 @@ class Book:
         with self.transaction() as db:
             db.execute('UPDATE account SET paused=?',(int(pause),));self.event(db,now,'PAUSE_ENTRIES' if pause else 'RESUME_ENTRIES',None,{'exits_remain_managed':True})
 
-    def snapshot(self,now):
+    def snapshot(self,now,since=None):
+        # since (IST ISO text): the app's lane pages show only the lane day; the back office has the history (18 Nov 2026).
+        # Open positions, live orders and the summary numbers stay whole.
+        cut=since or ''
         with self.db() as db:
             db.execute('BEGIN')
             a,positions,equity,unsettled=self.valuation(db);held=[p for p in positions if not p['closed_at']];closed=[p for p in positions if p['closed_at']]
             realized=sum(p['pnl_paise'] for p in closed);unrealized=equity-a['initial_paise']-realized
-            orders=[dict(r) for r in db.execute('SELECT * FROM orders ORDER BY created_at DESC,id LIMIT 300')]
-            curves=[dict(r) for r in db.execute('SELECT * FROM (SELECT * FROM equity ORDER BY at DESC LIMIT 2000) ORDER BY at')]
-            events=[{**dict(r),'detail':json.loads(r['detail'])} for r in db.execute('SELECT * FROM events ORDER BY id DESC LIMIT 100')]
-            decisions=[{**dict(r),'payload':json.loads(r['payload'])} for r in db.execute('SELECT * FROM decisions ORDER BY at DESC LIMIT 100')]
-            fills=[dict(r) for r in db.execute('SELECT * FROM fills ORDER BY at DESC LIMIT 300')]
+            orders=[dict(r) for r in db.execute("SELECT * FROM orders WHERE created_at>=? OR state NOT IN ('CLOSED','EXPIRED','REJECTED','SUPERSEDED') ORDER BY created_at DESC,id LIMIT 300",(cut,))]
+            curves=[dict(r) for r in db.execute('SELECT * FROM (SELECT * FROM equity WHERE at>=? ORDER BY at DESC LIMIT 2000) ORDER BY at',(cut,))]
+            events=[{**dict(r),'detail':json.loads(r['detail'])} for r in db.execute('SELECT * FROM events WHERE at>=? ORDER BY id DESC LIMIT 100',(cut,))]
+            decisions=[{**dict(r),'payload':json.loads(r['payload'])} for r in db.execute('SELECT * FROM decisions WHERE at>=? ORDER BY at DESC LIMIT 100',(cut,))]
+            fills=[dict(r) for r in db.execute('SELECT * FROM fills WHERE at>=? ORDER BY at DESC LIMIT 300',(cut,))]
             total_fees=db.execute('SELECT coalesce(sum(fee_paise),0) FROM fills').fetchone()[0]
             state=db.execute('SELECT * FROM status').fetchone()
             stale=sum((now-datetime.fromisoformat(p['last_at'])).total_seconds()>self.terms['quote_age_seconds'] for p in held)
@@ -453,6 +456,6 @@ class Book:
                     'win_rate':sum(p['pnl_paise']>0 for p in closed)/len(closed) if closed else None,
                     'expectancy':realized/100/len(closed) if closed else None,'paused':bool(a['paused']),'stale_positions':stale,
                     'strategy_closed_count':sum(json.loads(p['payload']).get('strategy_version')==self.terms.get('strategy_version') for p in closed) if self.terms.get('strategy_version') else len(closed),
-                    'policy':self.terms,'positions':held,'closed':closed[-300:],'orders':orders,'equity_curve':curves,
+                    'policy':self.terms,'positions':held,'closed':[p for p in closed if (p['closed_at'] or '')>=cut][-300:],'orders':orders,'equity_curve':curves,
                     'events':events,'decisions':decisions,'fills':fills,'list_tests':tests,'fees_paid':total_fees/100,'checked_at':state['at'] if state else None,
                     'status':json.loads(state['payload']) if state else {'state':'awaiting_first_check'}}

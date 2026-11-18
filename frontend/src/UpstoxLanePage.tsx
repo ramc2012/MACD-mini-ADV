@@ -6,6 +6,7 @@ import { LaneChart, LaneChartModal, type LaneChartFocus } from "./LaneChart";
 import { EquityChart } from "./LaneEquityChart";
 import { fillMarkers, positionLevels } from "./laneChartMarks";
 import type { ClosedPosition, Order, Portfolio, Position, Tick, Trade } from "./types";
+import { inLaneDay, laneDayStart } from "./laneDay";
 
 // The Upstox live lane (upstox_live/lane.py, served at /api/upstox-live/ by nginx): MACD lane signals traded with
 // REAL Upstox orders sized from the account's available margin (return % is on the Rs 25,000 start). Laid out like the MACD and Spot lanes -- summary cards, then
@@ -138,6 +139,10 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   }, [closedRows, capital, d, equity]);
 
   const today = istDay(new Date().toISOString());
+  // The ledger tabs show the lane day only (owner, 18 Nov 2026); Performance and the Back office keep the history.
+  const dayStart = laneDayStart(new Date(), holidays);
+  const todayOrders = useMemo(() => orders.filter((o) => inLaneDay(o.created_at, dayStart)), [orders, dayStart]);
+  const todayTrades = useMemo(() => trades.filter((t) => inLaneDay(t.timestamp, dayStart)), [trades, dayStart]);
   const decisions = useMemo(() => d?.decisions ?? [], [d]);
   const todayDecisions = decisions.filter((r) => istDay(r.at) === today);
   const signalsSeen = todayDecisions.filter((r) => ENTRY_KINDS.includes(r.kind) && r.side !== "SELL").length;
@@ -234,7 +239,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
         </section>
       </div>}
 
-      {(tab === "PORTFOLIO" || tab === "ORDERS" || tab === "TRADES") && <TradingLedger tab={tab} orders={orders} trades={trades}
+      {(tab === "PORTFOLIO" || tab === "ORDERS" || tab === "TRADES") && <TradingLedger tab={tab} orders={todayOrders} trades={todayTrades}
         portfolio={portfolio} signals={[]} onOpenPosition={openChart} holidays={holidays} ledgerReady />}
 
       {tab === "STATUS" && <div className="spot-status">
