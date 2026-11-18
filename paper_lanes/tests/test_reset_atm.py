@@ -37,7 +37,7 @@ def test_vanguard_enters_same_session_and_cash_cbe_next_session(tmp_path):
     m=Manager(tmp_path,capital=5000000,now=NOW-timedelta(hours=1),market=object())
     pub=dict(lane='vanguard',id='new',decision_at=NOW.isoformat(),source_session=str(NOW.date()),
         paper_account_id=m.books['vanguard'].account_id,watchlist=[dict(instrument='NSE_FO|X',symbol='X',contract_kind='ATM',horizon_sessions=1)])
-    meta={'NSE_FO|X':dict(instrument='NSE_FO|X',symbol='X',expiry='2026-10-29',lot_size=50,tick=.05,
+    meta={'NSE_FO|X':dict(instrument='NSE_FO|X',symbol='X',expiry='2026-11-24',lot_size=50,tick=.05,
         atm_guard={'spot_instrument':'NSE_EQ|S','strikes':[1000],'strike':1000})}
     assert m.offer(pub,meta)==1
     order=m.snapshot('vanguard')['orders'][0]
@@ -69,3 +69,19 @@ def test_approved_vanguard_fills_only_while_atm_then_manages_exit_without_qwen(t
     result=b.snapshot(NOW)
     assert result['open_count']==0 and result['closed_count']==1 and len(result['fills'])==2
     assert result['closed'][0]['exit_reason']=='TARGET'
+
+
+def test_vanguard_buys_no_stock_option_inside_its_series_last_five_sessions(tmp_path):
+    # Owner, 18 Nov 2026 (R1, as the engine's books): from E-5 a stock series only closes.
+    from paper_lanes.manager import series_closed
+    from datetime import date
+    assert series_closed(date(2026,11,16),'2026-11-23') and not series_closed(date(2026,11,13),'2026-11-23')
+    day=datetime(2026,11,19,14,50,tzinfo=IST)
+    m=Manager(tmp_path,capital=5000000,now=day-timedelta(hours=1),market=object())
+    pub=dict(lane='vanguard',id='nov',decision_at=day.isoformat(),source_session=str(day.date()),
+        paper_account_id=m.books['vanguard'].account_id,watchlist=[dict(instrument=f'NSE_FO|{k}',symbol=k,contract_kind='ATM',horizon_sessions=3) for k in 'ND'])
+    guard={'spot_instrument':'NSE_EQ|S','strikes':[1000],'strike':1000}
+    meta={'NSE_FO|N':dict(instrument='NSE_FO|N',symbol='N',expiry='2026-11-23',lot_size=50,tick=.05,atm_guard=guard),
+          'NSE_FO|D':dict(instrument='NSE_FO|D',symbol='D',expiry='2026-12-29',lot_size=50,tick=.05,atm_guard=guard)}
+    assert m.offer(pub,meta)==1
+    assert [o['instrument'] for o in m.snapshot('vanguard')['orders']]==['NSE_FO|D']

@@ -29,6 +29,14 @@ def next_session(day,count=1):
     return day
 
 
+STOCK_EXIT_SESSIONS=5   # owner 18 Nov 2026 (R1): a stock option series is closed from its 5th session before expiry
+
+
+def series_closed(day,expiry):
+    """True when a stock option expiring on `expiry` is inside its last five sessions on `day` (E-5, as the engine)."""
+    return next_session(day,STOCK_EXIT_SESSIONS)>=date.fromisoformat(expiry)
+
+
 # Continuous sessions since 3 Aug 2026 (engine sessions.py regime 2026-08-session): F&O to 15:40; the cash book keeps its
 # 15:30 marking clock (its entries end 09:55 and its sales settle next session).
 SESSION_END={'vanguard':time(15,40),'cbe':time(15,30)}
@@ -157,6 +165,7 @@ class Manager:
             due_day=next_session(day,horizon)
             expiry=meta.get('expiry')
             if lane=='vanguard' and not expiry:continue
+            if lane=='vanguard' and series_closed(day,expiry):continue      # E-5: no new buys in a closing series
             if lane=='vanguard' and date.fromisoformat(expiry)<due_day:
                 # owner 28 Oct: every pick is entered; a series ending inside the hold exits on its expiry day
                 if date.fromisoformat(expiry)<=day:continue
@@ -192,6 +201,8 @@ class Manager:
             expiry=meta.get('expiry')
             if lane=='vanguard' and (not expiry or date.fromisoformat(expiry)<due_day):
                 skipped.append({'symbol':candidate.get('symbol'),'reason':'expires before planned exit'});continue
+            if lane=='vanguard' and series_closed(now.date(),expiry):
+                skipped.append({'symbol':candidate.get('symbol'),'reason':'series inside its last five sessions'});continue
             prepared.append({**meta,'sector':candidate.get('sector20') or candidate.get('sector') or meta.get('sector') or 'UNKNOWN',
                              'candidate':{**candidate,'owner_conversion':True},
                              'exit_due':datetime.combine(due_day,time(15,10) if expiry==str(due_day) else time(15,15),IST)})
