@@ -355,6 +355,21 @@ async def rollover_execute(body: RollInput):
     return fast_json(await engine.series_roll())
 
 
+class HistoryFillInput(BaseModel):
+    confirm: Literal["FILL"]
+
+
+@app.post("/api/history/fill-series", dependencies=[Depends(authorize)])
+async def history_fill_series(_payload: HistoryFillInput):
+    """Owner, 18 Nov 2026: full available minute history for the watchlist's stock option contracts."""
+    return engine.start_series_history_fill()
+
+
+@app.get("/api/history/fill-series", dependencies=[Depends(authorize)])
+async def history_fill_series_status():
+    return dict(getattr(engine, "series_history_report", {}) or {})
+
+
 @app.get("/api/expiry-exposure", dependencies=[Depends(authorize)])
 async def expiry_exposure():
     """Lanes' stock options / futures vs the physical-settlement margin calendar (E-4..E-1). Read-only."""

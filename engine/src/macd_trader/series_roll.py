@@ -376,7 +376,8 @@ def _lane_meta(lane_obj, old: str, new: str, entry: dict, position, now: datetim
 
 
 async def execute(engine, now: datetime | None = None, journal_dir: str | None = None) -> dict:
-    """Run the roll: every lane's outgoing legs first (frees cash), then the next-series legs."""
+    """Run the roll: every lane's outgoing legs are closed; the next-series legs open only with
+    ``series_roll_reopen`` (off since 18 Nov 2026: the lanes enter the next series on their own signals)."""
     from .option_agent import parse_option
     now = (now or datetime.now(IST)).astimezone(IST)
     rows = await plan(engine, now)
@@ -396,7 +397,11 @@ async def execute(engine, now: datetime | None = None, journal_dir: str | None =
                 row.update(status="EXITED_ONLY", error=f"closed; not rolled: {row['error']}")
         except Exception as exc:  # noqa: BLE001 -- one refused leg must not stop the others
             row.update(status="EXIT_FAILED", error=f"{type(exc).__name__}: {exc}"[:200])
+    reopen = bool(getattr(engine.settings, "series_roll_reopen", False))
     for row in rows:
+        if row["status"] == "EXITED" and not reopen:
+            row["status"] = "CLOSED"                   # owner: the next series is taken on the lane's own signal
+            continue
         if row["status"] != "EXITED":
             continue
         execution, lane_obj = books[row["lane"]]

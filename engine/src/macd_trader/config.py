@@ -326,6 +326,10 @@ class Settings(BaseSettings):
     # episodes study on 30-minute index bars -- initiate at a K x ATR directional-change confirmation, add on a
     # resumed strong running trend, reduce when old and fading, flip at the reversal -- trading about 2% ITM
     # options of the nearest monthly series >= 20 days out. Not proven forward.
+    # Owner, 18 Nov 2026 (after the 19:45 roll): "dont re-open in december. it will be taken by the lane when signal
+    # comes" -- the series roll closes the outgoing legs only; reopening in the next series is off.
+    series_roll_reopen: bool = False
+
     trend_lane_enabled: bool = True
     trend_lane_capital: float = Field(default=500_000.0, gt=0)
     trend_lane_indices_csv: str = "NIFTY,BANKNIFTY,FINNIFTY,MIDCPNIFTY,SENSEX"

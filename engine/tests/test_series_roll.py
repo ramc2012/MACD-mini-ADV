@@ -62,10 +62,10 @@ def _ticks(path):
     db.close()
 
 
-def _engine(tmp_path):
+def _engine(tmp_path, reopen=True):
     settings = Settings(execution_mode="paper", database_path=str(tmp_path / "m.sqlite3"),
                         research_database_path=str(tmp_path / "h.sqlite3"), tick_database_path=str(tmp_path / "t.sqlite3"),
-                        runtime_settings_path=str(tmp_path / "settings.json"))
+                        runtime_settings_path=str(tmp_path / "settings.json"), series_roll_reopen=reopen)
     _research(settings.research_database_path)
     _ticks(settings.tick_database_path)
     manager = ExecutionManager(settings, None, Portfolio(1_000_000), TradeRepository(settings.database_path), EventHub())
@@ -152,3 +152,29 @@ def test_the_expiry_view_lists_each_book_once():
     spot = object()
     stub = SimpleNamespace(_books=lambda: [("macd", object()), ("spot_macd", spot), ("spot_macd", spot)])
     assert [name for name, _ in TradingEngine._option_lanes(stub)] == ["macd", "spot_macd"]
+
+
+def test_by_default_the_roll_only_closes_the_outgoing_series(tmp_path):
+    engine = _engine(tmp_path, reopen=False)
+    out = asyncio.run(series_roll.execute(engine, NOW))
+    assert out["counts"] == {"CLOSED": 1}
+    book = engine.execution.portfolio
+    assert not book.positions and book.cash == pytest.approx(1_000_000 - 4000 + 4950)
+
+
+def test_the_history_fill_writes_only_missing_minutes(tmp_path):
+    from macd_trader import series_history
+    from macd_trader.candle_store import store_historical_candles
+    from macd_trader.models import Candle
+    db = str(tmp_path / "h.sqlite3")
+    t0 = int(datetime(2026, 10, 1, 9, 15, tzinfo=IST).timestamp())
+    store_historical_candles(db, [Candle(DEC_ATM, t0, 1, 1, 1, 1, 0, True)], "2026-12-29")
+
+    class Broker:
+        async def history_range(self, symbol, tf, start, end):
+            return [Candle(symbol, t0 + 60 * i, 2, 2, 2, 2, 5, True) for i in range(3)]
+
+    report = asyncio.run(series_history.fill(Broker(), db, {DEC_ATM: "2026-12-29"}, {}, pace=0))
+    assert report["rows"] == 2 and report["filled"] == 1 and report["finished_at"]
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT close FROM historical_candles WHERE timestamp = ?", (t0,)).fetchone()[0] == 1

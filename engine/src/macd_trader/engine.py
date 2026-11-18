@@ -2720,6 +2720,26 @@ class TradingEngine(DeskMixin):
         self.events.publish("snapshot_required", {"reason": "series_roll"})
         return result
 
+    def start_series_history_fill(self) -> dict:
+        """Full listed history for the watchlist's next-series stock options (series_history.py), in the background;
+        tradable (ATM) legs first. The next warm-up replays it."""
+        from . import series_history
+        task = self.__dict__.get("_series_history_task")
+        report = self.__dict__.setdefault("series_history_report", {})
+        if task is not None and not task.done():
+            return {"running": True, **report}
+        from .universe import INDEX_SPOTS
+        today = datetime.now(IST).date().isoformat()
+        rows = [c for c in self.contract_selector.contracts.values()
+                if c.expiry and str(c.expiry)[:10] > today and c.underlying not in INDEX_SPOTS]
+        rows.sort(key=lambda c: (bool(c.analysis_only), c.symbol))
+        symbols = {c.symbol: str(c.expiry)[:10] for c in rows}
+        report.clear()
+        report["queued"] = len(symbols)
+        self.__dict__["_series_history_task"] = asyncio.create_task(
+            series_history.fill(self.broker, self.settings.research_database_path, symbols, report))
+        return {"running": True, **report}
+
     async def _series_roll_loop(self) -> None:
         """R2 (owner, 18 Nov 2026: "complete rollover"): on a series' last day, at 15:05 IST, before the 15:10
         flatten, every held stock option / future of that series is rolled into the next one."""
@@ -2732,7 +2752,7 @@ class TradingEngine(DeskMixin):
             if self.__dict__.get("_series_rolled_on") == now.date():
                 continue
             try:
-                if any(r["status"] == "PLANNED" for r in await series_roll.plan(self, now)):
+                if any("exit" in r for r in await series_roll.plan(self, now)):
                     await self.series_roll()
                 self.__dict__["_series_rolled_on"] = now.date()
             except Exception as exc:  # noqa: BLE001 -- the 15:10 flatten still runs
