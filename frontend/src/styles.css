@@ -1547,3 +1547,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .blast-body > .straddle-mcx { height: auto; }
   .blast-body > .straddle-mcx .straddle-chart { height: calc(100dvh - 300px); min-height: 380px; flex: none; }
 }
+
+/* Upstox live lane: Performance / Trades filters and after-charges stats (19 Nov 2026) */
+.upstox-filters { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 2px 0 10px; }
+.upstox-filter { display: inline-flex; flex-wrap: wrap; align-items: center; }
+.upstox-filter > span { margin-right: 2px; color: var(--text-4); font-size: var(--fs-micro); letter-spacing: .05em; text-transform: uppercase; }
+.upstox-stats { margin-top: 12px; }
+.upstox-stats b { overflow: visible; font-size: var(--fs-lg); white-space: normal; }
+.upstox-stats small { display: block; margin-top: 6px; color: var(--text-4); font-size: var(--fs-micro); line-height: 1.4; white-space: normal; }
+.upstox-note { max-width: 150ch; margin: 10px 0 0; line-height: 1.5; }

@@ -499,6 +499,285 @@ def owner_exit_reason(p: dict, last: float | None) -> str | None:
 
 # ---------------------------------------------------------------- decisions
 
+# ---------------------------------------------------------------- charges (owner, 19 Nov 2026: metrics after charges,
+# read from Upstox, not calculated). Upstox reports the ACTUAL charges per day for the F&O segment
+# (GET /v2/trade/profit-loss/charges) and lists every execution of the day (GET /v2/charges/historical-trades); it has
+# no per-trade charge. Each day's actual figures are split over that day's executions: brokerage equally per order (a
+# lane order's fills share one), STT by sell value, stamp duty by buy value, exchange/SEBI/IPFT by value, GST in
+# proportion to brokerage + exchange. A day's lane legs therefore add up to exactly what Upstox charged for them; the
+# owner's other trades that day carry their own share and are not in the lane's numbers. Read-only, two calls per day;
+# a day is final once read on a later day, today's is re-read every CHARGES_REFRESH_SECONDS.
+CHARGES_REFRESH_SECONDS = float(os.environ.get("CHARGES_REFRESH_SECONDS", "1800"))
+CHARGES_RETRY_SECONDS = 300
+CHARGES_DAYS_PER_PASS = 2
+CHARGE_KEYS = ("total", "brokerage", "stt", "gst", "stamp_duty", "exchange")
+STRIKE_RE = re.compile(r"(\d+(?:\.\d+)?)(CE|PE)$")
+
+
+def financial_year(day: str) -> str:
+    y, m = int(day[:4]), int(day[5:7])
+    start = y if m >= 4 else y - 1
+    return f"{start % 100:02d}{(start + 1) % 100:02d}"
+
+
+def fetch_day_charges(day: str) -> dict:
+    """Upstox's actual F&O charges and executions for one IST day (YYYY-MM-DD)."""
+    dmy = f"{day[8:10]}-{day[5:7]}-{day[:4]}"
+    br = (upstox("GET", READ_HOST, "/v2/trade/profit-loss/charges", query={
+        "segment": "FO", "financial_year": financial_year(day), "from_date": dmy, "to_date": dmy}).get("data") or {}).get("charges_breakdown")
+    if not isinstance(br, dict) or "total" not in br:
+        raise RuntimeError("Upstox P&L charges answer has no charges_breakdown")
+    rows, page = [], 1
+    while True:
+        r = upstox("GET", READ_HOST, "/v2/charges/historical-trades", query={
+            "segment": "FO", "start_date": day, "end_date": day, "page_number": page, "page_size": 1000})
+        got = r.get("data") or []
+        rows += got
+        if len(got) < 1000 or page >= 20:
+            break
+        page += 1
+    num = lambda v: round(float(v or 0), 2)
+    taxes, other = br.get("taxes") or {}, br.get("charges") or {}
+    return {"day": day, "fetched_at": iso(),
+            "charges": {"total": num(br.get("total")), "brokerage": num(br.get("brokerage")), "stt": num(taxes.get("stt")),
+                        "gst": num(taxes.get("gst")), "stamp_duty": num(taxes.get("stamp_duty")),
+                        "exchange": num(sum(float(v or 0) for v in other.values() if isinstance(v, (int, float))))},
+            "trades": [{"trade_id": str(t.get("trade_id") or ""), "symbol": str(t.get("symbol") or "").upper(),
+                        "strike": float(t.get("strike_price") or 0), "option_type": str(t.get("option_type") or "").upper(),
+                        "side": str(t.get("transaction_type") or "").upper(), "quantity": int(t.get("quantity") or 0),
+                        "price": float(t.get("price") or 0), "amount": float(t.get("amount") or 0)} for t in rows]}
+
+
+def ist_day(s: str | None) -> str | None:
+    d = parse_time(s)
+    return d.astimezone(IST).date().isoformat() if d else None
+
+
+def charge_days() -> set[str]:
+    days = {ist_day(f.get("at")) for f in state["fills"].values()}
+    for rec in list(state.get("closed", [])) + list(state["positions"].values()):
+        if rec.get("origin") == "owner":
+            days.add(ist_day(rec.get("adopted_at") or rec.get("opened_at")))
+        if rec.get("closed_by") == "owner":
+            days.add(ist_day(rec.get("closed_at")))
+    return {d for d in days if d}
+
+
+def refresh_charges(limit: int = CHARGES_DAYS_PER_PASS) -> int:
+    """Read Upstox's charges for days not read yet, not final yet (read on the day itself) or due a refresh."""
+    today = now().astimezone(IST).date().isoformat()
+    tried = cache.setdefault("charges_tried", {})
+    with lock:
+        stored = state.setdefault("day_charges", {})
+        due = []
+        for day in sorted(charge_days()):
+            rec = stored.get(day)
+            final = rec and ist_day(rec.get("fetched_at")) > day
+            age = (now() - (parse_time(rec.get("fetched_at")) or now())).total_seconds() if rec else None
+            if final or (rec and age < CHARGES_REFRESH_SECONDS) or time.time() - tried.get(day, 0) < CHARGES_RETRY_SECONDS:
+                continue
+            if day > today:
+                continue
+            due.append(day)
+    done = 0
+    for day in due[:limit]:
+        try:
+            rec = fetch_day_charges(day)
+        except Exception as e:
+            tried[day] = time.time()
+            cache["charges_error"] = {"at": iso(), "day": day, "error": str(e)[:300]}
+            continue
+        with lock:
+            state["day_charges"][day] = rec
+            cache["charges_error"] = None
+        done += 1
+    return done
+
+
+def contract_key(symbol: str) -> tuple | None:
+    """("TRENT", 3250.0, "CE") from NSE:TRENT26NOV3250CE / NSE:NIFTY26N1024000CE: the tradebook's symbol, strike, type."""
+    m = ROOT_RE.match(symbol.split("|")[0])
+    if not m or not OPTION_RE.search(symbol.split("|")[0]):
+        return None
+    tail = symbol.split("|")[0][m.end() - 1:]
+    k = STRIKE_RE.match(tail)
+    return (m.group(1), float(k.group(1)), k.group(2)) if k else None
+
+
+def allocate_day(rec: dict) -> list[dict]:
+    """Each execution of the day with its share of the day's actual charges (see the section note)."""
+    trades, c = rec["trades"], rec["charges"]
+    lane_order = {tid.split("|")[0]: str(f.get("order_id")) for tid, f in state["fills"].items()}
+    order_of = [lane_order.get(t["trade_id"], "own|" + t["trade_id"]) for t in trades]
+    per_order: dict[str, int] = {}
+    for o, t in zip(order_of, trades):
+        per_order[o] = per_order.get(o, 0) + t["quantity"]
+    n_orders = len(per_order) or 1
+    value = sum(t["amount"] for t in trades) or 1.0
+    sells = sum(t["amount"] for t in trades if t["side"] == "SELL")
+    buys = sum(t["amount"] for t in trades if t["side"] == "BUY")
+    out = []
+    for o, t in zip(order_of, trades):
+        q_share = t["quantity"] / (per_order[o] or 1)
+        brokerage = c["brokerage"] / n_orders * q_share
+        exchange = c["exchange"] * t["amount"] / value
+        stt = c["stt"] * (t["amount"] / sells if sells and t["side"] == "SELL" else (0 if sells else t["amount"] / value))
+        stamp = c["stamp_duty"] * (t["amount"] / buys if buys and t["side"] == "BUY" else (0 if buys else t["amount"] / value))
+        out.append({**t, "charges": {"brokerage": brokerage, "exchange": exchange, "stt": stt, "stamp_duty": stamp}})
+    base = sum(x["charges"]["brokerage"] + x["charges"]["exchange"] for x in out) or 1.0
+    for x in out:
+        ch = x["charges"]
+        ch["gst"] = c["gst"] * (ch["brokerage"] + ch["exchange"]) / base
+        ch["total"] = sum(ch[k] for k in ("brokerage", "exchange", "stt", "stamp_duty", "gst"))
+    return out
+
+
+def _add(a: dict | None, b: dict | None, share: float = 1.0) -> dict | None:
+    if b is None:
+        return a
+    return {k: (a or {}).get(k, 0) + b.get(k, 0) * share for k in CHARGE_KEYS}
+
+
+def leg_charges() -> tuple[dict, dict]:
+    """(lane fill id -> charges or None, (day, contract key, side) -> owner executions) from the stored days."""
+    by_fill, owner_execs = {}, {}
+    days: dict[str, list] = {}
+    for tid, f in state["fills"].items():
+        days.setdefault(ist_day(f.get("at")) or "", []).append((tid, f))
+    stored = state.get("day_charges", {})
+    used: set[int] = set()
+    allocated = {day: allocate_day(rec) for day, rec in stored.items()}
+    for day, fills in days.items():
+        execs = allocated.get(day)
+        for tid, f in fills:
+            if execs is None:
+                by_fill[tid] = None
+                continue
+            hit = next((i for i, x in enumerate(execs) if id(x) not in used and x["trade_id"] == tid.split("|")[0]), None)
+            if hit is None:   # trade ids differ: the same contract, side, quantity and price
+                key = contract_key(f["symbol"])
+                hit = next((i for i, x in enumerate(execs) if id(x) not in used and key and (x["symbol"], x["strike"], x["option_type"]) == key
+                            and x["side"] == f["side"] and x["quantity"] == int(f.get("quantity") or 0)
+                            and abs(x["price"] - float(f.get("price") or 0)) < 0.011), None)
+            if hit is None:
+                by_fill[tid] = None
+                continue
+            used.add(id(execs[hit]))
+            by_fill[tid] = execs[hit]["charges"]
+    for day, execs in allocated.items():
+        for x in execs:
+            if id(x) not in used:
+                owner_execs.setdefault((day, (x["symbol"], x["strike"], x["option_type"]), x["side"]), []).append(x)
+    return by_fill, owner_execs
+
+
+def owner_leg(owner_execs: dict, rec: dict, side: str) -> dict | None:
+    """The owner's own BUY (on the adoption day, or the latest earlier day: an option bought the day before and adopted
+    before the open) or SELL (on the close day) of this contract, scaled to the record's quantity."""
+    day = ist_day(rec.get("adopted_at") or rec.get("opened_at")) if side == "BUY" else ist_day(rec.get("closed_at"))
+    stored = state.get("day_charges", {})
+    if day not in stored:
+        return None
+    execs = None
+    for d in sorted((d for d in stored if d <= day), reverse=True)[:5 if side == "BUY" else 1]:
+        execs = owner_execs.get((d, contract_key(rec["symbol"]), side))
+        if execs:
+            break
+    if not execs:
+        return None
+    qty = sum(x["quantity"] for x in execs) or 1
+    share = min(1.0, int(rec.get("bought") or rec.get("quantity") or 0) / qty)
+    total = None
+    for x in execs:
+        total = _add(total, x["charges"], share)
+    return total
+
+
+def with_charges(closed: list[dict], positions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Each closed trade and open position with its legs' share of Upstox's actual charges: a lane fill belongs to the
+    first cycle of its contract that closed at or after it (later fills belong to the open position).
+    `charges_pending` while a leg's day is not read from Upstox yet; `net_realized` = realized - charges."""
+    by_fill, owner_execs = leg_charges()
+    by_symbol: dict[str, list] = {}
+    for tid, f in state["fills"].items():
+        if not f.get("owner_managed"):
+            by_symbol.setdefault(f["symbol"], []).append((tid, f))
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    cycles: dict[str, list[dict]] = {}
+    for rec in [dict(r) for r in closed]:
+        cycles.setdefault(rec["symbol"], []).append(rec)
+    for rows in cycles.values():
+        rows.sort(key=lambda r: parse_time(r.get("closed_at")) or far)
+    opened = {p["symbol"]: dict(p) for p in positions}
+    for sym, fills in by_symbol.items():
+        for tid, f in fills:
+            at = parse_time(f.get("at")) or far
+            home = next((r for r in cycles.get(sym, []) if at <= (parse_time(r.get("closed_at")) or far) + timedelta(seconds=2)), None)
+            home = home or opened.get(sym)
+            if home is not None:
+                home.setdefault("_legs", []).append(by_fill.get(tid))
+    def finish(rec: dict) -> dict:
+        legs = rec.pop("_legs", [])
+        if rec.get("origin") == "owner":
+            legs.append(owner_leg(owner_execs, rec, "BUY"))
+        if rec.get("closed_by") == "owner" and "closed_at" in rec:
+            legs.append(owner_leg(owner_execs, rec, "SELL"))
+        total = None
+        for leg in legs:
+            total = _add(total, leg)
+        rec["charges"] = {k: round(v, 2) for k, v in (total or {k: 0.0 for k in CHARGE_KEYS}).items()}
+        rec["charges_pending"] = any(leg is None for leg in legs)
+        rec["initiated_by"] = "owner" if rec.get("origin") == "owner" else "lane"
+        if "closed_at" in rec:
+            rec["closed_by"] = rec.get("closed_by") or "lane"
+            rec["net_realized"] = round(float(rec.get("realized") or 0) - rec["charges"]["total"], 2)
+        return rec
+    out_closed = [finish(r) for rows in cycles.values() for r in rows]
+    out_closed.sort(key=lambda r: parse_time(r.get("closed_at")) or far)
+    return out_closed, [finish(p) for p in opened.values()]
+
+
+def initiated(f: dict) -> tuple[str, str]:
+    """Who started this lane fill and why (owner, 19 Nov 2026: the trades page says who initiated each trade)."""
+    reason = str((state["orders"].get(str(f.get("order_id"))) or {}).get("reason") or "")
+    if f.get("side") == "BUY":
+        return "lane", "MACD signal" + (f" ({reason.split(' at ')[0].replace('_', ' ').lower()})" if reason else "")
+    if reason.startswith("owner: exit all"):
+        return "owner", "you pressed Exit all"
+    if reason.startswith("owner position:"):
+        return "lane", "exit rule on your position: " + reason.split(":", 1)[1].strip()
+    if reason.startswith("MACD lane did not take"):
+        return "lane", "MACD lane never took the signal"
+    return "lane", reason or "MACD lane closed it"
+
+
+def trade_rows(closed: list[dict], positions: list[dict]) -> list[dict]:
+    """Every execution in the lane's book: its own fills plus the owner's legs (bought by hand and adopted, or sold by
+    hand), each with who initiated it and its share of Upstox's actual charges (None until the day is read)."""
+    by_fill, owner_execs = leg_charges()
+    rows = []
+    for tid, f in state["fills"].items():
+        who, why = initiated(f)
+        c = by_fill.get(tid)
+        rows.append({"id": tid, "order_id": f.get("order_id"), "symbol": f["symbol"], "side": f["side"], "quantity": f.get("quantity"),
+                     "price": f.get("price"), "at": f.get("at"), "initiated_by": who, "why": why + (" · handed to you" if f.get("owner_managed") else ""),
+                     "charges": round(c["total"], 2) if c else None})
+    for rec in closed + positions:
+        qty = int(rec.get("bought") or rec.get("quantity") or 0)
+        if rec.get("origin") == "owner":
+            c = owner_leg(owner_execs, rec, "BUY")
+            rows.append({"id": f"owner-buy|{rec['symbol']}|{rec.get('opened_at')}", "symbol": rec["symbol"], "side": "BUY", "quantity": qty,
+                         "price": rec.get("average_price"), "at": rec.get("adopted_at") or rec.get("opened_at"), "initiated_by": "owner",
+                         "why": "you bought it by hand; the lane adopted it", "charges": round(c["total"], 2) if c else None})
+        if rec.get("closed_by") == "owner" and rec.get("closed_at"):
+            c = owner_leg(owner_execs, rec, "SELL")
+            rows.append({"id": f"owner-sell|{rec['symbol']}|{rec.get('closed_at')}", "symbol": rec["symbol"], "side": "SELL", "quantity": qty,
+                         "price": rec.get("exit_price"), "at": rec.get("closed_at"), "initiated_by": "owner",
+                         "why": "you sold it by hand", "charges": round(c["total"], 2) if c else None})
+    far = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(rows, key=lambda r: parse_time(r.get("at")) or far, reverse=True)
+
+
 def deployed() -> float:
     held = sum(p["average_price"] * p["quantity"] for p in state["positions"].values())
     pending = sum(o["price"] * (o["quantity"] - o.get("filled", 0)) for o in state["orders"].values()
@@ -574,7 +853,7 @@ def place(symbol: str, inst: dict, side: str, qty: int, price: float, reason: st
             state["orders"][str(oid)] = {"order_id": str(oid), "symbol": symbol, "instrument": inst["upstox"], "side": side,
                                          "quantity": qty, "price": price, "placed_at": iso(), "placed_ts": time.time(), "reason": reason, "open": True,
                                          "status": "sent", "lot_size": inst.get("lot_size"), "tick": inst.get("tick_size"),
-                                         "attempt": 0}
+                                         "attempt": 0, "product": product}
         journal("ORDER_SENT", symbol=symbol, side=side, quantity=qty, price=price, order_ids=ids, reason=reason)
     except Exception as e:
         journal("ORDER_ERROR", symbol=symbol, side=side, quantity=qty, price=price, error=str(e)[:400])
@@ -770,6 +1049,8 @@ def loop() -> None:
                 read_upstox()
                 probe_order_api()
                 last_read = time.time()
+                if not stopping.is_set():
+                    refresh_charges()
             with lock:
                 if stopping.is_set():     # a stop arrived while waiting: no new step, no new order
                     break
@@ -869,6 +1150,10 @@ def snapshot() -> dict:
             positions.append({**p, "last_price": last,
                               "unrealized_pnl": round((last - p["average_price"]) * p["quantity"], 2) if last else None,
                               "return_pct": round((last / p["average_price"] - 1) * 100, 2) if last and p["average_price"] else None})
+        closed, positions = with_charges(state.get("closed", []), positions)
+        closed = closed[-200:]
+        charges_total = round(sum(r["charges"]["total"] for r in closed), 2)        # closed trades: realized_net
+        open_charges = round(sum(p["charges"]["total"] for p in positions), 2)      # entry legs of what is held
         unreal = sum(p["unrealized_pnl"] or 0 for p in positions)
         f = cache.get("funds") or {}
         free, basis = fund_status()
@@ -880,10 +1165,16 @@ def snapshot() -> dict:
             "realized": round(state["realized"], 2), "unrealized": round(unreal, 2),
             "equity": round(START_FUND + state["realized"] + unreal, 2),
             "upstox_funds": (f.get("equity") if isinstance(f, dict) else None),
-            "positions": positions, "closed": state.get("closed", [])[-100:],
+            "positions": positions, "closed": closed,
+            "charges_total": charges_total, "open_charges": open_charges, "charges_pending": sum(1 for r in closed + positions if r["charges_pending"]),
+            "charges_error": cache.get("charges_error"),
+            "charge_days": {d: {"upstox_total": r["charges"]["total"], "executions": len(r["trades"]), "read_at": r["fetched_at"]}
+                            for d, r in sorted(state.get("day_charges", {}).items())},
+            "realized_net": round(state["realized"] - charges_total, 2),
             "owner_managed": [{"symbol": k, **v} for k, v in state["owner_managed"].items()],
             "orders": sorted((o for o in state["orders"].values() if not o.get("dry")), key=lambda o: o["placed_at"], reverse=True)[:200],
-            "fills": sorted(state["fills"].values(), key=lambda f: str(f.get("at") or ""), reverse=True)[:200],
+            "fills": sorted(state["fills"].values(), key=lambda f: str(f.get("at") or ""), reverse=True)[:400],
+            "trade_rows": trade_rows(state.get("closed", []), list(state["positions"].values()))[:600],
             "decisions": list(reversed([d for d in state["decisions"] if d.get("kind") != "DRY_RUN_ORDER"][-200:])),
             "account": {"positions": cache["positions"], "orders": cache["orders"], "trades": cache["trades"],
                         "lane_instruments": sorted(lane_instruments)},

@@ -3,7 +3,8 @@ import { readableUpstreamError } from "./apiError";
 import { rupees, tone } from "./agentMath";
 import { TradingLedger, type FocusRow } from "./Ledger";
 import { LaneChart, LaneChartModal, type LaneChartFocus } from "./LaneChart";
-import { EquityChart } from "./LaneEquityChart";
+import { UpstoxPerformance, UpstoxTrades, type ChargeDay, type TradeRow } from "./UpstoxBook";
+import type { Charges } from "./upstoxBookMath";
 import { fillMarkers, positionLevels } from "./laneChartMarks";
 import type { ClosedPosition, Order, Portfolio, Position, Tick, Trade } from "./types";
 import { inLaneDay, laneDayStart } from "./laneDay";
@@ -15,7 +16,8 @@ import { inLaneDay, laneDayStart } from "./laneDay";
 // the lane stays armed until Kill.
 type LanePos = { symbol: string; instrument: string; quantity: number; average_price: number; last_price?: number | null;
   unrealized_pnl?: number | null; return_pct?: number | null; opened_at?: string | null; macd_seen?: boolean; realized?: number; lot_size?: number | null; bought?: number };
-type LaneClosed = LanePos & { closed_at?: string; exit_price?: number };
+type LaneClosed = LanePos & { closed_at?: string; exit_price?: number; charges?: Charges; charges_pending?: boolean; net_realized?: number;
+  initiated_by?: "lane" | "owner"; closed_by?: "lane" | "owner" };
 type LaneOrder = { order_id: string; symbol: string; side: string; quantity: number; price: number; placed_at: string; reason?: string;
   status?: string; filled?: number; message?: string | null; dry?: boolean; open?: boolean; lot_size?: number | null };
 type LaneFill = { order_id: string; symbol: string; side: string; quantity: number; price: number; at: string };
@@ -25,6 +27,8 @@ type Snapshot = { label: string; armed: boolean; mode: string; capital: number; 
   settings?: { sides: "BOTH" | "CE" | "PE" }; weekly_index_roots?: string[];
   unrealized: number; equity: number; upstox_funds?: { available_margin?: number; used_margin?: number; payin_amount?: number } | null;
   positions: LanePos[]; closed: LaneClosed[]; orders: LaneOrder[]; fills: LaneFill[]; decisions: Decision[];
+  trade_rows?: TradeRow[]; charges_total?: number; open_charges?: number; realized_net?: number; charge_days?: Record<string, ChargeDay>;
+  charges_error?: { day?: string; error: string } | null;
   account: { positions: Record<string, unknown>[]; orders: Record<string, unknown>[]; trades: Record<string, unknown>[]; lane_instruments?: string[] };
   macd_open: string[]; macd_checked_at?: string; read_at?: string | null; read_error?: string | null; engine_error?: string | null;
   order_api?: { ok: boolean; detail: string; checked_at: string } | null; orders_today?: { day: string; count: number }; max_orders_per_day?: number;
@@ -119,24 +123,21 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
     const at = c.closed_at || d?.checked_at || new Date().toISOString();
     return { closed_id: `${c.symbol}-${i}`, position_id: `${c.symbol}|${c.opened_at ?? ""}`, symbol: c.symbol, lane: "upstox_live", side: "LONG",
       quantity: qty, lots: Math.max(1, Math.round(qty / lot)), lot_size: lot, entry_time: c.opened_at || at, entry_price: c.average_price,
-      exit_time: at, exit_price: exit, gross_pnl: c.realized ?? 0, fees: 0, realized_pnl: c.realized ?? 0,
+      exit_time: at, exit_price: exit, gross_pnl: c.realized ?? 0, fees: c.charges?.total ?? 0,
+      realized_pnl: c.net_realized ?? (c.realized ?? 0) - (c.charges?.total ?? 0),
       return_pct: c.average_price ? (exit / c.average_price - 1) * 100 : 0, max_price: null, min_price: null, max_return_pct: null, min_return_pct: null,
       exit_reason: "MACD lane exit", partial: false, remaining_quantity: 0, exit_trade_id: "", visible_until: visibleUntil(at, holidays) };
   }), [d, holidays]);
   const unrealized = positions.reduce((sum, p) => sum + p.unrealized_pnl, 0);
   const marketValue = positions.reduce((sum, p) => sum + p.last_price * p.quantity, 0);
-  const realized = d?.realized ?? 0;
-  const equity = capital + realized + unrealized;
+  // After Upstox's actual charges (owner, 19 Nov 2026); the lane reports gross and net.
+  const realized = d?.realized_net ?? d?.realized ?? 0;
+  const charges = d?.charges_total ?? 0;
+  const openCharges = d?.open_charges ?? 0;    // entry charges already paid on what is held
+  const equity = capital + realized + unrealized - openCharges;
   const portfolio = useMemo<Portfolio>(() => ({ equity, cash: d?.free ?? 0, market_value: marketValue,
     realized_pnl: realized, unrealized_pnl: unrealized, positions, closed_positions: closedRows, lane: "upstox_live" }),
   [equity, capital, realized, d, marketValue, unrealized, positions, closedRows]);
-  const curve = useMemo(() => {
-    let running = capital;
-    const rows = [...closedRows].sort((a, b) => Date.parse(a.exit_time) - Date.parse(b.exit_time));
-    const start = d?.started_at || rows[0]?.entry_time;
-    return [...(start ? [{ at: start, equity: capital }] : []), ...rows.map((r) => ({ at: r.exit_time, equity: (running += r.realized_pnl) })),
-      ...(d ? [{ at: d.checked_at, equity }] : [])];
-  }, [closedRows, capital, d, equity]);
 
   const today = istDay(new Date().toISOString());
   // The ledger tabs show the lane day only (owner, 18 Nov 2026); Performance and the Back office keep the history.
@@ -149,7 +150,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   const kinds = useMemo(() => [...new Set(decisions.map((r) => r.kind))].sort(), [decisions]);
   const journal = kind ? decisions.filter((r) => r.kind === kind) : decisions;
   const counts: Partial<Record<Tab, number>> = { PORTFOLIO: positions.length, ORDERS: orders.filter((o) => istDay(o.created_at) === today).length,
-    TRADES: trades.filter((t) => istDay(t.timestamp) === today).length, JOURNAL: todayDecisions.length };
+    TRADES: (d?.trade_rows ?? []).filter((t) => inLaneDay(t.at, dayStart)).length, JOURNAL: todayDecisions.length };
 
   const watch = useMemo(() => {
     const held = [...positions].sort((a, b) => (b.return_pct ?? 0) - (a.return_pct ?? 0));
@@ -176,10 +177,6 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   const orderApi = d?.order_api;
   const orderDetail = readableUpstreamError(orderApi?.detail);
   const available = d?.upstox_funds?.available_margin;
-  const wins = closedRows.filter((c) => c.realized_pnl > 0);
-  const losses = closedRows.filter((c) => c.realized_pnl < 0);
-  const grossWin = wins.reduce((s, c) => s + c.realized_pnl, 0);
-  const grossLoss = -losses.reduce((s, c) => s + c.realized_pnl, 0);
   const problems = [error, d?.read_error && `Upstox read failed: ${d.read_error}`, d?.engine_error && `MACD engine read failed: ${d.engine_error}`,
     orderApi && !orderApi.ok && `Upstox order API: ${orderDetail}`].filter(Boolean) as string[];
 
@@ -199,7 +196,7 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
     <section className="blast-metrics" aria-label="Upstox lane book">
       <Metric label="Equity" value={`₹${rupeeText(equity)}`} />
       <Metric label={`Return on ₹${rupeeText(capital)} start`} value={percent((equity / capital - 1) * 100, 2)} tone={equity - capital} />
-      <Metric label="Realized · lifetime" value={rupees(realized)} tone={realized} />
+      <Metric label={`Realized after ₹${rupeeText(Math.round(charges))} charges`} value={rupees(realized)} tone={realized} />
       <Metric label="Open P&L · current marks" value={rupees(unrealized)} tone={unrealized} />
       <Metric label="Open positions" value={`${positions.length} · ₹${rupeeText(Math.round(marketValue))}`} />
       <Metric label="Free for next signal / Upstox margin" value={`₹${rupeeText(Math.round(d?.free ?? 0))} / ${available == null ? "—" : `₹${rupeeText(Math.round(available))}`}`} />
@@ -239,7 +236,9 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
         </section>
       </div>}
 
-      {(tab === "PORTFOLIO" || tab === "ORDERS" || tab === "TRADES") && <TradingLedger tab={tab} orders={todayOrders} trades={todayTrades}
+      {tab === "TRADES" && <UpstoxTrades rows={d.trade_rows ?? []} dayStart={dayStart} />}
+
+      {(tab === "PORTFOLIO" || tab === "ORDERS") && <TradingLedger tab={tab} orders={todayOrders} trades={todayTrades}
         portfolio={portfolio} signals={[]} onOpenPosition={openChart} holidays={holidays} ledgerReady />}
 
       {tab === "STATUS" && <div className="spot-status">
@@ -275,18 +274,9 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
         </section>
       </div>}
 
-      {tab === "PERFORMANCE" && <>
-        <section className="panel agent-panel">
-          <div className="panel-title">Equity <span>{closedRows.length} closed trades</span></div>
-          <EquityChart points={curve} capital={capital} height={240} />
-          <div className="agent-stats lane-stats">
-            <div className="agent-stat"><span>Closed trades</span><b>{closedRows.length}</b><small>win {closedRows.length ? `${Math.round(wins.length / closedRows.length * 100)}%` : "—"} · PF {grossLoss ? (grossWin / grossLoss).toFixed(2) : "—"}</small></div>
-            <div className="agent-stat"><span>Avg win / loss</span><b className="positive">{wins.length ? rupees(grossWin / wins.length) : "—"}</b><small className="negative">{losses.length ? rupees(-grossLoss / losses.length) : "—"}</small></div>
-            <div className="agent-stat"><span>Booked</span><b className={tone(realized)}>{rupees(realized)}</b><small>{percent(realized / capital * 100, 2)} of the fund</small></div>
-          </div>
-        </section>
-        <TradingLedger tab="STATISTICS" orders={orders} trades={trades} portfolio={portfolio} signals={[]} holidays={holidays} ledgerReady />
-      </>}
+      {tab === "PERFORMANCE" && <UpstoxPerformance closed={(d.closed ?? []).filter((c) => c.closed_at).map((c) => ({ ...c, closed_at: c.closed_at as string,
+        exit_price: c.exit_price ?? c.average_price }))} openPnl={unrealized} openCharges={openCharges} openCount={positions.length} capital={capital}
+        startedAt={d.started_at} checkedAt={d.checked_at} chargeDays={d.charge_days} chargesError={d.charges_error} />}
 
       {tab === "JOURNAL" && <section className="panel agent-panel">
         <div className="panel-title">Journal — every MACD signal and what the lane did

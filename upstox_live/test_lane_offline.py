@@ -416,3 +416,76 @@ if datetime.now(L.IST).strftime("%H:%M") < "23:59":
 L.EXPIRY_FLATTEN_IST = "00:00"; L.step(); assert "expiry day" in L.state["orders"][f"OID{len(sent)}"]["reason"]
 L.set_armed(False, "test")
 print("owner trades: adopt + manage, owner closes/adds acknowledged, lane fills never adopted OK")
+
+# 14. (19 Nov 2026) charges read from Upstox (owner: "read from upstox tradebook instead of calculating"): the day's
+# actual F&O charges split over the day's executions -- brokerage per order (two fills of one order share it), STT on
+# sells, stamp duty on buys; the owner's own legs found in the tradebook by contract; the lane's legs plus the owner's
+# other trades add up to Upstox's total; a fill belongs to the cycle of its contract that closed at or after it.
+L = lane
+calls = []
+DAY = L.now().astimezone(L.IST).date().isoformat()
+BOOK = {"charges": {"charges_breakdown": {"total": 100.0, "brokerage": 60.0, "taxes": {"gst": 12.0, "stt": 16.0, "stamp_duty": 2.0},
+                                          "charges": {"transaction": 0.0, "clearing": 0.0, "ipft": None, "others": 10.0, "sebi_turnover": 0.0}}},
+        "trades": [
+    {"trade_id": "t1", "symbol": "AAA", "strike_price": 100, "option_type": "CE", "transaction_type": "BUY", "quantity": 100, "price": 10.0, "amount": 1000.0},
+    {"trade_id": "t2", "symbol": "AAA", "strike_price": 100, "option_type": "CE", "transaction_type": "BUY", "quantity": 300, "price": 12.0, "amount": 3600.0},
+    {"trade_id": "x9", "symbol": "AAA", "strike_price": 100, "option_type": "CE", "transaction_type": "SELL", "quantity": 400, "price": 15.0, "amount": 6000.0},
+    {"trade_id": "o1", "symbol": "OWN", "strike_price": 50, "option_type": "CE", "transaction_type": "BUY", "quantity": 200, "price": 5.0, "amount": 1000.0},
+    {"trade_id": "o2", "symbol": "OWN", "strike_price": 50, "option_type": "CE", "transaction_type": "SELL", "quantity": 200, "price": 6.0, "amount": 1200.0},
+    {"trade_id": "z1", "symbol": "ZZZ", "strike_price": 10, "option_type": "PE", "transaction_type": "BUY", "quantity": 10, "price": 2.0, "amount": 20.0}]}
+def tradebook(method, host, path, body=None, query=None):
+    assert method == "GET"
+    calls.append((path, dict(query)))
+    if path == "/v2/trade/profit-loss/charges":
+        assert query["segment"] == "FO" and query["from_date"] == query["to_date"] == f"{DAY[8:]}-{DAY[5:7]}-{DAY[:4]}"
+        return {"data": BOOK["charges"]}
+    assert path == "/v2/charges/historical-trades" and query["start_date"] == DAY
+    return {"data": BOOK["trades"]}
+L.upstox = tradebook
+old = (L.now() - timedelta(minutes=10)).isoformat(); mid = (L.now() - timedelta(minutes=8)).isoformat()
+L.state.update(fills={}, orders={}, positions={}, closed=[], realized=3400.0, day_charges={})
+L.cache["charges_tried"] = {}
+L.state["fills"] = {   # x9's id differs in the day's trade list (S1|...): matched by contract, side, quantity, price
+    "t1|B1": {"order_id": "B1", "symbol": "NSE:AAA26NOV100CE", "side": "BUY", "quantity": 100, "price": 10.0, "at": old},
+    "t2|B1": {"order_id": "B1", "symbol": "NSE:AAA26NOV100CE", "side": "BUY", "quantity": 300, "price": 12.0, "at": old},
+    "s1|S1": {"order_id": "S1", "symbol": "NSE:AAA26NOV100CE", "side": "SELL", "quantity": 400, "price": 15.0, "at": mid}}
+L.state["closed"] = [
+    {"symbol": "NSE:AAA26NOV100CE", "bought": 400, "quantity": 400, "average_price": 11.5, "opened_at": old, "closed_at": mid,
+     "exit_price": 15.0, "realized": 1400.0},
+    {"symbol": "NSE:OWN26NOV50CE", "bought": 200, "quantity": 200, "average_price": 5.0, "opened_at": old, "adopted_at": old,
+     "closed_at": mid, "exit_price": 6.0, "realized": 200.0, "origin": "owner", "closed_by": "owner"}]
+snap = L.snapshot()
+assert all(r["charges_pending"] for r in snap["closed"]) and snap["charges_total"] == 0     # not read yet
+assert L.refresh_charges() == 1 and len(calls) == 2
+assert L.refresh_charges() == 0 and len(calls) == 2          # read today: refreshed only after CHARGES_REFRESH_SECONDS
+snap = L.snapshot()
+aaa, own = sorted(snap["closed"], key=lambda r: r["symbol"])
+# 4 orders (B1, S1, o1, o2) + z1 = 5 -> brokerage 12 each; B1's 12 split 3:9 by quantity
+assert abs(aaa["charges"]["brokerage"] - 24) < 0.01 and abs(own["charges"]["brokerage"] - 24) < 0.01
+assert abs(aaa["charges"]["stt"] - 16 * 6000 / 7200) < 0.01 and abs(own["charges"]["stt"] - 16 * 1200 / 7200) < 0.01
+assert abs(aaa["charges"]["stamp_duty"] - 2 * 4600 / 5620) < 0.01
+z = 100 - aaa["charges"]["total"] - own["charges"]["total"]            # the owner's unrelated ZZZ trade keeps the rest
+assert 0 < z < 15 and not aaa["charges_pending"] and not own["charges_pending"], z
+assert aaa["initiated_by"] == "lane" and aaa["closed_by"] == "lane" and own["initiated_by"] == own["closed_by"] == "owner"
+assert abs(aaa["net_realized"] - (1400 - aaa["charges"]["total"])) < 0.01
+assert snap["charge_days"][DAY]["upstox_total"] == 100.0 and abs(snap["realized_net"] - (3400 - snap["charges_total"])) < 0.02
+# a later day re-reads today's figures; a failing report is retried after CHARGES_RETRY_SECONDS, not in a loop
+L.state["day_charges"][DAY]["fetched_at"] = (L.now() - timedelta(seconds=L.CHARGES_REFRESH_SECONDS + 1)).isoformat()
+def down(method, host, path, body=None, query=None): raise RuntimeError("GET /v2/trade/profit-loss/charges -> 500: down")
+L.upstox = down
+assert L.refresh_charges() == 0 and L.cache["charges_error"]["error"].endswith("down") and L.state["day_charges"][DAY]
+L.upstox = tradebook
+assert L.refresh_charges() == 0
+L.cache["charges_tried"][DAY] -= L.CHARGES_RETRY_SECONDS
+assert L.refresh_charges() == 1
+assert L.contract_key("NSE:NIFTY26N1024000CE") == ("NIFTY", 24000.0, "CE") and L.contract_key("NSE:M&M26NOV3500PE") == ("M&M", 3500.0, "PE")
+assert L.financial_year("2026-11-19") == "2627" and L.financial_year("2027-02-01") == "2627" and L.financial_year("2027-04-01") == "2728"
+L.state["orders"] = {"B1": {"instrument": "NSE_FO|9", "reason": "PREMIUM_MACD_ZERO_CROSS_UP_INTRABAR at 10.0", "placed_at": old, "side": "BUY", "price": 1, "quantity": 1, "filled": 1},
+                     "S1": {"instrument": "NSE_FO|9", "reason": "owner: exit all", "placed_at": mid, "side": "SELL", "price": 1, "quantity": 1, "filled": 1}}
+rows = L.snapshot()["trade_rows"]
+assert [(r["side"], r["initiated_by"]) for r in rows if r["symbol"] == "NSE:OWN26NOV50CE"] == [("SELL", "owner"), ("BUY", "owner")]
+aaa_rows = {r["id"]: r for r in rows if r["symbol"] == "NSE:AAA26NOV100CE"}
+assert aaa_rows["t1|B1"]["why"].startswith("MACD signal (premium macd zero cross up intrabar)") and aaa_rows["t1|B1"]["initiated_by"] == "lane"
+assert aaa_rows["s1|S1"]["initiated_by"] == "owner" and aaa_rows["s1|S1"]["why"] == "you pressed Exit all"
+assert abs(sum(r["charges"] for r in rows) - (100 - z)) < 0.05
+print("charges: Upstox daily actuals split per execution, owner legs, cycle attribution, retry back-off OK")

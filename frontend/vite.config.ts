@@ -11,6 +11,8 @@ export default defineConfig({
     host: "0.0.0.0",
     proxy: {
       "/mi/api/logins": { target: process.env.MI_CONSOLE_PROXY || "http://localhost:8410", rewrite: (path) => path.replace(/^\/mi/, "") },
+      // Dev only: point the Upstox lane page at a preview copy of the lane (e.g. a new lane.py on its own port).
+      ...(process.env.UPSTOX_LIVE_PROXY ? { "/api/upstox-live": process.env.UPSTOX_LIVE_PROXY } : {}),
       "/api": gateway,
       "/health": gateway,
       "/parallel": gateway,
