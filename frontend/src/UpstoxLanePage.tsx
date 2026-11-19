@@ -3,7 +3,7 @@ import { readableUpstreamError } from "./apiError";
 import { rupees, tone } from "./agentMath";
 import { TradingLedger, type FocusRow } from "./Ledger";
 import { LaneChart, LaneChartModal, type LaneChartFocus } from "./LaneChart";
-import { UpstoxPerformance, UpstoxTrades, type ChargeDay, type TradeRow } from "./UpstoxBook";
+import { UpstoxClosedTrades, UpstoxPerformance, UpstoxTrades, type ChargeDay, type ClosedTrade, type TradeRow } from "./UpstoxBook";
 import type { Charges } from "./upstoxBookMath";
 import { fillMarkers, positionLevels } from "./laneChartMarks";
 import type { ClosedPosition, Order, Portfolio, Position, Tick, Trade } from "./types";
@@ -75,6 +75,8 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
   const [error, setError] = useState("");
   const [selected, setSelected] = useState("");
   const [kind, setKind] = useState("");
+  const [journalView, setJournalView] = useState<"DECISIONS" | "CLOSED">(() => recall("macd.upstoxJournal") === "CLOSED" ? "CLOSED" : "DECISIONS");
+  const pickJournal = (next: "DECISIONS" | "CLOSED") => { setJournalView(next); remember("macd.upstoxJournal", next); };
   const [focus, setFocus] = useState<{ list: LaneChartFocus[]; index: number }>();
   const pickTab = (next: Tab) => { setTab(next); remember(TAB_STORE, next); };
 
@@ -128,6 +130,8 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
       return_pct: c.average_price ? (exit / c.average_price - 1) * 100 : 0, max_price: null, min_price: null, max_return_pct: null, min_return_pct: null,
       exit_reason: "MACD lane exit", partial: false, remaining_quantity: 0, exit_trade_id: "", visible_until: visibleUntil(at, holidays) };
   }), [d, holidays]);
+  const closedTrades = useMemo<ClosedTrade[]>(() => (d?.closed ?? []).filter((c) => c.closed_at)
+    .map((c) => ({ ...c, closed_at: c.closed_at as string, exit_price: c.exit_price ?? c.average_price })), [d]);
   const unrealized = positions.reduce((sum, p) => sum + p.unrealized_pnl, 0);
   const marketValue = positions.reduce((sum, p) => sum + p.last_price * p.quantity, 0);
   // After Upstox's actual charges (owner, 19 Nov 2026); the lane reports gross and net.
@@ -274,18 +278,23 @@ export function UpstoxLanePage({ ticks = {}, holidays }: { ticks?: Record<string
         </section>
       </div>}
 
-      {tab === "PERFORMANCE" && <UpstoxPerformance closed={(d.closed ?? []).filter((c) => c.closed_at).map((c) => ({ ...c, closed_at: c.closed_at as string,
-        exit_price: c.exit_price ?? c.average_price }))} openPnl={unrealized} openCharges={openCharges} openCount={positions.length} capital={capital}
-        startedAt={d.started_at} checkedAt={d.checked_at} chargeDays={d.charge_days} chargesError={d.charges_error} />}
+      {tab === "PERFORMANCE" && <UpstoxPerformance closed={closedTrades} capital={capital}
+        startedAt={d.started_at} chargeDays={d.charge_days} chargesError={d.charges_error} />}
 
       {tab === "JOURNAL" && <section className="panel agent-panel">
-        <div className="panel-title">Journal — every MACD signal and what the lane did
-          <select value={kind} onChange={(e) => setKind(e.target.value)}><option value="">all decisions</option>{kinds.map((k) => <option key={k} value={k}>{words(k)}</option>)}</select>
+        <div className="panel-title">{journalView === "CLOSED" ? "Journal — closed trades, after charges" : "Journal — every MACD signal and what the lane did"}
+          {journalView === "DECISIONS" && <select value={kind} onChange={(e) => setKind(e.target.value)}><option value="">all decisions</option>{kinds.map((k) => <option key={k} value={k}>{words(k)}</option>)}</select>}
         </div>
+        <div className="risk-tabs upstox-filter upstox-journal-view" role="group" aria-label="Journal view">
+          <button type="button" aria-pressed={journalView === "DECISIONS"} onClick={() => pickJournal("DECISIONS")}>Decisions {decisions.length}</button>
+          <button type="button" aria-pressed={journalView === "CLOSED"} onClick={() => pickJournal("CLOSED")}>Closed trades {closedTrades.length}</button>
+        </div>
+        {journalView === "CLOSED" ? <UpstoxClosedTrades closed={closedTrades} /> : <>
         {journal.length === 0 ? <div className="agent-empty">No new MACD signals since the lane started ({when(d.started_at)}).</div> :
           <div className="live-table-wrap lane-scroll"><table className="live-table agent-table"><thead><tr><th>Time</th><th>Decision</th><th>Contract</th><th>Detail</th></tr></thead>
             <tbody>{journal.map((r, i) => <tr key={`${r.at}-${i}`} className={r.symbol ? "openable-row" : ""} onClick={() => { if (r.symbol) { setSelected(r.symbol); pickTab("TERMINAL"); } }}>
               <td>{when(r.at)}</td><td className={DECISION_TONE[r.kind] ?? ""}>{words(r.kind)}</td><td>{r.symbol ? short(r.symbol) : "—"}</td><td>{detail(r)}</td></tr>)}</tbody></table></div>}
+        </>}
       </section>}
     </div>}
     {focus && <LaneChartModal list={focus.list} index={focus.index} onIndex={(index) => setFocus((old) => old && { ...old, index })} onClose={() => setFocus(undefined)} />}

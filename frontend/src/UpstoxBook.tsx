@@ -41,22 +41,62 @@ function Stat({ label, value, note, sign }: { label: string; value: string; note
   return <div><span>{label}</span><b className={sign == null ? "" : tone(sign)}>{value}</b>{note && <small>{note}</small>}</div>;
 }
 
-export function UpstoxPerformance({ closed, openPnl, openCharges = 0, openCount, capital, startedAt, checkedAt, chargeDays = {}, chargesError }: {
-  closed: ClosedTrade[]; openPnl: number; openCharges?: number; openCount: number; capital: number; startedAt?: string; checkedAt?: string;
-  chargeDays?: Record<string, ChargeDay>; chargesError?: { day?: string; error: string } | null;
-}) {
+/** The Instrument / Opened-by filters shared by Performance and the Journal's closed trades. */
+function useBookFilter(closed: ClosedTrade[]) {
   const [instrument, setInstrument] = useState<Instrument>("ALL");
   const [who, setWho] = useState<Who>("ALL");
-  const [sort, setSort] = useState<SortState>({ key: "closed", direction: "desc" });
   const rows = useMemo(() => filterBook(closed, instrument, who), [closed, instrument, who]);
-  const s = useMemo(() => bookStats(rows), [rows]);
   const all = filterBook(closed, "ALL", who);
   const counts = { ALL: all.length, INDEX: all.filter((r) => instrumentOf(r.symbol) === "INDEX").length, STOCK: all.filter((r) => instrumentOf(r.symbol) === "STOCK").length };
-  const filtered = instrument !== "ALL" || who !== "ALL";
-  const curve = useMemo(() => netCurve(rows, capital, startedAt, checkedAt, filtered ? 0 : openPnl - openCharges), [rows, capital, startedAt, checkedAt, filtered, openPnl, openCharges]);
+  const filters = <div className="upstox-filters">
+    <Toggle label="Instrument" value={instrument} onChange={setInstrument}
+      options={[["ALL", `All ${counts.ALL}`], ["INDEX", `Index options ${counts.INDEX}`], ["STOCK", `Stock options ${counts.STOCK}`]]} />
+    <Toggle label="Opened by" value={who} onChange={setWho} options={[["ALL", "Anyone"], ["LANE", "Lane"], ["OWNER", "You"]]} />
+  </div>;
+  return { rows, instrument, who, filters, filtered: instrument !== "ALL" || who !== "ALL" };
+}
+
+/** Closed trades only (owner, 19 Nov 2026: one equity line against the capital line, no drawdown pane; open P&L is in
+ * the page header, not here). */
+export function UpstoxPerformance({ closed, capital, startedAt, chargeDays = {}, chargesError }: {
+  closed: ClosedTrade[]; capital: number; startedAt?: string;
+  chargeDays?: Record<string, ChargeDay>; chargesError?: { day?: string; error: string } | null;
+}) {
+  const { rows, instrument, who, filters, filtered } = useBookFilter(closed);
+  const s = useMemo(() => bookStats(rows), [rows]);
+  const curve = useMemo(() => netCurve(rows, capital, startedAt, undefined), [rows, capital, startedAt]);
   const upstoxTotal = Object.values(chargeDays).reduce((sum, d) => sum + d.upstox_total, 0);
   const scope = [instrument === "INDEX" ? "index options" : instrument === "STOCK" ? "stock options" : "all options",
     who === "LANE" ? "opened by the lane" : who === "OWNER" ? "opened by you" : ""].filter(Boolean).join(", ");
+  return <section className="panel agent-panel upstox-perf">
+      <div className="panel-title">Performance after charges <span>{s.count} closed trade{s.count === 1 ? "" : "s"}{filtered ? ` · ${scope}` : ""}</span></div>
+      {filters}
+      <EquityChart points={curve} capital={capital} height={220} label="Booked equity after charges" drawdown={false} />
+      <div className="statistics-grid upstox-stats">
+        <Stat label="Closed trades" value={String(s.count)}
+          note={`opened: lane ${s.openedByLane} · you ${s.openedByOwner} — closed: lane ${s.closedByLane} · you ${s.closedByOwner}`} />
+        <Stat label="Net P&L after charges" value={signed(s.net)} sign={s.net} note={`${pct(s.net / capital * 100, 2)} of the ₹${capital.toLocaleString("en-IN")} start`} />
+        <Stat label="Gross P&L" value={signed(s.gross)} sign={s.gross} note="before charges" />
+        <Stat label="Charges (Upstox)" value={inr(-s.charges.total)} sign={-s.charges.total}
+          note={`brokerage ${inr(s.charges.brokerage)} · STT ${inr(s.charges.stt)} · GST ${inr(s.charges.gst)} · exchange ${inr(s.charges.exchange)} · stamp ${inr(s.charges.stamp_duty)}`} />
+        <Stat label="Won / lost" value={`${s.wins} / ${s.losses}`} note={`win rate ${s.winRate == null ? "—" : `${s.winRate.toFixed(1)}%`}${s.count - s.wins - s.losses ? ` · ${s.count - s.wins - s.losses} flat` : ""}`} />
+        <Stat label="Profit factor" value={s.profitFactor == null ? "—" : s.profitFactor.toFixed(2)} note={`net won ${inr(s.netWin, 0)} ÷ net lost ${inr(s.netLoss, 0)}`} />
+        <Stat label="Average win / loss" value={`${signed(s.avgWin)} / ${signed(s.avgLoss)}`} note={s.sizeRatio == null ? undefined : `a win is ${s.sizeRatio.toFixed(2)}× a loss`} />
+        <Stat label="Best / worst trade" value={`${signed(s.best)} / ${signed(s.worst)}`} />
+        <Stat label="Average net return" value={pct(s.avgReturnPct, 2)} sign={s.avgReturnPct} note="per trade, on the premium paid" />
+      </div>
+      <p className="statistics-note upstox-note">Charges are Upstox's own figures: each day's actual F&amp;O charges from its P&amp;L report
+        ({inr(upstoxTotal)} over {Object.keys(chargeDays).length} days, including any trades of yours outside the lane), split over that day's executions —
+        brokerage per order, STT on sells, stamp duty on buys, exchange and GST by value.
+        {s.pending ? ` ${s.pending} trade${s.pending === 1 ? " waits" : "s wait"} for Upstox's report; shown at gross until then.` : ""}
+        {chargesError ? ` Last read failed${chargesError.day ? ` for ${chargesError.day}` : ""}: ${chargesError.error}` : ""}</p>
+  </section>;
+}
+
+/** Every closed trade, after charges: shown in the Journal next to the decisions (owner, 19 Nov 2026). */
+export function UpstoxClosedTrades({ closed }: { closed: ClosedTrade[] }) {
+  const { rows, filters } = useBookFilter(closed);
+  const [sort, setSort] = useState<SortState>({ key: "closed", direction: "desc" });
   const columns: Column<ClosedTrade>[] = [
     { key: "closed", label: "Closed (IST)", value: (r) => Date.parse(r.closed_at), render: (r) => when(r.closed_at) },
     { key: "contract", label: "Contract", value: (r) => short(r.symbol) },
@@ -73,38 +113,8 @@ export function UpstoxPerformance({ closed, openPnl, openCharges = 0, openCount,
   ];
   const onSort = (key: string) => setSort((old) => ({ key, direction: old.key === key && old.direction === "desc" ? "asc" : "desc" }));
   return <>
-    <section className="panel agent-panel upstox-perf">
-      <div className="panel-title">Performance after charges <span>{s.count} closed trade{s.count === 1 ? "" : "s"}{filtered ? ` · ${scope}` : ""}</span></div>
-      <div className="upstox-filters">
-        <Toggle label="Instrument" value={instrument} onChange={setInstrument}
-          options={[["ALL", `All ${counts.ALL}`], ["INDEX", `Index options ${counts.INDEX}`], ["STOCK", `Stock options ${counts.STOCK}`]]} />
-        <Toggle label="Opened by" value={who} onChange={setWho} options={[["ALL", "Anyone"], ["LANE", "Lane"], ["OWNER", "You"]]} />
-      </div>
-      <EquityChart points={curve} capital={capital} height={220} label="Equity after charges" />
-      <div className="statistics-grid upstox-stats">
-        <Stat label="Closed trades" value={String(s.count)}
-          note={`opened: lane ${s.openedByLane} · you ${s.openedByOwner} — closed: lane ${s.closedByLane} · you ${s.closedByOwner}`} />
-        <Stat label="Net P&L after charges" value={signed(s.net)} sign={s.net} note={`${pct(s.net / capital * 100, 2)} of the ₹${capital.toLocaleString("en-IN")} start`} />
-        <Stat label="Gross P&L" value={signed(s.gross)} sign={s.gross} note="before charges" />
-        <Stat label="Charges (Upstox)" value={inr(-s.charges.total)} sign={-s.charges.total}
-          note={`brokerage ${inr(s.charges.brokerage)} · STT ${inr(s.charges.stt)} · GST ${inr(s.charges.gst)} · exchange ${inr(s.charges.exchange)} · stamp ${inr(s.charges.stamp_duty)}`} />
-        <Stat label="Won / lost" value={`${s.wins} / ${s.losses}`} note={`win rate ${s.winRate == null ? "—" : `${s.winRate.toFixed(1)}%`}${s.count - s.wins - s.losses ? ` · ${s.count - s.wins - s.losses} flat` : ""}`} />
-        <Stat label="Profit factor" value={s.profitFactor == null ? "—" : s.profitFactor.toFixed(2)} note={`net won ${inr(s.netWin, 0)} ÷ net lost ${inr(s.netLoss, 0)}`} />
-        <Stat label="Average win / loss" value={`${signed(s.avgWin)} / ${signed(s.avgLoss)}`} note={s.sizeRatio == null ? undefined : `a win is ${s.sizeRatio.toFixed(2)}× a loss`} />
-        <Stat label="Best / worst trade" value={`${signed(s.best)} / ${signed(s.worst)}`} />
-        <Stat label="Average net return" value={pct(s.avgReturnPct, 2)} sign={s.avgReturnPct} note="per trade, on the premium paid" />
-        {!filtered && <Stat label="Open now" value={`${openCount} · ${signed(openPnl)}`} sign={openPnl} note={`current marks · entry charges ${inr(openCharges)} paid, exit charges not yet`} />}
-      </div>
-      <p className="statistics-note upstox-note">Charges are Upstox's own figures: each day's actual F&amp;O charges from its P&amp;L report
-        ({inr(upstoxTotal)} over {Object.keys(chargeDays).length} days, including any trades of yours outside the lane), split over that day's executions —
-        brokerage per order, STT on sells, stamp duty on buys, exchange and GST by value.
-        {s.pending ? ` ${s.pending} trade${s.pending === 1 ? " waits" : "s wait"} for Upstox's report; shown at gross until then.` : ""}
-        {chargesError ? ` Last read failed${chargesError.day ? ` for ${chargesError.day}` : ""}: ${chargesError.error}` : ""}</p>
-    </section>
-    <section className="panel agent-panel">
-      <div className="panel-title">Closed trades <span>{rows.length}</span></div>
-      <SortableTable rows={rows} columns={columns} sort={sort} onSort={onSort} empty="No closed trades in this filter" />
-    </section>
+    {filters}
+    <SortableTable rows={rows} columns={columns} sort={sort} onSort={onSort} empty="No closed trades in this filter" />
   </>;
 }
 

@@ -1556,3 +1556,4 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .upstox-stats b { overflow: visible; font-size: var(--fs-lg); white-space: normal; }
 .upstox-stats small { display: block; margin-top: 6px; color: var(--text-4); font-size: var(--fs-micro); line-height: 1.4; white-space: normal; }
 .upstox-note { max-width: 150ch; margin: 10px 0 0; line-height: 1.5; }
+.upstox-journal-view { margin: 2px 0 10px; }

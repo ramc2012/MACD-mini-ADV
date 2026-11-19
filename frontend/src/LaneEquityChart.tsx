@@ -57,12 +57,13 @@ function useResize(element: React.RefObject<HTMLDivElement>, chart: React.Mutabl
   }, [element, chart]);
 }
 
-/** One book's equity, its capital line and its drawdown. */
-export function EquityChart({ points, capital, height = 220, label = "Equity" }: { points: readonly EquityPoint[]; capital: number; height?: number; label?: string }) {
+/** One book's equity, its capital line and (unless drawdown is false) its drawdown below the peak in a second pane. */
+export function EquityChart({ points, capital, height = 220, label = "Equity", drawdown = true }: {
+  points: readonly EquityPoint[]; capital: number; height?: number; label?: string; drawdown?: boolean }) {
   const element = useRef<HTMLDivElement>(null);
   const legend = useRef<HTMLDivElement>(null);
   const chart = useRef<IChartApi>();
-  const series = useRef<{ equity: ISeriesApi<"Line">; dd: ISeriesApi<"Area"> }>();
+  const series = useRef<{ equity: ISeriesApi<"Line">; dd?: ISeriesApi<"Area"> }>();
   const rows = useMemo(() => chartPoints(points), [points]);
   const falls = useMemo(() => drawdowns(rows.map((row) => row.equity)), [rows]);
   const byTime = useRef(new Map<number, [number, number]>());
@@ -78,17 +79,19 @@ export function EquityChart({ points, capital, height = 220, label = "Equity" }:
     const [equity, dd] = hit;
     el.innerHTML = `<b>${istDateTime.format(new Date(at * 1000))} IST</b><span>${label} <i>${lakh(equity)}</i></span>`
       + `<span>Return <i class="${equity >= capital ? "up" : "down"}">${capital ? signed((equity / capital - 1) * 100) : "—"}</i></span>`
-      + `<span>Below peak <i class="${dd < 0 ? "down" : ""}">${signed(dd * 100)}</i></span>`;
+      + (drawdown ? `<span>Below peak <i class="${dd < 0 ? "down" : ""}">${signed(dd * 100)}</i></span>` : "");
   };
 
   useEffect(() => {
     if (!element.current) return;
     const api = baseChart(element.current, false);
     const equity = api.addSeries(LineSeries, { color: SERIES[0], lineWidth: 2, priceLineVisible: false, lastValueVisible: true }, 0);
-    const dd = api.addSeries(AreaSeries, { lineColor: "#e66767", topColor: "#e6676700", bottomColor: "#e6676766", lineWidth: 1,
-      priceLineVisible: false, lastValueVisible: false, priceFormat: { type: "custom", formatter: (v: number) => `${v.toFixed(1)}%` } }, 1);
-    api.panes()[0]?.setStretchFactor(3);
-    api.panes()[1]?.setStretchFactor(1);
+    const dd = drawdown ? api.addSeries(AreaSeries, { lineColor: "#e66767", topColor: "#e6676700", bottomColor: "#e6676766", lineWidth: 1,
+      priceLineVisible: false, lastValueVisible: false, priceFormat: { type: "custom", formatter: (v: number) => `${v.toFixed(1)}%` } }, 1) : undefined;
+    if (dd) {
+      api.panes()[0]?.setStretchFactor(3);
+      api.panes()[1]?.setStretchFactor(1);
+    }
     chart.current = api; series.current = { equity, dd };
     const onMove = (param: MouseEventParams<Time>) => paint(typeof param.time === "number" ? param.time : undefined);
     api.subscribeCrosshairMove(onMove);
@@ -100,7 +103,7 @@ export function EquityChart({ points, capital, height = 220, label = "Equity" }:
     const s = series.current;
     if (!s || !chart.current) return;
     s.equity.setData(rows.map((row) => ({ time: row.time as Time, value: row.equity })));
-    s.dd.setData(rows.map((row, i) => ({ time: row.time as Time, value: falls[i] * 100 })));
+    s.dd?.setData(rows.map((row, i) => ({ time: row.time as Time, value: falls[i] * 100 })));
     byTime.current = new Map(rows.map((row, i) => [row.time, [row.equity, falls[i]]]));
     s.equity.priceLines().forEach((line) => s.equity.removePriceLine(line));
     if (capital > 0) s.equity.createPriceLine({ price: capital, color: "#68758a", lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "Capital" });
@@ -110,7 +113,7 @@ export function EquityChart({ points, capital, height = 220, label = "Equity" }:
   }, [rows, falls, capital]);
 
   return <div className="equity-chart" style={{ height }}>
-    <div ref={element} className="equity-chart-canvas" aria-label={`${label} over time with drawdown below its peak`} />
+    <div ref={element} className="equity-chart-canvas" aria-label={`${label} over time${drawdown ? " with drawdown below its peak" : " against the capital line"}`} />
     <div ref={legend} className="chart-legend equity-chart-legend" aria-live="off" />
   </div>;
 }
