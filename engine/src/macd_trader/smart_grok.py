@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -33,6 +33,9 @@ GROK_STALE = "GROK_STALE"
 EXIT_REVIEW_FROM = time(9, 46)        # 30-minute bars close at :15/:45 -- a minute later, every 30 minutes
 EXIT_REVIEW_UNTIL = time(15, 20)
 QUEUE_MAX_AGE_S = 900.0               # a queued signal Grok has not seen within 15 minutes is history
+TAKE_QUOTE_WAIT_S = 120.0             # a take waits this long for a fresh quote (Grok answers in 7-30 s; thin contracts
+                                      # tick less often -- 19 Nov 2026: 2 of 3 takes lost to "no fresh quote")
+TAKE_QUOTE_RETRY_S = 5.0
 CALLS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS smart_grok_calls (
   id TEXT PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, items INTEGER, taken INTEGER,
@@ -69,15 +72,25 @@ EXIT_SCHEMA = {
 
 HOUSE_NOTES = """House notes from this app's own paper history (short samples -- not proven):
 - MACD-lane index option signals paid best on the call side (index CE profit factor ~4.9, index PE ~1.9);
-  stock PE signals were weak; stock CE was middling.
+  stock PE signals were weak; stock CE was middling and carried by rally days.
 - Payoffs are fat-tailed: a few large winners carry the book. Judge by side selection and payoff asymmetry
   (how far it can run vs how far it can fall), not by how often it wins. Tight stops lost money in past studies.
-- A cross that fires late in a move already stretched far from the day's open/VWAP, or against the index's
-  direction, tends to fade. Signals in the same direction as the broad market's breadth did better.
+- A premium MACD cross only fires AFTER the premium has risen, so being well up from the open is normal for every
+  candidate (about +17% was typical on 19 Nov 2026). On 19 Nov the less-stretched calls did no better than the more
+  stretched ones (+14% vs +12% by the close), and the four index calls skipped as "stretched" closed +41%. Do not skip
+  a signal for being up from the open alone; stretch_rank_today (0 = least stretched of today's candidates, 1 = most)
+  compares it with the other signals. Signals in the same direction as the market's breadth did better.
+- reviewed_today shows how the signals already seen today (taken and skipped) have moved since that decision, by
+  group -- live feedback on whether this book's skips are leaving money on the table.
 - Signal-time features: u_* are the underlying's returns signed in the option's favour (positive = moving the
-  option's way); o_* are the option premium's own; crowd_* count how many option contracts crossed on the same /
-  other side in this bar; dip_* describe the MACD dip before the cross; research_rank is an old model's 0-1 rank
-  (weak separation, context only); whale = unusually heavy recent volume in that underlying (no direction).
+  option's way); nifty_ret_prev_pct is NIFTY vs yesterday's close signed the same way; o_* are the option premium's
+  own; o_vol_vs_prev_day is today's option volume so far as a multiple of yesterday's WHOLE day (0.3 an hour into the
+  session is normal, not thin); crowd_* count option contracts that crossed on the same / other side in this bar;
+  dip_* describe the MACD dip before the cross; research_rank is an old model's 0-1 rank (weak separation, context
+  only); whale_multiple = unusually heavy recent volume in that underlying (null = none; no direction).
+- market.option_macd_breadth counts ATM options whose 30-minute premium MACD is above zero: it is slow and still
+  carries yesterday's move in the first hour. market.cash_breadth (stocks up/down vs yesterday, above VWAP) is the
+  live read of the tape; index fut_vs_vwap_pct comes from the index future.
 - Near-expiry options decay fast; stock series must be closed by the code five sessions before expiry."""
 
 
@@ -174,6 +187,8 @@ class GrokDesk:
         self.runtime_dir = runtime_dir
         self.client_factory = lambda: make_client(lane.settings, self.runtime_dir)
         self.queue: list[tuple] = []           # (Pending, price when queued, queued at)
+        self.retry: list[tuple] = []           # takes waiting for a fresh quote: (Pending, queued price, pick, retry at)
+        self._reviewed: tuple[tuple, list[dict]] | None = None
         self._entry_task: asyncio.Task | None = None
         self._entry_batch: list[tuple] = []
         self._exit_task: asyncio.Task | None = None
@@ -224,6 +239,14 @@ class GrokDesk:
 
     # ------------------------------------------------------------------- loop
 
+    def wait_for_quote(self, item, price: float, pick: dict, now: datetime) -> bool:
+        """Hold a take whose contract has not ticked in the last few seconds; False once the wait is over."""
+        started = item.detail.setdefault("grok_quote_wait_from", now.isoformat())
+        if (now - datetime.fromisoformat(started)).total_seconds() >= TAKE_QUOTE_WAIT_S:
+            return False
+        self.retry.append((item, price, pick, now + timedelta(seconds=TAKE_QUOTE_RETRY_S)))
+        return True
+
     def enqueue(self, item, price: float, now: datetime) -> None:
         item.detail["grok_queued_price"] = price
         item.detail["grok_queued_at"] = now.isoformat()
@@ -237,6 +260,14 @@ class GrokDesk:
         if self._exit_task is not None and self._exit_task.done():
             task, self._exit_task = self._exit_task, None
             await self._apply_exits(task, now)
+        if self.retry:
+            due, self.retry = [r for r in self.retry if r[3] <= now], [r for r in self.retry if r[3] > now]
+            for item, price, pick, _at in due:
+                try:
+                    await self.lane._grok_enter(item, price, pick, now)
+                except Exception as exc:  # noqa: BLE001 -- one bad entry must not stop the others
+                    self.lane.error = f"{item.symbol}: {type(exc).__name__}: {exc}"[:300]
+                    self.lane._record(item, "ENTRY_REJECTED", now, detail={"error": str(exc)[:200]})
         settings = self.lane.settings
         fresh = []
         for row in self.queue:
@@ -291,7 +322,61 @@ class GrokDesk:
         return {"time_ist": now.astimezone(IST).strftime("%Y-%m-%d %H:%M"), "market": market,
                 "book": {"cash": round(snap["cash"]), "equity": round(snap["equity"]),
                          "realized_today": None, "open": positions, "slots": self.slots},
-                "track_record": self.track_record()}
+                "track_record": self.track_record(), "reviewed_today": self.reviewed_summary(now)}
+
+    def reviewed_today(self, now: datetime) -> list[dict]:
+        """Today's candidates and Grok's answer for each, from the call journal (survives a restart)."""
+        lane = self.lane
+        day = datetime.now(UTC).astimezone(IST).date().isoformat()      # calls are journalled at wall-clock time
+        with lane._db_lock:
+            rows = lane._db.execute(
+                "SELECT at, request, response FROM smart_grok_calls WHERE day = ? AND kind = 'entry' AND response IS NOT NULL"
+                " ORDER BY at", (day,)).fetchall()
+        key = (day, len(rows))
+        if self._reviewed is not None and self._reviewed[0] == key:
+            return self._reviewed[1]
+        out = []
+        for row in rows:
+            try:
+                request, response = json.loads(row[1]), json.loads(row[2])
+            except (TypeError, ValueError):
+                continue
+            picks = {str(p.get("id")): p for p in response.get("picks") or [] if isinstance(p, dict)}
+            for c in request.get("candidates") or []:
+                pick = picks.get(str(c.get("id"))) or {}
+                out.append({"symbol": c.get("symbol"), "side": c.get("side"), "index": bool(c.get("index")),
+                            "premium": c.get("premium"), "stretch": c.get("o_ret_open_pct"),
+                            "action": pick.get("action") or "skip"})
+        self._reviewed = (key, out)
+        return out
+
+    def reviewed_summary(self, now: datetime) -> dict:
+        """How today's reviewed signals have moved since Grok's decision, per group (premium now vs then)."""
+        prices = getattr(self.lane.execution, "last_prices", {}) or {}
+        groups: dict[str, list[float]] = {}
+        for row in self.reviewed_today(now):
+            then, last = row.get("premium"), prices.get(row.get("symbol"))
+            if not then or not last or then <= 0 or last <= 0:
+                continue
+            key = f"{row['action']}:{'index' if row['index'] else 'stock'}_{row['side']}"
+            groups.setdefault(key, []).append(100 * (last / then - 1))
+        out = {}
+        for key, moves in sorted(groups.items()):
+            moves.sort()
+            out[key] = {"n": len(moves), "median_pct": round(moves[len(moves) // 2], 1),
+                        "mean_pct": round(sum(moves) / len(moves), 1),
+                        "share_up": round(sum(1 for m in moves if m > 0) / len(moves), 2)}
+        return out
+
+    def stretch_rank(self, value, now: datetime, batch_values: list) -> float | None:
+        """Where this candidate's premium-from-open sits among today's candidates (0 least stretched, 1 most)."""
+        if value is None:
+            return None
+        seen = [r["stretch"] for r in self.reviewed_today(now) if r.get("stretch") is not None]
+        seen += [v for v in batch_values if v is not None]
+        if len(seen) < 2:
+            return None
+        return round(sum(1 for v in seen if v < value) / (len(seen) - 1), 2)
 
     def track_record(self) -> dict:
         """This book's own Grok-chosen closed trades, by index/stock and side."""
@@ -329,7 +414,8 @@ class GrokDesk:
             "macd_pct": _pct(f.get("macd_preview_pct"), 3), "macd_slope_pct": _pct(f.get("macd_slope_pct"), 3),
             "dip_bars": f.get("dip_bars"), "dip_depth_pct": _pct(f.get("dip_depth_pct")),
             "o_ret_open_pct": _pct(f.get("o_ret_open")), "o_ret_prev_pct": _pct(f.get("o_ret_prev")),
-            "o_range_pos": _r(f.get("o_range_pos"), 2), "o_vol_ratio": _r(f.get("o_vol_ratio"), 2),
+            "o_range_pos": _r(f.get("o_range_pos"), 2),
+            "o_vol_vs_prev_day": _r(math.expm1(f["o_vol_ratio"]), 2) if f.get("o_vol_ratio") is not None else None,
             "u_ret_open_pct": _pct(f.get("u_ret_open")), "u_ret_prev_pct": _pct(f.get("u_ret_prev")),
             "u_vwap_pct": _pct(f.get("u_vwap")), "nifty_ret_prev_pct": _pct(f.get("nifty_ret_prev")),
             "crowd_same_side": f.get("crowd_same_side"), "crowd_other_side": f.get("crowd_other_side"),
@@ -345,6 +431,9 @@ class GrokDesk:
             cid = f"c{i}"
             ids[cid] = item
             rows.append(self.candidate(cid, item, price, now))
+        values = [r.get("o_ret_open_pct") for r in rows]
+        for row in rows:
+            row["stretch_rank_today"] = self.stretch_rank(row.get("o_ret_open_pct"), now, values)
         payload = {**self.frame(now), "ticket": self.ticket_text(), "candidates": rows}
         return json.dumps(payload, separators=(",", ":"), default=str), ids
 
@@ -523,7 +612,7 @@ class GrokDesk:
 
     def health(self) -> dict:
         return {"enabled": True, "ticket": self.ticket_text(), "slots": self.slots, "index_only": self.index_only,
-                "effort": self.lane.settings.smart_grok_effort, "queued": len(self.queue),
+                "effort": self.lane.settings.smart_grok_effort, "queued": len(self.queue), "waiting_quote": len(self.retry),
                 "entry_in_flight": self._entry_task is not None, "exit_in_flight": self._exit_task is not None,
                 "safety_stop_pct": self.hard_pct, "last_entry": self.last_entry, "last_exit": self.last_exit,
                 "today": self.usage_today(), "error": self.error,

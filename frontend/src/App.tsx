@@ -592,6 +592,8 @@ export default function App() {
   const brokerStatus = observedBrokerStatus(snapshot?.broker.status, health, healthUpdated);
   const brokerDown = !!snapshot && brokerStatus !== "connected";
   const token = tokenLeft(snapshot?.broker.token_expires_at, new Date(quoteNow));
+  // A verified token with the feed still being built is a login that worked, not an outage: no red alarm.
+  const feedStarting = brokerStatus === "connecting" && !token.expired && !!snapshot?.broker.token_expires_at;
   const lastHistoryBar = visibleCandles[visibleCandles.length - 1];
   const formingBar = chartReady ? current[selected] : undefined;
   const latestChartBar = formingBar && (!lastHistoryBar || formingBar.timestamp >= lastHistoryBar.timestamp) ? formingBar : lastHistoryBar;
@@ -606,14 +608,14 @@ export default function App() {
   });
   return <main style={{ "--chrome-h": `${chromeHeight}px` } as CSSProperties}>
     <div className="shell-top" ref={chromeRef}>
-    <header className={brokerDown ? "feed-alarm" : undefined}>
+    <header className={brokerDown && !feedStarting ? "feed-alarm" : undefined}>
       <div className="brand"><span className="logo">M</span><strong>MACD Trader</strong><span className="parallel-badge" title="Parallel React terminal through the Go API gateway">PARALLEL</span></div>
       <div className="index-strip">{HEADER_INDICES.map((row) => <IndexTicker key={row.symbol} label={row.label} short={row.short} tick={ticks[row.symbol]} observedAt={quoteNow} />)}</div>
       <div className="status">
         <SessionChip now={quoteNow} holidays={snapshot?.config.market_holidays} health={health} />
         {brokerDown || token.expired
           ? <button className="fyers-login-cta" onClick={() => openSettings("FYERS")} title={feedTitle(snapshot, health, brokerStatus)}>
-              <span className="feed-dot" aria-hidden="true">●</span>{token.expired ? "Log in to Fyers" : `Fyers ${brokerStatus.replace("_", " ")}`}
+              <span className="feed-dot" aria-hidden="true">●</span>{token.expired ? "Log in to Fyers" : feedStarting ? "Fyers logged in · feed starting" : `Fyers ${brokerStatus.replace("_", " ")}`}
             </button>
           : <button className="fyers-chip" onClick={() => openSettings("FYERS")} title={`${feedTitle(snapshot, health, brokerStatus)} · stream ${connected ? "linked" : "reconnecting"} · token ${token.text}`}>
               <span className={`feed-dot${feedTone(brokerStatus, health)}`} aria-hidden="true">●</span>Fyers<small>{connected ? token.text : "reconnecting"}</small>

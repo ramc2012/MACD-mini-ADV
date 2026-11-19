@@ -148,6 +148,9 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
   PRIMARY KEY (ts, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_chain_underlying_ts ON chain_snapshots(underlying, ts);
+-- One contract's marks (chain_warmup.chain_minutes): without it each read scanned the whole table, ~0.65 s a
+-- contract, 161 s of the 19 Nov 2026 morning connect.
+CREATE INDEX IF NOT EXISTS idx_chain_symbol_ts ON chain_snapshots(symbol, ts);
 -- One row per (day, root) the collector actually stored a chain for. Counting
 -- collected days off chain_snapshots means COUNT(DISTINCT date(ts, ...)) over
 -- every leg of every minute of every session — a scan no index can serve, on

@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS chain_snapshots (
   bid REAL, ask REAL, prev_oi INTEGER, fp REAL, vix REAL, PRIMARY KEY (ts, symbol)
 );
 CREATE INDEX IF NOT EXISTS idx_chain_underlying_ts ON chain_snapshots(underlying, ts);
+-- One contract's marks (chain_warmup.chain_minutes): without it each read scanned the whole table, ~0.65 s a
+-- contract, 161 s of the 19 Nov 2026 morning connect.
+CREATE INDEX IF NOT EXISTS idx_chain_symbol_ts ON chain_snapshots(symbol, ts);
 CREATE TABLE IF NOT EXISTS chain_days (day TEXT NOT NULL, underlying TEXT NOT NULL, PRIMARY KEY (day, underlying));
 """
 

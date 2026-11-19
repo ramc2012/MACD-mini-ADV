@@ -212,3 +212,62 @@ def test_levels_survive_a_restart_and_only_named_books_run_grok(tmp_path):
     assert all(b.grok is None for b in off.lanes)
     assert smart_grok.is_index_option("NSE:BANKNIFTY26NOV60000PE") and not smart_grok.is_index_option(STOCK)
     assert smart_grok.is_index_option("BSE:SENSEX26N2085000CE")
+
+
+def test_a_take_waits_for_a_fresh_quote_instead_of_dropping_it(tmp_path):
+    # 19 Nov 2026: two of Grok's three takes were dropped as NO_PRICE because the thin contract had not ticked
+    # inside the 10 s quote window by the time Grok answered.
+    lane = build(tmp_path, grok=FakeGrok(take()))
+    lane.on_macd_signal(signal(), "CE", {}, now=T0)
+    lane.execution.set_quote(STOCK, 10.0)
+
+    async def go():
+        await lane.step(T0 + timedelta(seconds=330))
+        await lane.step(T0 + timedelta(seconds=395))
+        await lane.grok._entry_task
+        lane.execution.set_quote(STOCK, 10.0, datetime.now(UTC) - timedelta(seconds=40))   # last print 40 s old
+        await lane.step(T0 + timedelta(seconds=400))
+        assert not lane.portfolio.positions and len(lane.grok.retry) == 1
+        lane.execution.set_quote(STOCK, 10.2)                                                # it prints again
+        await lane.step(T0 + timedelta(seconds=410))
+    asyncio.run(go())
+    lane.flush_journal()
+    assert lane.portfolio.positions[STOCK].lots > 0
+    assert [r["decision"] for r in lane.journal_rows()][:2] == ["TAKEN", "WAITING_PRICE"] or \
+        {"TAKEN", "WAITING_PRICE"} <= {r["decision"] for r in lane.journal_rows()}
+
+
+def test_a_take_with_no_print_for_two_minutes_is_recorded_as_no_price(tmp_path):
+    lane = build(tmp_path, grok=FakeGrok(take()))
+    lane.on_macd_signal(signal(), "CE", {}, now=T0)
+    lane.execution.set_quote(STOCK, 10.0)
+
+    async def go():
+        await lane.step(T0 + timedelta(seconds=330))
+        await lane.step(T0 + timedelta(seconds=395))
+        await lane.grok._entry_task
+        lane.execution.set_quote(STOCK, 10.0, datetime.now(UTC) - timedelta(seconds=40))
+        for seconds in range(400, 560, 5):
+            await lane.step(T0 + timedelta(seconds=seconds))
+    asyncio.run(go())
+    assert not lane.portfolio.positions and lane.counts.get("NO_PRICE") == 1 and not lane.grok.retry
+
+
+def test_grok_sees_how_todays_skips_moved_a_stretch_rank_and_plain_volume(tmp_path):
+    import json
+    grok = FakeGrok(take(action="skip"), take(action="skip"))
+    lane = build(tmp_path, grok=grok)
+    lane.execution.set_quote(STOCK, 10.0)
+    lane.on_macd_signal(signal(), "CE", {"o_ret_open": 0.30, "o_vol_ratio": 0.2623642645}, now=T0)
+    asyncio.run(run_batch(lane))
+    lane.execution.set_quote(STOCK, 13.0)                                     # the skipped call ran 30%
+    later = T0 + timedelta(minutes=30)
+    lane.on_macd_signal(signal(bucket=2000, price=13.0), "CE", {"o_ret_open": 0.10}, now=later)
+    asyncio.run(run_batch(lane, later))
+    second = json.loads(grok.calls[1]["user"])
+    assert second["reviewed_today"]["skip:stock_CE"]["n"] == 1
+    assert second["reviewed_today"]["skip:stock_CE"]["median_pct"] == pytest.approx(30.0)
+    assert second["candidates"][0]["stretch_rank_today"] == 0.0             # less stretched than the first
+    first = json.loads(grok.calls[0]["user"])["candidates"][0]
+    assert first["o_vol_vs_prev_day"] == pytest.approx(0.3) and "o_vol_ratio" not in first
+    assert "Do not skip" in grok.calls[0]["system"] and "cash_breadth" in grok.calls[0]["system"]

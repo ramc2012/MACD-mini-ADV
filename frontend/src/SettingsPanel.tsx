@@ -51,7 +51,22 @@ type RuntimeSettings = {
 const headers = { "content-type": "application/json", ...(API_TOKEN ? { "x-macd-token": API_TOKEN } : {}) };
 
 type PanelTab = "FYERS" | "UPSTOX_LOGIN" | "UPSTOX" | "ALERTS" | "STRATEGY";
-type LiveBroker = { status: string; error?: string | null; token_expires_at?: string | null; symbol_count?: number };
+type LiveBroker = { status: string; error?: string | null; token_expires_at?: string | null; symbol_count?: number;
+  connect_step?: string | null; connect_started_at?: string | null };
+
+/** What the engine is doing after the token was accepted (its last finished connect step -> the step now running). */
+const FEED_STEP: Record<string, string> = {
+  "": "checking the token and choosing today's contracts",
+  selection: "checking lot sizes", lot_audit: "pricing open positions", marks: "loading stored minute bars",
+  blast_warm: "opening the market-data socket", stream: "opening the market-data socket",
+};
+
+export function feedStartText(step: string | null | undefined, startedAt: string | null | undefined, now: number): string {
+  const doing = FEED_STEP[step || ""] || "starting the market-data feed";
+  const started = startedAt ? Date.parse(startedAt) : NaN;
+  const seconds = Number.isFinite(started) ? Math.max(0, Math.round((now - started) / 1000)) : null;
+  return `Market feed starting: ${doing}${seconds !== null ? ` (${seconds} s)` : ""}…`;
+}
 
 const IST_EXPIRY = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", weekday: "short", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
 
@@ -414,13 +429,17 @@ function FyersLogin(props: FyersLoginProps) {
   const connected = status === "connected" && !token.expired;
   const appReady = !!settings.fyers_client_id.trim() && settings.fyers_secret_configured;
   const code = extractAuthCode(props.authInput);
-  const headline = connected ? "Connected to Fyers" : status === "connecting" ? "Connecting…"
+  // The token is proven before the server answers; only the feed is still starting. Say so at once (Upstox's card
+  // confirms the login straight away -- this one sat on "Connecting..." for ~3 minutes on 19 Nov 2026).
+  const loggedIn = status === "connecting" && !token.expired && !!expiresAt;
+  const headline = connected ? "Connected to Fyers" : loggedIn ? "Logged in to Fyers ✓" : status === "connecting" ? "Connecting…"
     : token.expired && settings.fyers_access_token_configured ? "Today's login needed" : status === "stale" ? "Connected, but no ticks arriving" : "Not connected";
-  const tone = connected ? "ok" : status === "connecting" ? "pending" : "down";
+  const tone = connected || loggedIn ? "ok" : status === "connecting" ? "pending" : "down";
   return <div className="settings-section fyers-login">
     <div className={`login-status login-${tone}`}>
       <div className="login-headline"><i aria-hidden="true" /><div><b>{headline}</b>
         <small>{connected ? `Daily token valid until ${expiresAt ? IST_EXPIRY.format(new Date(expiresAt)) : "—"} IST · ${token.text}`
+          : loggedIn ? `Token valid until ${IST_EXPIRY.format(new Date(expiresAt!))} IST · ${feedStartText(live?.connect_step, live?.connect_started_at, clock)}`
           : live?.error || settings.broker.error || "Fyers issues a new access token every day; log in once each morning."}</small></div></div>
       <dl>
         <div><dt>Client ID</dt><dd>{settings.fyers_client_id || "—"}</dd></div>

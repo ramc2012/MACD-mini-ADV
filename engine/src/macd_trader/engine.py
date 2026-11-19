@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import copy
 import sqlite3
 import time
@@ -125,6 +127,7 @@ FEED_RECOVERY_COOLDOWN = 180
 # leaks its thread, which is a far smaller cost than wedging the desk.
 FEED_STEP_TIMEOUT = 25.0
 FEED_WATCHDOG_INTERVAL = 30.0
+FEED_HEAL_SECONDS = 10.0          # ticks this fresh mean the feed works, whatever an earlier attempt reported
 # The socket is opened whenever the process starts — often two hours before
 # the bell — and then sits idle. The Fyers SDK burns its five reconnects
 # silently during that idle window, so a socket that still reports "connected"
@@ -173,6 +176,8 @@ def minute_closed_moment(candle) -> datetime:
     """The IST wall-clock moment a closed candle belongs to."""
     return datetime.fromtimestamp(candle.timestamp, UTC).astimezone(IST)
 
+
+logger = logging.getLogger("macd_trader.engine")
 
 def regular_session_open(moment: datetime | None = None) -> bool:
     """True while any segment is in its continuous session on a trading day.
@@ -955,6 +960,7 @@ class TradingEngine(DeskMixin):
         connect_started = time.monotonic()
         connect_steps: dict[str, float] = {}
         self.connect_steps = connect_steps
+        self.connect_started_at = datetime.now(UTC).isoformat()
 
         def step(name: str) -> None:
             connect_steps[name] = round(time.monotonic() - connect_started, 1)
@@ -1107,6 +1113,7 @@ class TradingEngine(DeskMixin):
         except Exception as exc:
             self.status = "error"
             self.error = str(exc)
+            self._socket_error = False
         finally:
             self.events.publish("broker", self.broker_status())
 
@@ -1489,6 +1496,7 @@ class TradingEngine(DeskMixin):
             self.error = str(exc) or type(exc).__name__
             if self.status == "connected":
                 self.status = "error"
+                self._socket_error = True
                 with suppress(Exception):
                     await asyncio.wait_for(self.broker.close(), FEED_STEP_TIMEOUT)
             self.events.publish("broker", self.broker_status())
@@ -1590,7 +1598,27 @@ class TradingEngine(DeskMixin):
             except Exception as exc:  # noqa: BLE001 — survive to the next sweep
                 self.error = f"feed watchdog sweep failed: {exc}"
 
+    def _heal_feed_status(self) -> bool:
+        """Turn a stale "error" back to "connected" once ticks are arriving again.
+
+        A recovery that timed out (or a socket the SDK later re-opened by itself) left status="error" with ticks
+        flowing at 80/s: the header showed "Fyers error" all day on 19 Nov 2026 while every NSE minute was recorded.
+        Only a successful restart_stream used to clear it. The last error is kept in last_feed_error.
+        """
+        if self.status != "error" or not getattr(self, "_socket_error", False):
+            return False          # a failed universe build (connect_feed) is not healed by ticks from the old socket
+        age = self.seconds_since_last_tick()
+        if age is None or age > FEED_HEAL_SECONDS or self.token_expired() or self.socket_auth_rejected():
+            return False
+        self.last_feed_error = {"at": datetime.now(UTC).isoformat(), "error": self.error}
+        logger.warning("feed status healed: ticks arriving (%.1fs old) after error: %s", age, self.error)
+        self.status = "connected"
+        self.error = None
+        self.events.publish("broker", self.broker_status())
+        return True
+
     async def _watchdog_sweep(self) -> None:
+        self._heal_feed_status()
         try:
             refreshed = await asyncio.wait_for(
                 self._preopen_refresh(), FEED_STEP_TIMEOUT * 2)
@@ -1619,6 +1647,12 @@ class TradingEngine(DeskMixin):
         except Exception as exc:  # noqa: BLE001 — retry on the next sweep
             self.status = "error"
             self.error = f"feed recovery failed: {str(exc) or type(exc).__name__}"
+            self._socket_error = True
+            logger.warning("feed recovery %d failed after %.0fs without ticks: %s", self.feed_recoveries,
+                           age if age is not None else -1, self.error)
+        else:
+            logger.warning("feed recovery %d: socket restarted after %.0fs without ticks", self.feed_recoveries,
+                           age if age is not None else -1)
         finally:
             self.events.publish("broker", self.broker_status())
 
@@ -2386,16 +2420,30 @@ class TradingEngine(DeskMixin):
             return round(100 * (a / b - 1), 2) if a and b and a > 0 and b > 0 else None
 
         out: dict = {"indices": {}}
-        for root in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+        roots = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")
+        futures: dict[str, object] = {}
+        # Index ticks carry no traded price, so their VWAP was always null (19 Nov 2026); the index future's is the
+        # session VWAP of the same index. The nearest listed series is the one with the most recent tick.
+        pattern = re.compile(r"^(?:NSE|BSE):([A-Z]+)\d{2}[A-Z]{3}FUT$")
+        for symbol, tick in self.latest_ticks.items():
+            match = pattern.match(symbol)
+            if match and match.group(1) in roots and tick.avg_trade_price:
+                held = futures.get(match.group(1))
+                if held is None or tick.timestamp > held.timestamp:
+                    futures[match.group(1)] = tick
+        for root in roots:
             symbol = INDEX_SPOTS[root]
             tick = self.latest_ticks.get(symbol)
             if not tick:
                 continue
             opened, high, low = self.entry_gate.days.get(symbol)
+            fut = futures.get(root)
             out["indices"][root] = {"ltp": round(tick.ltp, 2), "vs_prev_close_pct": pct(tick.ltp, tick.prev_close),
-                                    "vs_open_pct": pct(tick.ltp, opened), "vs_vwap_pct": pct(tick.ltp, tick.avg_trade_price),
+                                    "vs_open_pct": pct(tick.ltp, opened),
+                                    "fut_vs_vwap_pct": pct(fut.ltp, fut.avg_trade_price) if fut else None,
                                     "day_high": high, "day_low": low,
                                     "age_s": round((now - tick.timestamp).total_seconds())}
+        out["cash_breadth"] = self._cash_breadth()
         vix = self.latest_ticks.get(self.settings.vix_symbol)
         if vix:
             out["india_vix"] = {"ltp": round(vix.ltp, 2), "vs_prev_close_pct": pct(vix.ltp, vix.prev_close)}
@@ -2408,6 +2456,27 @@ class TradingEngine(DeskMixin):
             out["agentic_view"] = {"at": last.get("at"), "regime": last.get("regime"),
                                    "market_view": str(last.get("market_view") or "")[:600]}
         return out
+
+    def _cash_breadth(self) -> dict | None:
+        """Live tape for the smart books: F&O stocks up / down vs yesterday's close and above / below their VWAP,
+        from the latest ticks (no broker call). The option-MACD breadth is a slow 30-minute reading; this is not."""
+        up = down = above = below = 0
+        moves = []
+        for symbol, tick in self.latest_ticks.items():
+            if not symbol.endswith("-EQ") or not tick.ltp or not tick.prev_close or tick.prev_close <= 0:
+                continue
+            move = tick.ltp / tick.prev_close - 1
+            moves.append(move)
+            up += move > 0
+            down += move < 0
+            if tick.avg_trade_price and tick.avg_trade_price > 0:
+                above += tick.ltp > tick.avg_trade_price
+                below += tick.ltp < tick.avg_trade_price
+        if not moves:
+            return None
+        moves.sort()
+        return {"stocks": len(moves), "up": up, "down": down, "above_vwap": above, "below_vwap": below,
+                "median_move_pct": round(100 * moves[len(moves) // 2], 2)}
 
     def _smart_entry_context(self, item, now: datetime) -> dict:
         """Read existing quotes/indicators/flow; no broker request or signal/crowd recomputation."""
@@ -3394,6 +3463,11 @@ class TradingEngine(DeskMixin):
             "spot_count": len(self.settings.symbols),
             "option_count": len(self.option_symbols),
             "analysis_option_count": len(getattr(self, "analysis_option_symbols", set())),
+            # While the feed is (re)built after a login: the last finished step and when it began, so the login
+            # card can say "logged in, feed starting" instead of a bare "Connecting..." (19 Nov 2026).
+            **({"connect_started_at": getattr(self, "connect_started_at", None),
+                "connect_step": next(reversed(getattr(self, "connect_steps", None) or {}), None)}
+               if self.status == "connecting" else {}),
             "tick_buffer": getattr(self.broker, "tick_buffer_status", lambda: None)(),
             "market_hub": getattr(self.broker, "hub_status", lambda: None)(),
         }
@@ -3648,6 +3722,7 @@ class TradingEngine(DeskMixin):
             "token_expired": self.token_expired(),
             "socket_auth_failed": self.socket_auth_rejected(),
             "feed_recoveries": self.feed_recoveries,
+            "last_feed_error": getattr(self, "last_feed_error", None),
             "lane_errors": self.lane_errors,
             "entry_scoring": self.entry_gate.status(),
             "whale_interest": {k: v for k, v in self.whale_interest.status().items() if k != "live"},

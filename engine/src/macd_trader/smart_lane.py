@@ -724,7 +724,15 @@ class SmartLane:
         try:
             price = execution._fresh_price(symbol)
         except RuntimeError:
-            return self._record(item, NO_PRICE, now, detail={"reason": "no fresh quote when Grok's answer came"})
+            # Grok answers 7-30 s after the batch; a thin contract may not have ticked inside the 10 s quote window by
+            # then. Wait for its next print (up to 2 minutes) instead of dropping the take (19 Nov 2026: ADANIENT and
+            # LUPIN lost this way). The drift check below still guards against chasing.
+            first = "grok_quote_wait_from" not in item.detail
+            if grok.wait_for_quote(item, queued_price, pick, now):
+                if first:
+                    self._record(item, WAITING_PRICE, now, detail={"reason": "Grok took it; waiting for a fresh quote"})
+                return None
+            return self._record(item, NO_PRICE, now, detail={"reason": "no fresh quote within 2 minutes of Grok's take"})
         drift = self.settings.smart_grok_max_drift_pct
         if queued_price > 0 and price > queued_price * (1 + drift):
             return self._record(item, smart_grok.GROK_PRICE_MOVED, now, price=price,
